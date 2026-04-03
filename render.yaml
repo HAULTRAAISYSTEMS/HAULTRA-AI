@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: haultra-ai-systems
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 2 --threads 2 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true       # Render auto-generates a secure random value
+      - key: FLASK_DEBUG
+        value: "0"
+      - key: DATABASE_PATH
+        value: haultra.db
+      - key: UPLOAD_FOLDER
+        value: static/uploads
+    disk:
+      name: haultra-data
+      mountPath: /opt/render/project/src
+      sizeGB: 1
