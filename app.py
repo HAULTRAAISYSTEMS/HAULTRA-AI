@@ -1797,15 +1797,46 @@ def manage_users():
     ).fetchall()
     conn.close()
 
+    current_uid = session["user_id"]
+    boss_count  = sum(1 for u in users if u["role"] == "boss")
+
     rows = ""
     for u in users:
+        is_self      = u["id"] == current_uid
+        is_last_boss = u["role"] == "boss" and boss_count <= 1
+
+        _del_td_style = 'style="text-align:right;white-space:nowrap;width:80px;"'
+        if is_self:
+            delete_cell = f'<td {_del_td_style}><span class="muted small">You</span></td>'
+        elif is_last_boss:
+            delete_cell = f'<td {_del_td_style}><span class="muted small" title="Cannot delete the last boss">—</span></td>'
+        else:
+            delete_cell = (
+                f'<td {_del_td_style}>'
+                f'<form method="POST" action="{url_for("delete_user", user_id=u["id"])}" style="margin:0;" '
+                f'onsubmit="return confirm(\'Delete {e(u[\"username\"])}? This cannot be undone.\');">'
+                f'<button type="submit" '
+                f'style="background:transparent;color:#f87171;border:1px solid rgba(248,113,113,0.4);'
+                f'border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;line-height:1.4;">'
+                f'Delete</button>'
+                f'</form>'
+                f'</td>'
+            )
+
+        role_badge = (
+            '<span class="badge completed">Boss</span>'
+            if u["role"] == "boss"
+            else '<span class="badge">Driver</span>'
+        )
+
         rows += f"""
         <tr>
             <td>{e(u['username'])}</td>
             <td>{e(u['full_name'] or '')}</td>
             <td>{e(u['phone'] or '')}</td>
-            <td>{e(u['role'])}</td>
+            <td>{role_badge}</td>
             <td>{e(u['created_at'])}</td>
+            {delete_cell}
         </tr>
         """
 
@@ -1822,13 +1853,58 @@ def manage_users():
         </div>
         <div class="table-wrap">
             <table>
-                <thead><tr><th>Username</th><th>Full Name</th><th>Phone</th><th>Role</th><th>Created</th></tr></thead>
+                <thead><tr><th>Username</th><th>Full Name</th><th>Phone</th><th>Role</th><th>Created</th><th style="width:80px;"></th></tr></thead>
                 <tbody>{rows}</tbody>
             </table>
         </div>
     </div>
     """
     return render_template_string(shell_page("Users", body))
+
+
+@app.route("/users/<int:user_id>/delete", methods=["POST"])
+@boss_required
+def delete_user(user_id):
+    conn = get_db()
+
+    # Verify the target user belongs to this company
+    target = conn.execute(
+        "SELECT * FROM users WHERE id=? AND company_id=?", (user_id, cid())
+    ).fetchone()
+    if not target:
+        conn.close()
+        flash("User not found.", "error")
+        return redirect(url_for("manage_users"))
+
+    # Cannot delete yourself
+    if user_id == session["user_id"]:
+        conn.close()
+        flash("You cannot delete your own account.", "error")
+        return redirect(url_for("manage_users"))
+
+    # Cannot delete the last boss
+    if target["role"] == "boss":
+        boss_count = conn.execute(
+            "SELECT COUNT(*) n FROM users WHERE role='boss' AND company_id=?", (cid(),)
+        ).fetchone()["n"]
+        if boss_count <= 1:
+            conn.close()
+            flash("Cannot delete the last boss account.", "error")
+            return redirect(url_for("manage_users"))
+
+    # If deleting a driver: unassign their active routes (set assigned_to = NULL)
+    if target["role"] == "driver":
+        conn.execute(
+            "UPDATE routes SET assigned_to=NULL WHERE assigned_to=? AND company_id=?",
+            (user_id, cid())
+        )
+
+    conn.execute("DELETE FROM users WHERE id=? AND company_id=?", (user_id, cid()))
+    conn.commit()
+    conn.close()
+
+    flash(f"User '{target['username']}' has been deleted.", "success")
+    return redirect(url_for("manage_users"))
 
 
 @app.route("/drivers")
