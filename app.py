@@ -383,6 +383,41 @@ def init_db():
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS dump_locations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        address TEXT,
+        city TEXT,
+        state TEXT,
+        zip_code TEXT,
+        notes TEXT,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    # Seed dump locations if table is empty
+    if cur.execute("SELECT COUNT(*) FROM dump_locations").fetchone()[0] == 0:
+        _seed_dumps = [
+            ("Bay",         "83 Pagan Ave",          "Smithfield",    "VA", "23430", ""),
+            ("SPSA Landfill","1 Bob Foeller Dr",      "Suffolk",       "VA", "",      ""),
+            ("Holland",     "4801 Nansemond Pkwy",   "Suffolk",       "VA", "",      ""),
+            ("Spivey",      "228 Salters Creek Rd",  "Hampton",       "VA", "",      ""),
+            ("SB Cox",      "217 Cox Dr",            "Yorktown",      "VA", "",      ""),
+            ("United",      "161 Wellman St",        "Norfolk",       "VA", "",      ""),
+            ("Waterway",    "1431 Precon Dr",        "Chesapeake",    "VA", "",      ""),
+            ("Dominion",    "5444 Bainbridge Blvd",  "Chesapeake",    "VA", "",      ""),
+            ("Sykes",       "124 Sykes Ave",         "Virginia Beach","VA", "",      ""),
+            ("MM GU2737",   "Seaboard Rd",           "",              "VA", "",      "Verify full city and ZIP before production"),
+        ]
+        _ts = now_ts()
+        for _n, _a, _c, _s, _z, _notes in _seed_dumps:
+            cur.execute(
+                "INSERT INTO dump_locations (name, address, city, state, zip_code, notes, active, created_at) VALUES (?,?,?,?,?,?,1,?)",
+                (_n, _a, _c, _s, _z, _notes, _ts)
+            )
+
     # --- column migrations (safe, idempotent) ---
     safe_add_column(conn, "users", "full_name TEXT")
     safe_add_column(conn, "users", "phone TEXT")
@@ -399,6 +434,7 @@ def init_db():
     safe_add_column(conn, "orders", "company_id INTEGER")
     safe_add_column(conn, "load_scores", "company_id INTEGER")
     safe_add_column(conn, "route_photos", "uploaded_by INTEGER")
+    safe_add_column(conn, "routes", "dump_location_id INTEGER")
 
     # --- default company bootstrap ---
     default_co = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()
@@ -860,6 +896,7 @@ def shell_page(title, body, extra_head=""):
     {users}
     {new_route}
     {text_route}
+    {dump_locs}
     {co_settings}
     {subscription}
 """.format(
@@ -868,6 +905,7 @@ def shell_page(title, body, extra_head=""):
     users=nav_link(url_for("manage_users"), "👥 Users", path),
     new_route=nav_link(url_for("new_route"), "➕ Create Route", path),
     text_route=nav_link(url_for("text_to_route"), "📝 Text to Route", path),
+    dump_locs=nav_link(url_for("dump_locations_page"), "🗑 Dump Locations", path),
     co_settings=nav_link(url_for("company_settings"), "⚙ Company Settings", path),
     subscription=nav_link(url_for("company_subscription"), "💳 Subscription", path),
 )
@@ -2824,25 +2862,32 @@ def new_route():
         "SELECT id, username FROM users WHERE role='driver' AND company_id=? ORDER BY username",
         (cid(),)
     ).fetchall()
+    dump_locs = conn.execute(
+        "SELECT id, name, city FROM dump_locations WHERE active=1 ORDER BY name"
+    ).fetchall()
 
     if request.method == "POST":
-        route_name = request.form.get("route_name", "").strip()
-        route_date = request.form.get("route_date", today_str()).strip()
-        assigned_to = request.form.get("assigned_to", "").strip()
-        raw_text = request.form.get("raw_text", "").strip()
-        notes = request.form.get("notes", "").strip()
+        route_name       = request.form.get("route_name", "").strip()
+        route_date       = request.form.get("route_date", today_str()).strip()
+        assigned_to      = request.form.get("assigned_to", "").strip()
+        raw_text         = request.form.get("raw_text", "").strip()
+        notes            = request.form.get("notes", "").strip()
+        dump_location_id = request.form.get("dump_location_id", "").strip()
 
         if not route_name:
             flash("Route name required.", "error")
             conn.close()
             return redirect(url_for("new_route"))
 
-        assigned_to_val = int(assigned_to) if assigned_to.isdigit() else None
+        assigned_to_val    = int(assigned_to) if assigned_to.isdigit() else None
+        dump_location_val  = int(dump_location_id) if dump_location_id.isdigit() else None
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO routes (route_date, route_name, raw_text, assigned_to, created_by, status, notes, company_id, created_at)
-            VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?)
-        """, (route_date, route_name, raw_text, assigned_to_val, session["user_id"], notes, cid(), now_ts()))
+            INSERT INTO routes (route_date, route_name, raw_text, assigned_to, created_by,
+                                status, notes, dump_location_id, company_id, created_at)
+            VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
+        """, (route_date, route_name, raw_text, assigned_to_val, session["user_id"],
+              notes, dump_location_val, cid(), now_ts()))
         route_id = cur.lastrowid
 
         parsed_stops = parse_boss_text(raw_text)
@@ -2879,6 +2924,11 @@ def new_route():
     for d in drivers:
         driver_options += f'<option value="{d["id"]}">{e(d["username"])}</option>'
 
+    dump_options = '<option value="">— No dump location —</option>'
+    for dl in dump_locs:
+        city_label = f" ({e(dl['city'])})" if dl['city'] else ""
+        dump_options += f'<option value="{dl["id"]}">{e(dl["name"])}{city_label}</option>'
+
     body = f"""
     <div class="hero">
         <h1>Create Route</h1>
@@ -2892,6 +2942,8 @@ def new_route():
             <input type="date" name="route_date" value="{today_str()}" required>
             <label>Assign Driver</label>
             <select name="assigned_to">{driver_options}</select>
+            <label>Dump Location</label>
+            <select name="dump_location_id">{dump_options}</select>
             <label>Boss Route Text</label>
             <textarea name="raw_text" placeholder="Paste the exact route text your boss sends..."></textarea>
             <label>Notes</label>
@@ -2927,6 +2979,13 @@ def driver_route_detail(route_id):
 
     stop_ids = [s["id"] for s in stops]
     photos_by_stop = load_stop_photos(conn, stop_ids)
+
+    dump_loc = None
+    if route["dump_location_id"]:
+        dump_loc = conn.execute(
+            "SELECT * FROM dump_locations WHERE id=?", (route["dump_location_id"],)
+        ).fetchone()
+
     conn.close()
 
     completed_count = sum(1 for s in stops if s["status"] == "completed")
@@ -3006,6 +3065,34 @@ def driver_route_detail(route_id):
     <div style="font-weight:900;font-size:16px;margin-bottom:4px;">Start Full Route Navigation</div>
     <div class="small muted" style="margin-bottom:14px;">Opens all {len(addresses)} {stop_word} in order &bull; driving mode</div>
     <div class="dsc-action-row">{nav_card_btns}</div>
+</div>"""
+
+    # Dump location card
+    dump_card_html = ""
+    if dump_loc:
+        from urllib.parse import quote_plus as _qp
+        _dump_addr_parts = [
+            dump_loc["address"] or "",
+            dump_loc["city"] or "",
+            dump_loc["state"] or "",
+            dump_loc["zip_code"] or "",
+        ]
+        _dump_addr = " ".join(p for p in _dump_addr_parts if p).strip()
+        _dump_google = "https://www.google.com/maps/dir/?api=1&destination=" + _qp(_dump_addr) if _dump_addr else ""
+        _dump_apple  = "http://maps.apple.com/?daddr=" + _qp(_dump_addr) if _dump_addr else ""
+        _dump_notes  = f'<div class="small muted" style="margin-top:4px;">{e(dump_loc["notes"])}</div>' if dump_loc["notes"] else ""
+        _dump_nav = ""
+        if _dump_google:
+            _dump_nav += f'<a class="btn-driver btn-driver-nav" target="_blank" href="{_dump_google}">&#128205; Google Maps</a>'
+        if _dump_apple:
+            _dump_nav += f'<a class="btn-driver btn-driver-apple" target="_blank" href="{_dump_apple}">&#63743; Apple Maps</a>'
+        dump_card_html = f"""
+<div class="card" style="margin-bottom:14px;border-color:rgba(255,138,138,0.35);">
+    <div style="font-weight:900;font-size:16px;margin-bottom:2px;">&#128465; Dump Location</div>
+    <div style="font-size:18px;font-weight:800;color:#ff8a8a;margin-bottom:2px;">{e(dump_loc["name"])}</div>
+    <div class="small muted">{e(_dump_addr)}</div>
+    {_dump_notes}
+    {f'<div class="dsc-action-row" style="margin-top:12px;">{_dump_nav}</div>' if _dump_nav else ""}
 </div>"""
 
     # Build stop data list for JS distance calculation
@@ -3340,6 +3427,8 @@ def driver_route_detail(route_id):
 </div>
 
 {nav_card_html}
+
+{dump_card_html}
 
 <div class="stop-list-wrap" id="stop-list">
     {stop_cards if stop_cards else '<div class="card">No stops on this route.</div>'}
@@ -5269,6 +5358,226 @@ def terms_of_service():
     </div>
     """
     return render_template_string(shell_page("Terms of Service", body))
+
+
+# =========================================================
+# DUMP LOCATIONS
+# =========================================================
+@app.route("/dump-locations")
+@boss_required
+def dump_locations_page():
+    conn = get_db()
+    locs = conn.execute(
+        "SELECT * FROM dump_locations ORDER BY active DESC, name ASC"
+    ).fetchall()
+    conn.close()
+
+    rows = ""
+    for dl in locs:
+        addr = ", ".join(p for p in [dl["address"], dl["city"], dl["state"], dl["zip_code"]] if p)
+        active_badge = (
+            '<span class="badge completed">Active</span>'
+            if dl["active"]
+            else '<span class="badge" style="opacity:0.5;">Inactive</span>'
+        )
+        toggle_label = "Deactivate" if dl["active"] else "Activate"
+        toggle_style = (
+            'background:transparent;color:#fbbf24;border:1px solid rgba(251,191,36,0.4);'
+            'border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;'
+        ) if dl["active"] else (
+            'background:transparent;color:#4ade80;border:1px solid rgba(74,222,128,0.4);'
+            'border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;'
+        )
+        _dlid   = dl["id"]
+        _dlname = e(dl["name"])
+        rows += f"""
+        <tr>
+            <td><strong>{_dlname}</strong></td>
+            <td class="muted small">{e(addr)}</td>
+            <td class="muted small">{e(dl['notes'] or '')}</td>
+            <td>{active_badge}</td>
+            <td style="text-align:right;white-space:nowrap;">
+                <a href="{url_for('edit_dump_location', loc_id=_dlid)}"
+                   style="color:#3fd2ff;font-size:12px;margin-right:10px;">Edit</a>
+                <form method="POST" action="{url_for('toggle_dump_location', loc_id=_dlid)}" style="display:inline;">
+                    <button type="submit" style="{toggle_style}">{toggle_label}</button>
+                </form>
+                <form method="POST" action="{url_for('delete_dump_location', loc_id=_dlid)}" style="display:inline;margin-left:6px;"
+                      onsubmit="return confirm('Delete {_dlname}?');">
+                    <button type="submit"
+                       style="background:transparent;color:#f87171;border:1px solid rgba(248,113,113,0.4);
+                              border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;">Delete</button>
+                </form>
+            </td>
+        </tr>"""
+
+    body = f"""
+    <div class="hero">
+        <h1>Dump Locations</h1>
+        <p>Manage the disposal sites available for route assignment.</p>
+    </div>
+    <div class="card">
+        <div class="row between" style="margin-bottom:16px;">
+            <h2 style="margin:0;">All Locations</h2>
+            <a class="btn" href="{url_for('add_dump_location')}">+ Add Location</a>
+        </div>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr><th>Name</th><th>Address</th><th>Notes</th><th>Status</th><th style="width:200px;"></th></tr>
+                </thead>
+                <tbody>
+                    {rows or '<tr><td colspan="5" class="muted">No dump locations found.</td></tr>'}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    """
+    return render_template_string(shell_page("Dump Locations", body))
+
+
+@app.route("/dump-locations/add", methods=["GET", "POST"])
+@boss_required
+def add_dump_location():
+    if request.method == "POST":
+        name     = request.form.get("name", "").strip()
+        address  = request.form.get("address", "").strip()
+        city     = request.form.get("city", "").strip()
+        state    = request.form.get("state", "").strip()
+        zip_code = request.form.get("zip_code", "").strip()
+        notes    = request.form.get("notes", "").strip()
+
+        if not name:
+            flash("Location name is required.", "error")
+            return redirect(url_for("add_dump_location"))
+
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO dump_locations (name, address, city, state, zip_code, notes, active, created_at) VALUES (?,?,?,?,?,?,1,?)",
+            (name, address, city, state, zip_code, notes, now_ts())
+        )
+        conn.commit()
+        conn.close()
+        flash(f"Dump location '{name}' added.", "success")
+        return redirect(url_for("dump_locations_page"))
+
+    body = """
+    <div class="hero"><h1>Add Dump Location</h1></div>
+    <div class="card" style="max-width:560px;">
+        <form method="POST">
+            <label>Name *</label>
+            <input name="name" required placeholder="e.g. Bay">
+            <label>Address</label>
+            <input name="address" placeholder="Street address">
+            <div class="grid">
+                <div><label>City</label><input name="city"></div>
+                <div><label>State</label><input name="state" value="VA" maxlength="2"></div>
+                <div><label>ZIP</label><input name="zip_code" maxlength="10"></div>
+            </div>
+            <label>Notes</label>
+            <textarea name="notes" placeholder="Any special instructions..."></textarea>
+            <div style="margin-top:12px;display:flex;gap:10px;">
+                <button type="submit">Save Location</button>
+                <a class="btn secondary" href="/dump-locations">Cancel</a>
+            </div>
+        </form>
+    </div>
+    """
+    return render_template_string(shell_page("Add Dump Location", body))
+
+
+@app.route("/dump-locations/<int:loc_id>/edit", methods=["GET", "POST"])
+@boss_required
+def edit_dump_location(loc_id):
+    conn = get_db()
+    dl = conn.execute("SELECT * FROM dump_locations WHERE id=?", (loc_id,)).fetchone()
+    if not dl:
+        conn.close()
+        flash("Location not found.", "error")
+        return redirect(url_for("dump_locations_page"))
+
+    if request.method == "POST":
+        name     = request.form.get("name", "").strip()
+        address  = request.form.get("address", "").strip()
+        city     = request.form.get("city", "").strip()
+        state    = request.form.get("state", "").strip()
+        zip_code = request.form.get("zip_code", "").strip()
+        notes    = request.form.get("notes", "").strip()
+
+        if not name:
+            flash("Location name is required.", "error")
+            conn.close()
+            return redirect(url_for("edit_dump_location", loc_id=loc_id))
+
+        conn.execute(
+            "UPDATE dump_locations SET name=?, address=?, city=?, state=?, zip_code=?, notes=? WHERE id=?",
+            (name, address, city, state, zip_code, notes, loc_id)
+        )
+        conn.commit()
+        conn.close()
+        flash("Location updated.", "success")
+        return redirect(url_for("dump_locations_page"))
+
+    conn.close()
+    body = f"""
+    <div class="hero"><h1>Edit Dump Location</h1></div>
+    <div class="card" style="max-width:560px;">
+        <form method="POST">
+            <label>Name *</label>
+            <input name="name" required value="{e(dl['name'])}">
+            <label>Address</label>
+            <input name="address" value="{e(dl['address'] or '')}">
+            <div class="grid">
+                <div><label>City</label><input name="city" value="{e(dl['city'] or '')}"></div>
+                <div><label>State</label><input name="state" value="{e(dl['state'] or 'VA')}" maxlength="2"></div>
+                <div><label>ZIP</label><input name="zip_code" value="{e(dl['zip_code'] or '')}" maxlength="10"></div>
+            </div>
+            <label>Notes</label>
+            <textarea name="notes">{e(dl['notes'] or '')}</textarea>
+            <div style="margin-top:12px;display:flex;gap:10px;">
+                <button type="submit">Save Changes</button>
+                <a class="btn secondary" href="{url_for('dump_locations_page')}">Cancel</a>
+            </div>
+        </form>
+    </div>
+    """
+    return render_template_string(shell_page("Edit Dump Location", body))
+
+
+@app.route("/dump-locations/<int:loc_id>/toggle", methods=["POST"])
+@boss_required
+def toggle_dump_location(loc_id):
+    conn = get_db()
+    dl = conn.execute("SELECT active, name FROM dump_locations WHERE id=?", (loc_id,)).fetchone()
+    if not dl:
+        conn.close()
+        flash("Location not found.", "error")
+        return redirect(url_for("dump_locations_page"))
+    new_active = 0 if dl["active"] else 1
+    conn.execute("UPDATE dump_locations SET active=? WHERE id=?", (new_active, loc_id))
+    conn.commit()
+    conn.close()
+    status_word = "activated" if new_active else "deactivated"
+    flash(f"'{dl['name']}' {status_word}.", "success")
+    return redirect(url_for("dump_locations_page"))
+
+
+@app.route("/dump-locations/<int:loc_id>/delete", methods=["POST"])
+@boss_required
+def delete_dump_location(loc_id):
+    conn = get_db()
+    dl = conn.execute("SELECT name FROM dump_locations WHERE id=?", (loc_id,)).fetchone()
+    if not dl:
+        conn.close()
+        flash("Location not found.", "error")
+        return redirect(url_for("dump_locations_page"))
+    # Unlink from any routes that reference this location
+    conn.execute("UPDATE routes SET dump_location_id=NULL WHERE dump_location_id=?", (loc_id,))
+    conn.execute("DELETE FROM dump_locations WHERE id=?", (loc_id,))
+    conn.commit()
+    conn.close()
+    flash(f"'{dl['name']}' deleted.", "success")
+    return redirect(url_for("dump_locations_page"))
 
 
 # =========================================================
