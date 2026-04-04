@@ -1811,10 +1811,12 @@ def manage_users():
         elif is_last_boss:
             delete_cell = f'<td {_del_td_style}><span class="muted small" title="Cannot delete the last boss">—</span></td>'
         else:
+            _del_uname  = e(u["username"])
+            _del_action = url_for("delete_user", user_id=u["id"])
             delete_cell = (
                 f'<td {_del_td_style}>'
-                f'<form method="POST" action="{url_for("delete_user", user_id=u["id"])}" style="margin:0;" '
-                f'onsubmit="return confirm(\'Delete {e(u[\"username\"])}? This cannot be undone.\');">'
+                f'<form method="POST" action="{_del_action}" style="margin:0;" '
+                f'onsubmit="return confirm(\'Delete {_del_uname}? This cannot be undone.\');">'
                 f'<button type="submit" '
                 f'style="background:transparent;color:#f87171;border:1px solid rgba(248,113,113,0.4);'
                 f'border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;line-height:1.4;">'
