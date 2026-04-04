@@ -436,6 +436,37 @@ def init_db():
     safe_add_column(conn, "route_photos", "uploaded_by INTEGER")
     safe_add_column(conn, "routes", "dump_location_id INTEGER")
 
+    # --- dump tickets table ---
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS dump_tickets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        stop_id INTEGER NOT NULL,
+        route_id INTEGER NOT NULL,
+        company_id INTEGER,
+        dump_site TEXT,
+        arrival_time TEXT,
+        departure_time TEXT,
+        can_number TEXT,
+        scale_in_weight REAL,
+        scale_out_weight REAL,
+        net_tons REAL,
+        ticket_number TEXT,
+        notes TEXT,
+        photo_path TEXT,
+        created_at TEXT NOT NULL,
+        created_by INTEGER,
+        FOREIGN KEY (stop_id) REFERENCES stops(id),
+        FOREIGN KEY (route_id) REFERENCES routes(id)
+    )
+    """)
+    # --- driver workflow columns on stops ---
+    safe_add_column(conn, "stops", "driver_status TEXT NOT NULL DEFAULT 'pending'")
+    safe_add_column(conn, "stops", "arrived_at TEXT")
+    safe_add_column(conn, "stops", "box_in_at TEXT")
+    safe_add_column(conn, "stops", "box_out_at TEXT")
+    safe_add_column(conn, "stops", "go_to_dump_at TEXT")
+    safe_add_column(conn, "stops", "wo_type TEXT")
+
     # --- default company bootstrap ---
     default_co = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()
     if not default_co:
@@ -603,8 +634,8 @@ def extract_ticket(line):
 
 def extract_container_size(line):
     patterns = [
-        r"\b(10|12|15|20|30|40)\s*(?:yd|yard|yards)\b",
-        r"\b(10|12|15|20|30|40)\b"
+        r"\b(\d{1,2})\s*(?:yd|yard|yards)\b",
+        r"\b(\d{1,2})\b"
     ]
     for p in patterns:
         m = re.search(p, line, re.IGNORECASE)
@@ -616,19 +647,11 @@ def extract_container_size(line):
 def extract_action(line):
     lower = line.lower()
     action_map = [
-        ("swap", "Swap"),
-        ("switch", "Swap"),
-        ("remove", "Remove"),
-        ("pickup", "Pickup"),
-        ("pick up", "Pickup"),
-        ("drop", "Drop"),
-        ("delivery", "Drop"),
-        ("deliver", "Drop"),
-        ("dump", "Dump"),
-        ("empty", "Dump"),
-        ("final", "Final"),
-        ("relocate", "Relocate"),
-        ("service", "Service")
+        ("swap", "Swap"), ("switch", "Swap"),
+        ("remove", "Remove"), ("pickup", "Pickup"), ("pick up", "Pickup"),
+        ("drop", "Drop"), ("delivery", "Drop"), ("deliver", "Drop"),
+        ("dump", "Dump"), ("empty", "Dump"),
+        ("final", "Final"), ("relocate", "Relocate"), ("service", "Service")
     ]
     for key, label in action_map:
         if key in lower:
@@ -641,58 +664,31 @@ def split_into_stop_blocks(raw_text):
     lines = [x for x in lines if x]
     if not lines:
         return []
-
-    blocks = []
-    current = []
-
+    blocks, current = [], []
     for line in lines:
         if re.match(r"^\d+[\).\-\s]+", line):
             if current:
                 blocks.append(current)
                 current = []
         current.append(line)
-
     if current:
         blocks.append(current)
-
     return blocks
 
 
 def parse_stop_block(lines, order_num):
-    customer_name = ""
-    address = ""
-    city = ""
-    state = ""
-    zip_code = ""
-    action = ""
-    container_size = ""
-    ticket_number = ""
-    reference_number = ""
-    notes = []
-
-    # Clean lines first
+    customer_name = address = city = state = zip_code = ""
+    action = container_size = ticket_number = reference_number = ""
     cleaned_lines = [x.strip() for x in lines if x.strip()]
-
     if not cleaned_lines:
-        return {
-            "stop_order": order_num,
-            "customer_name": "",
-            "address": "",
-            "city": "",
-            "state": "",
-            "zip_code": "",
-            "action": "Service",
-            "container_size": "",
-            "ticket_number": "",
-            "reference_number": "",
-            "notes": ""
-        }
+        return {"stop_order": order_num, "wo_type": "", "customer_name": "",
+                "address": "", "city": "", "state": "", "zip_code": "",
+                "action": "Service", "container_size": "", "ticket_number": "",
+                "reference_number": "", "notes": ""}
 
-    # 1) First line = customer, remove "1." / "2." / etc
     first_line = cleaned_lines[0]
     customer_name = re.sub(r"^\d+[\).\-\s]+", "", first_line).strip()
 
-    # 2) Find first true address line AFTER customer
     address_index = None
     for i in range(1, len(cleaned_lines)):
         if looks_like_address(cleaned_lines[i]):
@@ -700,65 +696,156 @@ def parse_stop_block(lines, order_num):
             address_index = i
             break
 
-    # 3) If next line after address is city/state/zip, capture it
     if address_index is not None and address_index + 1 < len(cleaned_lines):
         csz = extract_city_state_zip(cleaned_lines[address_index + 1])
         if any(csz):
             city, state, zip_code = csz
 
-    # 4) Parse action / size / ticket / reference from all lines
     for line in cleaned_lines:
         if not action:
-            found_action = extract_action(line)
-            if found_action:
-                action = found_action
-
+            action = extract_action(line)
         if not container_size:
-            found_size = extract_container_size(line)
-            if found_size:
-                container_size = found_size
-
+            container_size = extract_container_size(line)
         if not ticket_number:
-            found_ticket = extract_ticket(line)
-            if found_ticket:
-                ticket_number = found_ticket
-
+            ticket_number = extract_ticket(line)
         if not reference_number:
             m = re.search(r"(?:po|ref)\s*#?:?\s*([A-Za-z0-9\-\/]+)", line, re.IGNORECASE)
             if m:
                 reference_number = m.group(1).strip()
 
-    # 5) Default action
     if not action:
         action = "Service"
 
-    # 6) Notes = everything except the numbered customer line
-    notes = "\n".join(cleaned_lines).strip()
-
     return {
-        "stop_order": order_num,
-        "customer_name": customer_name,
-        "address": address,
-        "city": city,
-        "state": state,
-        "zip_code": zip_code,
-        "action": action,
-        "container_size": container_size,
-        "ticket_number": ticket_number,
-        "reference_number": reference_number,
-        "notes": notes
+        "stop_order": order_num, "wo_type": "",
+        "customer_name": customer_name, "address": address,
+        "city": city, "state": state, "zip_code": zip_code,
+        "action": action, "container_size": container_size,
+        "ticket_number": ticket_number, "reference_number": reference_number,
+        "notes": "\n".join(cleaned_lines).strip()
     }
 
-def parse_boss_text(raw_text):
-    blocks = split_into_stop_blocks(raw_text)
-    parsed = []
 
+# ─── Work-order format parser (PR / P / D prefix lines) ───────────────────────
+
+# Maps work-order code → dumpster action
+_WO_ACTION = {"PR": "Swap", "P": "Pickup", "D": "Drop"}
+
+
+def _is_wo_line(line):
+    """Return 'PR', 'P', or 'D' if line starts with a work-order prefix, else None."""
+    m = re.match(r"^(PR|P|D)\s+", line, re.IGNORECASE)
+    return m.group(1).upper() if m else None
+
+
+def _parse_wo_line(line, order_num):
+    """
+    Parse one work-order stop line.
+    Expected format:
+        <TYPE> <street address>, <city>, <state>, <customer> <size>yd [dump <site>] [notes]
+    Example:
+        PR 1233 Westover Ave, Norfolk, VA, ringen 30yd dump dominion
+    """
+    wo_type = _is_wo_line(line)
+    if not wo_type:
+        return None
+
+    # Remove the type prefix
+    body = re.sub(r"^(PR|P|D)\s+", "", line, flags=re.IGNORECASE).strip()
+
+    # Split on ", " up to 3 times so we get [address, city, state, rest]
+    parts = body.split(", ", 3)
+    address = parts[0].strip() if len(parts) > 0 else ""
+    city    = parts[1].strip() if len(parts) > 1 else ""
+    state   = parts[2].strip() if len(parts) > 2 else ""
+    rest    = parts[3].strip() if len(parts) > 3 else ""
+
+    customer_name  = ""
+    container_size = ""
+    notes          = ""
+
+    if rest:
+        tokens = rest.split()
+        customer_name = tokens[0] if tokens else ""
+
+        size_m = re.search(r"\b(\d{1,2})\s*yd\b", rest, re.IGNORECASE)
+        container_size = size_m.group(1) if size_m else ""
+
+        # Notes = remainder after stripping customer, size, and "dump <name>"
+        notes_body = rest[len(customer_name):].strip()
+        notes_body = re.sub(r"\b\d{1,2}\s*yd\b", "", notes_body, flags=re.IGNORECASE)
+        notes_body = re.sub(r"\bdump\s+\w+\b", "", notes_body, flags=re.IGNORECASE)
+        notes = re.sub(r"\s+", " ", notes_body).strip()
+
+    return {
+        "stop_order":     order_num,
+        "wo_type":        wo_type,
+        "customer_name":  customer_name,
+        "address":        address,
+        "city":           city,
+        "state":          state,
+        "zip_code":       "",
+        "action":         _WO_ACTION.get(wo_type, "Service"),
+        "container_size": container_size,
+        "ticket_number":  "",
+        "reference_number": "",
+        "notes":          notes,
+    }
+
+
+def _parse_workorder_format(lines):
+    """
+    Parse lines in PR/P/D work-order format.
+    Returns (stops_list, dump_site_str).
+    - Lines starting with PR/P/D become stops.
+    - 'Dump: <name>' sets the route-level dump site.
+    - All other lines (driver name, blank headers) are ignored.
+    """
+    stops     = []
+    dump_site = ""
+    order_num = 1
+
+    for line in lines:
+        if not line:
+            continue
+
+        # "Dump: Dominion Landfill" → route-level dump site, not a stop
+        dm = re.match(r"^dump\s*:\s*(.+)$", line, re.IGNORECASE)
+        if dm:
+            dump_site = dm.group(1).strip()
+            continue
+
+        wo_type = _is_wo_line(line)
+        if wo_type:
+            stop = _parse_wo_line(line, order_num)
+            if stop:
+                stops.append(stop)
+                order_num += 1
+        # else: non-stop header line (driver name, notes, etc.) → skip
+
+    return stops, dump_site
+
+
+def parse_boss_text(raw_text):
+    """
+    Parse pasted route text into (stops_list, dump_site_str).
+
+    Auto-detects format:
+      • PR/P/D work-order format (new)  → _parse_workorder_format()
+      • Numbered-list format (legacy)   → split_into_stop_blocks() / parse_stop_block()
+    """
+    lines = [clean_line(x) for x in raw_text.splitlines()]
+    if any(_is_wo_line(l) for l in lines if l):
+        return _parse_workorder_format(lines)
+
+    # Legacy numbered-list fallback
+    blocks = split_into_stop_blocks(raw_text)
+    stops = []
     for idx, block in enumerate(blocks, start=1):
         stop = parse_stop_block(block, idx)
         if stop["customer_name"] or stop["address"]:
-            parsed.append(stop)
-
-    return parsed 
+            stops.append(stop)
+    return stops, ""
 
 # =========================================================
 # LOAD SCORING / AI SIDE
@@ -933,7 +1020,9 @@ def shell_page(title, body, extra_head=""):
                 {nav_link(url_for('drivers_page'), '🚚 Drivers', path) if user['role'] == 'boss' else ''}
                 {boss_only}
                 {superadmin_link}
-                {nav_link(url_for('logout'), '🚪Logout', path)}
+                <form method="POST" action="{url_for('logout')}" style="margin:0;padding:0;">
+                    <button type="submit" class="nav-item" style="background:none;border:none;cursor:pointer;width:100%;text-align:left;">🚪Logout</button>
+                </form>
             </nav>
         </aside>
         """
@@ -1551,7 +1640,7 @@ def login():
     </div>
     """
     return render_template_string(shell_page("Login", body))
-@app.route("/logout")
+@app.route("/logout", methods=["POST"])
 def logout():
     session.clear()
     flash("Logged out.", "success")
@@ -2372,17 +2461,18 @@ def convert_order_to_route(order_id):
     ))
     route_id = cur.lastrowid
 
-    parsed_stops = parse_boss_text(raw_text)
+    parsed_stops, _parsed_dump = parse_boss_text(raw_text)
     for stop in parsed_stops:
         cur.execute("""
             INSERT INTO stops (
-                route_id, stop_order, customer_name, address, city, state, zip_code,
+                route_id, stop_order, wo_type, customer_name, address, city, state, zip_code,
                 action, container_size, ticket_number, reference_number, notes,
                 status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
         """, (
             route_id,
             stop["stop_order"],
+            stop.get("wo_type", ""),
             stop["customer_name"],
             stop["address"],
             stop["city"],
@@ -2505,7 +2595,11 @@ def boss_dashboard():
             </form>"""
         return f"""
         <tr class="{row_class}">
-            <td><a href="{url_for('view_route', route_id=r['id'])}">{e(r['route_name'])}</a></td>
+            <td>
+                <a href="{url_for('view_route', route_id=r['id'])}">{e(r['route_name'])}</a>
+                <br><a href="{url_for('route_daily_log', route_id=r['id'])}"
+                       style="font-size:11px;color:#9dc8f0;">&#x1F4CB; Daily Log</a>
+            </td>
             <td style="white-space:nowrap;">{e(r['route_date'] or '')}</td>
             <td><span class="badge {e(r['status'])}">{status_label}</span></td>
             <td>{e(r['assigned_username'])}</td>
@@ -2664,7 +2758,7 @@ def text_to_route():
             flash("Route name and pasted text are required.", "error")
             return redirect(url_for("text_to_route"))
 
-        parsed_stops = parse_boss_text(raw_text)
+        parsed_stops, _parsed_dump = parse_boss_text(raw_text)
 
         if not parsed_stops:
             conn.close()
@@ -2693,13 +2787,14 @@ def text_to_route():
         for stop in parsed_stops:
             cur.execute("""
                 INSERT INTO stops (
-                    route_id, stop_order, customer_name, address, city, state, zip_code,
+                    route_id, stop_order, wo_type, customer_name, address, city, state, zip_code,
                     action, container_size, ticket_number, reference_number, notes,
                     status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
             """, (
                 route_id,
                 stop["stop_order"],
+                stop.get("wo_type", ""),
                 stop["customer_name"],
                 stop["address"],
                 stop["city"],
@@ -2890,17 +2985,18 @@ def new_route():
               notes, dump_location_val, cid(), now_ts()))
         route_id = cur.lastrowid
 
-        parsed_stops = parse_boss_text(raw_text)
+        parsed_stops, _parsed_dump = parse_boss_text(raw_text)
         for stop in parsed_stops:
             cur.execute("""
                 INSERT INTO stops (
-                    route_id, stop_order, customer_name, address, city, state, zip_code,
+                    route_id, stop_order, wo_type, customer_name, address, city, state, zip_code,
                     action, container_size, ticket_number, reference_number, notes,
                     status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
             """, (
                 route_id,
                 stop["stop_order"],
+                stop.get("wo_type", ""),
                 stop["customer_name"],
                 stop["address"],
                 stop["city"],
@@ -2932,7 +3028,6 @@ def new_route():
     body = f"""
     <div class="hero">
         <h1>Create Route</h1>
-        <p>Paste your boss route text, auto-parse stops, assign a driver, and send it live.</p>
     </div>
     <div class="card">
         <form method="POST">
@@ -2944,8 +3039,8 @@ def new_route():
             <select name="assigned_to">{driver_options}</select>
             <label>Dump Location</label>
             <select name="dump_location_id">{dump_options}</select>
-            <label>Boss Route Text</label>
-            <textarea name="raw_text" placeholder="Paste the exact route text your boss sends..."></textarea>
+            <label>Route Text</label>
+            <textarea name="raw_text" placeholder="Paste route text to auto-parse stops..."></textarea>
             <label>Notes</label>
             <textarea name="notes" placeholder="Extra route instructions..."></textarea>
             <div style="margin-top:10px;"><button type="submit">Create Route + Parse Stops</button></div>
@@ -3116,8 +3211,10 @@ def driver_route_detail(route_id):
             s["zip_code"] or "",
         ])).strip()
 
-        nav_google = "https://www.google.com/maps/dir/?api=1&destination=" + quote_plus(full_address)
-        nav_apple  = "http://maps.apple.com/?daddr=" + quote_plus(full_address)
+        _enc_addr  = quote_plus(full_address)
+        nav_google_web = "https://www.google.com/maps/dir/?api=1&destination=" + _enc_addr
+        nav_google_app = "comgooglemaps://?daddr=" + _enc_addr + "&directionsmode=driving"
+        nav_apple      = "https://maps.apple.com/?daddr=" + _enc_addr + "&dirflg=d"
 
         photo_html = build_photo_gallery_html(photos_by_stop.get(s["id"], []))
 
@@ -3129,6 +3226,54 @@ def driver_route_detail(route_id):
 
         toggle_label = "Reopen Stop" if is_done else "Complete Stop"
         toggle_class = "btn-driver btn-driver-reopen" if is_done else "btn-driver btn-driver-complete"
+
+        # --- driver workflow state ---
+        _s = dict(s)
+        _driver_status = _s.get("driver_status") or "pending"
+        _csrf = get_csrf_token()
+
+        # Compact trail of completed workflow steps with times
+        _trail_parts = []
+        for _tc, _tl in [("arrived_at","Arrived"),("box_in_at","Box In"),
+                         ("box_out_at","Box Out"),("go_to_dump_at","To Dump")]:
+            _tv = _s.get(_tc)
+            if _tv:
+                _trail_parts.append(
+                    f'<span style="color:#4ade80;font-size:11px;background:rgba(74,222,128,0.1);'
+                    f'padding:2px 7px;border-radius:6px;white-space:nowrap;">✓ {_tl} {_tv[-8:-3]}</span>'
+                )
+        _status_trail_html = (
+            '<div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:10px;">'
+            + "".join(_trail_parts) + '</div>'
+        ) if _trail_parts else ""
+
+        # Next workflow action button (appears above Complete Stop)
+        _workflow_btn_html = ""
+        if not is_done:
+            _wf_map = {
+                "pending":      ("arrived",      "🚛 Arrived at Stop",  "btn-driver btn-driver-complete"),
+                "arrived":      ("box_in",       "📦 Box In",           "btn-driver btn-driver-complete"),
+                "box_in":       ("box_out",      "✅ Box Out",          "btn-driver btn-driver-complete"),
+                "box_out":      ("going_to_dump","🗑️ Go To Dump",       "btn-driver btn-driver-dump"),
+            }
+            if _driver_status in _wf_map:
+                _nxt, _lbl, _cls = _wf_map[_driver_status]
+                _workflow_btn_html = (
+                    f'<form method="POST" action="{url_for("stop_driver_action", stop_id=s["id"])}"'
+                    f' style="margin-bottom:8px;">'
+                    f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
+                    f'<input type="hidden" name="action" value="{_nxt}">'
+                    f'<button class="{_cls}" type="submit" style="width:100%;">{_lbl}</button>'
+                    f'</form>'
+                )
+            elif _driver_status == "going_to_dump":
+                _workflow_btn_html = (
+                    f'<a class="btn-driver btn-driver-dump" '
+                    f'href="{url_for("dump_ticket", stop_id=s["id"])}" '
+                    f'style="display:block;text-align:center;text-decoration:none;'
+                    f'padding:12px 16px;border-radius:12px;font-weight:700;margin-bottom:8px;">'
+                    f'🧾 Enter Dump Ticket</a>'
+                )
 
         card_class = "driver-stop-card"
         if is_next:
@@ -3153,6 +3298,7 @@ def driver_route_detail(route_id):
       <div class="dsc-customer">{e(s['customer_name'] or 'Stop ' + str(s['stop_order']))}</div>
       <div class="dsc-addr">{e(full_address or 'No address')}</div>
       <div class="dsc-meta-row">
+        {f'<span class="action-pill" style="background:rgba(255,200,80,0.22);color:#fde68a;font-weight:900;letter-spacing:.5px;">{e(dict(s).get("wo_type") or "")}</span>' if dict(s).get("wo_type") else ''}
         <span class="action-pill" style="background:{action_color};color:#06101f;">{e(s['action'] or 'Service')}</span>
         {f'<span class="action-pill" style="background:rgba(150,200,255,0.18);color:#cde;">{e(s["container_size"])} yd</span>' if s['container_size'] else ''}
         <span class="badge" id="badge-{stop_key}" style="font-size:11px;">{e(s['status'])}</span>
@@ -3172,13 +3318,18 @@ def driver_route_detail(route_id):
     {photo_html}
 
     <div class="dsc-action-row" style="margin-bottom:10px;">
-      <a class="btn-driver btn-driver-nav" href="{nav_google}" target="_blank">
+      <a class="btn-driver btn-driver-nav"
+         href="{nav_google_web}"
+         onclick="return openGoogleMapsStop(event, '{nav_google_app}', '{nav_google_web}')">
         &#128205; Google Maps
       </a>
-      <a class="btn-driver btn-driver-apple" href="{nav_apple}" target="_blank">
+      <a class="btn-driver btn-driver-apple" href="{nav_apple}">
         &#63743; Apple Maps
       </a>
     </div>
+
+    {_status_trail_html}
+    {_workflow_btn_html}
     <form class="dsc-toggle-form" method="POST"
           action="{url_for('toggle_stop_complete', stop_id=s['id'])}"
           data-stop-id="{stop_key}">
@@ -3348,6 +3499,10 @@ def driver_route_detail(route_id):
     background: linear-gradient(90deg,#6e8dcb,#4d6ab2);
     color: #fff;
 }
+.btn-driver-dump {
+    background: linear-gradient(90deg,#f59e0b,#d97706);
+    color: #0a0500;
+}
 .btn-driver-apple {
     background: linear-gradient(90deg,#c8cdd8,#9aa0b0);
     color: #0a1020;
@@ -3459,6 +3614,28 @@ def driver_route_detail(route_id):
         if (b) b.style.display = 'none';
         if (c) c.textContent = '\u25bc';
     }}
+
+    // ================================================================
+    // Open Google Maps: try app scheme first, fall back to web URL
+    // ================================================================
+    window.openGoogleMapsStop = function(e, appUrl, webUrl) {{
+        e.preventDefault();
+        var isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+            (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+        var isAndroid = /Android/.test(navigator.userAgent);
+        if (isIOS || isAndroid) {{
+            var start = Date.now();
+            var fallback = setTimeout(function() {{ window.location = webUrl; }}, 600);
+            window.location = appUrl;
+            window.addEventListener('blur', function onBlur() {{
+                clearTimeout(fallback);
+                window.removeEventListener('blur', onBlur);
+            }});
+        }} else {{
+            window.open(webUrl, '_blank');
+        }}
+        return false;
+    }};
 
     // ================================================================
     // Toggle stop detail (tap header)
@@ -3727,6 +3904,7 @@ def view_route(route_id):
 
     if session.get("role") == "boss":
         route_action_buttons += f"""
+    <a class="btn secondary" href="{url_for('route_daily_log', route_id=route_id)}">&#x1F4CB; Daily Log</a>
     <form class="inline" method="POST" action="{url_for('optimize_route', route_id=route_id)}"
           id="optimize-form"
           onsubmit="showOptimizeOverlay(event, {len(stops)})">
@@ -3790,6 +3968,7 @@ def view_route(route_id):
                 <div class="row">
                     {edit_button}
                     {delete_button}
+                    <a class="btn secondary" href="{url_for('dump_ticket', stop_id=s['id'])}" style="font-size:13px;">&#x1F9FE; Dump Ticket</a>
                     <form class="inline" method="POST" action="{url_for('toggle_stop_complete', stop_id=s['id'])}">
                         <button class="btn green" type="submit">{'Reopen Stop' if s['status']=='completed' else 'Complete Stop'}</button>
                     </form>
@@ -4224,10 +4403,11 @@ def toggle_stop_complete(stop_id):
 
     new_status = "completed" if stop["status"] == "open" else "open"
     completed_at = now_ts() if new_status == "completed" else None
+    new_driver_status = "completed" if new_status == "completed" else "pending"
 
     conn.execute("""
-        UPDATE stops SET status=?, completed_at=? WHERE id=?
-    """, (new_status, completed_at, stop_id))
+        UPDATE stops SET status=?, completed_at=?, driver_status=? WHERE id=?
+    """, (new_status, completed_at, new_driver_status, stop_id))
     conn.commit()
 
     if request.headers.get("X-Requested-With") == "XMLHttpRequest":
@@ -4244,6 +4424,406 @@ def toggle_stop_complete(stop_id):
 
     conn.close()
     return redirect(url_for("view_route", route_id=stop["route_id"]))
+
+
+# =========================================================
+# DRIVER WORKFLOW ACTION  (Arrived / Box In / Box Out / Go To Dump)
+# =========================================================
+@app.route("/stop/<int:stop_id>/driver-action", methods=["POST"])
+@login_required
+def stop_driver_action(stop_id):
+    action = request.form.get("action", "").strip()
+    valid_actions = {"arrived", "box_in", "box_out", "going_to_dump"}
+    if action not in valid_actions:
+        flash("Invalid action.", "error")
+        return redirect(url_for("dashboard"))
+
+    conn = get_db()
+    stop = conn.execute(
+        """SELECT s.*, r.assigned_to, r.company_id, r.id AS rid
+           FROM stops s JOIN routes r ON s.route_id = r.id
+           WHERE s.id=? AND r.company_id=?""",
+        (stop_id, cid())
+    ).fetchone()
+    if not stop:
+        conn.close()
+        abort(404)
+
+    if session.get("role") != "boss" and stop["assigned_to"] != session["user_id"]:
+        conn.close()
+        flash("Access denied.", "error")
+        return redirect(url_for("dashboard"))
+
+    col_map = {
+        "arrived":      "arrived_at",
+        "box_in":       "box_in_at",
+        "box_out":      "box_out_at",
+        "going_to_dump":"go_to_dump_at",
+    }
+    time_col = col_map[action]
+    ts = now_ts()
+    conn.execute(
+        f"UPDATE stops SET driver_status=?, {time_col}=? WHERE id=?",
+        (action, ts, stop_id)
+    )
+    conn.commit()
+    route_id = stop["rid"]
+    conn.close()
+    return redirect(url_for("driver_route_detail", route_id=route_id))
+
+
+# =========================================================
+# DUMP TICKET  (enter landfill scale ticket per stop)
+# =========================================================
+@app.route("/stop/<int:stop_id>/dump-ticket", methods=["GET", "POST"])
+@login_required
+def dump_ticket(stop_id):
+    conn = get_db()
+    stop = conn.execute(
+        """SELECT s.*, r.assigned_to, r.company_id, r.id AS rid, r.dump_location_id
+           FROM stops s JOIN routes r ON s.route_id = r.id
+           WHERE s.id=? AND r.company_id=?""",
+        (stop_id, cid())
+    ).fetchone()
+    if not stop:
+        conn.close()
+        abort(404)
+
+    if session.get("role") != "boss" and stop["assigned_to"] != session["user_id"]:
+        conn.close()
+        flash("Access denied.", "error")
+        return redirect(url_for("dashboard"))
+
+    route_id = stop["rid"]
+
+    if request.method == "POST":
+        def _sf(k):
+            v = request.form.get(k, "").strip()
+            try:
+                return float(v) if v else None
+            except ValueError:
+                return None
+
+        dump_site      = request.form.get("dump_site", "").strip()
+        arrival_time   = request.form.get("arrival_time", "").strip()
+        departure_time = request.form.get("departure_time", "").strip()
+        can_number     = request.form.get("can_number", "").strip()
+        scale_in       = _sf("scale_in_weight")
+        scale_out      = _sf("scale_out_weight")
+        net_tons       = _sf("net_tons")
+        ticket_number  = request.form.get("ticket_number", "").strip()
+        notes          = request.form.get("notes", "").strip()
+
+        existing = conn.execute(
+            "SELECT id FROM dump_tickets WHERE stop_id=?", (stop_id,)
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """UPDATE dump_tickets SET dump_site=?, arrival_time=?, departure_time=?,
+                   can_number=?, scale_in_weight=?, scale_out_weight=?, net_tons=?,
+                   ticket_number=?, notes=? WHERE stop_id=?""",
+                (dump_site, arrival_time, departure_time, can_number,
+                 scale_in, scale_out, net_tons, ticket_number, notes, stop_id)
+            )
+        else:
+            conn.execute(
+                """INSERT INTO dump_tickets
+                   (stop_id, route_id, company_id, dump_site, arrival_time, departure_time,
+                    can_number, scale_in_weight, scale_out_weight, net_tons, ticket_number,
+                    notes, created_at, created_by)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (stop_id, route_id, cid(), dump_site, arrival_time, departure_time,
+                 can_number, scale_in, scale_out, net_tons, ticket_number,
+                 notes, now_ts(), session["user_id"])
+            )
+
+        # Optional ticket photo
+        photo = request.files.get("ticket_photo")
+        if photo and photo.filename and allowed_file(photo.filename):
+            uid = secrets.token_hex(8)
+            fname = f"dt_{stop_id}_{uid}_{secure_filename(photo.filename)}"
+            path = os.path.join(app.config["UPLOAD_FOLDER"], fname)
+            photo.save(path)
+            conn.execute(
+                "UPDATE dump_tickets SET photo_path=? WHERE stop_id=?", (path, stop_id)
+            )
+
+        # Auto-complete stop when dump ticket is saved from going_to_dump
+        _ds = dict(stop).get("driver_status") or "pending"
+        if _ds == "going_to_dump":
+            conn.execute(
+                "UPDATE stops SET driver_status='completed', status='completed', completed_at=? WHERE id=?",
+                (now_ts(), stop_id)
+            )
+
+        conn.commit()
+        conn.close()
+        flash("Dump ticket saved.", "success")
+        if session.get("role") == "driver":
+            return redirect(url_for("driver_route_detail", route_id=route_id))
+        return redirect(url_for("view_route", route_id=route_id))
+
+    # GET: show form
+    ticket    = conn.execute("SELECT * FROM dump_tickets WHERE stop_id=?", (stop_id,)).fetchone()
+    dump_locs = conn.execute(
+        "SELECT * FROM dump_locations WHERE active=1 ORDER BY name"
+    ).fetchall()
+
+    # Pre-select route dump location name
+    default_site = ""
+    if stop["dump_location_id"]:
+        _dl = conn.execute(
+            "SELECT name FROM dump_locations WHERE id=?", (stop["dump_location_id"],)
+        ).fetchone()
+        if _dl:
+            default_site = _dl["name"]
+
+    conn.close()
+
+    csrf_tok = get_csrf_token()
+
+    def _fv(field):
+        if ticket and ticket[field] is not None:
+            return e(str(ticket[field]))
+        return ""
+
+    _cur_site = _fv("dump_site") or e(default_site)
+    site_opts = "".join(
+        f'<option value="{e(d["name"])}" {"selected" if e(d["name"]) == _cur_site else ""}>'
+        f'{e(d["name"])}</option>'
+        for d in dump_locs
+    )
+
+    body = f"""
+    <div class="hero">
+        <h1>&#x1F9FE; Dump Ticket</h1>
+        <p>Stop #{e(str(stop["stop_order"]))} &mdash; {e(stop["customer_name"] or "")}
+           &nbsp;|&nbsp; {e(stop["address"] or "")} {e(stop["city"] or "")}</p>
+        <a class="btn secondary" href="javascript:history.back()" style="margin-top:10px;display:inline-block;">&#8592; Back</a>
+    </div>
+    <div class="card">
+        <form method="POST" enctype="multipart/form-data">
+            <input type="hidden" name="_csrf_token" value="{csrf_tok}">
+            <div class="grid">
+                <div>
+                    <label>Dump Site</label>
+                    <select name="dump_site">
+                        <option value="">&#8212; Select &#8212;</option>
+                        {site_opts}
+                    </select>
+                </div>
+                <div>
+                    <label>Can / Box Number</label>
+                    <input name="can_number" value="{_fv("can_number")}" placeholder="e.g. 1042">
+                </div>
+                <div>
+                    <label>Arrival Time</label>
+                    <input name="arrival_time" type="time" value="{_fv("arrival_time")}">
+                </div>
+                <div>
+                    <label>Departure Time</label>
+                    <input name="departure_time" type="time" value="{_fv("departure_time")}">
+                </div>
+                <div>
+                    <label>Scale-In Weight (tons)</label>
+                    <input name="scale_in_weight" id="f-sin" type="number" step="0.001"
+                           value="{_fv("scale_in_weight")}" placeholder="0.000">
+                </div>
+                <div>
+                    <label>Scale-Out Weight (tons)</label>
+                    <input name="scale_out_weight" id="f-sout" type="number" step="0.001"
+                           value="{_fv("scale_out_weight")}" placeholder="0.000">
+                </div>
+                <div>
+                    <label>Net Tons</label>
+                    <input name="net_tons" id="f-net" type="number" step="0.001"
+                           value="{_fv("net_tons")}" placeholder="Auto-calculated">
+                </div>
+                <div>
+                    <label>Ticket Number</label>
+                    <input name="ticket_number" value="{_fv("ticket_number")}" placeholder="Landfill ticket #">
+                </div>
+            </div>
+            <label>Notes</label>
+            <textarea name="notes" placeholder="Issues, observations, gate info...">{_fv("notes")}</textarea>
+            <label>Ticket Photo / Scan</label>
+            <input type="file" name="ticket_photo" accept=".png,.jpg,.jpeg,.webp,.pdf"
+                   style="margin-bottom:16px;">
+            <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px;">
+                <button class="btn green" type="submit" style="flex:1;min-width:160px;">
+                    &#128190; Save Dump Ticket
+                </button>
+                <a class="btn secondary" href="javascript:history.back()"
+                   style="flex:1;min-width:120px;text-align:center;padding:12px 16px;">
+                    &#8592; Back
+                </a>
+            </div>
+        </form>
+    </div>
+    <script>
+    (function() {{
+        var sin  = document.getElementById('f-sin');
+        var sout = document.getElementById('f-sout');
+        var net  = document.getElementById('f-net');
+        function calcNet() {{
+            var i = parseFloat(sin.value), o = parseFloat(sout.value);
+            if (!isNaN(i) && !isNaN(o) && i > 0)
+                net.value = Math.max(0, i - o).toFixed(3);
+        }}
+        if (sin)  sin.addEventListener('input', calcNet);
+        if (sout) sout.addEventListener('input', calcNet);
+    }})();
+    </script>
+    """
+    return render_template_string(shell_page("Dump Ticket", body))
+
+
+# =========================================================
+# DAILY ROUTE LOG  (boss printable route sheet)
+# =========================================================
+@app.route("/route/<int:route_id>/daily-log")
+@boss_required
+def route_daily_log(route_id):
+    conn = get_db()
+    route = conn.execute(
+        """SELECT r.*, u.username AS driver_name, u.full_name AS driver_full
+           FROM routes r LEFT JOIN users u ON r.assigned_to=u.id
+           WHERE r.id=? AND r.company_id=?""",
+        (route_id, cid())
+    ).fetchone()
+    if not route:
+        conn.close()
+        abort(404)
+
+    stops = conn.execute(
+        """SELECT s.*,
+                  dt.dump_site, dt.arrival_time AS dump_arrival, dt.departure_time AS dump_departure,
+                  dt.can_number, dt.scale_in_weight, dt.scale_out_weight, dt.net_tons,
+                  dt.ticket_number AS dump_ticket_number, dt.notes AS dump_notes
+           FROM stops s
+           LEFT JOIN dump_tickets dt ON dt.stop_id = s.id
+           WHERE s.route_id=?
+           ORDER BY s.stop_order ASC""",
+        (route_id,)
+    ).fetchall()
+    conn.close()
+
+    def _t(ts):
+        if not ts:
+            return ""
+        return ts[11:16] if len(ts) >= 16 else ts
+
+    def _w(v):
+        return f"{v:.3f}" if v is not None else ""
+
+    total_net  = sum((s["net_tons"] or 0) for s in stops)
+    done_count = sum(1 for s in stops if s["status"] == "completed")
+    total_count = len(stops)
+
+    rows = ""
+    for s in stops:
+        _sd = dict(s)
+        rows += f"""
+        <tr class="{'row-done' if s['status'] == 'completed' else ''}">
+            <td class="col-num">#{e(str(s['stop_order']))}</td>
+            <td>{e(s['customer_name'] or '')}</td>
+            <td class="col-addr">{e(s['address'] or '')} {e(s['city'] or '')}</td>
+            <td class="col-center">{e(s['action'] or '')}</td>
+            <td class="col-center">{e(str(s['container_size']) + ' yd') if s['container_size'] else ''}</td>
+            <td class="col-time">{_t(_sd.get('arrived_at'))}</td>
+            <td class="col-time">{_t(_sd.get('box_in_at'))}</td>
+            <td class="col-time">{_t(_sd.get('box_out_at'))}</td>
+            <td class="col-time">{_t(_sd.get('go_to_dump_at'))}</td>
+            <td class="col-center">{e(s['dump_site'] or '')}</td>
+            <td class="col-time">{_t(s['dump_arrival'])}</td>
+            <td class="col-time">{_t(s['dump_departure'])}</td>
+            <td class="col-center">{e(s['can_number'] or '')}</td>
+            <td class="col-num">{_w(s['scale_in_weight'])}</td>
+            <td class="col-num">{_w(s['scale_out_weight'])}</td>
+            <td class="col-num" style="font-weight:700;color:#61f7df;">{_w(s['net_tons'])}</td>
+            <td class="col-center">{e(s['dump_ticket_number'] or '')}</td>
+            <td class="col-center">
+                <span class="badge {e(s['status'])}" style="font-size:10px;">{e(s['status'])}</span>
+            </td>
+        </tr>"""
+
+    body = f"""
+    <style>
+    .log-tbl {{ width:100%;border-collapse:collapse;font-size:12px;min-width:900px; }}
+    .log-tbl th {{
+        background:rgba(97,247,223,0.10);color:#61f7df;font-size:10px;font-weight:700;
+        padding:8px 5px;border-bottom:1px solid rgba(97,247,223,0.18);
+        text-align:center;white-space:nowrap;letter-spacing:.4px;
+    }}
+    .log-tbl td {{ padding:7px 5px;border-bottom:1px solid rgba(80,100,140,0.15);font-size:12px; }}
+    .log-tbl tr.row-done td {{ color:#4ade80;opacity:.85; }}
+    .log-tbl tr:hover td {{ background:rgba(97,247,223,0.04); }}
+    .col-num   {{ text-align:right;font-family:monospace; }}
+    .col-time  {{ text-align:center;font-family:monospace;color:#9dc8f0; }}
+    .col-center{{ text-align:center; }}
+    .col-addr  {{ font-size:11px; }}
+    .log-totals-row td {{ border-top:2px solid rgba(97,247,223,0.35);
+                          font-weight:700;color:#fbbf24;font-size:13px; }}
+    @media print {{
+        .sidebar,.btn,.hero p {{display:none!important;}}
+        body {{background:#fff!important;color:#000!important;}}
+        .card {{background:#fff!important;border:none!important;}}
+        .log-tbl th {{background:#eee!important;color:#000!important;}}
+        .log-tbl td {{color:#000!important;}}
+        .log-tbl tr.row-done td {{color:#007700!important;opacity:1;}}
+        .col-time {{color:#333!important;}}
+    }}
+    </style>
+
+    <div class="hero">
+        <h1>&#x1F4CB; Daily Route Log</h1>
+        <p>{e(route['route_name'])} &nbsp;&#124;&nbsp; {e(route['route_date'])}
+           &nbsp;&#124;&nbsp; Driver: {e(route['driver_full'] or route['driver_name'] or 'Unassigned')}</p>
+        <p>Progress: {done_count}/{total_count} stops &nbsp;&#124;&nbsp;
+           Total Net Tons: <strong style="color:#fbbf24;">{total_net:.3f}</strong></p>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;">
+            <a class="btn secondary" href="{url_for('view_route', route_id=route_id)}">&#8592; Route View</a>
+            <button class="btn" onclick="window.print()">&#128424; Print</button>
+            <a class="btn secondary" href="{url_for('export_route_csv', route_id=route_id)}">&#128229; CSV</a>
+        </div>
+    </div>
+
+    <div class="card" style="padding:0;overflow-x:auto;">
+        <table class="log-tbl">
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th style="text-align:left;">Customer</th>
+                    <th style="text-align:left;">Address</th>
+                    <th>Action</th>
+                    <th>Size</th>
+                    <th>Arrived</th>
+                    <th>Box&nbsp;In</th>
+                    <th>Box&nbsp;Out</th>
+                    <th>To&nbsp;Dump</th>
+                    <th>Dump Site</th>
+                    <th>Dump&nbsp;In</th>
+                    <th>Dump&nbsp;Out</th>
+                    <th>Can&nbsp;#</th>
+                    <th>Scale&nbsp;In</th>
+                    <th>Scale&nbsp;Out</th>
+                    <th>Net Tons</th>
+                    <th>Ticket&nbsp;#</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+                {rows}
+                <tr class="log-totals-row">
+                    <td colspan="15" style="text-align:right;padding-right:8px;">TOTAL NET TONS</td>
+                    <td class="col-num">{total_net:.3f}</td>
+                    <td colspan="2"></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+    """
+    return render_template_string(shell_page("Daily Route Log", body))
 
 
 # =========================================================
@@ -4964,7 +5544,9 @@ def subscription_blocked():
             <p class="muted">{e(action)}</p>
             {sub_link}
             <p style="margin-top:20px;">
-                <a href="{url_for('logout')}" class="muted small">Log out</a>
+                <form method="POST" action="{url_for('logout')}" style="display:inline;margin:0;padding:0;">
+                    <button type="submit" class="muted small" style="background:none;border:none;cursor:pointer;padding:0;font:inherit;color:inherit;">Log out</button>
+                </form>
                 &nbsp;·&nbsp;
                 <a href="mailto:info@haultraai.com" class="muted small">Contact Support</a>
             </p>
