@@ -28,6 +28,13 @@ try:
 except Exception:
     PDF_ENABLED = False
 
+# Optional Stripe billing
+STRIPE_ENABLED = True
+try:
+    import stripe
+except ImportError:
+    STRIPE_ENABLED = False
+
 app = Flask(__name__)
 _secret_key = os.environ.get("SECRET_KEY", "")
 if not _secret_key:
@@ -43,6 +50,39 @@ UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", os.path.join("static", "uploads"
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "pdf"}
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+
+# ----------------------------------------------------------
+# STRIPE CONFIG
+# ---------------------------------------------------------------
+# To use TEST mode, set these env vars (sk_test_... keys):
+#   STRIPE_SECRET_KEY      — Stripe secret key
+#   STRIPE_PRICE_STARTER   — price ID for Starter plan
+#   STRIPE_PRICE_PRO       — price ID for Pro plan
+#   STRIPE_WEBHOOK_SECRET  — whsec_... from Stripe dashboard or CLI
+#
+# To go LIVE, just swap the env var values for live keys/price IDs.
+# No code changes required.
+# ---------------------------------------------------------------
+STRIPE_SECRET_KEY     = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+
+# Price IDs come from env vars; fall back to your test IDs during development
+STRIPE_PRICE_IDS = {
+    "starter": os.environ.get("STRIPE_PRICE_STARTER", "price_1TIdAH3WbELPhsjWEJ5zn0s3"),
+    "pro":     os.environ.get("STRIPE_PRICE_PRO",     "price_1TIdBM3WbELPhsjWFMWRQQn2"),
+}
+
+# Driver seat limits per paid plan (trial limits stay in app logic, not Stripe)
+STRIPE_PLAN_LIMITS = {
+    "starter": 10,
+    "pro":     30,
+}
+
+# Plans that go through Stripe — trial and enterprise are handled outside Stripe
+STRIPE_PURCHASABLE_PLANS = {"starter", "pro"}
+
+if STRIPE_ENABLED and STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
 
 
 # =========================================================
@@ -93,7 +133,9 @@ def csrf_protect():
 # Routes that are always accessible regardless of subscription status
 _SUBSCRIPTION_EXEMPT = {
     "login", "logout", "company_register", "static",
-    "subscription_blocked", "privacy_policy", "terms_of_service",
+    "subscription_blocked", "subscription_success", "billing",
+    "company_subscription", "stripe_webhook",
+    "privacy_policy", "terms_of_service",
 }
 
 @app.before_request
@@ -466,6 +508,9 @@ def init_db():
     safe_add_column(conn, "stops", "box_out_at TEXT")
     safe_add_column(conn, "stops", "go_to_dump_at TEXT")
     safe_add_column(conn, "stops", "wo_type TEXT")
+    safe_add_column(conn, "companies", "stripe_customer_id TEXT")
+    safe_add_column(conn, "companies", "stripe_subscription_id TEXT")
+    safe_add_column(conn, "users", "email TEXT")
 
     # --- default company bootstrap ---
     default_co = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()
@@ -5304,11 +5349,11 @@ def company_subscription():
     # upgrade CTA visibility: only show when not already on enterprise
     show_upgrade = plan in ("trial", "starter", "pro")
     upgrade_btn = (
-        '<a href="mailto:info@haultraai.com?subject=Upgrade%20Request" '
+        '<button onclick="haultraCheckout(\'starter\',this)" '
         'class="btn" style="background:linear-gradient(135deg,#3fd2ff,#56f0b7);'
         'color:#0a1628;font-weight:700;border:none;padding:10px 22px;'
-        'text-decoration:none;border-radius:8px;display:inline-block;">'
-        '&#11014;&#65039; Upgrade Plan</a>'
+        'border-radius:8px;cursor:pointer;">'
+        '&#11014;&#65039; Upgrade Plan</button>'
     ) if show_upgrade else ""
 
     plan_cards = ""
@@ -5318,13 +5363,13 @@ def company_subscription():
         badge  = (f'<span class="badge" style="background:{color}30;color:{color};'
                   f'font-size:11px;margin-left:8px;">&#10003; Current</span>') if active else ""
         upgrade_card_btn = ""
-        if not active and key != "trial":
+        if not active and key in ("starter", "pro"):
             upgrade_card_btn = (
                 f'<div style="margin-top:12px;">'
-                f'<a href="mailto:info@haultraai.com?subject=Upgrade%20to%20{label}" '
+                f'<button onclick="haultraCheckout(\'{key}\',this)" '
                 f'class="btn" style="background:{color}22;color:{color};border:1px solid {color}55;'
-                f'font-size:13px;padding:7px 16px;text-decoration:none;border-radius:7px;display:inline-block;">'
-                f'Upgrade to {label}</a></div>'
+                f'font-size:13px;padding:7px 16px;border-radius:7px;cursor:pointer;width:100%;">'
+                f'Upgrade to {label}</button></div>'
             )
         plan_cards += f"""
         <div class="stat" style="padding:18px;{border}border-radius:12px;">
@@ -5407,8 +5452,7 @@ def company_subscription():
         <h2>Available Plans</h2>
         <div class="grid">{plan_cards}</div>
         <p class="muted small" style="margin-top:14px;">
-            &#9993; To upgrade, email <strong>info@haultraai.com</strong> with your company name and desired plan.
-            Self-serve billing coming soon.
+            Secure checkout powered by Stripe. Cancel anytime.
         </p>
     </div>
 
@@ -5421,6 +5465,20 @@ def company_subscription():
             </table>
         </div>
     </div>
+
+    <!-- Hidden form used by JS to POST to /create-checkout-session -->
+    <form id="checkout-form" method="POST" action="{url_for('create_checkout_session')}" style="display:none;">
+        <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+        <input type="hidden" name="plan" id="checkout-plan" value="">
+    </form>
+
+    <script>
+    window.haultraCheckout = function(plan, btn) {{
+        if (btn) {{ btn.disabled = true; btn.textContent = 'Redirecting to Stripe…'; }}
+        document.getElementById('checkout-plan').value = plan;
+        document.getElementById('checkout-form').submit();
+    }};
+    </script>
     """
     return render_template_string(shell_page("Subscription", body))
 
@@ -5500,6 +5558,232 @@ def superadmin_panel():
     </div>
     """
     return render_template_string(shell_page("Superadmin", body))
+
+
+# =========================================================
+# STRIPE CHECKOUT
+# =========================================================
+
+def _stripe_apply_plan(company_id, plan, customer_id, sub_id, note):
+    """
+    Central helper — update companies + write a subscriptions history row.
+    Called from multiple webhook handlers so the DB logic lives in one place.
+    """
+    max_d = STRIPE_PLAN_LIMITS.get(plan, 10)
+    conn  = get_db()
+    conn.execute(
+        """UPDATE companies
+           SET subscription_plan=?, subscription_status='active',
+               max_drivers=?, stripe_customer_id=?, stripe_subscription_id=?
+           WHERE id=?""",
+        (plan, max_d, customer_id or "", sub_id or "", int(company_id))
+    )
+    conn.execute(
+        """INSERT INTO subscriptions (company_id, plan, status, started_at, notes, created_at)
+           VALUES (?,?,'active',?,?,?)""",
+        (int(company_id), plan, now_ts(), note, now_ts())
+    )
+    conn.commit()
+    conn.close()
+
+
+def _stripe_suspend_by_sub(sub_id):
+    """Suspend the company whose stripe_subscription_id matches sub_id."""
+    conn = get_db()
+    conn.execute(
+        "UPDATE companies SET subscription_status='suspended' WHERE stripe_subscription_id=?",
+        (sub_id,)
+    )
+    conn.commit()
+    conn.close()
+
+
+@app.route("/create-checkout-session", methods=["POST"])
+@boss_required
+def create_checkout_session():
+    if not STRIPE_ENABLED or not STRIPE_SECRET_KEY:
+        flash("Stripe billing is not configured on this server.", "error")
+        return redirect(url_for("company_subscription"))
+
+    plan = request.form.get("plan", "").lower()
+    if plan not in STRIPE_PURCHASABLE_PLANS:
+        flash("Invalid plan selected.", "error")
+        return redirect(url_for("company_subscription"))
+
+    price_id = STRIPE_PRICE_IDS.get(plan)
+    if not price_id:
+        flash("Price ID not configured for this plan.", "error")
+        return redirect(url_for("company_subscription"))
+
+    conn = get_db()
+    company  = conn.execute("SELECT * FROM companies WHERE id=?", (cid(),)).fetchone()
+    try:
+        user_row = conn.execute("SELECT email FROM users WHERE id=?", (session["user_id"],)).fetchone()
+        user_email = (user_row["email"] if user_row and user_row["email"] else "") or ""
+    except Exception:
+        user_email = ""
+    conn.close()
+
+    company_dict      = dict(company) if company else {}
+    existing_customer = company_dict.get("stripe_customer_id") or None
+
+    success_url = url_for("subscription_success", _external=True) + "?session_id={CHECKOUT_SESSION_ID}"
+    cancel_url  = url_for("billing", _external=True)
+
+    try:
+        checkout_kwargs = dict(
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            # client_reference_id lets the webhook look up the company
+            # without relying solely on metadata
+            client_reference_id=str(cid()),
+            metadata={"company_id": str(cid()), "plan": plan},
+            allow_promotion_codes=True,
+        )
+        if existing_customer:
+            # Re-use existing Stripe customer so payment history is preserved
+            checkout_kwargs["customer"] = existing_customer
+        elif user_email:
+            checkout_kwargs["customer_email"] = user_email
+
+        checkout = stripe.checkout.Session.create(**checkout_kwargs)
+        return redirect(checkout.url, code=303)
+
+    except stripe.error.StripeError as ex:
+        flash(f"Stripe error: {getattr(ex, 'user_message', None) or str(ex)}", "error")
+        return redirect(url_for("billing"))
+
+
+@app.route("/stripe-webhook", methods=["POST"])
+def stripe_webhook():
+    """
+    Receives Stripe events. Register this URL in your Stripe dashboard:
+        https://yourdomain.com/stripe-webhook
+
+    Enable these events:
+        checkout.session.completed
+        customer.subscription.created
+        customer.subscription.updated
+        customer.subscription.deleted
+
+    Stripe-Signature header is verified against STRIPE_WEBHOOK_SECRET so
+    spoofed POST requests are rejected before touching the database.
+    """
+    if not STRIPE_ENABLED or not STRIPE_WEBHOOK_SECRET:
+        return "Webhook not configured", 400
+
+    payload    = request.get_data()
+    sig_header = request.headers.get("Stripe-Signature", "")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except ValueError:
+        return "Bad payload", 400
+    except stripe.error.SignatureVerificationError:
+        return "Invalid signature", 400
+
+    etype = event["type"]
+    obj   = event["data"]["object"]
+
+    # ------------------------------------------------------------------
+    # checkout.session.completed
+    # First payment succeeded; activate the plan immediately.
+    # ------------------------------------------------------------------
+    if etype == "checkout.session.completed":
+        company_id  = obj.get("client_reference_id") or (obj.get("metadata") or {}).get("company_id")
+        plan        = (obj.get("metadata") or {}).get("plan", "starter")
+        customer_id = obj.get("customer")
+        sub_id      = obj.get("subscription")
+
+        if company_id and plan in STRIPE_PURCHASABLE_PLANS:
+            _stripe_apply_plan(
+                company_id, plan, customer_id, sub_id,
+                f"Activated via Stripe checkout. sub={sub_id}"
+            )
+
+    # ------------------------------------------------------------------
+    # customer.subscription.created
+    # Stripe fires this when the subscription object is first created.
+    # We already handled activation in checkout.session.completed, but
+    # we store the sub ID here in case the checkout event arrives late.
+    # ------------------------------------------------------------------
+    elif etype == "customer.subscription.created":
+        sub_id      = obj.get("id")
+        customer_id = obj.get("customer")
+        # Resolve plan from the price ID on the first item
+        items    = (obj.get("items") or {}).get("data") or []
+        price_id = items[0]["price"]["id"] if items else ""
+        plan     = next((k for k, v in STRIPE_PRICE_IDS.items() if v == price_id), None)
+
+        if plan and customer_id:
+            # Look up company by stripe_customer_id (set during checkout)
+            conn    = get_db()
+            company = conn.execute(
+                "SELECT id FROM companies WHERE stripe_customer_id=?", (customer_id,)
+            ).fetchone()
+            conn.close()
+            if company:
+                _stripe_apply_plan(
+                    company["id"], plan, customer_id, sub_id,
+                    f"Subscription created by Stripe. sub={sub_id}"
+                )
+
+    # ------------------------------------------------------------------
+    # customer.subscription.updated
+    # Handles plan changes (e.g. starter → pro upgrade via Stripe portal).
+    # ------------------------------------------------------------------
+    elif etype == "customer.subscription.updated":
+        sub_id      = obj.get("id")
+        customer_id = obj.get("customer")
+        status      = obj.get("status", "")      # active, past_due, canceled, etc.
+        items       = (obj.get("items") or {}).get("data") or []
+        price_id    = items[0]["price"]["id"] if items else ""
+        plan        = next((k for k, v in STRIPE_PRICE_IDS.items() if v == price_id), None)
+
+        conn = get_db()
+        if status in ("active", "trialing") and plan in STRIPE_PURCHASABLE_PLANS:
+            max_d = STRIPE_PLAN_LIMITS.get(plan, 10)
+            conn.execute(
+                """UPDATE companies
+                   SET subscription_plan=?, subscription_status='active', max_drivers=?
+                   WHERE stripe_subscription_id=?""",
+                (plan, max_d, sub_id)
+            )
+        elif status in ("past_due", "unpaid"):
+            conn.execute(
+                "UPDATE companies SET subscription_status='suspended' WHERE stripe_subscription_id=?",
+                (sub_id,)
+            )
+        conn.commit()
+        conn.close()
+
+    # ------------------------------------------------------------------
+    # customer.subscription.deleted
+    # Subscription was cancelled or expired — suspend the company.
+    # Trial logic stays in-app and is NOT affected by this event.
+    # ------------------------------------------------------------------
+    elif etype == "customer.subscription.deleted":
+        sub_id = obj.get("id")
+        if sub_id:
+            _stripe_suspend_by_sub(sub_id)
+
+    return "ok", 200
+
+
+@app.route("/subscription/success")
+@boss_required
+def subscription_success():
+    flash("Payment successful! Your plan is now active.", "success")
+    return redirect(url_for("billing"))
+
+
+@app.route("/billing")
+@boss_required
+def billing():
+    """Clean /billing URL — renders the same subscription management page."""
+    return company_subscription()
 
 
 # =========================================================
