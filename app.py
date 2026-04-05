@@ -28,13 +28,45 @@ try:
 except Exception:
     PDF_ENABLED = False
 
-# Optional Stripe billing
+# ----------------------------------------------------------
+# STRIPE — read env vars immediately after imports, before
+# anything else runs, so Render vars are guaranteed available.
+# To switch to live: update the four env vars. No code changes.
+# ----------------------------------------------------------
+STRIPE_SECRET_KEY     = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_PRICE_STARTER  = os.getenv("STRIPE_PRICE_STARTER")
+STRIPE_PRICE_PRO      = os.getenv("STRIPE_PRICE_PRO")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+
+print("=== STRIPE CHECK ===")
+print("SECRET:",  STRIPE_SECRET_KEY)
+print("STARTER:", STRIPE_PRICE_STARTER)
+print("PRO:",     STRIPE_PRICE_PRO)
+print("WEBHOOK:", STRIPE_WEBHOOK_SECRET)
+print("====================")
+
 STRIPE_ENABLED = True
 try:
     import stripe
+    stripe.api_key = STRIPE_SECRET_KEY
 except ImportError:
     STRIPE_ENABLED = False
 
+stripe_configured = all([
+    STRIPE_SECRET_KEY,
+    STRIPE_PRICE_STARTER,
+    STRIPE_PRICE_PRO,
+])
+
+STRIPE_PRICE_IDS = {
+    "starter": STRIPE_PRICE_STARTER or "",
+    "pro":     STRIPE_PRICE_PRO     or "",
+}
+
+STRIPE_PLAN_LIMITS       = {"starter": 10, "pro": 30}
+STRIPE_PURCHASABLE_PLANS = {"starter", "pro"}
+
+# ----------------------------------------------------------
 app = Flask(__name__)
 _secret_key = os.environ.get("SECRET_KEY", "")
 if not _secret_key:
@@ -50,39 +82,6 @@ UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", os.path.join("static", "uploads"
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "pdf"}
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-
-# ----------------------------------------------------------
-# STRIPE CONFIG
-# ---------------------------------------------------------------
-# To use TEST mode, set these env vars (sk_test_... keys):
-#   STRIPE_SECRET_KEY      — Stripe secret key
-#   STRIPE_PRICE_STARTER   — price ID for Starter plan
-#   STRIPE_PRICE_PRO       — price ID for Pro plan
-#   STRIPE_WEBHOOK_SECRET  — whsec_... from Stripe dashboard or CLI
-#
-# To go LIVE, just swap the env var values for live keys/price IDs.
-# No code changes required.
-# ---------------------------------------------------------------
-STRIPE_SECRET_KEY     = os.environ.get("STRIPE_SECRET_KEY", "")
-STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-
-# Price IDs come from env vars; fall back to your test IDs during development
-STRIPE_PRICE_IDS = {
-    "starter": os.environ.get("STRIPE_PRICE_STARTER", "price_1TIdAH3WbELPhsjWEJ5zn0s3"),
-    "pro":     os.environ.get("STRIPE_PRICE_PRO",     "price_1TIdBM3WbELPhsjWFMWRQQn2"),
-}
-
-# Driver seat limits per paid plan (trial limits stay in app logic, not Stripe)
-STRIPE_PLAN_LIMITS = {
-    "starter": 10,
-    "pro":     30,
-}
-
-# Plans that go through Stripe — trial and enterprise are handled outside Stripe
-STRIPE_PURCHASABLE_PLANS = {"starter", "pro"}
-
-if STRIPE_ENABLED and STRIPE_SECRET_KEY:
-    stripe.api_key = STRIPE_SECRET_KEY
 
 
 # =========================================================
@@ -5601,9 +5600,11 @@ def _stripe_suspend_by_sub(sub_id):
 @app.route("/create-checkout-session", methods=["POST"])
 @boss_required
 def create_checkout_session():
-    if not STRIPE_ENABLED or not STRIPE_SECRET_KEY:
+    if not STRIPE_ENABLED or not stripe_configured:
+        print("STRIPE NOT CONFIGURED — STRIPE_ENABLED={} stripe_configured={}".format(
+            STRIPE_ENABLED, stripe_configured))
         flash("Stripe billing is not configured on this server.", "error")
-        return redirect(url_for("company_subscription"))
+        return redirect(url_for("billing"))
 
     plan = request.form.get("plan", "").lower()
     if plan not in STRIPE_PURCHASABLE_PLANS:
@@ -5671,7 +5672,7 @@ def stripe_webhook():
     Stripe-Signature header is verified against STRIPE_WEBHOOK_SECRET so
     spoofed POST requests are rejected before touching the database.
     """
-    if not STRIPE_ENABLED or not STRIPE_WEBHOOK_SECRET:
+    if not STRIPE_ENABLED or not stripe_configured or not STRIPE_WEBHOOK_SECRET:
         return "Webhook not configured", 400
 
     payload    = request.get_data()
@@ -5777,6 +5778,37 @@ def stripe_webhook():
 def subscription_success():
     flash("Payment successful! Your plan is now active.", "success")
     return redirect(url_for("billing"))
+
+
+@app.route("/debug-stripe")
+@superadmin_required
+def debug_stripe():
+    """
+    Safe Stripe config check — only accessible to superadmins.
+    Shows whether each var is set and a masked preview; never returns the full key.
+    Remove or gate this route before going live.
+    """
+    import os
+    def _mask(val):
+        if not val:
+            return "MISSING"
+        if len(val) <= 8:
+            return "SET (too short to preview)"
+        return val[:7] + "..." + val[-4:]
+
+    sk  = os.getenv("STRIPE_SECRET_KEY")    or ""
+    ps  = os.getenv("STRIPE_PRICE_STARTER") or ""
+    pp  = os.getenv("STRIPE_PRICE_PRO")     or ""
+    wh  = os.getenv("STRIPE_WEBHOOK_SECRET") or ""
+
+    return jsonify({
+        "stripe_configured": bool(sk and ps and pp),
+        "STRIPE_SECRET_KEY":     _mask(sk),
+        "STRIPE_PRICE_STARTER":  ps  or "MISSING",
+        "STRIPE_PRICE_PRO":      pp  or "MISSING",
+        "STRIPE_WEBHOOK_SECRET": "SET" if wh else "MISSING",
+        "key_mode": ("live" if sk.startswith("sk_live_") else "test" if sk.startswith("sk_test_") else "unknown") if sk else "n/a",
+    })
 
 
 @app.route("/billing")
