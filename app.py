@@ -476,6 +476,7 @@ def init_db():
     safe_add_column(conn, "load_scores", "company_id INTEGER")
     safe_add_column(conn, "route_photos", "uploaded_by INTEGER")
     safe_add_column(conn, "routes", "dump_location_id INTEGER")
+    safe_add_column(conn, "stops", "phone TEXT")
 
     # --- dump tickets table ---
     cur.execute("""
@@ -688,19 +689,55 @@ def extract_container_size(line):
     return ""
 
 
+# Action tokens that may appear as the first field in a dash-delimited line
+_ACTION_TOKENS = {
+    "P":    "Pickup",
+    "D":    "Drop",
+    "PR":   "Pickup and Return",
+    "DUMP": "Dump",
+}
+
+
 def extract_action(line):
+    # Check short token at start of line first (e.g. "P - ", "D - ", "PR - ")
+    stripped = re.sub(r"^\d+[\).\-\s]+", "", line).strip()
+    first_token = stripped.split(" - ")[0].strip().upper()
+    if first_token in _ACTION_TOKENS:
+        return _ACTION_TOKENS[first_token]
+
     lower = line.lower()
     action_map = [
-        ("swap", "Swap"), ("switch", "Swap"),
-        ("remove", "Remove"), ("pickup", "Pickup"), ("pick up", "Pickup"),
-        ("drop", "Drop"), ("delivery", "Drop"), ("deliver", "Drop"),
-        ("dump", "Dump"), ("empty", "Dump"),
-        ("final", "Final"), ("relocate", "Relocate"), ("service", "Service")
+        ("pickup and return", "Pickup and Return"),
+        ("swap",     "Swap"),
+        ("switch",   "Swap"),
+        ("remove",   "Remove"),
+        ("pickup",   "Pickup"),
+        ("pick up",  "Pickup"),
+        ("drop",     "Drop"),
+        ("delivery", "Drop"),
+        ("deliver",  "Drop"),
+        ("dump",     "Dump"),
+        ("empty",    "Dump"),
+        ("final",    "Final"),
+        ("relocate", "Relocate"),
+        ("service",  "Service"),
     ]
     for key, label in action_map:
         if key in lower:
             return label
     return ""
+
+def _is_dash_delimited(line):
+    """Return True if a line looks like an action-prefixed or plain dash-delimited stop."""
+    stripped = re.sub(r"^\d+[\).\-\s]+", "", line).strip()
+    if not stripped:
+        return False
+    # Action-prefixed: "P - ADDRESS - ..." or "DUMP - LOCATION - ADDRESS"
+    first_token = stripped.split(" - ")[0].strip().upper()
+    if first_token in _ACTION_TOKENS:
+        return True
+    # Plain dash-delimited: needs at least 2 separators (ADDRESS - CONTAINER - NAME)
+    return stripped.count(" - ") >= 2
 
 
 def split_into_stop_blocks(raw_text):
@@ -708,30 +745,130 @@ def split_into_stop_blocks(raw_text):
     lines = [x for x in lines if x]
     if not lines:
         return []
-    blocks, current = [], []
-    for line in lines:
-        if re.match(r"^\d+[\).\-\s]+", line):
-            if current:
-                blocks.append(current)
-                current = []
-        current.append(line)
-    if current:
-        blocks.append(current)
-    return blocks
+
+    # Dash-delimited format: one stop per line (ADDRESS - CONTAINER - NAME - PHONE)
+    # Detect if the majority of non-empty lines look like this format
+    dash_lines = sum(1 for l in lines if _is_dash_delimited(l))
+    if dash_lines >= max(1, len(lines) // 2):
+        return [[line] for line in lines]
+
+    # Numbered multi-line format: split on lines that start with a digit prefix
+    has_numbered = any(re.match(r"^\d+[\).\-\s]+", line) for line in lines)
+    if has_numbered:
+        blocks = []
+        current = []
+        for line in lines:
+            if re.match(r"^\d+[\).\-\s]+", line):
+                if current:
+                    blocks.append(current)
+                    current = []
+            current.append(line)
+        if current:
+            blocks.append(current)
+        return blocks
+
+    # Fallback: each line is its own block
+    return [[line] for line in lines]
 
 
 def parse_stop_block(lines, order_num):
-    customer_name = address = city = state = zip_code = ""
-    action = container_size = ticket_number = reference_number = ""
     cleaned_lines = [x.strip() for x in lines if x.strip()]
+
+    _empty = {
+        "stop_order": order_num,
+        "customer_name": "",
+        "address": "",
+        "city": "",
+        "state": "",
+        "zip_code": "",
+        "action": "Service",
+        "container_size": "",
+        "ticket_number": "",
+        "reference_number": "",
+        "phone": "",
+        "notes": "",
+    }
+
     if not cleaned_lines:
-        return {"stop_order": order_num, "wo_type": "", "customer_name": "",
-                "address": "", "city": "", "state": "", "zip_code": "",
-                "action": "Service", "container_size": "", "ticket_number": "",
-                "reference_number": "", "notes": ""}
+        return _empty
 
     first_line = cleaned_lines[0]
-    customer_name = re.sub(r"^\d+[\).\-\s]+", "", first_line).strip()
+    # Strip leading number prefix ("1. ", "2) ", etc.)
+    stripped_first = re.sub(r"^\d+[\).\-\s]+", "", first_line).strip()
+
+    # ── Dash-delimited format ─────────────────────────────────────────────────
+    # Supported layouts:
+    #   ACTION - ADDRESS - CONTAINER - NAME [- PHONE]   (action-prefixed)
+    #   DUMP   - LOCATION_NAME - ADDRESS                 (dump stop, no customer)
+    #   ADDRESS - CONTAINER - NAME [- PHONE]             (plain, no action prefix)
+    if " - " in stripped_first:
+        parts = [p.strip() for p in stripped_first.split(" - ")]
+
+        first_token = parts[0].upper() if parts else ""
+        action_from_token = _ACTION_TOKENS.get(first_token, "")
+
+        if action_from_token == "Dump":
+            # DUMP - LOCATION_NAME - ADDRESS
+            location_name = parts[1] if len(parts) > 1 else ""
+            dump_address  = parts[2] if len(parts) > 2 else ""
+            if not dump_address:
+                dump_address  = location_name
+                location_name = ""
+            return {
+                "stop_order":       order_num,
+                "customer_name":    location_name,
+                "address":          dump_address,
+                "city":             "",
+                "state":            "",
+                "zip_code":         "",
+                "action":           "Dump",
+                "container_size":   "",
+                "ticket_number":    "",
+                "reference_number": "",
+                "phone":            "",
+                "notes":            "",
+            }
+
+        if action_from_token:
+            # ACTION - ADDRESS - CONTAINER - NAME [- PHONE]
+            raw_address   = parts[1] if len(parts) > 1 else ""
+            raw_size      = parts[2] if len(parts) > 2 else ""
+            customer_name = parts[3] if len(parts) > 3 else ""
+            phone         = parts[4] if len(parts) > 4 else ""
+            action        = action_from_token
+        else:
+            # Plain: ADDRESS - CONTAINER - NAME [- PHONE]
+            raw_address   = parts[0]
+            raw_size      = parts[1] if len(parts) > 1 else ""
+            customer_name = parts[2] if len(parts) > 2 else ""
+            phone         = parts[3] if len(parts) > 3 else ""
+            action        = extract_action(stripped_first) or "Service"
+
+        container_size = extract_container_size(raw_size) or raw_size
+
+        return {
+            "stop_order":       order_num,
+            "customer_name":    customer_name,
+            "address":          raw_address,
+            "city":             "",
+            "state":            "",
+            "zip_code":         "",
+            "action":           action,
+            "container_size":   container_size,
+            "ticket_number":    "",
+            "reference_number": "",
+            "phone":            phone,
+            "notes":            "",
+        }
+
+    # ── Legacy multi-line format ──────────────────────────────────────────────
+    customer_name    = stripped_first
+    address          = ""
+    city = state = zip_code = ""
+    action           = ""
+    container_size   = ""
+    ticket_number    = ""
+    reference_number = ""
 
     address_index = None
     for i in range(1, len(cleaned_lines)):
@@ -747,11 +884,17 @@ def parse_stop_block(lines, order_num):
 
     for line in cleaned_lines:
         if not action:
-            action = extract_action(line)
+            found_action = extract_action(line)
+            if found_action:
+                action = found_action
         if not container_size:
-            container_size = extract_container_size(line)
+            found_size = extract_container_size(line)
+            if found_size:
+                container_size = found_size
         if not ticket_number:
-            ticket_number = extract_ticket(line)
+            found_ticket = extract_ticket(line)
+            if found_ticket:
+                ticket_number = found_ticket
         if not reference_number:
             m = re.search(r"(?:po|ref)\s*#?:?\s*([A-Za-z0-9\-\/]+)", line, re.IGNORECASE)
             if m:
@@ -760,13 +903,21 @@ def parse_stop_block(lines, order_num):
     if not action:
         action = "Service"
 
+    notes = "\n".join(cleaned_lines).strip()
+
     return {
-        "stop_order": order_num, "wo_type": "",
-        "customer_name": customer_name, "address": address,
-        "city": city, "state": state, "zip_code": zip_code,
-        "action": action, "container_size": container_size,
-        "ticket_number": ticket_number, "reference_number": reference_number,
-        "notes": "\n".join(cleaned_lines).strip()
+        "stop_order":       order_num,
+        "customer_name":    customer_name,
+        "address":          address,
+        "city":             city,
+        "state":            state,
+        "zip_code":         zip_code,
+        "action":           action,
+        "container_size":   container_size,
+        "ticket_number":    ticket_number,
+        "reference_number": reference_number,
+        "phone":            "",
+        "notes":            notes,
     }
 
 
@@ -2509,14 +2660,13 @@ def convert_order_to_route(order_id):
     for stop in parsed_stops:
         cur.execute("""
             INSERT INTO stops (
-                route_id, stop_order, wo_type, customer_name, address, city, state, zip_code,
-                action, container_size, ticket_number, reference_number, notes,
+                route_id, stop_order, customer_name, address, city, state, zip_code,
+                action, container_size, ticket_number, reference_number, phone, notes,
                 status, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
         """, (
             route_id,
             stop["stop_order"],
-            stop.get("wo_type", ""),
             stop["customer_name"],
             stop["address"],
             stop["city"],
@@ -2526,6 +2676,7 @@ def convert_order_to_route(order_id):
             stop["container_size"],
             stop["ticket_number"],
             stop["reference_number"],
+            stop.get("phone", ""),
             stop["notes"],
             now_ts()
         ))
@@ -2831,14 +2982,13 @@ def text_to_route():
         for stop in parsed_stops:
             cur.execute("""
                 INSERT INTO stops (
-                    route_id, stop_order, wo_type, customer_name, address, city, state, zip_code,
-                    action, container_size, ticket_number, reference_number, notes,
+                    route_id, stop_order, customer_name, address, city, state, zip_code,
+                    action, container_size, ticket_number, reference_number, phone, notes,
                     status, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
             """, (
                 route_id,
                 stop["stop_order"],
-                stop.get("wo_type", ""),
                 stop["customer_name"],
                 stop["address"],
                 stop["city"],
@@ -2848,6 +2998,7 @@ def text_to_route():
                 stop["container_size"],
                 stop["ticket_number"],
                 stop["reference_number"],
+                stop.get("phone", ""),
                 stop["notes"],
                 now_ts()
             ))
@@ -3033,14 +3184,13 @@ def new_route():
         for stop in parsed_stops:
             cur.execute("""
                 INSERT INTO stops (
-                    route_id, stop_order, wo_type, customer_name, address, city, state, zip_code,
-                    action, container_size, ticket_number, reference_number, notes,
+                    route_id, stop_order, customer_name, address, city, state, zip_code,
+                    action, container_size, ticket_number, reference_number, phone, notes,
                     status, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
             """, (
                 route_id,
                 stop["stop_order"],
-                stop.get("wo_type", ""),
                 stop["customer_name"],
                 stop["address"],
                 stop["city"],
@@ -3050,6 +3200,7 @@ def new_route():
                 stop["container_size"],
                 stop["ticket_number"],
                 stop["reference_number"],
+                stop.get("phone", ""),
                 stop["notes"],
                 now_ts()
             ))
@@ -3264,6 +3415,7 @@ def driver_route_detail(route_id):
 
         action_color = {
             "Drop": "#3fd2ff", "Pickup": "#56f0b7", "Swap": "#ffd27c",
+            "Pickup and Return": "#a78bfa",
             "Dump": "#ff8a8a", "Remove": "#ff8a8a", "Service": "#b0c4ff",
             "Final": "#c084fc", "Relocate": "#f9a8d4",
         }.get(s["action"] or "", "#b0c4ff")
@@ -3355,6 +3507,7 @@ def driver_route_detail(route_id):
   <div class="dsc-body" id="body-{stop_key}" style="{detail_style}">
     {"" if not s['ticket_number'] else f'<div class="dsc-field"><span class="dsc-label">Ticket</span>{e(s["ticket_number"])}</div>'}
     {"" if not s['reference_number'] else f'<div class="dsc-field"><span class="dsc-label">Ref</span>{e(s["reference_number"])}</div>'}
+    {"" if not s.get('phone') else f'<div class="dsc-field"><span class="dsc-label">Phone</span><a href="tel:{e(s["phone"])}" style="color:#56f0b7;">{e(s["phone"])}</a></div>'}
     {"" if not s['notes'] else f'<div class="dsc-field"><span class="dsc-label">Notes</span><span style="white-space:pre-wrap;">{e(s["notes"] or "")}</span></div>'}
     <div class="dsc-field" id="done-at-row-{stop_key}" style="{'display:none;' if not s['completed_at'] else ''}">
       <span class="dsc-label">Done</span><span id="done-at-{stop_key}">{e(s['completed_at'] or '')}</span>
@@ -4235,9 +4388,9 @@ def add_stop(route_id):
     conn.execute("""
         INSERT INTO stops (
             route_id, stop_order, customer_name, address, city, state, zip_code,
-            action, container_size, ticket_number, reference_number, notes,
+            action, container_size, ticket_number, reference_number, phone, notes,
             status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
     """, (
         route_id,
         last + 1,
@@ -4250,6 +4403,7 @@ def add_stop(route_id):
         request.form.get("container_size"),
         request.form.get("ticket_number"),
         request.form.get("reference_number"),
+        request.form.get("phone", ""),
         request.form.get("notes"),
         now_ts()
     ))
