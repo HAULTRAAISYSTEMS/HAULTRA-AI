@@ -77,7 +77,20 @@ if not _secret_key:
     _secret_key = "haultra-super-secret-key-change-me"
 app.secret_key = _secret_key
 
-DATABASE     = os.environ.get("DATABASE_PATH", "haultra.db")
+# On Windows the database must live OUTSIDE the OneDrive folder.
+# On Render / Linux the DATABASE_PATH env var must point to a persistent disk mount.
+# If neither is set, fall back to a safe local-app-data path on Windows,
+# or the current directory on Linux (suitable only for dev).
+_db_env = os.environ.get("DATABASE_PATH", "")
+if _db_env:
+    DATABASE = _db_env
+elif os.name == "nt":  # Windows local dev — store outside OneDrive
+    _local_data = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+    _db_dir = os.path.join(_local_data, "haultra")
+    os.makedirs(_db_dir, exist_ok=True)
+    DATABASE = os.path.join(_db_dir, "haultra.db")
+else:
+    DATABASE = "haultra.db"
 UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", os.path.join("static", "uploads"))
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "pdf"}
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
