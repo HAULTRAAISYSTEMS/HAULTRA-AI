@@ -700,7 +700,7 @@ _ACTION_TOKENS = {
 
 def extract_action(line):
     # Check short token at start of line first (e.g. "P - ", "D - ", "PR - ")
-    stripped = re.sub(r"^\d+[\).\-\s]+", "", line).strip()
+    stripped = re.sub(r"^\d{1,3}[).\-:]\s*", "", line).strip()
     first_token = stripped.split(" - ")[0].strip().upper()
     if first_token in _ACTION_TOKENS:
         return _ACTION_TOKENS[first_token]
@@ -728,16 +728,54 @@ def extract_action(line):
     return ""
 
 def _is_dash_delimited(line):
-    """Return True if a line looks like an action-prefixed or plain dash-delimited stop."""
+    """Return True if a line is a complete one-line dash-delimited stop.
+
+    Requires at least 3 parts (>= 2 separators) for both action-prefixed and
+    plain formats.  This prevents multiline first-lines like "P - John Smith"
+    (only 2 parts) from being mistaken for one-line stops.
+    """
+    stripped = re.sub(r"^\d{1,3}[).\-:]\s*", "", line).strip()
+    if not stripped:
+        return False
+    parts = [p.strip() for p in stripped.split(" - ")]
+    if len(parts) < 3:
+        return False
+    first_token = parts[0].upper()
+    # Action-prefixed one-liner: P/D/PR/DUMP - ADDRESS - ... (>= 3 parts confirmed above)
+    if first_token in _ACTION_TOKENS:
+        return True
+    # Plain format: ADDRESS - CONTAINER - NAME  (first part must look like a street)
+    return bool(re.match(r"^\d", parts[0]))
+
+
+# Words that identify a line as a route/day title rather than a stop
+_ROUTE_TITLE_WORDS = {
+    "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY",
+    "ROUTE", "DRIVER", "RUN", "AM", "PM",
+}
+
+
+def _is_route_header(line):
+    """Return True if line looks like a route title and should be skipped.
+
+    Matches lines like: MONDAY ROUTE, TUESDAY ROUTE, DRIVER TIM, ROUTE, WEDNESDAY
+    Does NOT match customer names, addresses, actions, or city/state lines.
+    """
     stripped = re.sub(r"^\d+[\).\-\s]+", "", line).strip()
     if not stripped:
         return False
-    # Action-prefixed: "P - ADDRESS - ..." or "DUMP - LOCATION - ADDRESS"
-    first_token = stripped.split(" - ")[0].strip().upper()
-    if first_token in _ACTION_TOKENS:
-        return True
-    # Plain dash-delimited: needs at least 2 separators (ADDRESS - CONTAINER - NAME)
-    return stripped.count(" - ") >= 2
+    # Must contain only letters and spaces (no digits, dashes, commas, etc.)
+    if not re.match(r"^[A-Za-z\s]+$", stripped):
+        return False
+    # Must be entirely uppercase
+    if stripped != stripped.upper():
+        return False
+    words = stripped.split()
+    # Single word: only skip if it is a known route-title word
+    if len(words) == 1:
+        return words[0] in _ROUTE_TITLE_WORDS
+    # Multi-word: skip if at least one word is a route-title keyword
+    return any(w in _ROUTE_TITLE_WORDS for w in words)
 
 
 def split_into_stop_blocks(raw_text):
@@ -746,74 +784,91 @@ def split_into_stop_blocks(raw_text):
     if not lines:
         return []
 
-    # Dash-delimited format: one stop per line (ADDRESS - CONTAINER - NAME - PHONE)
-    # Detect if the majority of non-empty lines look like this format
+    # Numbered-stop detector: 1–3 digits followed by a separator ( . ) : - ) then
+    # at least one space.  Intentionally NOT matching street addresses:
+    #   "1. "  "2) "  "3- "  → numbered stop  ✓
+    #   "5678 Tidewater"      → address, 4 digits, no separator  ✗
+    #   "123 Main St"         → address, digits+space, no separator  ✗
+    _NUMBERED = re.compile(r"^\d{1,3}[).\-:]\s")
+
+    # Dash-delimited: one true one-line stop per line (>= 3 parts)
     dash_lines = sum(1 for l in lines if _is_dash_delimited(l))
     if dash_lines >= max(1, len(lines) // 2):
-        return [[line] for line in lines]
+        return [[line] for line in lines if not _is_route_header(line)]
 
-    # Numbered multi-line format: split on lines that start with a digit prefix
-    has_numbered = any(re.match(r"^\d+[\).\-\s]+", line) for line in lines)
+    # Numbered multi-line format: each numbered line starts a new block.
+    # Lines before the first numbered stop (route headers, driver names) are skipped.
+    has_numbered = any(_NUMBERED.match(line) for line in lines)
     if has_numbered:
         blocks = []
         current = []
+        seen_first_stop = False
         for line in lines:
-            if re.match(r"^\d+[\).\-\s]+", line):
+            if _NUMBERED.match(line):
                 if current:
                     blocks.append(current)
-                    current = []
-            current.append(line)
+                current = [line]
+                seen_first_stop = True
+            elif not seen_first_stop:
+                # Pre-stop line (route header, driver label, etc.) — skip
+                continue
+            else:
+                current.append(line)
         if current:
             blocks.append(current)
         return blocks
 
-    # Fallback: each line is its own block
-    return [[line] for line in lines]
+    # Fallback: each non-header line is its own block
+    return [[line] for line in lines if not _is_route_header(line)]
 
 
 def parse_stop_block(lines, order_num):
     cleaned_lines = [x.strip() for x in lines if x.strip()]
 
     _empty = {
-        "stop_order": order_num,
-        "customer_name": "",
-        "address": "",
-        "city": "",
-        "state": "",
-        "zip_code": "",
-        "action": "Service",
-        "container_size": "",
-        "ticket_number": "",
+        "stop_order":       order_num,
+        "customer_name":    "",
+        "address":          "",
+        "city":             "",
+        "state":            "",
+        "zip_code":         "",
+        "action":           "Service",
+        "container_size":   "",
+        "ticket_number":    "",
         "reference_number": "",
-        "phone": "",
-        "notes": "",
+        "phone":            "",
+        "notes":            "",
     }
 
     if not cleaned_lines:
         return _empty
 
     first_line = cleaned_lines[0]
-    # Strip leading number prefix ("1. ", "2) ", etc.)
-    stripped_first = re.sub(r"^\d+[\).\-\s]+", "", first_line).strip()
+    # Strip leading number prefix ("1. ", "2) ", "4. ", etc.)
+    stripped_first = re.sub(r"^\d{1,3}[).\-:]\s*", "", first_line).strip()
 
-    # ── Dash-delimited format ─────────────────────────────────────────────────
-    # Supported layouts:
-    #   ACTION - ADDRESS - CONTAINER - NAME [- PHONE]   (action-prefixed)
-    #   DUMP   - LOCATION_NAME - ADDRESS                 (dump stop, no customer)
-    #   ADDRESS - CONTAINER - NAME [- PHONE]             (plain, no action prefix)
+    # ── Dash-delimited ONE-LINE format ────────────────────────────────────────
+    # Only enter this branch when there are >= 3 dash-separated parts.
+    # A line like "P - John Smith" has only 2 parts and is the start of a
+    # multiline stop — it falls through to the multiline section below.
+    #
+    # Supported one-line layouts:
+    #   P  - ADDRESS - SIZE - NAME [- PHONE]
+    #   D  - ADDRESS - SIZE - NAME [- PHONE]
+    #   PR - ADDRESS - SIZE - NAME [- PHONE]
+    #   DUMP - LOCATION_NAME - ADDRESS
+    #   ADDRESS - SIZE - NAME [- PHONE]        (plain, no action prefix)
     if " - " in stripped_first:
         parts = [p.strip() for p in stripped_first.split(" - ")]
-
         first_token = parts[0].upper() if parts else ""
         action_from_token = _ACTION_TOKENS.get(first_token, "")
 
+        # DUMP is always a one-liner regardless of part count
         if action_from_token == "Dump":
-            # DUMP - LOCATION_NAME - ADDRESS
             location_name = parts[1] if len(parts) > 1 else ""
             dump_address  = parts[2] if len(parts) > 2 else ""
             if not dump_address:
-                dump_address  = location_name
-                location_name = ""
+                dump_address, location_name = location_name, ""
             return {
                 "stop_order":       order_num,
                 "customer_name":    location_name,
@@ -829,60 +884,98 @@ def parse_stop_block(lines, order_num):
                 "notes":            "",
             }
 
-        if action_from_token:
-            # ACTION - ADDRESS - CONTAINER - NAME [- PHONE]
-            raw_address   = parts[1] if len(parts) > 1 else ""
-            raw_size      = parts[2] if len(parts) > 2 else ""
-            customer_name = parts[3] if len(parts) > 3 else ""
-            phone         = parts[4] if len(parts) > 4 else ""
-            action        = action_from_token
-        else:
-            # Plain: ADDRESS - CONTAINER - NAME [- PHONE]
-            raw_address   = parts[0]
-            raw_size      = parts[1] if len(parts) > 1 else ""
-            customer_name = parts[2] if len(parts) > 2 else ""
-            phone         = parts[3] if len(parts) > 3 else ""
-            action        = extract_action(stripped_first) or "Service"
+        if len(parts) >= 3:
+            # True one-line stop — parse all fields from the single line
+            if action_from_token:
+                raw_address   = parts[1]
+                raw_size      = parts[2] if len(parts) > 2 else ""
+                customer_name = parts[3] if len(parts) > 3 else ""
+                phone         = parts[4] if len(parts) > 4 else ""
+                action        = action_from_token
+            else:
+                raw_address   = parts[0]
+                raw_size      = parts[1]
+                customer_name = parts[2] if len(parts) > 2 else ""
+                phone         = parts[3] if len(parts) > 3 else ""
+                action        = extract_action(stripped_first) or "Service"
 
-        container_size = extract_container_size(raw_size) or raw_size
+            container_size = extract_container_size(raw_size) or raw_size
+            return {
+                "stop_order":       order_num,
+                "customer_name":    customer_name,
+                "address":          raw_address,
+                "city":             "",
+                "state":            "",
+                "zip_code":         "",
+                "action":           action,
+                "container_size":   container_size,
+                "ticket_number":    "",
+                "reference_number": "",
+                "phone":            phone,
+                "notes":            "",
+            }
 
-        return {
-            "stop_order":       order_num,
-            "customer_name":    customer_name,
-            "address":          raw_address,
-            "city":             "",
-            "state":            "",
-            "zip_code":         "",
-            "action":           action,
-            "container_size":   container_size,
-            "ticket_number":    "",
-            "reference_number": "",
-            "phone":            phone,
-            "notes":            "",
-        }
+        # < 3 parts (e.g. "P - John Smith") — fall through to multiline
 
-    # ── Legacy multi-line format ──────────────────────────────────────────────
-    customer_name    = stripped_first
+    # ── Multiline format ──────────────────────────────────────────────────────
+    # The first line carries the action token and customer name.
+    # Subsequent lines carry address, city/state, container size, etc.
+    #
+    # Examples handled:
+    #   ["4. P - John Smith",  "5678 Tidewater Dr, Virginia Beach VA", "10yd"]
+    #   ["1. D - Mary Jones",  "123 Main St, Norfolk, VA 23510",       "20yd"]
+    #   ["John Smith",         "5678 Tidewater Dr",                    "10yd"]
+    parts_ml   = [p.strip() for p in stripped_first.split(" - ")]
+    first_tok  = parts_ml[0].upper() if parts_ml else ""
+    action_tok = _ACTION_TOKENS.get(first_tok, "")
+
+    if action_tok:
+        # "P - John Smith" → action=Pickup, customer_name="John Smith"
+        customer_name = " - ".join(parts_ml[1:]).strip() if len(parts_ml) > 1 else ""
+    else:
+        customer_name = stripped_first
+
     address          = ""
+    address_line_raw = ""          # original line as it appears in cleaned_lines
     city = state = zip_code = ""
-    action           = ""
+    action           = action_tok or ""
     container_size   = ""
     ticket_number    = ""
     reference_number = ""
 
+    # Find the first subsequent line that looks like a street address
     address_index = None
     for i in range(1, len(cleaned_lines)):
         if looks_like_address(cleaned_lines[i]):
-            address = cleaned_lines[i]
-            address_index = i
+            address_line_raw = cleaned_lines[i]
+            address          = cleaned_lines[i]
+            address_index    = i
             break
 
-    if address_index is not None and address_index + 1 < len(cleaned_lines):
-        csz = extract_city_state_zip(cleaned_lines[address_index + 1])
+    # Try city/state/zip from the address line itself
+    if address:
+        csz = extract_city_state_zip(address)
         if any(csz):
             city, state, zip_code = csz
+        else:
+            # Handle "5678 Main St, Virginia Beach VA" where state has no leading comma
+            m = re.search(r",\s*(.+?)\s+([A-Z]{2})\s*(\d{5})?$", address)
+            if m:
+                city     = m.group(1).strip()
+                state    = m.group(2).strip()
+                zip_code = (m.group(3) or "").strip()
+                address  = address[:m.start()].strip()
 
-    for line in cleaned_lines:
+    # Also check the line immediately after the address for standalone city/state
+    if address_index is not None and not city:
+        nxt = address_index + 1
+        if nxt < len(cleaned_lines):
+            csz = extract_city_state_zip(cleaned_lines[nxt])
+            if any(csz):
+                city, state, zip_code = csz
+
+    # Scan all continuation lines for action, size, ticket, ref
+    for line in cleaned_lines[1:]:
         if not action:
             found_action = extract_action(line)
             if found_action:
@@ -896,14 +989,31 @@ def parse_stop_block(lines, order_num):
             if found_ticket:
                 ticket_number = found_ticket
         if not reference_number:
-            m = re.search(r"(?:po|ref)\s*#?:?\s*([A-Za-z0-9\-\/]+)", line, re.IGNORECASE)
-            if m:
-                reference_number = m.group(1).strip()
+            mo = re.search(r"(?:po|ref)\s*#?:?\s*([A-Za-z0-9\-\/]+)", line, re.IGNORECASE)
+            if mo:
+                reference_number = mo.group(1).strip()
 
     if not action:
         action = "Service"
 
-    notes = "\n".join(cleaned_lines).strip()
+    # Notes: only lines that are genuinely extra (not address, not pure size/action)
+    extra_lines = []
+    for line in cleaned_lines[1:]:
+        # Skip the original address line (before or after city stripping)
+        if line == address_line_raw or line == address:
+            continue
+        # Skip standalone city/state/zip lines
+        if city and state and city.lower() in line.lower() and state in line:
+            continue
+        # Skip lines that are only a container size ("10yd", "10", "20 yd")
+        if re.match(r"^\d{1,2}\s*(?:yd|yard|yards)?$", line, re.IGNORECASE):
+            continue
+        # Skip bare action tokens
+        if line.upper() in _ACTION_TOKENS:
+            continue
+        extra_lines.append(line)
+
+    notes = "\n".join(extra_lines).strip()
 
     return {
         "stop_order":       order_num,
@@ -928,8 +1038,13 @@ _WO_ACTION = {"PR": "Swap", "P": "Pickup", "D": "Drop"}
 
 
 def _is_wo_line(line):
-    """Return 'PR', 'P', or 'D' if line starts with a work-order prefix, else None."""
-    m = re.match(r"^(PR|P|D)\s+", line, re.IGNORECASE)
+    """Return 'PR', 'P', or 'D' if line starts with a work-order prefix, else None.
+
+    Work-order lines look like: 'P 1233 Westover Ave, Norfolk, VA, ...'
+    They do NOT look like dash-delimited: 'P - John Smith' or '4. P - John Smith'.
+    The (?!-) lookahead guards against the dash-delimited case.
+    """
+    m = re.match(r"^(PR|P|D)\s+(?!-)", line, re.IGNORECASE)
     return m.group(1).upper() if m else None
 
 
