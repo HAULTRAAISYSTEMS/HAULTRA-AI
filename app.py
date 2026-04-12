@@ -337,6 +337,7 @@ def init_db():
         container_size TEXT,
         ticket_number TEXT,
         reference_number TEXT,
+        dump_location TEXT,
         notes TEXT,
         status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','completed')),
         completed_at TEXT,
@@ -508,6 +509,7 @@ def init_db():
     safe_add_column(conn, "stops", "box_out_at TEXT")
     safe_add_column(conn, "stops", "go_to_dump_at TEXT")
     safe_add_column(conn, "stops", "wo_type TEXT")
+    safe_add_column(conn, "stops", "dump_location TEXT")
     safe_add_column(conn, "companies", "stripe_customer_id TEXT")
     safe_add_column(conn, "companies", "stripe_subscription_id TEXT")
     safe_add_column(conn, "users", "email TEXT")
@@ -837,6 +839,7 @@ def parse_stop_block(lines, order_num):
         "ticket_number":    "",
         "reference_number": "",
         "phone":            "",
+        "dump_location":    "",
         "notes":            "",
     }
 
@@ -881,6 +884,7 @@ def parse_stop_block(lines, order_num):
                 "ticket_number":    "",
                 "reference_number": "",
                 "phone":            "",
+                "dump_location":    "",
                 "notes":            "",
             }
 
@@ -912,6 +916,7 @@ def parse_stop_block(lines, order_num):
                 "ticket_number":    "",
                 "reference_number": "",
                 "phone":            phone,
+                "dump_location":    "",
                 "notes":            "",
             }
 
@@ -1027,6 +1032,7 @@ def parse_stop_block(lines, order_num):
         "ticket_number":    ticket_number,
         "reference_number": reference_number,
         "phone":            "",
+        "dump_location":    "",
         "notes":            notes,
     }
 
@@ -1099,6 +1105,7 @@ def _parse_wo_line(line, order_num):
         "container_size": container_size,
         "ticket_number":  "",
         "reference_number": "",
+        "dump_location":  "",
         "notes":          notes,
     }
 
@@ -1320,14 +1327,6 @@ def _parse_rolloff_stop(block_lines, order_num):
     # Split remaining text into customer name and driver notes
     customer_name, instruction_notes = _split_rolloff_customer_notes(rest)
 
-    # Compose the notes field
-    notes_parts = []
-    if dump_site:
-        notes_parts.append(f"Dump: {dump_site}")
-    if instruction_notes:
-        notes_parts.append(instruction_notes)
-    notes = "\n".join(notes_parts)
-
     return {
         "stop_order":       order_num,
         "customer_name":    customer_name,
@@ -1340,8 +1339,8 @@ def _parse_rolloff_stop(block_lines, order_num):
         "ticket_number":    "",
         "reference_number": "",
         "phone":            "",
-        "notes":            notes,
-        "dump_site":        dump_site,  # extra key for display; not stored in DB column
+        "dump_location":    dump_site,
+        "notes":            instruction_notes,
     }
 
 
@@ -3038,7 +3037,7 @@ def convert_order_to_route(order_id):
         cur.execute("""
             INSERT INTO stops (
                 route_id, stop_order, customer_name, address, city, state, zip_code,
-                action, container_size, ticket_number, reference_number, phone, notes,
+                action, container_size, ticket_number, reference_number, dump_location, notes,
                 status, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
         """, (
@@ -3053,7 +3052,7 @@ def convert_order_to_route(order_id):
             stop["container_size"],
             stop["ticket_number"],
             stop["reference_number"],
-            stop.get("phone", ""),
+            stop.get("dump_location", ""),
             stop["notes"],
             now_ts()
         ))
@@ -3366,9 +3365,9 @@ def text_to_route():
             cur.execute("""
                 INSERT INTO stops (
                     route_id, stop_order, customer_name, address, city, state, zip_code,
-                    action, container_size, ticket_number, reference_number, notes,
+                    action, container_size, ticket_number, reference_number, dump_location, notes,
                     status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
             """, (
                 route_id,
                 stop["stop_order"],
@@ -3381,6 +3380,7 @@ def text_to_route():
                 stop["container_size"],
                 stop["ticket_number"],
                 stop["reference_number"],
+                stop.get("dump_location", ""),
                 stop["notes"],
                 now_ts()
             ))
@@ -3579,9 +3579,9 @@ def new_route():
             cur.execute("""
                 INSERT INTO stops (
                     route_id, stop_order, customer_name, address, city, state, zip_code,
-                    action, container_size, ticket_number, reference_number, notes,
+                    action, container_size, ticket_number, reference_number, dump_location, notes,
                     status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
             """, (
                 route_id,
                 stop["stop_order"],
@@ -3594,6 +3594,7 @@ def new_route():
                 stop["container_size"],
                 stop["ticket_number"],
                 stop["reference_number"],
+                stop.get("dump_location", ""),
                 stop["notes"],
                 now_ts()
             ))
@@ -3899,8 +3900,8 @@ def driver_route_detail(route_id):
 
   <div class="dsc-body" id="body-{stop_key}" style="{detail_style}">
     {"" if not s['ticket_number'] else f'<div class="dsc-field"><span class="dsc-label">Ticket</span>{e(s["ticket_number"])}</div>'}
-    {"" if not s['reference_number'] else f'<div class="dsc-field"><span class="dsc-label">Ref</span>{e(s["reference_number"])}</div>'}
     {"" if not _s.get('phone') else f'<div class="dsc-field"><span class="dsc-label">Phone</span><a href="tel:{e(_s["phone"])}" style="color:#56f0b7;">{e(_s["phone"])}</a></div>'}
+    {"" if not _s.get('dump_location') else f'<div class="dsc-field"><span class="dsc-label">Dump Location</span>{e(_s["dump_location"])}</div>'}
     {"" if not s['notes'] else f'<div class="dsc-field"><span class="dsc-label">Notes</span><span style="white-space:pre-wrap;">{e(s["notes"] or "")}</span></div>'}
     <div class="dsc-field" id="done-at-row-{stop_key}" style="{'display:none;' if not s['completed_at'] else ''}">
       <span class="dsc-label">Done</span><span id="done-at-{stop_key}">{e(s['completed_at'] or '')}</span>
@@ -4781,7 +4782,7 @@ def add_stop(route_id):
     conn.execute("""
         INSERT INTO stops (
             route_id, stop_order, customer_name, address, city, state, zip_code,
-            action, container_size, ticket_number, reference_number, phone, notes,
+            action, container_size, ticket_number, reference_number, dump_location, notes,
             status, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
     """, (
@@ -4796,7 +4797,7 @@ def add_stop(route_id):
         request.form.get("container_size"),
         request.form.get("ticket_number"),
         request.form.get("reference_number"),
-        request.form.get("phone", ""),
+        request.form.get("dump_location", ""),
         request.form.get("notes"),
         now_ts()
     ))
@@ -4829,7 +4830,8 @@ def edit_stop(stop_id):
         conn.execute("""
             UPDATE stops SET
                 customer_name=?, address=?, city=?, state=?, zip_code=?,
-                action=?, container_size=?, ticket_number=?, reference_number=?, notes=?
+                action=?, container_size=?, ticket_number=?, reference_number=?,
+                dump_location=?, notes=?
             WHERE id=?
         """, (
             request.form.get("customer_name"),
@@ -4841,6 +4843,7 @@ def edit_stop(stop_id):
             request.form.get("container_size"),
             request.form.get("ticket_number"),
             request.form.get("reference_number"),
+            request.form.get("dump_location", ""),
             request.form.get("notes"),
             stop_id
         ))
@@ -4866,6 +4869,7 @@ def edit_stop(stop_id):
             <input name="container_size" value="{e(stop['container_size'])}">
             <input name="ticket_number" value="{e(stop['ticket_number'])}">
             <input name="reference_number" value="{e(stop['reference_number'])}">
+            <input name="dump_location" placeholder="Dump location (e.g. Dominion)" value="{e(dict(stop).get('dump_location') or '')}">
             <textarea name="notes">{e(stop['notes'])}</textarea>
             <button type="submit">Save</button>
         </form>
