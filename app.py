@@ -1136,21 +1136,283 @@ def _parse_workorder_format(lines):
     return stops, dump_site
 
 
+# ─── Roll-off shorthand dispatch parser ───────────────────────────────────────
+#
+# Handles the boss's compressed single-line format, e.g.:
+#   Pr 5660 lowery rd,orf, jaswal
+#   30yd dump dominion
+#
+#   Pull 280 benton rd,suff, power bolt 20yd dump dominion and take to yard empty
+#   Del  2008 seafarer cove,vb, decor 20yd place on right hand side of driveway
+#   Pr   4333 Indian river rd,ches, Doyle 30yd dump dominion then do the two at lowery
+
+# Roll-off action prefix → canonical action label
+_ROLLOFF_PREFIXES = {
+    "PR":   "Pickup and Return",
+    "PULL": "Pull",
+    "DEL":  "Delivery",
+    "D":    "Delivery",
+    "P":    "Pull",
+}
+
+# City shorthand codes (Hampton Roads / Tidewater Virginia)
+_CITY_CODES = {
+    "orf":   ("Norfolk",        "VA"),
+    "norf":  ("Norfolk",        "VA"),
+    "vb":    ("Virginia Beach", "VA"),
+    "nb":    ("Virginia Beach", "VA"),
+    "suff":  ("Suffolk",        "VA"),
+    "ches":  ("Chesapeake",     "VA"),
+    "port":  ("Portsmouth",     "VA"),
+    "prt":   ("Portsmouth",     "VA"),
+    "smith": ("Smithfield",     "VA"),
+    "hamp":  ("Hampton",        "VA"),
+    "nn":    ("Newport News",   "VA"),
+    "york":  ("Yorktown",       "VA"),
+    "isle":  ("Isle of Wight",  "VA"),
+}
+
+# Dump site short names → canonical display names
+_DUMP_SITES = {
+    "dominion": "Dominion",
+    "dom":      "Dominion",
+    "bay":      "Bay",
+    "holland":  "Holland",
+    "holl":     "Holland",
+    "spsa":     "SPSA",
+    "spivey":   "Spivey",
+    "cox":      "SB Cox",
+    "united":   "United",
+    "waterway": "Waterway",
+    "sykes":    "Sykes",
+    "mm":       "MM GU2737",
+}
+
+# Matches a new roll-off stop line: action prefix followed by a house number.
+# Uses (?=\d) lookahead so the digit is NOT consumed — m.end() lands right
+# before the house number and body = merged[m.end():] keeps the full address.
+_ROLLOFF_LINE_RE = re.compile(r"^(PR|PULL|DEL|D|P)\s+(?=\d)", re.IGNORECASE)
+
+# Matches the city-shorthand pattern that confirms roll-off format
+_ROLLOFF_CITY_RE = re.compile(
+    r",\s*(orf|norf|vb|nb|suff|ches|port|prt|smith|hamp|nn|york|isle)\s*,",
+    re.IGNORECASE
+)
+
+# Instruction phrases that signal the start of driver notes (not customer name)
+_ROLLOFF_NOTES_RE = re.compile(
+    r"\b(?:"
+    r"take\s+to"
+    r"|and\s+take"
+    r"|place\s+on"
+    r"|place\s+in"
+    r"|put\s+on"
+    r"|put\s+in"
+    r"|then\s+do"
+    r"|then\s+go"
+    r"|then\b"
+    r"|with\s+enough"
+    r"|with\s+room"
+    r"|empty\s+to"
+    r"|to\s+end\s+the"
+    r"|do\s+the\s+two"
+    r"|leave\s"
+    r")\b",
+    re.IGNORECASE
+)
+
+
+def _is_rolloff_format(lines):
+    """Return True if any line looks like a roll-off shorthand stop.
+
+    Requires BOTH an action prefix (Pr/Pull/Del/D/P + house number)
+    AND a city shorthand code in comma position (,orf, / ,vb, etc.).
+    Both conditions must match the same line.
+    """
+    for line in lines:
+        if _ROLLOFF_LINE_RE.match(line) and _ROLLOFF_CITY_RE.search(line):
+            return True
+    return False
+
+
+def _extract_rolloff_dump(text):
+    """Find and extract 'dump <site>' from text.
+    Returns (canonical_site_name, text_with_phrase_removed).
+    """
+    m = re.search(r"\bdump\s+(\w+)", text, re.IGNORECASE)
+    if not m:
+        return "", text
+    key  = m.group(1).lower()
+    site = _DUMP_SITES.get(key, m.group(1).title())
+    cleaned = (text[:m.start()] + " " + text[m.end():]).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return site, cleaned
+
+
+def _split_rolloff_customer_notes(text):
+    """Split 'CustomerName [driver notes]' into (customer_name, notes_text).
+
+    Customer name ends at the first instruction-trigger phrase.
+    Examples:
+      "jaswal"                                 → ("jaswal", "")
+      "power bolt and take to yard empty..."   → ("power bolt", "take to yard empty...")
+      "decor place on right hand side..."      → ("decor", "place on right hand side...")
+      "Doyle then do the two at lowery..."     → ("Doyle", "then do the two at lowery...")
+    """
+    text = text.strip()
+    if not text:
+        return "", ""
+
+    m = _ROLLOFF_NOTES_RE.search(text)
+    if not m:
+        return text, ""
+
+    customer = text[:m.start()].strip()
+    # Strip a trailing " and" connector that bridges to the note
+    customer = re.sub(r"\s+and\s*$", "", customer, flags=re.IGNORECASE).strip()
+
+    # Notes begin at trigger; drop a leading "and " if trigger started with it
+    notes = text[m.start():].strip()
+    notes = re.sub(r"^and\s+", "", notes, flags=re.IGNORECASE)
+
+    return customer, notes
+
+
+def _parse_rolloff_stop(block_lines, order_num):
+    """Parse one roll-off shorthand stop (one or more lines merged).
+
+    Structure after action prefix is stripped:
+        STREET_ADDRESS, CITY_CODE, CUSTOMER [SIZEyd] [dump SITE] [notes]
+
+    Returns a stop dict or None if the block can't be parsed.
+    """
+    # Merge all lines of this block into one string
+    merged = " ".join(clean_line(l) for l in block_lines if clean_line(l))
+
+    m = _ROLLOFF_LINE_RE.match(merged)
+    if not m:
+        return None
+
+    prefix = m.group(1).upper()
+    action = _ROLLOFF_PREFIXES.get(prefix, "Service")
+    body   = merged[m.end():].strip()
+    # body: "5660 lowery rd,orf, jaswal 30yd dump dominion and take to yard..."
+
+    # Split at the first two commas to isolate: [street, city_code, customer+rest]
+    parts     = body.split(",", 2)
+    address   = parts[0].strip()
+    city_code = parts[1].strip().lower() if len(parts) > 1 else ""
+    rest      = parts[2].strip()         if len(parts) > 2 else ""
+
+    city, state = _CITY_CODES.get(city_code, (city_code.title(), "VA"))
+
+    # Extract container size first (before dump extraction changes text positions)
+    container_size = ""
+    size_m = re.search(r"\b(\d{1,2})\s*yd\b", rest, re.IGNORECASE)
+    if size_m:
+        container_size = size_m.group(1)
+        rest = (rest[:size_m.start()] + " " + rest[size_m.end():]).strip()
+        rest = re.sub(r"\s+", " ", rest)
+
+    # Extract dump site
+    dump_site, rest = _extract_rolloff_dump(rest)
+
+    # Split remaining text into customer name and driver notes
+    customer_name, instruction_notes = _split_rolloff_customer_notes(rest)
+
+    # Compose the notes field
+    notes_parts = []
+    if dump_site:
+        notes_parts.append(f"Dump: {dump_site}")
+    if instruction_notes:
+        notes_parts.append(instruction_notes)
+    notes = "\n".join(notes_parts)
+
+    return {
+        "stop_order":       order_num,
+        "customer_name":    customer_name,
+        "address":          address,
+        "city":             city,
+        "state":            state,
+        "zip_code":         "",
+        "action":           action,
+        "container_size":   container_size,
+        "ticket_number":    "",
+        "reference_number": "",
+        "phone":            "",
+        "notes":            notes,
+        "dump_site":        dump_site,  # extra key for display; not stored in DB column
+    }
+
+
+def _parse_rolloff_shorthand(lines):
+    """Parse a full roll-off shorthand dispatch text.
+
+    Returns (stops_list, dump_site_str).
+    Each stop begins with an action-prefix line (Pr/Pull/Del/D/P + house number).
+    Continuation lines (e.g. '30yd dump dominion') are merged into the preceding stop.
+    Blank lines and new action lines both flush the current stop block.
+    """
+    stops       = []
+    order_num   = 1
+    current_block = []
+
+    for line in lines:
+        if not line:
+            # Blank line: flush current block
+            if current_block:
+                stop = _parse_rolloff_stop(current_block, order_num)
+                if stop:
+                    stops.append(stop)
+                    order_num += 1
+                current_block = []
+            continue
+
+        if _ROLLOFF_LINE_RE.match(line):
+            # New action line: flush previous block
+            if current_block:
+                stop = _parse_rolloff_stop(current_block, order_num)
+                if stop:
+                    stops.append(stop)
+                    order_num += 1
+            current_block = [line]
+        elif current_block:
+            # Continuation line (size / dump info) — belongs to current stop
+            current_block.append(line)
+        # Lines before any stop (header text) are dropped
+
+    # Flush final block
+    if current_block:
+        stop = _parse_rolloff_stop(current_block, order_num)
+        if stop:
+            stops.append(stop)
+
+    return stops, ""
+
+
+# ─── Top-level parser dispatcher ──────────────────────────────────────────────
+
 def parse_boss_text(raw_text):
     """
     Parse pasted route text into (stops_list, dump_site_str).
 
-    Auto-detects format:
-      • PR/P/D work-order format (new)  → _parse_workorder_format()
-      • Numbered-list format (legacy)   → split_into_stop_blocks() / parse_stop_block()
+    Format detection priority:
+      1. Roll-off shorthand  — boss compressed format (Pr/Pull/Del + city code)
+      2. Work-order format   — PR/P/D with full address, city, state, customer
+      3. Numbered/dash-delimited legacy format
     """
-    lines = [clean_line(x) for x in raw_text.splitlines()]
-    if any(_is_wo_line(l) for l in lines if l):
-        return _parse_workorder_format(lines)
+    lines          = [clean_line(x) for x in raw_text.splitlines()]
+    lines_nonempty = [l for l in lines if l]
 
-    # Legacy numbered-list fallback
+    if _is_rolloff_format(lines_nonempty):
+        return _parse_rolloff_shorthand(lines)
+
+    if any(_is_wo_line(l) for l in lines_nonempty):
+        return _parse_workorder_format(lines_nonempty)
+
+    # Legacy numbered-list / dash-delimited fallback
     blocks = split_into_stop_blocks(raw_text)
-    stops = []
+    stops  = []
     for idx, block in enumerate(blocks, start=1):
         stop = parse_stop_block(block, idx)
         if stop["customer_name"] or stop["address"]:
