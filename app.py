@@ -3900,7 +3900,7 @@ def driver_route_detail(route_id):
   <div class="dsc-body" id="body-{stop_key}" style="{detail_style}">
     {"" if not s['ticket_number'] else f'<div class="dsc-field"><span class="dsc-label">Ticket</span>{e(s["ticket_number"])}</div>'}
     {"" if not s['reference_number'] else f'<div class="dsc-field"><span class="dsc-label">Ref</span>{e(s["reference_number"])}</div>'}
-    {"" if not s.get('phone') else f'<div class="dsc-field"><span class="dsc-label">Phone</span><a href="tel:{e(s["phone"])}" style="color:#56f0b7;">{e(s["phone"])}</a></div>'}
+    {"" if not _s.get('phone') else f'<div class="dsc-field"><span class="dsc-label">Phone</span><a href="tel:{e(_s["phone"])}" style="color:#56f0b7;">{e(_s["phone"])}</a></div>'}
     {"" if not s['notes'] else f'<div class="dsc-field"><span class="dsc-label">Notes</span><span style="white-space:pre-wrap;">{e(s["notes"] or "")}</span></div>'}
     <div class="dsc-field" id="done-at-row-{stop_key}" style="{'display:none;' if not s['completed_at'] else ''}">
       <span class="dsc-label">Done</span><span id="done-at-{stop_key}">{e(s['completed_at'] or '')}</span>
