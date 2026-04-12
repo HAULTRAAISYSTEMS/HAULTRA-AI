@@ -2938,15 +2938,20 @@ def text_to_route():
         "SELECT id, username FROM users WHERE role='driver' AND company_id=? ORDER BY username",
         (company_id,)
     ).fetchall()
+    dump_locs = conn.execute(
+        "SELECT id, name, city FROM dump_locations WHERE active=1 ORDER BY name"
+    ).fetchall()
 
     if request.method == "POST":
-        route_date = request.form.get("route_date", "").strip() or today_str()
-        route_name = request.form.get("route_name", "").strip()
-        raw_text = request.form.get("raw_text", "").strip()
-        assigned_to_raw = request.form.get("assigned_to", "").strip()
-        notes = request.form.get("notes", "").strip()
+        route_date       = request.form.get("route_date", "").strip() or today_str()
+        route_name       = request.form.get("route_name", "").strip()
+        raw_text         = request.form.get("raw_text", "").strip()
+        assigned_to_raw  = request.form.get("assigned_to", "").strip()
+        notes            = request.form.get("notes", "").strip()
+        dump_location_id = request.form.get("dump_location_id", "").strip()
 
-        assigned_to = int(assigned_to_raw) if assigned_to_raw.isdigit() else None
+        assigned_to       = int(assigned_to_raw) if assigned_to_raw.isdigit() else None
+        dump_location_val = int(dump_location_id) if dump_location_id.isdigit() else None
 
         if not route_name or not raw_text:
             conn.close()
@@ -2964,8 +2969,8 @@ def text_to_route():
         cur.execute("""
             INSERT INTO routes (
                 route_date, route_name, raw_text, assigned_to, created_by,
-                status, notes, company_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?)
+                status, notes, dump_location_id, company_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
         """, (
             route_date,
             route_name,
@@ -2973,6 +2978,7 @@ def text_to_route():
             assigned_to,
             session["user_id"],
             notes,
+            dump_location_val,
             company_id,
             now_ts()
         ))
@@ -3013,6 +3019,11 @@ def text_to_route():
     for d in drivers:
         driver_options += f'<option value="{d["id"]}">{e(d["username"])}</option>'
 
+    dump_options = '<option value="">— No dump location —</option>'
+    for dl in dump_locs:
+        city_label = f" ({e(dl['city'])})" if dl['city'] else ""
+        dump_options += f'<option value="{dl["id"]}">{e(dl["name"])}{city_label}</option>'
+
     conn.close()
 
     body = f"""
@@ -3023,12 +3034,19 @@ def text_to_route():
 
     <div class="card">
         <form method="POST">
-            <input name="route_name" placeholder="Route Name" required>
-            <select name="assigned_to">
-                {driver_options}
-            </select>
+            <label>Route Name</label>
+            <input name="route_name" placeholder="Friday Roll Off Route" required>
+            <label>Route Date</label>
+            <input type="date" name="route_date" value="{today_str()}" required>
+            <label>Assign Driver</label>
+            <select name="assigned_to">{driver_options}</select>
+            <label>Dump Location</label>
+            <select name="dump_location_id">{dump_options}</select>
+            <label>Route Text</label>
             <textarea name="raw_text" placeholder="Paste boss text here..." required></textarea>
-            <button type="submit" class="btn green">Create Route</button>
+            <label>Notes</label>
+            <textarea name="notes" placeholder="Extra route instructions..."></textarea>
+            <div style="margin-top:10px;"><button type="submit" class="btn green">Create Route from Text</button></div>
         </form>
     </div>
     """
