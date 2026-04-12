@@ -3366,9 +3366,9 @@ def text_to_route():
             cur.execute("""
                 INSERT INTO stops (
                     route_id, stop_order, customer_name, address, city, state, zip_code,
-                    action, container_size, ticket_number, reference_number, phone, notes,
+                    action, container_size, ticket_number, reference_number, notes,
                     status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
             """, (
                 route_id,
                 stop["stop_order"],
@@ -3381,7 +3381,6 @@ def text_to_route():
                 stop["container_size"],
                 stop["ticket_number"],
                 stop["reference_number"],
-                stop.get("phone", ""),
                 stop["notes"],
                 now_ts()
             ))
@@ -3580,9 +3579,9 @@ def new_route():
             cur.execute("""
                 INSERT INTO stops (
                     route_id, stop_order, customer_name, address, city, state, zip_code,
-                    action, container_size, ticket_number, reference_number, phone, notes,
+                    action, container_size, ticket_number, reference_number, notes,
                     status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
             """, (
                 route_id,
                 stop["stop_order"],
@@ -3595,7 +3594,6 @@ def new_route():
                 stop["container_size"],
                 stop["ticket_number"],
                 stop["reference_number"],
-                stop.get("phone", ""),
                 stop["notes"],
                 now_ts()
             ))
