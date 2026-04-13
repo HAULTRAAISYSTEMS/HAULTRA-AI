@@ -338,6 +338,58 @@ def _dump_aware_order(stops_data, origin=None):
     return [s["id"] for s in ordered]
 
 
+def compute_can_flow(conn, route_id, starts_with_can=False):
+    """
+    Walk ordered stops and stamp each with can_state_before TEXT.
+
+    States
+    ------
+    "no_can"    — truck is empty, no container loaded
+    "empty_can" — truck carries a clean empty container
+
+    (Loaded-can is transient while driving to dump; not persisted.)
+
+    Stop-type transitions
+    ---------------------
+    Pull      : requires no_can   → after dump: empty_can
+    Delivery  : requires empty_can → after drop: no_can
+    PR / Swap : requires empty_can → after dump: empty_can  (can source irrelevant here)
+    Other     : no change to can state
+
+    Call this after ordering stops so the sequence is meaningful.
+    Commits the updates inside the existing transaction context.
+    """
+    stops = conn.execute(
+        "SELECT id, action FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
+        (route_id,)
+    ).fetchall()
+
+    can_state = "empty_can" if starts_with_can else "no_can"
+
+    for s in stops:
+        action_lower = (s["action"] or "").lower().strip()
+
+        # Stamp BEFORE this stop executes
+        conn.execute(
+            "UPDATE stops SET can_state_before=? WHERE id=?",
+            (can_state, s["id"])
+        )
+
+        # Compute state AFTER this stop
+        if "delivery" in action_lower:
+            # Drops empty can at customer site → no can remaining
+            can_state = "no_can"
+        elif "pull" in action_lower and "return" not in action_lower:
+            # Picks up full can → drives to dump → leaves dump with empty can
+            can_state = "empty_can"
+        elif "pickup and return" in action_lower or (
+            "swap" in action_lower and "pull" not in action_lower
+        ):
+            # Swaps empty for full → drives to dump → leaves with empty can
+            can_state = "empty_can"
+        # All other stop types: can state unchanged
+
+
 def load_stop_photos(conn, stop_ids):
     """Return dict {stop_id: [photo_row, ...]} for the given stop IDs."""
     if not stop_ids:
@@ -599,6 +651,7 @@ def init_db():
     safe_add_column(conn, "stops", "go_to_dump_at TEXT")
     safe_add_column(conn, "stops", "wo_type TEXT")
     safe_add_column(conn, "stops", "dump_location TEXT")
+    safe_add_column(conn, "stops", "swap_with_prev_pull INTEGER NOT NULL DEFAULT 0")
     safe_add_column(conn, "companies", "stripe_customer_id TEXT")
     safe_add_column(conn, "companies", "stripe_subscription_id TEXT")
     safe_add_column(conn, "users", "email TEXT")
@@ -606,6 +659,7 @@ def init_db():
     safe_add_column(conn, "companies", "yard_city TEXT")
     safe_add_column(conn, "companies", "yard_state TEXT")
     safe_add_column(conn, "companies", "yard_zip TEXT")
+    safe_add_column(conn, "stops", "can_state_before TEXT")
 
     # --- default company bootstrap ---
     default_co = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()
@@ -4157,9 +4211,15 @@ def driver_route_detail(route_id):
         _driver_status = _s.get("driver_status") or "pending"
         _csrf = get_csrf_token()
 
-        # Is this a PR/Pull stop that requires the full box-out → dump → box-in workflow?
-        _action_val = (_s.get("action") or "").lower()
-        _is_pr = any(x in _action_val for x in ("pickup and return", "pull", "swap"))
+        # ---- classify this stop's workflow type ----
+        _action_val   = (_s.get("action") or "").lower()
+        # True PR / Swap action: needs box-in step
+        _is_pr        = "pickup and return" in _action_val or (
+                            "swap" in _action_val and "pull" not in _action_val)
+        # Pure Pull: box-out → dump → complete (no box-in)
+        _is_pull      = "pull" in _action_val and "return" not in _action_val
+        # PR swap flag: driver is carrying empty can from prior Pull — skip dump entirely
+        _is_swap_pr   = _is_pr and bool(_s.get("swap_with_prev_pull"))
 
         # Compact trail of completed workflow steps with times (logical order for PR)
         _trail_parts = []
@@ -4176,23 +4236,52 @@ def driver_route_detail(route_id):
             + "".join(_trail_parts) + '</div>'
         ) if _trail_parts else ""
 
-        # Next workflow action button (appears above Complete Stop)
+        # Next workflow action button
         _workflow_btn_html = ""
         if not is_done:
-            if _is_pr:
-                # PR/Pull workflow: arrived → box_out → going_to_dump → dump ticket → need_box_in → box_in
+            if _is_swap_pr:
+                # PR swap: driver already has empty from prior Pull — skip dump entirely
                 _wf_map = {
-                    "pending":      ("arrived",       "🚛 Arrived at Stop",         "btn-driver btn-driver-complete"),
-                    "arrived":      ("box_out",        "📦 Box Out — Remove Container","btn-driver btn-driver-complete"),
-                    "box_out":      ("going_to_dump",  "🗑️ Go To Dump",              "btn-driver btn-driver-dump"),
-                    "need_box_in":  ("box_in",         "📦 Box In — Return Container","btn-driver btn-driver-complete"),
+                    "pending":     ("arrived",      "🚛 Arrived at Stop",           "btn-driver btn-driver-complete"),
+                    "arrived":     ("box_out",       "📦 Box Out — Remove Old Container","btn-driver btn-driver-complete"),
+                    "box_out":     ("need_box_in",   "📦 Box In — Place Empty Can",  "btn-driver btn-driver-complete"),
+                    "need_box_in": ("box_in",        "✅ Confirm Box In",            "btn-driver btn-driver-complete"),
+                }
+            elif _is_pr:
+                # Normal PR: box-out → dump → box-in
+                _wf_map = {
+                    "pending":     ("arrived",       "🚛 Arrived at Stop",           "btn-driver btn-driver-complete"),
+                    "arrived":     ("box_out",        "📦 Box Out — Remove Container","btn-driver btn-driver-complete"),
+                    "box_out":     ("going_to_dump",  "🗑️ Go To Dump",               "btn-driver btn-driver-dump"),
+                    "need_box_in": ("box_in",         "📦 Box In — Return Container", "btn-driver btn-driver-complete"),
+                }
+            elif _is_pull:
+                # Pull: box-out → dump → complete (no box-in)
+                _wf_map = {
+                    "pending":     ("arrived",       "🚛 Arrived at Stop",           "btn-driver btn-driver-complete"),
+                    "arrived":     ("box_out",        "📦 Box Out — Remove Container","btn-driver btn-driver-complete"),
+                    "box_out":     ("going_to_dump",  "🗑️ Go To Dump",               "btn-driver btn-driver-dump"),
                 }
             else:
-                # Simple workflow: arrived only (deliver/drop/service)
+                # Delivery / Drop / Service: arrived → complete
                 _wf_map = {
-                    "pending":      ("arrived",       "🚛 Arrived at Stop",         "btn-driver btn-driver-complete"),
+                    "pending":     ("arrived",       "🚛 Arrived at Stop",           "btn-driver btn-driver-complete"),
                 }
-            if _driver_status in _wf_map:
+
+            # "need_box_in" for swap PR is a form action (same driver-action endpoint)
+            # but for swap PR the "going_to_dump" transition is replaced by direct need_box_in
+            if _is_swap_pr and _driver_status == "box_out":
+                # Override: post "need_box_in" as the action so we record it as box_in_pending
+                _workflow_btn_html = (
+                    f'<form method="POST" action="{url_for("stop_driver_action", stop_id=s["id"])}"'
+                    f' style="margin-bottom:8px;">'
+                    f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
+                    f'<input type="hidden" name="action" value="skip_to_box_in">'
+                    f'<button class="btn-driver btn-driver-complete" type="submit" style="width:100%;">'
+                    f'📦 Box In — Place Empty Can</button>'
+                    f'</form>'
+                )
+            elif _driver_status in _wf_map:
                 _nxt, _lbl, _cls = _wf_map[_driver_status]
                 _workflow_btn_html = (
                     f'<form method="POST" action="{url_for("stop_driver_action", stop_id=s["id"])}"'
@@ -4212,6 +4301,13 @@ def driver_route_detail(route_id):
                     f'padding:12px 16px;border-radius:12px;font-weight:700;margin-bottom:8px;">'
                     f'{_dump_label}</a>'
                 )
+
+        # Badge on the stop card header showing swap PR mode
+        _swap_badge = (
+            '<span style="font-size:10px;background:rgba(255,200,80,0.22);color:#fde68a;'
+            'padding:2px 8px;border-radius:6px;font-weight:700;letter-spacing:.4px;">'
+            '&#x1F504; SWAP</span> '
+        ) if _is_swap_pr else ""
 
         card_class = "driver-stop-card"
         if is_next:
@@ -4237,6 +4333,7 @@ def driver_route_detail(route_id):
       <div class="dsc-addr">{e(full_address or 'No address')}</div>
       <div class="dsc-meta-row">
         {f'<span class="action-pill" style="background:rgba(255,200,80,0.22);color:#fde68a;font-weight:900;letter-spacing:.5px;">{e(dict(s).get("wo_type") or "")}</span>' if dict(s).get("wo_type") else ''}
+        {_swap_badge}
         <span class="action-pill" style="background:{action_color};color:#06101f;">{e(s['action'] or 'Service')}</span>
         {f'<span class="action-pill" style="background:rgba(150,200,255,0.18);color:#cde;">{e(s["container_size"])} yd</span>' if s['container_size'] else ''}
         <span class="badge" id="badge-{stop_key}" style="font-size:11px;">{e(s['status'])}</span>
@@ -4958,6 +5055,26 @@ def view_route(route_id):
         edit_button = f'<a class="btn secondary" href="{url_for("edit_stop", stop_id=s["id"])}">Edit</a>' if session.get("role") == "boss" else ''
         delete_button = f'<form class="inline" method="POST" action="{url_for("delete_stop", stop_id=s["id"])}" onsubmit="return confirm(\'Delete this stop?\')"><button class="btn red" type="submit">Delete</button></form>' if session.get("role") == "boss" else ''
 
+        # Can-state pill — boss view only, shown when compute_can_flow has run
+        _csb = dict(s).get("can_state_before") or ""
+        if session.get("role") == "boss" and _csb:
+            if _csb == "empty_can":
+                _can_pill = (
+                    ' <span title="Truck arrives with empty can" style="font-size:11px;'
+                    'background:rgba(97,247,223,0.15);color:#61f7df;padding:2px 8px;'
+                    'border-radius:6px;font-weight:700;vertical-align:middle;">'
+                    '&#x1F7E2; Empty Can</span>'
+                )
+            else:  # no_can
+                _can_pill = (
+                    ' <span title="Truck arrives with no container" style="font-size:11px;'
+                    'background:rgba(120,120,140,0.18);color:#9aa5b8;padding:2px 8px;'
+                    'border-radius:6px;font-weight:700;vertical-align:middle;">'
+                    '&#x26AA; No Can</span>'
+                )
+        else:
+            _can_pill = ""
+
         stop_cards += f"""
         <div class="stop-card" data-stop-id="{s['id']}">
             <div class="row between">
@@ -4977,7 +5094,7 @@ def view_route(route_id):
             </div>
             <p><strong>Customer:</strong> {e(s['customer_name'] or '')}</p>
             <p><strong>Address:</strong> {e(s['address'] or '')} {e(s['city'] or '')} {e(s['state'] or '')} {e(s['zip_code'] or '')}</p>
-            <p><strong>Action:</strong> {e(s['action'] or '')}</p>
+            <p><strong>Action:</strong> {e(s['action'] or '')}{_can_pill}</p>
             <p><strong>Container:</strong> {e(s['container_size'] or '')}</p>
             <p><strong>Ticket:</strong> {e(s['ticket_number'] or '')}</p>
             <p><strong>Reference:</strong> {e(s['reference_number'] or '')}</p>
@@ -5016,6 +5133,19 @@ def view_route(route_id):
                 </div>
                 <label>Notes</label>
                 <textarea name="notes"></textarea>
+                <div style="margin-top:12px;padding:12px 14px;background:rgba(255,200,80,0.07);
+                            border:1px solid rgba(255,200,80,0.25);border-radius:10px;">
+                    <label style="display:flex;align-items:center;gap:10px;cursor:pointer;">
+                        <input type="checkbox" name="swap_with_prev_pull" value="1"
+                               style="width:16px;height:16px;accent-color:#ffb830;cursor:pointer;">
+                        <span style="color:#fde68a;font-size:13px;font-weight:600;">
+                            &#x1F504; Use empty can from previous Pull
+                        </span>
+                    </label>
+                    <p style="color:#a89060;font-size:11px;margin:4px 0 0 26px;">
+                        PR stop — skip dump trip, driver brings emptied can from prior Pull.
+                    </p>
+                </div>
                 <div style="margin-top:10px;"><button type="submit">Add Stop</button></div>
             </form>
         </div>
@@ -5197,8 +5327,8 @@ def add_stop(route_id):
         INSERT INTO stops (
             route_id, stop_order, customer_name, address, city, state, zip_code,
             action, container_size, ticket_number, reference_number, dump_location, notes,
-            status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+            swap_with_prev_pull, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
     """, (
         route_id,
         last + 1,
@@ -5213,6 +5343,7 @@ def add_stop(route_id):
         request.form.get("reference_number"),
         request.form.get("dump_location", ""),
         request.form.get("notes"),
+        1 if request.form.get("swap_with_prev_pull") else 0,
         now_ts()
     ))
 
@@ -5245,7 +5376,7 @@ def edit_stop(stop_id):
             UPDATE stops SET
                 customer_name=?, address=?, city=?, state=?, zip_code=?,
                 action=?, container_size=?, ticket_number=?, reference_number=?,
-                dump_location=?, notes=?
+                dump_location=?, notes=?, swap_with_prev_pull=?
             WHERE id=?
         """, (
             request.form.get("customer_name"),
@@ -5259,6 +5390,7 @@ def edit_stop(stop_id):
             request.form.get("reference_number"),
             request.form.get("dump_location", ""),
             request.form.get("notes"),
+            1 if request.form.get("swap_with_prev_pull") else 0,
             stop_id
         ))
         conn.commit()
@@ -5335,6 +5467,23 @@ def edit_stop(stop_id):
                     <textarea name="notes" rows="3">{e(_stop['notes'])}</textarea>
                 </div>
             </div>
+
+            <div style="margin-top:16px;padding:14px 16px;background:rgba(255,200,80,0.07);
+                        border:1px solid rgba(255,200,80,0.25);border-radius:10px;">
+                <label style="display:flex;align-items:center;gap:10px;cursor:pointer;">
+                    <input type="checkbox" name="swap_with_prev_pull" value="1"
+                           style="width:18px;height:18px;accent-color:#ffb830;cursor:pointer;"
+                           {"checked" if _stop.get('swap_with_prev_pull') else ""}>
+                    <span>
+                        <strong style="color:#fde68a;font-size:13px;">&#x1F504; Use empty can from previous Pull</strong><br>
+                        <span style="color:#a89060;font-size:12px;">
+                            Skips dump trip on this PR stop. Driver arrives carrying the emptied container from the prior Pull job.
+                            Workflow: Arrive → Box Out → Box In → Complete.
+                        </span>
+                    </span>
+                </label>
+            </div>
+
             <div style="margin-top:18px;display:flex;gap:10px;">
                 <button type="submit" class="btn">Save Changes</button>
                 <a class="btn secondary" href="{url_for('view_route', route_id=_stop['route_id'])}">Cancel</a>
@@ -5495,7 +5644,7 @@ def toggle_stop_complete(stop_id):
 @login_required
 def stop_driver_action(stop_id):
     action = request.form.get("action", "").strip()
-    valid_actions = {"arrived", "box_in", "box_out", "going_to_dump"}
+    valid_actions = {"arrived", "box_in", "box_out", "going_to_dump", "skip_to_box_in"}
     if action not in valid_actions:
         flash("Invalid action.", "error")
         return redirect(url_for("dashboard"))
@@ -5516,18 +5665,27 @@ def stop_driver_action(stop_id):
         flash("Access denied.", "error")
         return redirect(url_for("dashboard"))
 
-    col_map = {
-        "arrived":      "arrived_at",
-        "box_in":       "box_in_at",
-        "box_out":      "box_out_at",
-        "going_to_dump":"go_to_dump_at",
-    }
-    time_col = col_map[action]
     ts = now_ts()
-    conn.execute(
-        f"UPDATE stops SET driver_status=?, {time_col}=? WHERE id=?",
-        (action, ts, stop_id)
-    )
+
+    if action == "skip_to_box_in":
+        # Swap PR: driver has empty can from prior Pull — skip dump, go straight to need_box_in
+        conn.execute(
+            "UPDATE stops SET driver_status='need_box_in' WHERE id=?",
+            (stop_id,)
+        )
+    else:
+        col_map = {
+            "arrived":       "arrived_at",
+            "box_in":        "box_in_at",
+            "box_out":       "box_out_at",
+            "going_to_dump": "go_to_dump_at",
+        }
+        time_col = col_map[action]
+        conn.execute(
+            f"UPDATE stops SET driver_status=?, {time_col}=? WHERE id=?",
+            (action, ts, stop_id)
+        )
+
     conn.commit()
     route_id = stop["rid"]
     conn.close()
@@ -5610,18 +5768,23 @@ def dump_ticket(stop_id):
                 "UPDATE dump_tickets SET photo_path=? WHERE stop_id=?", (path, stop_id)
             )
 
-        # After dump ticket saved: PR/Pull stops need Box In next; others auto-complete
+        # After dump ticket saved: decide next state based on job type
+        # - PR (Pickup and Return) / Swap action  → need_box_in (driver must return empty can)
+        # - Pull / everything else               → auto-complete (no box-in needed)
         _ds = dict(stop).get("driver_status") or "pending"
         _stop_action = (dict(stop).get("action") or "").lower()
-        _is_pr_stop = any(x in _stop_action for x in ("pickup and return", "pull", "swap"))
+        _pr_needs_box_in = (
+            "pickup and return" in _stop_action
+            or ("swap" in _stop_action and "pull" not in _stop_action)
+        )
         if _ds == "going_to_dump":
-            if _is_pr_stop:
-                # Driver still needs to box in the empty container
+            if _pr_needs_box_in:
                 conn.execute(
                     "UPDATE stops SET driver_status='need_box_in' WHERE id=?",
                     (stop_id,)
                 )
             else:
+                # Pull, Dump, or other — complete after dump
                 conn.execute(
                     "UPDATE stops SET driver_status='completed', status='completed', completed_at=? WHERE id=?",
                     (now_ts(), stop_id)
@@ -6075,6 +6238,10 @@ def optimize_route(route_id):
 
     for new_order, stop_id in enumerate(final_order, start=1):
         conn.execute("UPDATE stops SET stop_order=? WHERE id=?", (new_order, stop_id))
+    conn.commit()
+
+    # Stamp can_state_before on every stop now that order is final
+    compute_can_flow(conn, route_id)
     conn.commit()
     conn.close()
 
