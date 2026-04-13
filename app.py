@@ -104,7 +104,15 @@ def e(value):
     return html.escape("" if value is None else str(value))
 
 
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+    _EASTERN = _ZoneInfo("America/New_York")
+except Exception:
+    _EASTERN = None
+
 def now_ts():
+    if _EASTERN:
+        return datetime.now(_EASTERN).strftime("%Y-%m-%d %H:%M:%S")
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -4077,10 +4085,14 @@ def driver_route_detail(route_id):
         _driver_status = _s.get("driver_status") or "pending"
         _csrf = get_csrf_token()
 
-        # Compact trail of completed workflow steps with times
+        # Is this a PR/Pull stop that requires the full box-out → dump → box-in workflow?
+        _action_val = (_s.get("action") or "").lower()
+        _is_pr = any(x in _action_val for x in ("pickup and return", "pull", "swap"))
+
+        # Compact trail of completed workflow steps with times (logical order for PR)
         _trail_parts = []
-        for _tc, _tl in [("arrived_at","Arrived"),("box_in_at","Box In"),
-                         ("box_out_at","Box Out"),("go_to_dump_at","To Dump")]:
+        for _tc, _tl in [("arrived_at","Arrived"),("box_out_at","Box Out"),
+                         ("go_to_dump_at","To Dump"),("box_in_at","Box In")]:
             _tv = _s.get(_tc)
             if _tv:
                 _trail_parts.append(
@@ -4095,12 +4107,19 @@ def driver_route_detail(route_id):
         # Next workflow action button (appears above Complete Stop)
         _workflow_btn_html = ""
         if not is_done:
-            _wf_map = {
-                "pending":      ("arrived",      "🚛 Arrived at Stop",  "btn-driver btn-driver-complete"),
-                "arrived":      ("box_in",       "📦 Box In",           "btn-driver btn-driver-complete"),
-                "box_in":       ("box_out",      "✅ Box Out",          "btn-driver btn-driver-complete"),
-                "box_out":      ("going_to_dump","🗑️ Go To Dump",       "btn-driver btn-driver-dump"),
-            }
+            if _is_pr:
+                # PR/Pull workflow: arrived → box_out → going_to_dump → dump ticket → need_box_in → box_in
+                _wf_map = {
+                    "pending":      ("arrived",       "🚛 Arrived at Stop",         "btn-driver btn-driver-complete"),
+                    "arrived":      ("box_out",        "📦 Box Out — Remove Container","btn-driver btn-driver-complete"),
+                    "box_out":      ("going_to_dump",  "🗑️ Go To Dump",              "btn-driver btn-driver-dump"),
+                    "need_box_in":  ("box_in",         "📦 Box In — Return Container","btn-driver btn-driver-complete"),
+                }
+            else:
+                # Simple workflow: arrived only (deliver/drop/service)
+                _wf_map = {
+                    "pending":      ("arrived",       "🚛 Arrived at Stop",         "btn-driver btn-driver-complete"),
+                }
             if _driver_status in _wf_map:
                 _nxt, _lbl, _cls = _wf_map[_driver_status]
                 _workflow_btn_html = (
@@ -4112,12 +4131,14 @@ def driver_route_detail(route_id):
                     f'</form>'
                 )
             elif _driver_status == "going_to_dump":
+                _dump_loc_hint = _s.get("dump_location") or ""
+                _dump_label = f"🧾 Enter Dump Ticket{' — ' + _dump_loc_hint if _dump_loc_hint else ''}"
                 _workflow_btn_html = (
                     f'<a class="btn-driver btn-driver-dump" '
                     f'href="{url_for("dump_ticket", stop_id=s["id"])}" '
                     f'style="display:block;text-align:center;text-decoration:none;'
                     f'padding:12px 16px;border-radius:12px;font-weight:700;margin-bottom:8px;">'
-                    f'🧾 Enter Dump Ticket</a>'
+                    f'{_dump_label}</a>'
                 )
 
         card_class = "driver-stop-card"
@@ -4779,6 +4800,9 @@ def view_route(route_id):
     stops = conn.execute("SELECT * FROM stops WHERE route_id = ? ORDER BY stop_order ASC, id ASC", (route_id,)).fetchall()
     stop_ids = [s["id"] for s in stops]
     photos_by_stop = load_stop_photos(conn, stop_ids)
+    dump_locs_for_form = conn.execute(
+        "SELECT name FROM dump_locations WHERE active=1 ORDER BY name"
+    ).fetchall()
     conn.close()
 
     completed_count = sum(1 for s in stops if s["status"] == "completed")
@@ -4913,6 +4937,10 @@ def view_route(route_id):
                     <div><label>Container Size</label><input name="container_size"></div>
                     <div><label>Ticket Number</label><input name="ticket_number"></div>
                     <div><label>Reference Number</label><input name="reference_number"></div>
+                    <div>
+                        <label>Dump Location</label>
+                        {'<select name="dump_location"><option value="">-- None --</option>' + "".join(f'<option value="{e(dl["name"])}">{e(dl["name"])}</option>' for dl in dump_locs_for_form) + '</select>' if dump_locs_for_form else '<input name="dump_location" placeholder="e.g. Dominion">'}
+                    </div>
                 </div>
                 <label>Notes</label>
                 <textarea name="notes"></textarea>
@@ -5168,24 +5196,77 @@ def edit_stop(stop_id):
         return redirect(url_for("view_route", route_id=route_id))
 
     stop = ownership
+    _stop = dict(stop)
+    _edit_dump_locs = conn.execute(
+        "SELECT name FROM dump_locations WHERE active=1 ORDER BY name"
+    ).fetchall()
     conn.close()
 
+    _cur_dump = _stop.get('dump_location') or ''
+    _dump_field = (
+        '<select name="dump_location">'
+        + '<option value="">-- None --</option>'
+        + "".join(
+            f'<option value="{e(dl["name"])}"{"  selected" if dl["name"] == _cur_dump else ""}>{e(dl["name"])}</option>'
+            for dl in _edit_dump_locs
+        )
+        + '</select>'
+    ) if _edit_dump_locs else f'<input name="dump_location" placeholder="e.g. Dominion" value="{e(_cur_dump)}">'
+
     body = f"""
-    <div class="card">
-        <h2>Edit Stop</h2>
+    <div class="card" style="max-width:680px;">
+        <h2 style="margin-bottom:18px;">Edit Stop</h2>
         <form method="POST">
-            <input name="customer_name" value="{e(stop['customer_name'])}">
-            <input name="address" value="{e(stop['address'])}">
-            <input name="city" value="{e(stop['city'])}">
-            <input name="state" value="{e(stop['state'])}">
-            <input name="zip_code" value="{e(stop['zip_code'])}">
-            <input name="action" value="{e(stop['action'])}">
-            <input name="container_size" value="{e(stop['container_size'])}">
-            <input name="ticket_number" value="{e(stop['ticket_number'])}">
-            <input name="reference_number" value="{e(stop['reference_number'])}">
-            <input name="dump_location" placeholder="Dump location (e.g. Dominion)" value="{e(dict(stop).get('dump_location') or '')}">
-            <textarea name="notes">{e(stop['notes'])}</textarea>
-            <button type="submit">Save</button>
+            <div class="grid" style="grid-template-columns:1fr 1fr;gap:12px 16px;">
+                <div style="grid-column:1/-1;">
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Customer Name</label>
+                    <input name="customer_name" value="{e(_stop['customer_name'])}">
+                </div>
+                <div style="grid-column:1/-1;">
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Address</label>
+                    <input name="address" value="{e(_stop['address'])}">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">City</label>
+                    <input name="city" value="{e(_stop['city'])}">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">State</label>
+                    <input name="state" value="{e(_stop['state'])}">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">ZIP</label>
+                    <input name="zip_code" value="{e(_stop['zip_code'])}">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Action</label>
+                    <input name="action" value="{e(_stop['action'])}">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Container Size</label>
+                    <input name="container_size" value="{e(_stop['container_size'])}">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Ticket Number</label>
+                    <input name="ticket_number" value="{e(_stop['ticket_number'])}">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Reference Number</label>
+                    <input name="reference_number" value="{e(_stop['reference_number'])}">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Dump Location</label>
+                    {_dump_field}
+                </div>
+                <div style="grid-column:1/-1;">
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Notes</label>
+                    <textarea name="notes" rows="3">{e(_stop['notes'])}</textarea>
+                </div>
+            </div>
+            <div style="margin-top:18px;display:flex;gap:10px;">
+                <button type="submit" class="btn">Save Changes</button>
+                <a class="btn secondary" href="{url_for('view_route', route_id=_stop['route_id'])}">Cancel</a>
+            </div>
         </form>
     </div>
     """
@@ -5457,13 +5538,22 @@ def dump_ticket(stop_id):
                 "UPDATE dump_tickets SET photo_path=? WHERE stop_id=?", (path, stop_id)
             )
 
-        # Auto-complete stop when dump ticket is saved from going_to_dump
+        # After dump ticket saved: PR/Pull stops need Box In next; others auto-complete
         _ds = dict(stop).get("driver_status") or "pending"
+        _stop_action = (dict(stop).get("action") or "").lower()
+        _is_pr_stop = any(x in _stop_action for x in ("pickup and return", "pull", "swap"))
         if _ds == "going_to_dump":
-            conn.execute(
-                "UPDATE stops SET driver_status='completed', status='completed', completed_at=? WHERE id=?",
-                (now_ts(), stop_id)
-            )
+            if _is_pr_stop:
+                # Driver still needs to box in the empty container
+                conn.execute(
+                    "UPDATE stops SET driver_status='need_box_in' WHERE id=?",
+                    (stop_id,)
+                )
+            else:
+                conn.execute(
+                    "UPDATE stops SET driver_status='completed', status='completed', completed_at=? WHERE id=?",
+                    (now_ts(), stop_id)
+                )
 
         conn.commit()
         conn.close()
