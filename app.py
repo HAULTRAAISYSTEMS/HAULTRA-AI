@@ -251,16 +251,27 @@ def _geocode_server(address):
     return None
 
 
-def _nearest_neighbor(stops_coords):
+def _nearest_neighbor(stops_coords, origin=None):
     """
     Greedy nearest-neighbor route ordering.
     stops_coords: list of (stop_id, lat, lng)
+    origin: optional (lat, lng) starting point (e.g. yard address).
+            When supplied the first stop chosen is the one nearest to origin
+            rather than the first item in the list.
     Returns stop_ids in optimized order.
     """
     if not stops_coords:
         return []
-    visited   = [stops_coords[0]]
-    remaining = list(stops_coords[1:])
+    remaining = list(stops_coords)
+    visited   = []
+    if origin:
+        # start from the stop closest to the yard/origin
+        first = min(remaining,
+                    key=lambda s: _haversine_mi(origin[0], origin[1], s[1], s[2]))
+    else:
+        first = remaining[0]
+    visited.append(first)
+    remaining.remove(first)
     while remaining:
         last = visited[-1]
         nearest = min(remaining,
@@ -534,6 +545,10 @@ def init_db():
     safe_add_column(conn, "companies", "stripe_customer_id TEXT")
     safe_add_column(conn, "companies", "stripe_subscription_id TEXT")
     safe_add_column(conn, "users", "email TEXT")
+    safe_add_column(conn, "companies", "yard_address TEXT")
+    safe_add_column(conn, "companies", "yard_city TEXT")
+    safe_add_column(conn, "companies", "yard_state TEXT")
+    safe_add_column(conn, "companies", "yard_zip TEXT")
 
     # --- default company bootstrap ---
     default_co = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()
@@ -5856,6 +5871,8 @@ def reorder_stops(route_id):
 # =========================================================
 # ROUTE OPTIMIZATION
 # =========================================================
+_EOD_KEYWORDS = ("end of day", "return to yard", "take to yard", "back to yard", "eod")
+
 @app.route("/route/<int:route_id>/optimize", methods=["POST"])
 @boss_required
 def optimize_route(route_id):
@@ -5870,11 +5887,39 @@ def optimize_route(route_id):
         flash("Need at least 2 stops to optimize.", "error")
         return redirect(url_for("view_route", route_id=route_id))
 
-    # Geocode every stop that has an address
+    # Fetch company yard address (origin for optimization)
+    company = conn.execute(
+        "SELECT yard_address, yard_city, yard_state, yard_zip FROM companies WHERE id=?",
+        (cid(),)
+    ).fetchone()
+    _co = dict(company) if company else {}
+    yard_str = " ".join(filter(None, [
+        _co.get("yard_address") or "",
+        _co.get("yard_city")    or "",
+        _co.get("yard_state")   or "",
+        _co.get("yard_zip")     or "",
+    ])).strip()
+    yard_origin = None
+    if yard_str:
+        yard_origin = _geocode_server(yard_str)
+        time.sleep(1.1)   # respect Nominatim rate-limit
+
+    # Separate end-of-day stops (always go last) from regular stops
+    _eod_ids  = []   # stop_ids flagged as end-of-day
+    _main     = []   # stops to be optimized
+
+    for s in stops:
+        notes_lower = (s["notes"] or "").lower()
+        if any(kw in notes_lower for kw in _EOD_KEYWORDS):
+            _eod_ids.append(s)
+        else:
+            _main.append(s)
+
+    # Geocode main stops
     geocoded   = []   # (stop_id, lat, lng)
     no_address = []   # stop_ids with no geocodable address
 
-    for idx, s in enumerate(stops):
+    for idx, s in enumerate(_main):
         addr = " ".join(filter(None, [
             s["address"] or "", s["city"] or "",
             s["state"] or "", s["zip_code"] or "",
@@ -5886,8 +5931,7 @@ def optimize_route(route_id):
                 geocoded.append((s["id"], coords[0], coords[1]))
             else:
                 no_address.append(s["id"])
-            # Nominatim rate-limit: 1 request/second
-            if idx < len(stops) - 1:
+            if idx < len(_main) - 1:
                 time.sleep(1.1)
         else:
             no_address.append(s["id"])
@@ -5897,17 +5941,29 @@ def optimize_route(route_id):
         flash("Not enough addresses could be geocoded to optimize the route.", "error")
         return redirect(url_for("view_route", route_id=route_id))
 
-    # Nearest-neighbor reorder; append ungeocoded stops at the end
-    optimized_ids = _nearest_neighbor(geocoded) + no_address
+    # Nearest-neighbor reorder using yard as origin when available
+    optimized_ids = (
+        _nearest_neighbor(geocoded, origin=yard_origin)
+        + no_address
+        + [s["id"] for s in _eod_ids]
+    )
 
     for new_order, stop_id in enumerate(optimized_ids, start=1):
         conn.execute("UPDATE stops SET stop_order=? WHERE id=?", (new_order, stop_id))
     conn.commit()
     conn.close()
 
-    skipped = len(no_address)
-    skip_note = f" ({skipped} stop{'s' if skipped != 1 else ''} without address appended at end)" if skipped else ""
-    flash(f"Route optimized: {len(geocoded)} stops reordered by shortest driving distance.{skip_note}", "success")
+    # Build informative flash message
+    skipped  = len(no_address)
+    eod_pins = len(_eod_ids)
+    origin_note = f" starting from {_co.get('yard_city') or 'yard'}" if yard_origin else ""
+    skip_note   = f", {skipped} stop{'s' if skipped != 1 else ''} without address appended" if skipped else ""
+    eod_note    = f", {eod_pins} end-of-day stop{'s' if eod_pins != 1 else ''} pinned last" if eod_pins else ""
+    flash(
+        f"Smart route optimized{origin_note} — {len(geocoded)} stops reordered by shortest driving distance"
+        f"{skip_note}{eod_note}.",
+        "success"
+    )
     return redirect(url_for("view_route", route_id=route_id))
 
 
@@ -6166,11 +6222,30 @@ def company_settings():
     company = conn.execute("SELECT * FROM companies WHERE id=?", (cid(),)).fetchone()
 
     if request.method == "POST":
-        new_name = request.form.get("company_name", "").strip()
-        if new_name:
-            conn.execute("UPDATE companies SET name=? WHERE id=?", (new_name, cid()))
+        action = request.form.get("_action", "profile")
+
+        if action == "yard":
+            conn.execute(
+                """UPDATE companies SET
+                       yard_address=?, yard_city=?, yard_state=?, yard_zip=?
+                   WHERE id=?""",
+                (
+                    request.form.get("yard_address", "").strip(),
+                    request.form.get("yard_city",    "").strip(),
+                    request.form.get("yard_state",   "").strip(),
+                    request.form.get("yard_zip",     "").strip(),
+                    cid(),
+                )
+            )
             conn.commit()
-            flash("Company name updated.", "success")
+            flash("Yard / base location saved.", "success")
+        else:
+            new_name = request.form.get("company_name", "").strip()
+            if new_name:
+                conn.execute("UPDATE companies SET name=? WHERE id=?", (new_name, cid()))
+                conn.commit()
+                flash("Company name updated.", "success")
+
         conn.close()
         return redirect(url_for("company_settings"))
 
@@ -6182,12 +6257,24 @@ def company_settings():
         "pro": ("Pro", "#56f0b7"),
         "enterprise": ("Enterprise", "#c084fc"),
     }
-    plan      = company["subscription_plan"] if company else "trial"
+    _co = dict(company) if company else {}
+    plan      = _co.get("subscription_plan") or "trial"
     plan_name, plan_color = plan_labels.get(plan, ("Unknown", "#9dc8f0"))
-    max_d     = company["max_drivers"] if company else 0
-    co_name   = company["name"] if company else ""
-    co_slug   = company["slug"] if company else ""
-    trial_end = company["trial_ends_at"] if company else ""
+    max_d     = _co.get("max_drivers") or 0
+    co_name   = _co.get("name") or ""
+    co_slug   = _co.get("slug") or ""
+    trial_end = _co.get("trial_ends_at") or ""
+    yard_addr  = _co.get("yard_address") or ""
+    yard_city  = _co.get("yard_city")    or ""
+    yard_state = _co.get("yard_state")   or ""
+    yard_zip   = _co.get("yard_zip")     or ""
+
+    _yard_set = bool(yard_addr or yard_city)
+    _yard_status = (
+        f'<span style="color:#00e87d;font-size:12px;">&#10003; Set — {e(yard_addr)}, {e(yard_city)}, {e(yard_state)} {e(yard_zip)}</span>'
+        if _yard_set else
+        '<span style="color:#ff9d00;font-size:12px;">&#9888; Not set — route optimization will use stop-to-stop ordering</span>'
+    )
 
     body = f"""
     <div class="hero">
@@ -6198,6 +6285,7 @@ def company_settings():
     <div class="card">
         <h2>Profile</h2>
         <form method="POST">
+            <input type="hidden" name="_action" value="profile">
             <label>Company Name</label>
             <input name="company_name" value="{e(co_name)}" required>
             <div style="margin-top:10px;">
@@ -6205,6 +6293,40 @@ def company_settings():
             </div>
         </form>
         <p class="muted small" style="margin-top:10px;">Slug: <code>{e(co_slug)}</code></p>
+    </div>
+
+    <div class="card">
+        <h2>&#127968; Yard / Base Location</h2>
+        <p style="color:#7aaac8;font-size:13px;margin-bottom:12px;">
+            Used as the starting point when optimizing routes. Stops with notes containing
+            <em>end of day</em>, <em>return to yard</em>, or <em>take to yard</em> are automatically
+            pinned to the end of the optimized route.
+        </p>
+        <p style="margin-bottom:14px;">{_yard_status}</p>
+        <form method="POST">
+            <input type="hidden" name="_action" value="yard">
+            <div class="grid" style="grid-template-columns:1fr 1fr;gap:12px 16px;">
+                <div style="grid-column:1/-1;">
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Yard / Base Address</label>
+                    <input name="yard_address" value="{e(yard_addr)}" placeholder="e.g. 100 Industrial Blvd">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">City</label>
+                    <input name="yard_city" value="{e(yard_city)}" placeholder="e.g. Suffolk">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">State</label>
+                    <input name="yard_state" value="{e(yard_state)}" placeholder="VA" style="max-width:100px;">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">ZIP</label>
+                    <input name="yard_zip" value="{e(yard_zip)}" placeholder="23434" style="max-width:140px;">
+                </div>
+            </div>
+            <div style="margin-top:14px;">
+                <button type="submit" class="btn gold">Save Yard Location</button>
+            </div>
+        </form>
     </div>
 
     <div class="card">
