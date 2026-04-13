@@ -857,6 +857,7 @@ _ACTION_TOKENS = {
     "D":    "Drop",
     "PR":   "Pickup and Return",
     "DUMP": "Dump",
+    "PULL": "Pull",
 }
 
 
@@ -984,6 +985,65 @@ def split_into_stop_blocks(raw_text):
     return [[line] for line in lines if not _is_route_header(line)]
 
 
+# Street-type suffixes used to split "STREET CITY STATE" without commas.
+_STREET_SFX_RE = re.compile(
+    r"\b(rd|st|ave|blvd|dr|ln|ct|way|pl|cir|hwy|pkwy|trl|ter|row|loop|run|pass|pt)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_structured_addr(addr_str):
+    """
+    Parse an address that may contain city and state without commas.
+
+    Handles both:
+      "4100 Holland Rd, Virginia Beach VA"   (comma form)
+      "4100 Holland Rd Virginia Beach VA"    (space form)
+
+    Returns (street, city, state, zip_code).
+    Falls back to (addr_str, "", "", "") if not parseable.
+    """
+    addr = addr_str.strip()
+
+    # ── Comma form ────────────────────────────────────────────────────────────
+    m = re.search(r",\s*(.+?)\s+([A-Z]{2})\s*(\d{5})?\s*$", addr)
+    if m:
+        return (
+            addr[:m.start()].strip(),
+            m.group(1).strip(),
+            m.group(2),
+            (m.group(3) or "").strip(),
+        )
+
+    # ── Space form: locate state code at end, then city before it ────────────
+    m_state = re.search(r"\s+([A-Z]{2})\s*(\d{5})?\s*$", addr)
+    if not m_state:
+        return addr, "", "", ""
+
+    state    = m_state.group(1)
+    zip_code = (m_state.group(2) or "").strip()
+    before   = addr[:m_state.start()].strip()
+
+    # Find the last street-type abbreviation; city starts after it
+    last_sfx = None
+    for m_sfx in _STREET_SFX_RE.finditer(before):
+        last_sfx = m_sfx
+
+    if last_sfx:
+        street = before[:last_sfx.end()].strip()
+        city   = before[last_sfx.end():].strip()
+    else:
+        # No suffix found — split at last two words as city
+        words = before.rsplit(None, 2)
+        if len(words) >= 3:
+            street = words[0].strip()
+            city   = " ".join(words[1:]).strip()
+        else:
+            street, city = before, ""
+
+    return street, city, state, zip_code
+
+
 def parse_stop_block(lines, order_num):
     cleaned_lines = [x.strip() for x in lines if x.strip()]
 
@@ -1049,7 +1109,42 @@ def parse_stop_block(lines, order_num):
             }
 
         if len(parts) >= 3:
-            # True one-line stop — parse all fields from the single line
+            # ── Detect structured format: CUSTOMER - ADDRESS - ACTION - SIZE [- DUMP: SITE]
+            # Signature: parts[0] is NOT a known action, but parts[2] IS.
+            # Example: "Smith Demo - 4100 Holland Rd Virginia Beach VA - P - 30yd - Dump: Dominion"
+            _p2_action = _ACTION_TOKENS.get(parts[2].strip().upper(), "")
+            if not action_from_token and _p2_action and len(parts) >= 4:
+                _cust  = parts[0].strip()
+                _addr  = parts[1].strip()
+                _act   = _p2_action
+                _size  = parts[3].strip()
+                _dump  = ""
+                for _pt in parts[4:]:
+                    if re.match(r"dump\s*:\s*", _pt.strip(), re.IGNORECASE):
+                        _dump = re.sub(r"^dump\s*:\s*", "", _pt.strip(),
+                                       flags=re.IGNORECASE).strip()
+                        break
+                _street, _city, _state, _zip = _parse_structured_addr(_addr)
+                _csz = extract_container_size(_size) or _size
+                return {
+                    "stop_order":       order_num,
+                    "customer_name":    _cust,
+                    "address":          _street,
+                    "city":             _city,
+                    "state":            _state,
+                    "zip_code":         _zip,
+                    "action":           _act,
+                    "container_size":   _csz,
+                    "ticket_number":    "",
+                    "reference_number": "",
+                    "phone":            "",
+                    "dump_location":    _dump,
+                    "notes":            "",
+                }
+
+            # ── Existing one-line formats ────────────────────────────────────
+            # ACTION - ADDRESS - SIZE - NAME [- PHONE]
+            # ADDRESS - SIZE - NAME [- PHONE]  (no action prefix)
             if action_from_token:
                 raw_address   = parts[1]
                 raw_size      = parts[2] if len(parts) > 2 else ""
