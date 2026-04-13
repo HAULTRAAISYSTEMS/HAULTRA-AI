@@ -251,13 +251,18 @@ def _geocode_server(address):
     return None
 
 
+# Actions that require a dump trip after the customer stop
+_DUMP_ACTIONS = frozenset({"pickup and return", "pull", "swap"})
+# Notes keywords that pin a stop to the very beginning of the route
+_FIRST_KEYWORDS = ("do this first", "first stop", "start here", "start with this")
+# Notes keywords that pin a stop to the very end (already used in optimize_route)
+_EOD_KEYWORDS_SET = frozenset(("end of day", "return to yard", "take to yard", "back to yard", "eod"))
+
+
 def _nearest_neighbor(stops_coords, origin=None):
     """
-    Greedy nearest-neighbor route ordering.
+    Simple greedy nearest-neighbor (kept for internal reuse).
     stops_coords: list of (stop_id, lat, lng)
-    origin: optional (lat, lng) starting point (e.g. yard address).
-            When supplied the first stop chosen is the one nearest to origin
-            rather than the first item in the list.
     Returns stop_ids in optimized order.
     """
     if not stops_coords:
@@ -265,7 +270,6 @@ def _nearest_neighbor(stops_coords, origin=None):
     remaining = list(stops_coords)
     visited   = []
     if origin:
-        # start from the stop closest to the yard/origin
         first = min(remaining,
                     key=lambda s: _haversine_mi(origin[0], origin[1], s[1], s[2]))
     else:
@@ -279,6 +283,59 @@ def _nearest_neighbor(stops_coords, origin=None):
         visited.append(nearest)
         remaining.remove(nearest)
     return [s[0] for s in visited]
+
+
+def _dump_aware_order(stops_data, origin=None):
+    """
+    Dump-aware greedy nearest-neighbor.
+
+    stops_data: list of dicts
+        {
+            "id":       stop_id (int),
+            "lat":      float,
+            "lng":      float,
+            "is_dump":  bool,        # True for PR / Pull / Swap stops
+            "dump_lat": float|None,  # dump site coords if known
+            "dump_lng": float|None,
+        }
+    origin: (lat, lng) or None — yard / base start position.
+
+    Logic
+    -----
+    Current position starts at origin (yard) or first stop.
+    At each step we pick the unvisited stop nearest to *current position*.
+    After visiting a stop:
+      - Normal stop  → current position = customer address
+      - PR/Pull stop with known dump → current position = dump location
+        (because the driver ends up at the dump, not the customer site)
+    This makes the algorithm choose the next stop relative to where the
+    driver will actually be — not just the customer they just serviced.
+
+    Returns list of stop_ids in optimised order.
+    """
+    if not stops_data:
+        return []
+    remaining = list(stops_data)
+    ordered   = []
+
+    if origin:
+        pos = origin
+    else:
+        # start from whichever stop is top of list (no yard set)
+        pos = (stops_data[0]["lat"], stops_data[0]["lng"])
+
+    while remaining:
+        best = min(remaining,
+                   key=lambda s: _haversine_mi(pos[0], pos[1], s["lat"], s["lng"]))
+        ordered.append(best)
+        remaining.remove(best)
+        # Advance position to dump exit when applicable
+        if best["is_dump"] and best["dump_lat"] is not None:
+            pos = (best["dump_lat"], best["dump_lng"])
+        else:
+            pos = (best["lat"], best["lng"])
+
+    return [s["id"] for s in ordered]
 
 
 def load_stop_photos(conn, stop_ids):
@@ -4852,7 +4909,7 @@ def view_route(route_id):
     <form class="inline" method="POST" action="{url_for('optimize_route', route_id=route_id)}"
           id="optimize-form"
           onsubmit="showOptimizeOverlay(event, {len(stops)})">
-        <button class="btn orange" type="submit" id="optimize-btn">&#9883; Optimize Route</button>
+        <button class="btn orange" type="submit" id="optimize-btn">&#9883; Smart Optimize</button>
     </form>
     <form class="inline" method="POST"
       action="{url_for('delete_route', route_id=route_id)}"
@@ -5869,14 +5926,16 @@ def reorder_stops(route_id):
 
 
 # =========================================================
-# ROUTE OPTIMIZATION
+# ROUTE OPTIMIZATION  (dump-aware)
 # =========================================================
 _EOD_KEYWORDS = ("end of day", "return to yard", "take to yard", "back to yard", "eod")
+
 
 @app.route("/route/<int:route_id>/optimize", methods=["POST"])
 @boss_required
 def optimize_route(route_id):
     conn = get_db()
+
     stops = conn.execute(
         "SELECT * FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
         (route_id,)
@@ -5887,7 +5946,9 @@ def optimize_route(route_id):
         flash("Need at least 2 stops to optimize.", "error")
         return redirect(url_for("view_route", route_id=route_id))
 
-    # Fetch company yard address (origin for optimization)
+    # ------------------------------------------------------------------
+    # 1. Yard / base origin
+    # ------------------------------------------------------------------
     company = conn.execute(
         "SELECT yard_address, yard_city, yard_state, yard_zip FROM companies WHERE id=?",
         (cid(),)
@@ -5902,68 +5963,152 @@ def optimize_route(route_id):
     yard_origin = None
     if yard_str:
         yard_origin = _geocode_server(yard_str)
-        time.sleep(1.1)   # respect Nominatim rate-limit
+        time.sleep(1.1)
 
-    # Separate end-of-day stops (always go last) from regular stops
-    _eod_ids  = []   # stop_ids flagged as end-of-day
-    _main     = []   # stops to be optimized
+    # ------------------------------------------------------------------
+    # 2. Load dump-location geocodes from DB (one query, cached by name)
+    # ------------------------------------------------------------------
+    dump_rows = conn.execute(
+        "SELECT name, address, city, state, zip_code FROM dump_locations WHERE active=1"
+    ).fetchall()
+    # dict: normalised_name → full address string
+    _dump_addr_map = {}
+    for dr in dump_rows:
+        addr_str = " ".join(filter(None, [
+            dr["address"] or "", dr["city"] or "",
+            dr["state"]   or "", dr["zip_code"] or "",
+        ])).strip()
+        if addr_str:
+            _dump_addr_map[dr["name"].lower().strip()] = addr_str
+
+    # geocode cache: normalised_name → (lat, lng) or None
+    _dump_coords_cache = {}
+
+    def _get_dump_coords(name_text):
+        """Return (lat, lng) for a dump location name, geocoding on first use."""
+        if not name_text:
+            return None
+        key = name_text.lower().strip()
+        if key in _dump_coords_cache:
+            return _dump_coords_cache[key]
+        # Try full address from DB first; fall back to raw name search
+        addr = _dump_addr_map.get(key) or name_text
+        coords = _geocode_server(addr)
+        time.sleep(1.1)
+        _dump_coords_cache[key] = coords
+        return coords
+
+    # ------------------------------------------------------------------
+    # 3. Bucket stops: pinned-first | main | no-address | pinned-last
+    # ------------------------------------------------------------------
+    first_pins = []   # notes: "do this first" etc.
+    main_stops = []   # stops to be optimized
+    no_address = []   # stop_ids with no geocodable address
+    eod_stops  = []   # notes: "end of day" / "return to yard" etc.
 
     for s in stops:
         notes_lower = (s["notes"] or "").lower()
-        if any(kw in notes_lower for kw in _EOD_KEYWORDS):
-            _eod_ids.append(s)
+        if any(kw in notes_lower for kw in _FIRST_KEYWORDS):
+            first_pins.append(s["id"])
+        elif any(kw in notes_lower for kw in _EOD_KEYWORDS):
+            eod_stops.append(s["id"])
         else:
-            _main.append(s)
+            main_stops.append(s)
 
-    # Geocode main stops
-    geocoded   = []   # (stop_id, lat, lng)
-    no_address = []   # stop_ids with no geocodable address
+    # ------------------------------------------------------------------
+    # 4. Geocode main stops; build stops_data for dump-aware algorithm
+    # ------------------------------------------------------------------
+    stops_data = []   # dicts for _dump_aware_order
+    ungeocoded = []   # stop_ids that couldn't be geocoded
 
-    for idx, s in enumerate(_main):
+    for s in main_stops:
         addr = " ".join(filter(None, [
             s["address"] or "", s["city"] or "",
             s["state"] or "", s["zip_code"] or "",
         ])).strip()
 
-        if addr:
-            coords = _geocode_server(addr)
-            if coords:
-                geocoded.append((s["id"], coords[0], coords[1]))
-            else:
-                no_address.append(s["id"])
-            if idx < len(_main) - 1:
-                time.sleep(1.1)
-        else:
-            no_address.append(s["id"])
+        if not addr:
+            ungeocoded.append(s["id"])
+            continue
 
-    if len(geocoded) < 2:
+        coords = _geocode_server(addr)
+        time.sleep(1.1)
+        if not coords:
+            ungeocoded.append(s["id"])
+            continue
+
+        action_lower = (s["action"] or "").lower().strip()
+        is_dump = action_lower in _DUMP_ACTIONS
+        dump_coords = None
+        if is_dump:
+            dl_name = (dict(s).get("dump_location") or "").strip()
+            if dl_name:
+                dump_coords = _get_dump_coords(dl_name)
+
+        stops_data.append({
+            "id":       s["id"],
+            "lat":      coords[0],
+            "lng":      coords[1],
+            "is_dump":  is_dump,
+            "dump_lat": dump_coords[0] if dump_coords else None,
+            "dump_lng": dump_coords[1] if dump_coords else None,
+        })
+
+    if len(stops_data) < 2:
         conn.close()
         flash("Not enough addresses could be geocoded to optimize the route.", "error")
         return redirect(url_for("view_route", route_id=route_id))
 
-    # Nearest-neighbor reorder using yard as origin when available
-    optimized_ids = (
-        _nearest_neighbor(geocoded, origin=yard_origin)
+    # ------------------------------------------------------------------
+    # 5. Run dump-aware ordering
+    # ------------------------------------------------------------------
+    dump_stop_count = sum(1 for s in stops_data if s["is_dump"] and s["dump_lat"] is not None)
+    ordered_ids = _dump_aware_order(stops_data, origin=yard_origin)
+
+    final_order = (
+        first_pins
+        + ordered_ids
+        + ungeocoded
         + no_address
-        + [s["id"] for s in _eod_ids]
+        + eod_stops
     )
 
-    for new_order, stop_id in enumerate(optimized_ids, start=1):
+    for new_order, stop_id in enumerate(final_order, start=1):
         conn.execute("UPDATE stops SET stop_order=? WHERE id=?", (new_order, stop_id))
     conn.commit()
     conn.close()
 
-    # Build informative flash message
-    skipped  = len(no_address)
-    eod_pins = len(_eod_ids)
-    origin_note = f" starting from {_co.get('yard_city') or 'yard'}" if yard_origin else ""
-    skip_note   = f", {skipped} stop{'s' if skipped != 1 else ''} without address appended" if skipped else ""
-    eod_note    = f", {eod_pins} end-of-day stop{'s' if eod_pins != 1 else ''} pinned last" if eod_pins else ""
-    flash(
-        f"Smart route optimized{origin_note} — {len(geocoded)} stops reordered by shortest driving distance"
-        f"{skip_note}{eod_note}.",
-        "success"
-    )
+    # ------------------------------------------------------------------
+    # 6. Flash message
+    # ------------------------------------------------------------------
+    used_dump_logic  = dump_stop_count > 0
+    used_yard        = yard_origin is not None
+    skipped          = len(ungeocoded)
+    eod_count        = len(eod_stops)
+    first_count      = len(first_pins)
+
+    if used_dump_logic or used_yard:
+        parts = []
+        if used_yard:
+            parts.append(f"yard start ({_co.get('yard_city') or 'base'})")
+        if used_dump_logic:
+            parts.append(f"dump flow for {dump_stop_count} PR/Pull stop{'s' if dump_stop_count != 1 else ''}")
+        if first_count:
+            parts.append(f"{first_count} stop{'s' if first_count != 1 else ''} pinned first")
+        if eod_count:
+            parts.append(f"{eod_count} end-of-day stop{'s' if eod_count != 1 else ''} pinned last")
+        if skipped:
+            parts.append(f"{skipped} without address appended")
+        flash(
+            "Smart route optimized using " + ", ".join(parts) + ".",
+            "success"
+        )
+    else:
+        skip_note = f" ({skipped} without address appended)" if skipped else ""
+        flash(
+            f"Basic route optimization applied by stop distance — {len(stops_data)} stops reordered{skip_note}.",
+            "success"
+        )
     return redirect(url_for("view_route", route_id=route_id))
 
 
