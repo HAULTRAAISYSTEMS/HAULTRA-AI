@@ -1295,7 +1295,7 @@ def parse_stop_block(lines, order_num):
 # ─── Work-order format parser (PR / P / D prefix lines) ───────────────────────
 
 # Maps work-order code → dumpster action
-_WO_ACTION = {"PR": "Swap", "P": "Pickup", "D": "Drop"}
+_WO_ACTION = {"PR": "Pickup and Return", "P": "Pull", "D": "Delivery"}
 
 
 def _is_wo_line(line):
@@ -1311,11 +1311,22 @@ def _is_wo_line(line):
 
 def _parse_wo_line(line, order_num):
     """
-    Parse one work-order stop line.
-    Expected format:
-        <TYPE> <street address>, <city>, <state>, <customer> <size>yd [dump <site>] [notes]
-    Example:
+    Parse one work-order / boss-style stop line.
+
+    Supports two variants:
+      Boss format (no state field):
+        TYPE ADDRESS, CITY, CUSTOMER SIZEyd [dump SITE]
+        D 2431 Southern Pines Dr, Chesapeake, Roof Joe 20yd
+        P 211 Marcella Rd, Hampton, Marlyn 30yd dump spivey
+        PR 2434 Cromwell Rd, Norfolk, Beck 30yd dump dominion
+
+      WO format (explicit state):
+        TYPE ADDRESS, CITY, STATE, CUSTOMER SIZEyd [dump SITE]
         PR 1233 Westover Ave, Norfolk, VA, ringen 30yd dump dominion
+
+    Detection: if the third comma-field is a bare two-letter state code (e.g. "VA")
+    treat it as the state and take the fourth field as customer+rest.
+    Otherwise there is no state field and the third field is customer+rest directly.
     """
     wo_type = _is_wo_line(line)
     if not wo_type:
@@ -1324,44 +1335,66 @@ def _parse_wo_line(line, order_num):
     # Remove the type prefix
     body = re.sub(r"^(PR|P|D)\s+", "", line, flags=re.IGNORECASE).strip()
 
-    # Split on ", " up to 3 times so we get [address, city, state, rest]
-    parts = body.split(", ", 3)
+    # Split on ", " — up to 3 splits → at most 4 parts
+    parts   = body.split(", ", 3)
     address = parts[0].strip() if len(parts) > 0 else ""
     city    = parts[1].strip() if len(parts) > 1 else ""
-    state   = parts[2].strip() if len(parts) > 2 else ""
-    rest    = parts[3].strip() if len(parts) > 3 else ""
+
+    # Detect whether parts[2] is a bare state code or already the customer+rest
+    _p2 = parts[2].strip() if len(parts) > 2 else ""
+    if re.match(r"^[A-Z]{2}$", _p2):
+        # Explicit state: ADDRESS, CITY, STATE, CUSTOMER+rest
+        state = _p2
+        rest  = parts[3].strip() if len(parts) > 3 else ""
+    else:
+        # Boss format (no state): ADDRESS, CITY, CUSTOMER+rest
+        state = ""
+        rest  = _p2
 
     customer_name  = ""
     container_size = ""
+    dump_location  = ""
     notes          = ""
 
     if rest:
-        tokens = rest.split()
-        customer_name = tokens[0] if tokens else ""
-
+        # Extract container size first (e.g. "30yd" or "20 yd")
         size_m = re.search(r"\b(\d{1,2})\s*yd\b", rest, re.IGNORECASE)
-        container_size = size_m.group(1) if size_m else ""
+        if size_m:
+            container_size = size_m.group(1)
+            # Customer name = everything before the size match (handles multi-word names)
+            customer_name = rest[:size_m.start()].strip()
+        else:
+            # No size — strip dump phrase and use the remainder as name
+            customer_name = re.sub(
+                r"\bdump\s+\w+\b", "", rest, flags=re.IGNORECASE
+            ).strip()
 
-        # Notes = remainder after stripping customer, size, and "dump <name>"
+        # Extract dump location into dump_location field
+        dump_m = re.search(r"\bdump\s+(\w+)", rest, re.IGNORECASE)
+        if dump_m:
+            dump_key      = dump_m.group(1).lower()
+            dump_location = _DUMP_SITES.get(dump_key, dump_m.group(1).title())
+
+        # Notes = remainder after stripping customer name, size, and dump phrase
         notes_body = rest[len(customer_name):].strip()
-        notes_body = re.sub(r"\b\d{1,2}\s*yd\b", "", notes_body, flags=re.IGNORECASE)
-        notes_body = re.sub(r"\bdump\s+\w+\b", "", notes_body, flags=re.IGNORECASE)
-        notes = re.sub(r"\s+", " ", notes_body).strip()
+        notes_body = re.sub(r"\b\d{1,2}\s*yd\b",    "", notes_body, flags=re.IGNORECASE)
+        notes_body = re.sub(r"\bdump\s+\w+\b",       "", notes_body, flags=re.IGNORECASE)
+        notes      = re.sub(r"\s+", " ", notes_body).strip()
 
     return {
-        "stop_order":     order_num,
-        "wo_type":        wo_type,
-        "customer_name":  customer_name,
-        "address":        address,
-        "city":           city,
-        "state":          state,
-        "zip_code":       "",
-        "action":         _WO_ACTION.get(wo_type, "Service"),
-        "container_size": container_size,
-        "ticket_number":  "",
+        "stop_order":       order_num,
+        "wo_type":          wo_type,
+        "customer_name":    customer_name,
+        "address":          address,
+        "city":             city,
+        "state":            state,
+        "zip_code":         "",
+        "action":           _WO_ACTION.get(wo_type, "Service"),
+        "container_size":   container_size,
+        "ticket_number":    "",
         "reference_number": "",
-        "dump_location":  "",
-        "notes":          notes,
+        "dump_location":    dump_location,
+        "notes":            notes,
     }
 
 
