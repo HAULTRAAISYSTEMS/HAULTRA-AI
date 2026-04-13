@@ -340,7 +340,7 @@ def _dump_aware_order(stops_data, origin=None):
 
 def compute_can_flow(conn, route_id, starts_with_can=False):
     """
-    Walk ordered stops and stamp each with can_state_before TEXT.
+    Walk ordered stops, stamp can_state_before, and derive swap_with_prev_pull.
 
     States
     ------
@@ -351,13 +351,17 @@ def compute_can_flow(conn, route_id, starts_with_can=False):
 
     Stop-type transitions
     ---------------------
-    Pull      : requires no_can   → after dump: empty_can
+    Pull      : requires no_can    → after dump: empty_can
     Delivery  : requires empty_can → after drop: no_can
-    PR / Swap : requires empty_can → after dump: empty_can  (can source irrelevant here)
+    PR / Swap : requires empty_can → after dump: empty_can
     Other     : no change to can state
 
-    Call this after ordering stops so the sequence is meaningful.
-    Commits the updates inside the existing transaction context.
+    swap_with_prev_pull is set to 1 for PR/Swap stops when can_state_before
+    is "empty_can" (i.e. a Pull precedes without an intervening Delivery).
+    This replaces the manual checkbox; the value is now sequence-derived.
+
+    Call after ordering stops so the sequence reflects actual drive order.
+    Caller is responsible for conn.commit().
     """
     stops = conn.execute(
         "SELECT id, action FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
@@ -369,25 +373,34 @@ def compute_can_flow(conn, route_id, starts_with_can=False):
     for s in stops:
         action_lower = (s["action"] or "").lower().strip()
 
-        # Stamp BEFORE this stop executes
-        conn.execute(
-            "UPDATE stops SET can_state_before=? WHERE id=?",
-            (can_state, s["id"])
+        # Is this a PR-type stop (Pickup and Return or Swap-only)?
+        is_pr = (
+            "pickup and return" in action_lower
+            or ("swap" in action_lower and "pull" not in action_lower)
         )
 
-        # Compute state AFTER this stop
-        if "delivery" in action_lower:
-            # Drops empty can at customer site → no can remaining
-            can_state = "no_can"
-        elif "pull" in action_lower and "return" not in action_lower:
-            # Picks up full can → drives to dump → leaves dump with empty can
+        if is_pr:
+            # Derive swap from whether truck arrives carrying an empty can
+            derived_swap = 1 if can_state == "empty_can" else 0
+            conn.execute(
+                "UPDATE stops SET can_state_before=?, swap_with_prev_pull=? WHERE id=?",
+                (can_state, derived_swap, s["id"])
+            )
+            # After PR: dump the full can → leave with empty can
             can_state = "empty_can"
-        elif "pickup and return" in action_lower or (
-            "swap" in action_lower and "pull" not in action_lower
-        ):
-            # Swaps empty for full → drives to dump → leaves with empty can
-            can_state = "empty_can"
-        # All other stop types: can state unchanged
+        else:
+            conn.execute(
+                "UPDATE stops SET can_state_before=? WHERE id=?",
+                (can_state, s["id"])
+            )
+            # Compute state AFTER this stop
+            if "delivery" in action_lower:
+                # Drops empty can → no can remaining
+                can_state = "no_can"
+            elif "pull" in action_lower and "return" not in action_lower:
+                # Pulls full can, dumps → leaves with empty can
+                can_state = "empty_can"
+            # All other stop types: can state unchanged
 
 
 def load_stop_photos(conn, stop_ids):
@@ -5075,6 +5088,48 @@ def view_route(route_id):
         else:
             _can_pill = ""
 
+        # Swap badge + warning — PR stops only, boss view
+        _action_sc  = (dict(s).get("action") or "").lower()
+        _is_pr_sc   = (
+            "pickup and return" in _action_sc
+            or ("swap" in _action_sc and "pull" not in _action_sc)
+        )
+        if session.get("role") == "boss" and _is_pr_sc:
+            if _csb == "empty_can":
+                _swap_badge = (
+                    ' <span title="Swap: driver carries empty can from prior Pull" '
+                    'style="font-size:11px;background:rgba(97,247,223,0.15);color:#61f7df;'
+                    'padding:2px 8px;border-radius:6px;font-weight:700;vertical-align:middle;">'
+                    '&#x1F504; Swap: Yes</span>'
+                )
+                _swap_warning = ""
+            elif _csb == "no_can":
+                _swap_badge = (
+                    ' <span title="No swap — yard empty can required" '
+                    'style="font-size:11px;background:rgba(120,120,140,0.18);color:#9aa5b8;'
+                    'padding:2px 8px;border-radius:6px;font-weight:700;vertical-align:middle;">'
+                    '&#x1F504; Swap: No</span>'
+                )
+                _swap_warning = (
+                    '<p style="margin:4px 0 0;padding:6px 10px;'
+                    'background:rgba(255,180,50,0.09);border-left:3px solid #fbbf24;'
+                    'border-radius:4px;color:#fbbf24;font-size:12px;">'
+                    '&#x26A0;&#xFE0F; PR has no empty can — check stop order or ensure driver '
+                    'picks up yard empty before this stop.</p>'
+                )
+            else:
+                # can_state_before is NULL — route not yet optimized
+                _swap_badge = (
+                    ' <span title="Run Smart Optimize to derive swap status" '
+                    'style="font-size:11px;background:rgba(120,120,140,0.12);color:#6a7a8a;'
+                    'padding:2px 8px;border-radius:6px;font-weight:700;vertical-align:middle;">'
+                    '&#x1F504; Swap: ?</span>'
+                )
+                _swap_warning = ""
+        else:
+            _swap_badge   = ""
+            _swap_warning = ""
+
         stop_cards += f"""
         <div class="stop-card" data-stop-id="{s['id']}">
             <div class="row between">
@@ -5094,7 +5149,8 @@ def view_route(route_id):
             </div>
             <p><strong>Customer:</strong> {e(s['customer_name'] or '')}</p>
             <p><strong>Address:</strong> {e(s['address'] or '')} {e(s['city'] or '')} {e(s['state'] or '')} {e(s['zip_code'] or '')}</p>
-            <p><strong>Action:</strong> {e(s['action'] or '')}{_can_pill}</p>
+            <p><strong>Action:</strong> {e(s['action'] or '')}{_can_pill}{_swap_badge}</p>
+            {_swap_warning}
             <p><strong>Container:</strong> {e(s['container_size'] or '')}</p>
             <p><strong>Ticket:</strong> {e(s['ticket_number'] or '')}</p>
             <p><strong>Reference:</strong> {e(s['reference_number'] or '')}</p>
@@ -5133,20 +5189,10 @@ def view_route(route_id):
                 </div>
                 <label>Notes</label>
                 <textarea name="notes"></textarea>
-                <div style="margin-top:12px;padding:12px 14px;background:rgba(255,200,80,0.07);
-                            border:1px solid rgba(255,200,80,0.25);border-radius:10px;">
-                    <label style="display:flex;align-items:center;gap:10px;cursor:pointer;">
-                        <input type="checkbox" name="swap_with_prev_pull" value="1"
-                               style="width:16px;height:16px;accent-color:#ffb830;cursor:pointer;">
-                        <span style="color:#fde68a;font-size:13px;font-weight:600;">
-                            &#x1F504; Use empty can from previous Pull
-                        </span>
-                    </label>
-                    <p style="color:#a89060;font-size:11px;margin:4px 0 0 26px;">
-                        PR stop — skip dump trip, driver brings emptied can from prior Pull.
-                    </p>
-                </div>
-                <div style="margin-top:10px;"><button type="submit">Add Stop</button></div>
+                <p style="margin:10px 0 4px;color:#6a8aa8;font-size:11px;">
+                    Swap logic for PR stops is auto-derived from route order after Smart Optimize.
+                </p>
+                <div style="margin-top:6px;"><button type="submit">Add Stop</button></div>
             </form>
         </div>
         """
@@ -5328,7 +5374,7 @@ def add_stop(route_id):
             route_id, stop_order, customer_name, address, city, state, zip_code,
             action, container_size, ticket_number, reference_number, dump_location, notes,
             swap_with_prev_pull, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'open', ?)
     """, (
         route_id,
         last + 1,
@@ -5343,10 +5389,12 @@ def add_stop(route_id):
         request.form.get("reference_number"),
         request.form.get("dump_location", ""),
         request.form.get("notes"),
-        1 if request.form.get("swap_with_prev_pull") else 0,
         now_ts()
     ))
 
+    conn.commit()
+    # Recompute can flow so the new stop gets swap_with_prev_pull derived from sequence
+    compute_can_flow(conn, route_id)
     conn.commit()
     conn.close()
     flash("Stop added.", "success")
@@ -5376,7 +5424,7 @@ def edit_stop(stop_id):
             UPDATE stops SET
                 customer_name=?, address=?, city=?, state=?, zip_code=?,
                 action=?, container_size=?, ticket_number=?, reference_number=?,
-                dump_location=?, notes=?, swap_with_prev_pull=?
+                dump_location=?, notes=?
             WHERE id=?
         """, (
             request.form.get("customer_name"),
@@ -5390,11 +5438,13 @@ def edit_stop(stop_id):
             request.form.get("reference_number"),
             request.form.get("dump_location", ""),
             request.form.get("notes"),
-            1 if request.form.get("swap_with_prev_pull") else 0,
             stop_id
         ))
         conn.commit()
         route_id = ownership["route_id"]
+        # Recompute can flow and derive swap_with_prev_pull from sequence
+        compute_can_flow(conn, route_id)
+        conn.commit()
         conn.close()
         flash("Stop updated.", "success")
         return redirect(url_for("view_route", route_id=route_id))
@@ -5405,6 +5455,59 @@ def edit_stop(stop_id):
         "SELECT name FROM dump_locations WHERE active=1 ORDER BY name"
     ).fetchall()
     conn.close()
+
+    # Derive swap display for read-only info panel
+    _csb_edit   = _stop.get("can_state_before") or ""
+    _action_edit = (_stop.get("action") or "").lower()
+    _is_pr_edit  = (
+        "pickup and return" in _action_edit
+        or ("swap" in _action_edit and "pull" not in _action_edit)
+    )
+    if _is_pr_edit:
+        if _csb_edit == "empty_can":
+            _swap_info_block = """
+            <div style="margin-top:16px;padding:14px 16px;
+                        background:rgba(97,247,223,0.08);
+                        border:1px solid rgba(97,247,223,0.28);border-radius:10px;">
+                <p style="margin:0 0 4px;color:#61f7df;font-size:13px;font-weight:700;">
+                    &#x1F7E2; Swap: Yes &#x2014; auto-derived from route sequence
+                </p>
+                <p style="margin:0;color:#7ab8a8;font-size:12px;">
+                    A Pull precedes this PR with no Delivery in between.
+                    Driver will carry the emptied can directly to this stop.
+                    Workflow: Arrive &#x2192; Box Out &#x2192; Box In &#x2192; Complete.
+                </p>
+            </div>"""
+        elif _csb_edit == "no_can":
+            _swap_info_block = """
+            <div style="margin-top:16px;padding:14px 16px;
+                        background:rgba(255,180,50,0.08);
+                        border:1px solid rgba(255,180,50,0.35);border-radius:10px;">
+                <p style="margin:0 0 4px;color:#fbbf24;font-size:13px;font-weight:700;">
+                    &#x26A0;&#xFE0F; Swap: No &#x2014; auto-derived from route sequence
+                </p>
+                <p style="margin:0;color:#b08a40;font-size:12px;">
+                    No empty can available at this point in the route
+                    (a Delivery consumed it, or no prior Pull exists).
+                    Driver will need a yard empty before this stop.
+                    Full PR workflow: Arrive &#x2192; Box Out &#x2192; Dump &#x2192; Box In &#x2192; Complete.
+                </p>
+            </div>"""
+        else:
+            _swap_info_block = """
+            <div style="margin-top:16px;padding:14px 16px;
+                        background:rgba(120,140,160,0.08);
+                        border:1px solid rgba(120,140,160,0.25);border-radius:10px;">
+                <p style="margin:0 0 4px;color:#9aa5b8;font-size:13px;font-weight:700;">
+                    &#x26AA; Swap: Unknown &#x2014; run Smart Optimize to calculate
+                </p>
+                <p style="margin:0;color:#6a7a8a;font-size:12px;">
+                    Can flow has not been computed for this route yet.
+                    Run Smart Optimize to derive swap status from stop sequence.
+                </p>
+            </div>"""
+    else:
+        _swap_info_block = ""
 
     _cur_dump = _stop.get('dump_location') or ''
     _dump_field = (
@@ -5468,21 +5571,7 @@ def edit_stop(stop_id):
                 </div>
             </div>
 
-            <div style="margin-top:16px;padding:14px 16px;background:rgba(255,200,80,0.07);
-                        border:1px solid rgba(255,200,80,0.25);border-radius:10px;">
-                <label style="display:flex;align-items:center;gap:10px;cursor:pointer;">
-                    <input type="checkbox" name="swap_with_prev_pull" value="1"
-                           style="width:18px;height:18px;accent-color:#ffb830;cursor:pointer;"
-                           {"checked" if _stop.get('swap_with_prev_pull') else ""}>
-                    <span>
-                        <strong style="color:#fde68a;font-size:13px;">&#x1F504; Use empty can from previous Pull</strong><br>
-                        <span style="color:#a89060;font-size:12px;">
-                            Skips dump trip on this PR stop. Driver arrives carrying the emptied container from the prior Pull job.
-                            Workflow: Arrive → Box Out → Box In → Complete.
-                        </span>
-                    </span>
-                </label>
-            </div>
+            {_swap_info_block}
 
             <div style="margin-top:18px;display:flex;gap:10px;">
                 <button type="submit" class="btn">Save Changes</button>
@@ -5582,6 +5671,9 @@ def delete_stop(stop_id):
 
     conn.execute("DELETE FROM route_photos WHERE stop_id=?", (stop_id,))
     conn.execute("DELETE FROM stops WHERE id=?", (stop_id,))
+    conn.commit()
+    # Recompute can flow with the stop removed
+    compute_can_flow(conn, route_id)
     conn.commit()
     conn.close()
 
@@ -6082,6 +6174,9 @@ def reorder_stops(route_id):
             "UPDATE stops SET stop_order=? WHERE id=? AND route_id=?",
             (i, sid, route_id)
         )
+    conn.commit()
+    # Recompute can flow so swap_with_prev_pull reflects the new order
+    compute_can_flow(conn, route_id)
     conn.commit()
     conn.close()
 
