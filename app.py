@@ -306,23 +306,44 @@ def _can_flow_valid(action_lower, can_state):
 
 
 def _next_can_state(action_lower, can_state):
-    """Simulate the can state after completing a stop (including its dump run)."""
+    """
+    Simulate the truck can-state after completing a stop (including its dump run).
+
+    Pull (return-same-can):
+      no_can → pick up full → dump → return empty to customer → no_can
+
+    PR swap mode (truck arrives with empty_can):
+      empty_can → drop off empty → pick up full → dump → truck now holds empty → empty_can
+
+    PR return-same-can mode (truck arrives with no_can):
+      no_can → pick up full → dump → return empty to customer → no_can
+
+    Delivery:
+      empty_can → drop off empty → no_can (truck is empty)
+    """
     is_pr = (
         "pickup and return" in action_lower
         or ("swap" in action_lower and "pull" not in action_lower)
     )
     is_delivery = "delivery" in action_lower
     is_pull     = "pull" in action_lower and "return" not in action_lower
+
     if is_delivery:
-        return "no_can"    # left the can at the site
+        return "no_can"   # left the can at the site; truck is empty
+
     if is_pull:
-        return "empty_can" # pulled customer's can, dumped it → now carrying empty
-    if is_pr:
-        # Swap mode: gave away empty can, dumped full can → truck empty
-        # Return-same-can mode: dumped full can, returned empty to customer → truck empty
-        # Both modes end with the truck carrying nothing
+        # Truck returns same dumped-empty can to customer — truck leaves empty
         return "no_can"
-    return can_state       # dump or unrecognised — no change
+
+    if is_pr:
+        if can_state == "empty_can":
+            # Swap mode: dropped off empty, dumped full → truck holds empty after dump
+            return "empty_can"
+        else:
+            # Return-same-can mode: dumped full, returned empty to customer → truck empty
+            return "no_can"
+
+    return can_state   # dump run or unrecognised — no change
 
 
 def _stop_trip_cost(pos, s):
@@ -438,11 +459,11 @@ def compute_can_flow(conn, route_id, starts_with_can=False):
 
     Stop-type transitions
     ---------------------
-    Pull      : requires no_can    → after dump: empty_can
-    Delivery  : requires empty_can → after drop: no_can
+    Pull      : requires no_can    → dumps + returns same can → after: no_can
+    Delivery  : requires empty_can → drops can at site        → after: no_can
     PR / Swap : valid in any state → mode derived from can_state_before:
-                  empty_can → swap mode   → after complete: no_can
-                  no_can    → return-same-can mode → after complete: no_can
+                  empty_can → swap mode        → dump full, keep empty → after: empty_can
+                  no_can    → return-same-can  → dump full, return same → after: no_can
     Other     : no change to can state
 
     swap_with_prev_pull is set to 1 for PR/Swap stops when can_state_before
@@ -474,21 +495,210 @@ def compute_can_flow(conn, route_id, starts_with_can=False):
                 "UPDATE stops SET can_state_before=?, swap_with_prev_pull=? WHERE id=?",
                 (can_state, derived_swap, s["id"])
             )
-            # After PR (either mode): truck leaves with no container
-            can_state = "no_can"
+            # PR swap (empty_can): dropped off empty, dumped full → truck holds empty
+            # PR return-same (no_can): dumped full, returned empty to customer → truck empty
+            can_state = _next_can_state(action_lower, can_state)
         else:
             conn.execute(
                 "UPDATE stops SET can_state_before=? WHERE id=?",
                 (can_state, s["id"])
             )
-            # Compute state AFTER this stop
-            if "delivery" in action_lower:
-                # Drops empty can → no can remaining
-                can_state = "no_can"
-            elif "pull" in action_lower and "return" not in action_lower:
-                # Pulls full can, dumps → leaves with empty can
-                can_state = "empty_can"
-            # All other stop types: can state unchanged
+            # Compute state AFTER this stop using shared helper
+            can_state = _next_can_state(action_lower, can_state)
+
+
+# =============================================================
+# PHASE 5A — CONTAINER FLOW ENGINE
+# Set to True to activate automatic per-stop container tracking.
+# False = tables are created but no writes happen.
+# =============================================================
+ENABLE_CONTAINER_TRACKING = False
+
+
+def update_container_flow(conn, stop_id):
+    """
+    Update container inventory records when a stop is completed.
+
+    Rules:
+      Delivery  → insert customer_containers row (on_site)
+      Pull      → close existing on_site row for that address
+      PR swap   → close existing row + insert new on_site row
+      PR return → close existing row + insert new on_site row
+                  (same can goes back; treated identically to swap at record level)
+
+    This function is always safe to call:
+      - wrapped in try/except so a tracking failure never aborts a stop completion
+      - only runs if ENABLE_CONTAINER_TRACKING is True
+      - never touches parser, can-flow, or optimization code
+    """
+    if not ENABLE_CONTAINER_TRACKING:
+        return
+
+    try:
+        stop = conn.execute(
+            """SELECT s.*, r.company_id
+               FROM stops s JOIN routes r ON s.route_id = r.id
+               WHERE s.id = ?""",
+            (stop_id,)
+        ).fetchone()
+        if not stop:
+            return
+
+        s       = dict(stop)
+        co_id   = s.get("company_id")
+        addr    = (s.get("address") or "").strip()
+        city    = (s.get("city")    or "").strip()
+        state   = (s.get("state")   or "").strip()
+        size    = (s.get("container_size") or "").strip()
+        ts      = now_ts()
+        action  = (s.get("action") or "").lower()
+
+        is_delivery = "delivery" in action
+        is_pull     = "pull" in action and "return" not in action
+        is_pr       = "pickup and return" in action or ("swap" in action and "pull" not in action)
+
+        if not addr:
+            return
+
+        if is_delivery:
+            # Drop off an empty can — truck leaves empty
+            conn.execute(
+                """INSERT INTO customer_containers
+                   (company_id, address, city, state, size,
+                    delivered_stop_id, delivered_at, status, created_at)
+                   VALUES (?,?,?,?,?,?,?,'on_site',?)""",
+                (co_id, addr, city, state, size, stop_id, ts, ts)
+            )
+
+        elif is_pull or is_pr:
+            # Pull  — box out full, dump, return SAME empty can to customer (cycle)
+            # PR    — same physical cycle (swap or return-same; both close + reopen)
+            # Close the full can that was on-site
+            conn.execute(
+                """UPDATE customer_containers
+                   SET pulled_stop_id=?, pulled_at=?, status='pulled'
+                   WHERE company_id=? AND LOWER(address)=LOWER(?) AND status='on_site'""",
+                (stop_id, ts, co_id, addr)
+            )
+            # Return the now-empty can to the customer
+            conn.execute(
+                """INSERT INTO customer_containers
+                   (company_id, address, city, state, size,
+                    delivered_stop_id, delivered_at, status, created_at)
+                   VALUES (?,?,?,?,?,?,?,'on_site',?)""",
+                (co_id, addr, city, state, size, stop_id, ts, ts)
+            )
+    except Exception:
+        pass  # Never abort a driver completion due to tracking failure
+
+
+# =============================================================
+# PHASE 5B — DRIVER HOURS / PAY CYCLE HELPERS
+# =============================================================
+
+def get_pay_period_bounds(company_settings, as_of_date_str=None):
+    """
+    Return (period_start, period_end) as 'YYYY-MM-DD' strings.
+
+    company_settings: dict with keys pay_period_type, pay_period_end_day.
+    as_of_date_str:   'YYYY-MM-DD'; defaults to today (UTC).
+
+    pay_period_end_day is a lowercase weekday name, e.g. 'thursday'.
+    pay_period_type is 'weekly' | 'biweekly'.
+    """
+    from datetime import date, timedelta
+
+    DAYS = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
+
+    as_of = (
+        date.fromisoformat(as_of_date_str)
+        if as_of_date_str else date.today()
+    )
+
+    ptype  = (company_settings.get("pay_period_type") or "weekly").lower()
+    endday = (company_settings.get("pay_period_end_day") or "sunday").lower()
+
+    try:
+        target_wd = DAYS.index(endday)  # 0=Mon … 6=Sun
+    except ValueError:
+        target_wd = 6  # default Sunday
+
+    # Find most recent occurrence of target_wd on or before as_of
+    days_back = (as_of.weekday() - target_wd) % 7
+    period_end = as_of - timedelta(days=days_back)
+
+    span = 6 if ptype == "weekly" else 13
+    period_start = period_end - timedelta(days=span)
+
+    return period_start.isoformat(), period_end.isoformat()
+
+
+def get_driver_day_hours(conn, driver_id, date_str, company_settings):
+    """
+    Return (start_ts, end_ts, hours_float) for a driver on a given calendar date.
+
+    company_settings: dict with driver_day_start_rule / driver_day_end_rule.
+    date_str: 'YYYY-MM-DD' in the company's local time (caller is responsible
+              for any TZ conversion before calling).
+
+    Returns (None, None, None) if insufficient data exists.
+    """
+    start_rule = (company_settings.get("driver_day_start_rule") or "first_action").lower()
+    end_rule   = (company_settings.get("driver_day_end_rule")   or "last_action").lower()
+
+    start_ts = end_ts = None
+
+    if start_rule == "first_action":
+        row = conn.execute(
+            """SELECT MIN(arrived_at) AS t
+               FROM stops s
+               JOIN routes r ON s.route_id = r.id
+               WHERE r.assigned_to = ?
+                 AND s.arrived_at >= ?
+                 AND s.arrived_at <  date(?, '+1 day')
+                 AND s.status = 'completed'""",
+            (driver_id, date_str, date_str)
+        ).fetchone()
+        start_ts = row["t"] if row else None
+    else:
+        row = conn.execute(
+            "SELECT clock_in_at FROM driver_clock_entries WHERE driver_id=? AND date=?",
+            (driver_id, date_str)
+        ).fetchone()
+        start_ts = row["clock_in_at"] if row else None
+
+    if end_rule == "last_action":
+        row = conn.execute(
+            """SELECT MAX(completed_at) AS t
+               FROM stops s
+               JOIN routes r ON s.route_id = r.id
+               WHERE r.assigned_to = ?
+                 AND s.completed_at >= ?
+                 AND s.completed_at <  date(?, '+1 day')
+                 AND s.status = 'completed'""",
+            (driver_id, date_str, date_str)
+        ).fetchone()
+        end_ts = row["t"] if row else None
+    else:
+        row = conn.execute(
+            "SELECT clock_out_at FROM driver_clock_entries WHERE driver_id=? AND date=?",
+            (driver_id, date_str)
+        ).fetchone()
+        end_ts = row["clock_out_at"] if row else None
+
+    if not start_ts or not end_ts:
+        return None, None, None
+
+    try:
+        from datetime import datetime
+        fmt = "%Y-%m-%d %H:%M:%S"
+        s = datetime.strptime(start_ts[:19], fmt)
+        e_ = datetime.strptime(end_ts[:19], fmt)
+        hours = max(0.0, (e_ - s).total_seconds() / 3600)
+    except Exception:
+        return start_ts, end_ts, None
+
+    return start_ts, end_ts, round(hours, 2)
 
 
 def load_stop_photos(conn, stop_ids):
@@ -744,6 +954,41 @@ def init_db():
         FOREIGN KEY (route_id) REFERENCES routes(id)
     )
     """)
+    # --- Phase 5A: container fleet tracking ---
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS containers (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id  INTEGER NOT NULL,
+        size        TEXT NOT NULL,
+        label       TEXT,
+        status      TEXT NOT NULL DEFAULT 'yard'
+                    CHECK(status IN ('yard','deployed','lost','retired')),
+        notes       TEXT,
+        created_at  TEXT NOT NULL
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS customer_containers (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id       INTEGER NOT NULL,
+        address          TEXT NOT NULL,
+        city             TEXT,
+        state            TEXT,
+        size             TEXT,
+        container_id     INTEGER,
+        delivered_stop_id INTEGER,
+        delivered_at     TEXT,
+        pulled_stop_id   INTEGER,
+        pulled_at        TEXT,
+        status           TEXT NOT NULL DEFAULT 'on_site'
+                         CHECK(status IN ('on_site','pulled','transferred')),
+        created_at       TEXT NOT NULL,
+        FOREIGN KEY (container_id)      REFERENCES containers(id),
+        FOREIGN KEY (delivered_stop_id) REFERENCES stops(id),
+        FOREIGN KEY (pulled_stop_id)    REFERENCES stops(id)
+    )
+    """)
+
     # --- driver workflow columns on stops ---
     safe_add_column(conn, "stops", "driver_status TEXT NOT NULL DEFAULT 'pending'")
     safe_add_column(conn, "stops", "arrived_at TEXT")
@@ -761,6 +1006,30 @@ def init_db():
     safe_add_column(conn, "companies", "yard_state TEXT")
     safe_add_column(conn, "companies", "yard_zip TEXT")
     safe_add_column(conn, "stops", "can_state_before TEXT")
+
+    # --- Phase 5B: company work hours / pay cycle ---
+    safe_add_column(conn, "companies", "timezone TEXT")
+    safe_add_column(conn, "companies", "workweek_start_day TEXT")
+    safe_add_column(conn, "companies", "workweek_reset_day TEXT")
+    safe_add_column(conn, "companies", "pay_period_type TEXT")
+    safe_add_column(conn, "companies", "pay_period_end_day TEXT")
+    safe_add_column(conn, "companies", "payday TEXT")
+    safe_add_column(conn, "companies", "driver_day_start_rule TEXT")
+    safe_add_column(conn, "companies", "driver_day_end_rule TEXT")
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS driver_clock_entries (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id   INTEGER NOT NULL,
+        driver_id    INTEGER NOT NULL,
+        date         TEXT NOT NULL,
+        clock_in_at  TEXT,
+        clock_out_at TEXT,
+        notes        TEXT,
+        created_at   TEXT NOT NULL,
+        FOREIGN KEY (driver_id) REFERENCES users(id)
+    )
+    """)
 
     # --- default company bootstrap ---
     default_co = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()
@@ -1932,6 +2201,8 @@ def shell_page(title, body, extra_head=""):
     {orders}
     {users}
     {dump_locs}
+    {containers}
+    {driver_hours}
     {co_settings}
     {subscription}
 """.format(
@@ -1939,6 +2210,8 @@ def shell_page(title, body, extra_head=""):
     orders=nav_link(url_for("orders_page"), "🧾 Orders", path),
     users=nav_link(url_for("manage_users"), "👥 Users", path),
     dump_locs=nav_link(url_for("dump_locations_page"), "🗑 Dump Locations", path),
+    containers=nav_link(url_for("containers_page"), "📦 Containers", path),
+    driver_hours=nav_link(url_for("driver_hours_page"), "⏱ Driver Hours", path),
     co_settings=nav_link(url_for("company_settings"), "⚙ Company Settings", path),
     subscription=nav_link(url_for("company_subscription"), "💳 Subscription", path),
 )
@@ -1966,6 +2239,7 @@ def shell_page(title, body, extra_head=""):
             <nav class="nav-stack">
                 {nav_link(url_for('dashboard'), '⬡ Dashboard', path)}
                 {nav_link(url_for('driver_dashboard'), '◈ My Routes', path) if user['role'] == 'driver' else ''}
+                {nav_link(url_for('driver_clock'), '⏱ Clock In/Out', path) if user['role'] == 'driver' else ''}
                 {nav_link(url_for('routes_page'), '◈ Routes', path) if user['role'] == 'boss' else ''}
                 {nav_link(url_for('drivers_page'), '◉ Drivers', path) if user['role'] == 'boss' else ''}
                 {boss_only}
@@ -5988,6 +6262,8 @@ def toggle_stop_complete(stop_id):
     conn.execute("""
         UPDATE stops SET status=?, completed_at=?, driver_status=? WHERE id=?
     """, (new_status, completed_at, new_driver_status, stop_id))
+    if new_status == "completed":
+        update_container_flow(conn, stop_id)
     conn.commit()
 
     if request.headers.get("X-Requested-With") == "XMLHttpRequest":
@@ -6161,6 +6437,7 @@ def dump_ticket(stop_id):
                     "UPDATE stops SET driver_status='completed', status='completed', completed_at=? WHERE id=?",
                     (now_ts(), stop_id)
                 )
+                update_container_flow(conn, stop_id)
 
         conn.commit()
         conn.close()
@@ -6948,6 +7225,27 @@ def company_settings():
             )
             conn.commit()
             flash("Yard / base location saved.", "success")
+        elif action == "work_hours":
+            conn.execute(
+                """UPDATE companies SET
+                       timezone=?, workweek_start_day=?, workweek_reset_day=?,
+                       pay_period_type=?, pay_period_end_day=?, payday=?,
+                       driver_day_start_rule=?, driver_day_end_rule=?
+                   WHERE id=?""",
+                (
+                    request.form.get("timezone",              "America/New_York").strip(),
+                    request.form.get("workweek_start_day",    "monday").strip(),
+                    request.form.get("workweek_reset_day",    "friday").strip(),
+                    request.form.get("pay_period_type",       "weekly").strip(),
+                    request.form.get("pay_period_end_day",    "thursday").strip(),
+                    request.form.get("payday",                "friday").strip(),
+                    request.form.get("driver_day_start_rule", "first_action").strip(),
+                    request.form.get("driver_day_end_rule",   "last_action").strip(),
+                    cid(),
+                )
+            )
+            conn.commit()
+            flash("Work hours & pay cycle settings saved.", "success")
         else:
             new_name = request.form.get("company_name", "").strip()
             if new_name:
@@ -6977,6 +7275,14 @@ def company_settings():
     yard_city  = _co.get("yard_city")    or ""
     yard_state = _co.get("yard_state")   or ""
     yard_zip   = _co.get("yard_zip")     or ""
+    wh_tz      = _co.get("timezone")              or "America/New_York"
+    wh_wstart  = _co.get("workweek_start_day")    or "monday"
+    wh_wreset  = _co.get("workweek_reset_day")    or "friday"
+    wh_ptype   = _co.get("pay_period_type")       or "weekly"
+    wh_pend    = _co.get("pay_period_end_day")    or "thursday"
+    wh_payday  = _co.get("payday")                or "friday"
+    wh_dstart  = _co.get("driver_day_start_rule") or "first_action"
+    wh_dend    = _co.get("driver_day_end_rule")   or "last_action"
 
     _yard_set = bool(yard_addr or yard_city)
     _yard_status = (
@@ -7034,6 +7340,85 @@ def company_settings():
             </div>
             <div style="margin-top:14px;">
                 <button type="submit" class="btn gold">Save Yard Location</button>
+            </div>
+        </form>
+    </div>
+
+    <div class="card" id="work-hours">
+        <h2>&#9201; Work Hours &amp; Pay Cycle</h2>
+        <p style="color:#7aaac8;font-size:13px;margin-bottom:16px;">
+            Configure your company&rsquo;s pay schedule and how driver day hours are measured.
+            These settings apply to all drivers in your company.
+        </p>
+        <form method="POST">
+            <input type="hidden" name="_action" value="work_hours">
+            <div class="grid" style="grid-template-columns:1fr 1fr;gap:12px 16px;">
+
+                <div style="grid-column:1/-1;">
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Timezone</label>
+                    <select name="timezone">
+                        {"".join(f'<option value="{tz}" {"selected" if tz == wh_tz else ""}>{tz}</option>' for tz in [
+                            "America/New_York","America/Chicago","America/Denver",
+                            "America/Los_Angeles","America/Phoenix","America/Anchorage",
+                            "America/Honolulu","UTC"
+                        ])}
+                    </select>
+                </div>
+
+                <div>
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Workweek Starts On</label>
+                    <select name="workweek_start_day">
+                        {"".join(f'<option value="{d}" {"selected" if d == wh_wstart else ""}>{d.title()}</option>' for d in ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"])}
+                    </select>
+                </div>
+
+                <div>
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Week Resets On</label>
+                    <select name="workweek_reset_day">
+                        {"".join(f'<option value="{d}" {"selected" if d == wh_wreset else ""}>{d.title()}</option>' for d in ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"])}
+                    </select>
+                </div>
+
+                <div>
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Pay Period Type</label>
+                    <select name="pay_period_type">
+                        {"".join(f'<option value="{pt}" {"selected" if pt == wh_ptype else ""}>{pt.title()}</option>' for pt in ["weekly","biweekly"])}
+                    </select>
+                </div>
+
+                <div>
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Pay Period Ends On</label>
+                    <select name="pay_period_end_day">
+                        {"".join(f'<option value="{d}" {"selected" if d == wh_pend else ""}>{d.title()}</option>' for d in ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"])}
+                    </select>
+                </div>
+
+                <div>
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Payday</label>
+                    <select name="payday">
+                        {"".join(f'<option value="{d}" {"selected" if d == wh_payday else ""}>{d.title()}</option>' for d in ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"])}
+                    </select>
+                </div>
+
+                <div>
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Driver Day Start</label>
+                    <select name="driver_day_start_rule">
+                        <option value="first_action" {"selected" if wh_dstart == "first_action" else ""}>First route action (automatic)</option>
+                        <option value="manual"       {"selected" if wh_dstart == "manual"       else ""}>Manual clock-in</option>
+                    </select>
+                </div>
+
+                <div>
+                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Driver Day End</label>
+                    <select name="driver_day_end_rule">
+                        <option value="last_action" {"selected" if wh_dend == "last_action" else ""}>Last route action (automatic)</option>
+                        <option value="manual"      {"selected" if wh_dend == "manual"      else ""}>Manual clock-out</option>
+                    </select>
+                </div>
+
+            </div>
+            <div style="margin-top:16px;">
+                <button type="submit" class="btn gold">Save Work Hours Settings</button>
             </div>
         </form>
     </div>
@@ -8262,6 +8647,458 @@ def delete_dump_location(loc_id):
     conn.close()
     flash(f"'{dl['name']}' deleted.", "success")
     return redirect(url_for("dump_locations_page"))
+
+
+# =========================================================
+# PHASE 5A — CONTAINER FLEET INVENTORY  (/boss/containers)
+# =========================================================
+@app.route("/boss/containers")
+@boss_required
+def containers_page():
+    conn = get_db()
+    containers = conn.execute(
+        "SELECT * FROM containers WHERE company_id=? ORDER BY size ASC, label ASC",
+        (cid(),)
+    ).fetchall()
+    # Count how many on-site records exist per container
+    on_site_counts = {}
+    rows = conn.execute(
+        "SELECT container_id, COUNT(*) n FROM customer_containers WHERE company_id=? AND status='on_site' GROUP BY container_id",
+        (cid(),)
+    ).fetchall()
+    for r in rows:
+        if r["container_id"]:
+            on_site_counts[r["container_id"]] = r["n"]
+    conn.close()
+
+    STATUS_COLOR = {
+        "yard":     "#56f0b7",
+        "deployed": "#fbbf24",
+        "lost":     "#f87171",
+        "retired":  "#6b7280",
+    }
+
+    rows_html = ""
+    for c in containers:
+        _cd   = dict(c)
+        _cid  = _cd["id"]
+        _sc   = STATUS_COLOR.get(_cd["status"], "#9dc8f0")
+        _badge = (
+            f'<span style="font-size:11px;padding:2px 8px;border-radius:5px;'
+            f'background:rgba(0,0,0,0.3);color:{_sc};border:1px solid {_sc}33;">'
+            f'{e(_cd["status"])}</span>'
+        )
+        _deployed_note = ""
+        if _cd["status"] == "deployed":
+            _deployed_note = f'<div class="small muted" style="margin-top:2px;">On site at {on_site_counts.get(_cid, "?")} location(s)</div>'
+        rows_html += f"""
+        <tr>
+            <td><strong>{e(_cd["size"])}</strong></td>
+            <td class="muted small">{e(_cd["label"] or "")}</td>
+            <td>{_badge}{_deployed_note}</td>
+            <td class="muted small">{e(_cd["notes"] or "")}</td>
+            <td style="text-align:right;white-space:nowrap;">
+                <a href="{url_for('edit_container', c_id=_cid)}"
+                   style="color:#3fd2ff;font-size:12px;margin-right:10px;">Edit</a>
+                <form method="POST" action="{url_for('delete_container', c_id=_cid)}"
+                      style="display:inline;"
+                      onsubmit="return confirm('Delete this container?');">
+                    <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+                    <button type="submit"
+                       style="background:transparent;color:#f87171;border:1px solid rgba(248,113,113,0.4);
+                              border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;">Delete</button>
+                </form>
+            </td>
+        </tr>"""
+
+    body = f"""
+    <div class="hero">
+        <h1>Container Fleet</h1>
+        <p>Track your roll-off containers by size and status.</p>
+    </div>
+    <div class="card">
+        <div class="row between" style="margin-bottom:16px;">
+            <h2 style="margin:0;">All Containers</h2>
+            <a class="btn" href="{url_for('add_container')}">+ Add Container</a>
+        </div>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr><th>Size</th><th>Label / Serial</th><th>Status</th><th>Notes</th><th style="width:160px;"></th></tr>
+                </thead>
+                <tbody>
+                    {rows_html or '<tr><td colspan="5" class="muted">No containers on file.</td></tr>'}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    """
+    return render_template_string(shell_page("Container Fleet", body))
+
+
+@app.route("/boss/containers/add", methods=["GET", "POST"])
+@boss_required
+def add_container():
+    csrf_tok = get_csrf_token()
+    if request.method == "POST":
+        size   = request.form.get("size", "").strip()
+        label  = request.form.get("label", "").strip()
+        status = request.form.get("status", "yard").strip()
+        notes  = request.form.get("notes", "").strip()
+        if not size:
+            flash("Container size is required.", "error")
+            return redirect(url_for("add_container"))
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO containers (company_id, size, label, status, notes, created_at) VALUES (?,?,?,?,?,?)",
+            (cid(), size, label or None, status, notes or None, now_ts())
+        )
+        conn.commit()
+        conn.close()
+        flash(f"{size} container added.", "success")
+        return redirect(url_for("containers_page"))
+
+    size_opts = "".join(
+        f'<option value="{s}">{s}</option>'
+        for s in ["10yd","15yd","20yd","30yd","40yd","Other"]
+    )
+    status_opts = "".join(
+        f'<option value="{s}">{s.title()}</option>'
+        for s in ["yard","deployed","lost","retired"]
+    )
+    body = f"""
+    <div class="hero"><h1>Add Container</h1></div>
+    <div class="card" style="max-width:480px;">
+        <form method="POST">
+            <input type="hidden" name="_csrf_token" value="{csrf_tok}">
+            <label>Size *</label>
+            <select name="size">{size_opts}</select>
+            <label>Label / Serial # (optional)</label>
+            <input name="label" placeholder="e.g. C-042">
+            <label>Status</label>
+            <select name="status">{status_opts}</select>
+            <label>Notes</label>
+            <textarea name="notes" placeholder="Any notes..."></textarea>
+            <div style="margin-top:12px;display:flex;gap:10px;">
+                <button type="submit">Save</button>
+                <a class="btn secondary" href="{url_for('containers_page')}">Cancel</a>
+            </div>
+        </form>
+    </div>"""
+    return render_template_string(shell_page("Add Container", body))
+
+
+@app.route("/boss/containers/<int:c_id>/edit", methods=["GET", "POST"])
+@boss_required
+def edit_container(c_id):
+    conn = get_db()
+    c = conn.execute("SELECT * FROM containers WHERE id=? AND company_id=?", (c_id, cid())).fetchone()
+    if not c:
+        conn.close()
+        abort(404)
+    csrf_tok = get_csrf_token()
+    if request.method == "POST":
+        size   = request.form.get("size", "").strip()
+        label  = request.form.get("label", "").strip()
+        status = request.form.get("status", "yard").strip()
+        notes  = request.form.get("notes", "").strip()
+        if not size:
+            flash("Container size is required.", "error")
+            conn.close()
+            return redirect(url_for("edit_container", c_id=c_id))
+        conn.execute(
+            "UPDATE containers SET size=?, label=?, status=?, notes=? WHERE id=?",
+            (size, label or None, status, notes or None, c_id)
+        )
+        conn.commit()
+        conn.close()
+        flash("Container updated.", "success")
+        return redirect(url_for("containers_page"))
+
+    _c = dict(c)
+    conn.close()
+
+    def _sel(name, opts, cur_val):
+        return "".join(
+            f'<option value="{o}" {"selected" if o == cur_val else ""}>{o}</option>'
+            for o in opts
+        )
+    size_opts   = _sel("size",   ["10yd","15yd","20yd","30yd","40yd","Other"], _c["size"])
+    status_opts = _sel("status", ["yard","deployed","lost","retired"], _c["status"])
+
+    body = f"""
+    <div class="hero"><h1>Edit Container</h1></div>
+    <div class="card" style="max-width:480px;">
+        <form method="POST">
+            <input type="hidden" name="_csrf_token" value="{csrf_tok}">
+            <label>Size *</label>
+            <select name="size">{size_opts}</select>
+            <label>Label / Serial #</label>
+            <input name="label" value="{e(_c['label'] or '')}">
+            <label>Status</label>
+            <select name="status">{status_opts}</select>
+            <label>Notes</label>
+            <textarea name="notes">{e(_c['notes'] or '')}</textarea>
+            <div style="margin-top:12px;display:flex;gap:10px;">
+                <button type="submit">Save Changes</button>
+                <a class="btn secondary" href="{url_for('containers_page')}">Cancel</a>
+            </div>
+        </form>
+    </div>"""
+    return render_template_string(shell_page("Edit Container", body))
+
+
+@app.route("/boss/containers/<int:c_id>/delete", methods=["POST"])
+@boss_required
+def delete_container(c_id):
+    conn = get_db()
+    c = conn.execute("SELECT size FROM containers WHERE id=? AND company_id=?", (c_id, cid())).fetchone()
+    if not c:
+        conn.close()
+        abort(404)
+    conn.execute("DELETE FROM containers WHERE id=?", (c_id,))
+    conn.commit()
+    conn.close()
+    flash(f"{c['size']} container deleted.", "success")
+    return redirect(url_for("containers_page"))
+
+
+# =========================================================
+# PHASE 5B — DRIVER HOURS REPORT  (/boss/driver-hours)
+# =========================================================
+@app.route("/boss/driver-hours")
+@boss_required
+def driver_hours_page():
+    from datetime import date, timedelta
+
+    conn = get_db()
+    company = conn.execute("SELECT * FROM companies WHERE id=?", (cid(),)).fetchone()
+    co_settings = dict(company) if company else {}
+
+    drivers = conn.execute(
+        "SELECT id, username FROM users WHERE company_id=? AND role='driver' ORDER BY username",
+        (cid(),)
+    ).fetchall()
+
+    selected_driver_id = request.args.get("driver_id", type=int)
+    if not selected_driver_id and drivers:
+        selected_driver_id = drivers[0]["id"]
+
+    period_start, period_end = get_pay_period_bounds(co_settings)
+
+    # Build list of dates in the pay period
+    start_d = date.fromisoformat(period_start)
+    end_d   = date.fromisoformat(period_end)
+    date_range = []
+    cur_d = start_d
+    while cur_d <= end_d:
+        date_range.append(cur_d.isoformat())
+        cur_d += timedelta(days=1)
+
+    # Compute hours per day
+    day_rows = []
+    total_hours = 0.0
+    if selected_driver_id:
+        for ds in date_range:
+            st, et, hrs = get_driver_day_hours(conn, selected_driver_id, ds, co_settings)
+            day_rows.append((ds, st, et, hrs))
+            if hrs is not None:
+                total_hours += hrs
+
+    conn.close()
+
+    def _fmt_ts(ts):
+        if not ts:
+            return '<span class="muted">—</span>'
+        try:
+            return e(ts[11:16])  # HH:MM
+        except Exception:
+            return e(ts)
+
+    def _fmt_h(h):
+        if h is None:
+            return '<span class="muted">—</span>'
+        return f"{h:.2f} h"
+
+    driver_opts = "".join(
+        f'<option value="{d["id"]}" {"selected" if d["id"] == selected_driver_id else ""}>'
+        f'{e(d["username"])}</option>'
+        for d in drivers
+    )
+
+    rows_html = ""
+    for ds, st, et, hrs in day_rows:
+        _day_label = date.fromisoformat(ds).strftime("%a %b %d")
+        rows_html += f"""
+        <tr>
+            <td>{e(_day_label)}</td>
+            <td>{_fmt_ts(st)}</td>
+            <td>{_fmt_ts(et)}</td>
+            <td style="text-align:right;font-weight:600;">{_fmt_h(hrs)}</td>
+        </tr>"""
+
+    ptype = (co_settings.get("pay_period_type") or "weekly").title()
+    payday = (co_settings.get("payday") or "").title()
+    payday_note = f" &bull; Payday: {e(payday)}" if payday else ""
+
+    body = f"""
+    <div class="hero">
+        <h1>Driver Hours</h1>
+        <p>{e(ptype)} pay period: {e(period_start)} &ndash; {e(period_end)}{payday_note}</p>
+    </div>
+    <div class="card" style="margin-bottom:16px;">
+        <form method="GET" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;">
+            <div>
+                <label style="font-size:12px;display:block;margin-bottom:4px;">Driver</label>
+                <select name="driver_id" onchange="this.form.submit()">{driver_opts}</select>
+            </div>
+        </form>
+    </div>
+    <div class="card">
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr><th>Date</th><th>Day Start</th><th>Day End</th><th style="text-align:right;">Hours</th></tr>
+                </thead>
+                <tbody>
+                    {rows_html or '<tr><td colspan="4" class="muted">No data for this period.</td></tr>'}
+                </tbody>
+                <tfoot>
+                    <tr style="border-top:1px solid rgba(255,255,255,0.12);">
+                        <td colspan="3" style="font-weight:700;">Pay Period Total</td>
+                        <td style="text-align:right;font-weight:900;color:#56f0b7;">{total_hours:.2f} h</td>
+                    </tr>
+                </tfoot>
+            </table>
+        </div>
+        <div class="small muted" style="margin-top:12px;">
+            Hours derived from first/last stop action per day.
+            Configure rules in <a href="{url_for('company_settings')}#work-hours" style="color:#3fd2ff;">Company Settings</a>.
+        </div>
+    </div>
+    """
+    return render_template_string(shell_page("Driver Hours", body))
+
+
+# =========================================================
+# PHASE 5B — MANUAL CLOCK-IN / CLOCK-OUT  (/driver/clock)
+# =========================================================
+@app.route("/driver/clock", methods=["GET", "POST"])
+@login_required
+def driver_clock():
+    conn = get_db()
+    company = conn.execute("SELECT * FROM companies WHERE id=?", (cid(),)).fetchone()
+    co_settings = dict(company) if company else {}
+
+    start_rule = (co_settings.get("driver_day_start_rule") or "first_action").lower()
+    end_rule   = (co_settings.get("driver_day_end_rule")   or "last_action").lower()
+
+    # Only show this page if at least one rule is manual
+    if start_rule != "manual" and end_rule != "manual":
+        conn.close()
+        flash("Manual clock-in is not enabled for your company.", "error")
+        return redirect(url_for("driver_dashboard"))
+
+    from datetime import date
+    today = date.today().isoformat()
+    driver_id = session["user_id"]
+
+    entry = conn.execute(
+        "SELECT * FROM driver_clock_entries WHERE driver_id=? AND date=?",
+        (driver_id, today)
+    ).fetchone()
+
+    csrf_tok = get_csrf_token()
+
+    if request.method == "POST":
+        action = request.form.get("clock_action", "").strip()
+        ts = now_ts()
+        if action == "clock_in":
+            if entry:
+                conn.execute(
+                    "UPDATE driver_clock_entries SET clock_in_at=? WHERE driver_id=? AND date=?",
+                    (ts, driver_id, today)
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO driver_clock_entries (company_id, driver_id, date, clock_in_at, created_at) VALUES (?,?,?,?,?)",
+                    (cid(), driver_id, today, ts, ts)
+                )
+            conn.commit()
+            conn.close()
+            flash("Clocked in.", "success")
+            return redirect(url_for("driver_clock"))
+        elif action == "clock_out":
+            if entry:
+                conn.execute(
+                    "UPDATE driver_clock_entries SET clock_out_at=? WHERE driver_id=? AND date=?",
+                    (ts, driver_id, today)
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO driver_clock_entries (company_id, driver_id, date, clock_out_at, created_at) VALUES (?,?,?,?,?)",
+                    (cid(), driver_id, today, ts, ts)
+                )
+            conn.commit()
+            conn.close()
+            flash("Clocked out.", "success")
+            return redirect(url_for("driver_clock"))
+
+    conn.close()
+
+    _entry = dict(entry) if entry else {}
+    _ci    = _entry.get("clock_in_at") or ""
+    _co    = _entry.get("clock_out_at") or ""
+
+    def _fmt(ts):
+        return ts[11:16] if ts and len(ts) >= 16 else "—"
+
+    clocked_in  = bool(_ci)
+    clocked_out = bool(_co)
+
+    status_line = ""
+    if clocked_in and not clocked_out:
+        status_line = f'<div style="color:#56f0b7;font-weight:700;margin-bottom:8px;">&#9899; Clocked in at {_fmt(_ci)}</div>'
+    elif clocked_in and clocked_out:
+        status_line = f'<div style="color:#9dc8f0;margin-bottom:8px;">&#10003; Day complete: {_fmt(_ci)} &ndash; {_fmt(_co)}</div>'
+    else:
+        status_line = '<div class="muted small" style="margin-bottom:8px;">No clock entry for today yet.</div>'
+
+    in_btn = ""
+    out_btn = ""
+    if start_rule == "manual":
+        _in_style = "btn-driver btn-driver-complete" if not clocked_in else "btn-driver"
+        in_btn = f"""
+        <form method="POST" style="margin-bottom:8px;">
+            <input type="hidden" name="_csrf_token" value="{csrf_tok}">
+            <input type="hidden" name="clock_action" value="clock_in">
+            <button class="{_in_style}" type="submit" style="width:100%;">
+                {'&#9201; Update Clock-In' if clocked_in else '&#9654; Clock In'}
+            </button>
+        </form>"""
+    if end_rule == "manual":
+        _out_style = "btn-driver btn-driver-dump" if clocked_in and not clocked_out else "btn-driver"
+        out_btn = f"""
+        <form method="POST">
+            <input type="hidden" name="_csrf_token" value="{csrf_tok}">
+            <input type="hidden" name="clock_action" value="clock_out">
+            <button class="{_out_style}" type="submit" style="width:100%;">
+                &#9632; Clock Out
+            </button>
+        </form>"""
+
+    body = f"""
+    <div class="hero">
+        <h1>&#9201; Clock In / Out</h1>
+        <p>{e(today)}</p>
+    </div>
+    <div class="card" style="max-width:400px;">
+        {status_line}
+        {in_btn}
+        {out_btn}
+    </div>
+    """
+    return render_template_string(shell_page("Clock In / Out", body))
 
 
 # =========================================================
