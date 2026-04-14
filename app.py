@@ -285,9 +285,48 @@ def _nearest_neighbor(stops_coords, origin=None):
     return [s[0] for s in visited]
 
 
-def _dump_aware_order(stops_data, origin=None):
+def _can_flow_valid(action_lower, can_state):
+    """Return True if a stop with this action is valid given the current simulated can state.
+
+    Rules (physical truck constraints):
+      PR       — needs an empty can on the truck to swap in → requires empty_can
+      Delivery — needs an empty can on the truck to drop off → requires empty_can
+      Pull     — truck must be empty to pick up a can       → requires no_can
+      Dump/unknown — always valid (no can-state constraint)
     """
-    Dump-aware greedy nearest-neighbor.
+    is_pr = (
+        "pickup and return" in action_lower
+        or ("swap" in action_lower and "pull" not in action_lower)
+    )
+    is_delivery = "delivery" in action_lower
+    is_pull     = "pull" in action_lower and "return" not in action_lower
+    if is_pr or is_delivery:
+        return can_state == "empty_can"
+    if is_pull:
+        return can_state == "no_can"
+    return True  # dump run or unrecognised — no constraint
+
+
+def _next_can_state(action_lower, can_state):
+    """Simulate the can state after completing a stop."""
+    is_pr = (
+        "pickup and return" in action_lower
+        or ("swap" in action_lower and "pull" not in action_lower)
+    )
+    is_delivery = "delivery" in action_lower
+    is_pull     = "pull" in action_lower and "return" not in action_lower
+    if is_delivery:
+        return "no_can"    # left the can at the site
+    if is_pull:
+        return "empty_can" # picked up the customer's can
+    if is_pr:
+        return "empty_can" # swapped — left new, picked up old
+    return can_state       # dump or unrecognised — no change
+
+
+def _dump_aware_order(stops_data, origin=None, action_map=None, starts_with_can=False):
+    """
+    Dump-aware greedy nearest-neighbor with optional can-flow constraints.
 
     stops_data: list of dicts
         {
@@ -298,44 +337,69 @@ def _dump_aware_order(stops_data, origin=None):
             "dump_lat": float|None,  # dump site coords if known
             "dump_lng": float|None,
         }
-    origin: (lat, lng) or None — yard / base start position.
+    origin:          (lat, lng) or None — yard / base start position.
+    action_map:      dict of {stop_id: action_string} — when supplied, only
+                     physically valid stops are candidates at each step.
+    starts_with_can: whether the truck starts the day with an empty can loaded.
 
     Logic
     -----
     Current position starts at origin (yard) or first stop.
-    At each step we pick the unvisited stop nearest to *current position*.
-    After visiting a stop:
-      - Normal stop  → current position = customer address
-      - PR/Pull stop with known dump → current position = dump location
-        (because the driver ends up at the dump, not the customer site)
-    This makes the algorithm choose the next stop relative to where the
-    driver will actually be — not just the customer they just serviced.
+    At each step we pick the nearest unvisited stop that is VALID for the
+    current simulated can state.  If no valid stop exists the algorithm is
+    stuck; remaining stops are appended in their original dispatcher order and
+    a constrained=True flag is returned so the caller can warn the boss.
 
-    Returns list of stop_ids in optimised order.
+    Returns (list_of_stop_ids_in_order, constrained: bool).
     """
     if not stops_data:
-        return []
-    remaining = list(stops_data)
-    ordered   = []
+        return [], False
+
+    remaining  = list(stops_data)   # preserves original dispatcher order
+    ordered    = []
+    constrained = False
+    can_state  = "empty_can" if starts_with_can else "no_can"
 
     if origin:
         pos = origin
     else:
-        # start from whichever stop is top of list (no yard set)
         pos = (stops_data[0]["lat"], stops_data[0]["lng"])
 
     while remaining:
-        best = min(remaining,
-                   key=lambda s: _haversine_mi(pos[0], pos[1], s["lat"], s["lng"]))
+        # When action_map is provided, filter to can-flow-valid candidates
+        if action_map:
+            valid = [
+                s for s in remaining
+                if _can_flow_valid(
+                    (action_map.get(s["id"]) or "").lower().strip(),
+                    can_state,
+                )
+            ]
+            if not valid:
+                # Stuck — no valid next stop; preserve original order for remainder
+                constrained = True
+                ordered.extend(remaining)
+                remaining = []
+                break
+        else:
+            valid = remaining
+
+        best = min(valid, key=lambda s: _haversine_mi(pos[0], pos[1], s["lat"], s["lng"]))
         ordered.append(best)
         remaining.remove(best)
+
         # Advance position to dump exit when applicable
         if best["is_dump"] and best["dump_lat"] is not None:
             pos = (best["dump_lat"], best["dump_lng"])
         else:
             pos = (best["lat"], best["lng"])
 
-    return [s["id"] for s in ordered]
+        # Simulate can state after this stop
+        if action_map:
+            action_lower = (action_map.get(best["id"]) or "").lower().strip()
+            can_state = _next_can_state(action_lower, can_state)
+
+    return [s["id"] for s in ordered], constrained
 
 
 def compute_can_flow(conn, route_id, starts_with_can=False):
@@ -6446,10 +6510,17 @@ def optimize_route(route_id):
         return redirect(url_for("view_route", route_id=route_id))
 
     # ------------------------------------------------------------------
-    # 5. Run dump-aware ordering
+    # 5. Run dump-aware ordering with can-flow constraints
     # ------------------------------------------------------------------
     dump_stop_count = sum(1 for s in stops_data if s["is_dump"] and s["dump_lat"] is not None)
-    ordered_ids = _dump_aware_order(stops_data, origin=yard_origin)
+
+    # Build action_map so the optimizer can simulate can state during selection.
+    # Only covers geocoded main_stops (the ones in stops_data).
+    action_map = {s["id"]: (s["action"] or "") for s in main_stops if s["id"] in {d["id"] for d in stops_data}}
+
+    ordered_ids, can_constrained = _dump_aware_order(
+        stops_data, origin=yard_origin, action_map=action_map
+    )
 
     final_order = (
         first_pins
@@ -6498,6 +6569,14 @@ def optimize_route(route_id):
         flash(
             f"Basic route optimization applied by stop distance — {len(stops_data)} stops reordered{skip_note}.",
             "success"
+        )
+
+    if can_constrained:
+        flash(
+            "⚠️ Can-flow constraint: one or more stops had no valid placement "
+            "(e.g. a PR with no empty can available). Those stops were kept in "
+            "their original dispatcher order at the end of the sequence.",
+            "warning"
         )
     return redirect(url_for("view_route", route_id=route_id))
 
