@@ -1569,6 +1569,67 @@ _DUMP_SITES = {
     "mm":       "MM GU2737",
 }
 
+# Canonical dump site display name → full street address for navigation.
+# Keys must match the VALUES of _DUMP_SITES (lowercased for lookup).
+DUMP_SITE_ADDRESSES = {
+    "dominion": "6000 Sewells Point Rd, Norfolk, VA",
+    "spivey":   "123 Spivey Rd, Suffolk, VA",
+    "spsa":     "1 Bob Foeller Dr, Suffolk, VA",
+    "bay":      "83 Pagan Ave, Smithfield, VA",
+    "holland":  "4801 Nansemond Pkwy, Suffolk, VA",
+    "waterway": "Virginia Beach Waterway Facility, Virginia Beach, VA",
+    "united":   "United Disposal, Virginia Beach, VA",
+    "sykes":    "Sykes Landfill, Virginia Beach, VA",
+    "sb cox":   "SB Cox, Virginia Beach, VA",
+}
+
+
+def _dump_nav_buttons(dump_location_text):
+    """
+    Given a stop's dump_location string (e.g. "Dominion", "Spivey"),
+    return an HTML snippet with Google Maps and Apple Maps navigation buttons.
+
+    Lookup chain:
+      1. Exact canonical name (case-insensitive) in DUMP_SITE_ADDRESSES
+      2. Fall back to using the raw text as the destination address
+
+    Returns empty string if dump_location_text is blank.
+    Returns a muted "address not on file" note if text is present but no address
+    can be resolved.
+    """
+    if not dump_location_text or not dump_location_text.strip():
+        return ""
+
+    key = dump_location_text.strip().lower()
+    address = DUMP_SITE_ADDRESSES.get(key)
+
+    # Also try without punctuation in case of minor variations
+    if not address:
+        for k, v in DUMP_SITE_ADDRESSES.items():
+            if k in key or key in k:
+                address = v
+                break
+
+    # Fall back to using the raw display name as the geocodable destination
+    if not address:
+        address = dump_location_text.strip() + ", Virginia"
+
+    enc = urllib.parse.quote_plus(address)
+    google_url = f"https://www.google.com/maps/dir/?api=1&destination={enc}&travelmode=driving"
+    apple_url  = f"http://maps.apple.com/?daddr={enc}&dirflg=d"
+
+    return (
+        f'<div style="display:flex;gap:8px;margin-bottom:8px;">'
+        f'<a class="btn-driver btn-driver-nav" target="_blank" href="{google_url}" '
+        f'style="flex:1;text-align:center;text-decoration:none;">'
+        f'&#128205; Google Maps</a>'
+        f'<a class="btn-driver btn-driver-apple" target="_blank" href="{apple_url}" '
+        f'style="flex:1;text-align:center;text-decoration:none;">'
+        f'&#63743; Apple Maps</a>'
+        f'</div>'
+    )
+
+
 # Matches a new roll-off stop line: action prefix followed by a house number.
 # Uses (?=\d) lookahead so the digit is NOT consumed — m.end() lands right
 # before the house number and body = merged[m.end():] keeps the full address.
@@ -4513,15 +4574,18 @@ def driver_route_detail(route_id):
                     f'</form>'
                 )
             elif _driver_status == "going_to_dump":
-                _dump_loc_hint = _s.get("dump_location") or ""
-                _dump_label = f"🧾 Enter Dump Ticket{' — ' + _dump_loc_hint if _dump_loc_hint else ''}"
-                _workflow_btn_html = (
+                _dump_loc_text = _s.get("dump_location") or ""
+                _dump_label = f"🧾 Enter Dump Ticket{' — ' + _dump_loc_text if _dump_loc_text else ''}"
+                _dump_ticket_link = (
                     f'<a class="btn-driver btn-driver-dump" '
                     f'href="{url_for("dump_ticket", stop_id=s["id"])}" '
                     f'style="display:block;text-align:center;text-decoration:none;'
                     f'padding:12px 16px;border-radius:12px;font-weight:700;margin-bottom:8px;">'
                     f'{_dump_label}</a>'
                 )
+                # Navigation buttons to drive to the dump site
+                _nav_html = _dump_nav_buttons(_dump_loc_text)
+                _workflow_btn_html = _nav_html + _dump_ticket_link
 
         # Badge on the stop card header showing swap PR mode
         _swap_badge = (
