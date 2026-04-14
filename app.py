@@ -4340,6 +4340,17 @@ def driver_route_detail(route_id):
         ORDER BY stop_order ASC, id ASC
     """, (route_id,)).fetchall()
 
+    # Ensure can_state_before is populated so PR mode always shows correctly
+    if stops and any(s["can_state_before"] is None for s in stops):
+        compute_can_flow(conn, route_id)
+        conn.commit()
+        stops = conn.execute("""
+            SELECT *
+            FROM stops
+            WHERE route_id = ?
+            ORDER BY stop_order ASC, id ASC
+        """, (route_id,)).fetchall()
+
     stop_ids = [s["id"] for s in stops]
     photos_by_stop = load_stop_photos(conn, stop_ids)
 
@@ -5263,6 +5274,13 @@ def view_route(route_id):
         return redirect(url_for("dashboard"))
 
     stops = conn.execute("SELECT * FROM stops WHERE route_id = ? ORDER BY stop_order ASC, id ASC", (route_id,)).fetchall()
+
+    # Ensure can_state_before is populated so PR mode always shows correctly
+    if stops and any(s["can_state_before"] is None for s in stops):
+        compute_can_flow(conn, route_id)
+        conn.commit()
+        stops = conn.execute("SELECT * FROM stops WHERE route_id = ? ORDER BY stop_order ASC, id ASC", (route_id,)).fetchall()
+
     stop_ids = [s["id"] for s in stops]
     photos_by_stop = load_stop_photos(conn, stop_ids)
     dump_locs_for_form = conn.execute(
