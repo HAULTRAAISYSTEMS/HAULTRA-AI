@@ -641,64 +641,75 @@ def get_driver_day_hours(conn, driver_id, date_str, company_settings):
     date_str: 'YYYY-MM-DD' in the company's local time (caller is responsible
               for any TZ conversion before calling).
 
-    Returns (None, None, None) if insufficient data exists.
+    Returns (None, None, None) if insufficient data exists or any query fails.
+
+    first_action: uses COALESCE(arrived_at, completed_at) so the report shows
+                  data even when drivers have not yet tapped the Arrived button.
+    last_action:  uses completed_at (always populated for completed stops).
     """
-    start_rule = (company_settings.get("driver_day_start_rule") or "first_action").lower()
-    end_rule   = (company_settings.get("driver_day_end_rule")   or "last_action").lower()
-
-    start_ts = end_ts = None
-
-    if start_rule == "first_action":
-        row = conn.execute(
-            """SELECT MIN(arrived_at) AS t
-               FROM stops s
-               JOIN routes r ON s.route_id = r.id
-               WHERE r.assigned_to = ?
-                 AND s.arrived_at >= ?
-                 AND s.arrived_at <  date(?, '+1 day')
-                 AND s.status = 'completed'""",
-            (driver_id, date_str, date_str)
-        ).fetchone()
-        start_ts = row["t"] if row else None
-    else:
-        row = conn.execute(
-            "SELECT clock_in_at FROM driver_clock_entries WHERE driver_id=? AND date=?",
-            (driver_id, date_str)
-        ).fetchone()
-        start_ts = row["clock_in_at"] if row else None
-
-    if end_rule == "last_action":
-        row = conn.execute(
-            """SELECT MAX(completed_at) AS t
-               FROM stops s
-               JOIN routes r ON s.route_id = r.id
-               WHERE r.assigned_to = ?
-                 AND s.completed_at >= ?
-                 AND s.completed_at <  date(?, '+1 day')
-                 AND s.status = 'completed'""",
-            (driver_id, date_str, date_str)
-        ).fetchone()
-        end_ts = row["t"] if row else None
-    else:
-        row = conn.execute(
-            "SELECT clock_out_at FROM driver_clock_entries WHERE driver_id=? AND date=?",
-            (driver_id, date_str)
-        ).fetchone()
-        end_ts = row["clock_out_at"] if row else None
-
-    if not start_ts or not end_ts:
-        return None, None, None
-
     try:
+        start_rule = (company_settings.get("driver_day_start_rule") or "first_action").lower()
+        end_rule   = (company_settings.get("driver_day_end_rule")   or "last_action").lower()
+
+        start_ts = end_ts = None
+
+        if start_rule == "first_action":
+            # COALESCE: prefer arrived_at, fall back to completed_at
+            row = conn.execute(
+                """SELECT MIN(COALESCE(arrived_at, completed_at)) AS t
+                   FROM stops s
+                   JOIN routes r ON s.route_id = r.id
+                   WHERE r.assigned_to = ?
+                     AND COALESCE(arrived_at, completed_at) >= ?
+                     AND COALESCE(arrived_at, completed_at) < date(?, '+1 day')
+                     AND s.status = 'completed'""",
+                (driver_id, date_str, date_str)
+            ).fetchone()
+            start_ts = row["t"] if row else None
+        else:
+            try:
+                row = conn.execute(
+                    "SELECT clock_in_at FROM driver_clock_entries WHERE driver_id=? AND date=?",
+                    (driver_id, date_str)
+                ).fetchone()
+                start_ts = row["clock_in_at"] if row else None
+            except Exception:
+                start_ts = None
+
+        if end_rule == "last_action":
+            row = conn.execute(
+                """SELECT MAX(completed_at) AS t
+                   FROM stops s
+                   JOIN routes r ON s.route_id = r.id
+                   WHERE r.assigned_to = ?
+                     AND s.completed_at >= ?
+                     AND s.completed_at < date(?, '+1 day')
+                     AND s.status = 'completed'""",
+                (driver_id, date_str, date_str)
+            ).fetchone()
+            end_ts = row["t"] if row else None
+        else:
+            try:
+                row = conn.execute(
+                    "SELECT clock_out_at FROM driver_clock_entries WHERE driver_id=? AND date=?",
+                    (driver_id, date_str)
+                ).fetchone()
+                end_ts = row["clock_out_at"] if row else None
+            except Exception:
+                end_ts = None
+
+        if not start_ts or not end_ts:
+            return None, None, None
+
         from datetime import datetime
         fmt = "%Y-%m-%d %H:%M:%S"
         s = datetime.strptime(start_ts[:19], fmt)
         e_ = datetime.strptime(end_ts[:19], fmt)
         hours = max(0.0, (e_ - s).total_seconds() / 3600)
-    except Exception:
-        return start_ts, end_ts, None
+        return start_ts, end_ts, round(hours, 2)
 
-    return start_ts, end_ts, round(hours, 2)
+    except Exception:
+        return None, None, None
 
 
 def load_stop_photos(conn, stop_ids):
@@ -8869,19 +8880,30 @@ def delete_container(c_id):
 @app.route("/boss/driver-hours")
 @boss_required
 def driver_hours_page():
-    from datetime import date, timedelta
-
     conn = get_db()
     company = conn.execute("SELECT * FROM companies WHERE id=?", (cid(),)).fetchone()
-    co_settings = dict(company) if company else {}
+    co_settings = {k: company[k] for k in company.keys()} if company else {}
 
     drivers = conn.execute(
         "SELECT id, username FROM users WHERE company_id=? AND role='driver' ORDER BY username",
         (cid(),)
     ).fetchall()
+    drivers = [dict(d) for d in drivers]
+
+    # No drivers — show clean empty state, no crash
+    if not drivers:
+        conn.close()
+        body = """
+        <div class="hero"><h1>Driver Hours</h1></div>
+        <div class="card">
+            <p class="muted">No drivers found. Add drivers under
+            <a href="/boss/users">Users</a> to see hours here.</p>
+        </div>
+        """
+        return render_template_string(shell_page("Driver Hours", body))
 
     selected_driver_id = request.args.get("driver_id", type=int)
-    if not selected_driver_id and drivers:
+    if not selected_driver_id:
         selected_driver_id = drivers[0]["id"]
 
     period_start, period_end = get_pay_period_bounds(co_settings)
@@ -8898,59 +8920,68 @@ def driver_hours_page():
     # Compute hours per day
     day_rows = []
     total_hours = 0.0
-    if selected_driver_id:
-        for ds in date_range:
-            st, et, hrs = get_driver_day_hours(conn, selected_driver_id, ds, co_settings)
-            day_rows.append((ds, st, et, hrs))
-            if hrs is not None:
-                total_hours += hrs
+    for ds in date_range:
+        st, et, hrs = get_driver_day_hours(conn, selected_driver_id, ds, co_settings)
+        day_rows.append((ds, st, et, hrs))
+        if hrs is not None:
+            total_hours += hrs
 
     conn.close()
 
     def _fmt_ts(ts):
         if not ts:
-            return '<span class="muted">—</span>'
+            return '<span class="muted">&#8212;</span>'
         try:
-            return e(ts[11:16])  # HH:MM
+            return e(str(ts)[11:16])
         except Exception:
-            return e(ts)
+            return e(str(ts))
 
     def _fmt_h(h):
         if h is None:
-            return '<span class="muted">—</span>'
-        return f"{h:.2f} h"
+            return '<span class="muted">&#8212;</span>'
+        return "%.2f h" % h
 
     driver_opts = "".join(
-        f'<option value="{d["id"]}" {"selected" if d["id"] == selected_driver_id else ""}>'
-        f'{e(d["username"])}</option>'
+        '<option value="%s"%s>%s</option>' % (
+            d["id"],
+            ' selected' if d["id"] == selected_driver_id else '',
+            e(d["username"] or "")
+        )
         for d in drivers
     )
 
     rows_html = ""
     for ds, st, et, hrs in day_rows:
-        _day_label = date.fromisoformat(ds).strftime("%a %b %d")
-        rows_html += f"""
-        <tr>
-            <td>{e(_day_label)}</td>
-            <td>{_fmt_ts(st)}</td>
-            <td>{_fmt_ts(et)}</td>
-            <td style="text-align:right;font-weight:600;">{_fmt_h(hrs)}</td>
-        </tr>"""
+        try:
+            _day_label = date.fromisoformat(ds).strftime("%a %b %d")
+        except Exception:
+            _day_label = ds
+        rows_html += (
+            "<tr>"
+            "<td>%s</td>"
+            "<td>%s</td>"
+            "<td>%s</td>"
+            '<td style="text-align:right;font-weight:600;">%s</td>'
+            "</tr>" % (e(_day_label), _fmt_ts(st), _fmt_ts(et), _fmt_h(hrs))
+        )
 
     ptype = (co_settings.get("pay_period_type") or "weekly").title()
-    payday = (co_settings.get("payday") or "").title()
-    payday_note = f" &bull; Payday: {e(payday)}" if payday else ""
+    payday_raw = co_settings.get("payday") or ""
+    payday_note = (" &bull; Payday: %s" % e(payday_raw.title())) if payday_raw else ""
+    settings_url = url_for("company_settings")
 
-    body = f"""
+    no_data_row = '<tr><td colspan="4" class="muted">No completed stops in this period.</td></tr>'
+
+    body = """
     <div class="hero">
         <h1>Driver Hours</h1>
-        <p>{e(ptype)} pay period: {e(period_start)} &ndash; {e(period_end)}{payday_note}</p>
+        <p>%s pay period: %s &ndash; %s%s</p>
     </div>
     <div class="card" style="margin-bottom:16px;">
         <form method="GET" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;">
             <div>
                 <label style="font-size:12px;display:block;margin-bottom:4px;">Driver</label>
-                <select name="driver_id" onchange="this.form.submit()">{driver_opts}</select>
+                <select name="driver_id" onchange="this.form.submit()">%s</select>
             </div>
         </form>
     </div>
@@ -8960,23 +8991,27 @@ def driver_hours_page():
                 <thead>
                     <tr><th>Date</th><th>Day Start</th><th>Day End</th><th style="text-align:right;">Hours</th></tr>
                 </thead>
-                <tbody>
-                    {rows_html or '<tr><td colspan="4" class="muted">No data for this period.</td></tr>'}
-                </tbody>
+                <tbody>%s</tbody>
                 <tfoot>
                     <tr style="border-top:1px solid rgba(255,255,255,0.12);">
                         <td colspan="3" style="font-weight:700;">Pay Period Total</td>
-                        <td style="text-align:right;font-weight:900;color:#56f0b7;">{total_hours:.2f} h</td>
+                        <td style="text-align:right;font-weight:900;color:#56f0b7;">%.2f h</td>
                     </tr>
                 </tfoot>
             </table>
         </div>
         <div class="small muted" style="margin-top:12px;">
-            Hours derived from first/last stop action per day.
-            Configure rules in <a href="{url_for('company_settings')}#work-hours" style="color:#3fd2ff;">Company Settings</a>.
+            Hours derived from first/last completed stop per day.
+            Configure rules in <a href="%s#work-hours" style="color:#3fd2ff;">Company Settings</a>.
         </div>
     </div>
-    """
+    """ % (
+        e(ptype), e(period_start), e(period_end), payday_note,
+        driver_opts,
+        rows_html if rows_html else no_data_row,
+        total_hours,
+        settings_url,
+    )
     return render_template_string(shell_page("Driver Hours", body))
 
 
