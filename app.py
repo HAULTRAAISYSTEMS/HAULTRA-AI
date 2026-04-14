@@ -289,26 +289,24 @@ def _can_flow_valid(action_lower, can_state):
     """Return True if a stop with this action is valid given the current simulated can state.
 
     Rules (physical truck constraints):
-      PR       — needs an empty can on the truck to swap in → requires empty_can
+      PR       — valid in ANY can state; mode is determined at runtime:
+                   empty_can → swap mode (bring empty, take full, dump)
+                   no_can    → return-same-can mode (take full, dump, return empty)
       Delivery — needs an empty can on the truck to drop off → requires empty_can
       Pull     — truck must be empty to pick up a can       → requires no_can
       Dump/unknown — always valid (no can-state constraint)
     """
-    is_pr = (
-        "pickup and return" in action_lower
-        or ("swap" in action_lower and "pull" not in action_lower)
-    )
     is_delivery = "delivery" in action_lower
     is_pull     = "pull" in action_lower and "return" not in action_lower
-    if is_pr or is_delivery:
+    if is_delivery:
         return can_state == "empty_can"
     if is_pull:
         return can_state == "no_can"
-    return True  # dump run or unrecognised — no constraint
+    return True  # PR (either mode), dump run, or unrecognised — no constraint
 
 
 def _next_can_state(action_lower, can_state):
-    """Simulate the can state after completing a stop."""
+    """Simulate the can state after completing a stop (including its dump run)."""
     is_pr = (
         "pickup and return" in action_lower
         or ("swap" in action_lower and "pull" not in action_lower)
@@ -318,9 +316,12 @@ def _next_can_state(action_lower, can_state):
     if is_delivery:
         return "no_can"    # left the can at the site
     if is_pull:
-        return "empty_can" # picked up the customer's can
+        return "empty_can" # pulled customer's can, dumped it → now carrying empty
     if is_pr:
-        return "empty_can" # swapped — left new, picked up old
+        # Swap mode: gave away empty can, dumped full can → truck empty
+        # Return-same-can mode: dumped full can, returned empty to customer → truck empty
+        # Both modes end with the truck carrying nothing
+        return "no_can"
     return can_state       # dump or unrecognised — no change
 
 
@@ -439,12 +440,13 @@ def compute_can_flow(conn, route_id, starts_with_can=False):
     ---------------------
     Pull      : requires no_can    → after dump: empty_can
     Delivery  : requires empty_can → after drop: no_can
-    PR / Swap : requires empty_can → after dump: empty_can
+    PR / Swap : valid in any state → mode derived from can_state_before:
+                  empty_can → swap mode   → after complete: no_can
+                  no_can    → return-same-can mode → after complete: no_can
     Other     : no change to can state
 
     swap_with_prev_pull is set to 1 for PR/Swap stops when can_state_before
-    is "empty_can" (i.e. a Pull precedes without an intervening Delivery).
-    This replaces the manual checkbox; the value is now sequence-derived.
+    is "empty_can" (swap mode). Value is sequence-derived, not manually set.
 
     Call after ordering stops so the sequence reflects actual drive order.
     Caller is responsible for conn.commit().
@@ -472,8 +474,8 @@ def compute_can_flow(conn, route_id, starts_with_can=False):
                 "UPDATE stops SET can_state_before=?, swap_with_prev_pull=? WHERE id=?",
                 (can_state, derived_swap, s["id"])
             )
-            # After PR: dump the full can → leave with empty can
-            can_state = "empty_can"
+            # After PR (either mode): truck leaves with no container
+            can_state = "no_can"
         else:
             conn.execute(
                 "UPDATE stops SET can_state_before=? WHERE id=?",
@@ -4543,12 +4545,12 @@ def driver_route_detail(route_id):
                     "box_in":      ("going_to_dump", "🗑️ Go To Dump",                    "btn-driver btn-driver-dump"),
                 }
             elif _is_pr:
-                # Normal PR: box-out → dump → box-in
+                # Return Same Can: box-out → dump → return to same location → box-in empty
                 _wf_map = {
-                    "pending":     ("arrived",       "🚛 Arrived at Stop",           "btn-driver btn-driver-complete"),
-                    "arrived":     ("box_out",        "📦 Box Out — Remove Container","btn-driver btn-driver-complete"),
-                    "box_out":     ("going_to_dump",  "🗑️ Go To Dump",               "btn-driver btn-driver-dump"),
-                    "need_box_in": ("box_in",         "📦 Box In — Return Container", "btn-driver btn-driver-complete"),
+                    "pending":     ("arrived",       "🚛 Arrived at Stop",                      "btn-driver btn-driver-complete"),
+                    "arrived":     ("box_out",       "📦 Box Out — Remove Container",            "btn-driver btn-driver-complete"),
+                    "box_out":     ("going_to_dump", "🗑️ Go To Dump",                           "btn-driver btn-driver-dump"),
+                    "need_box_in": ("box_in",        "🔄 Return & Box In — Place Empty Can",    "btn-driver btn-driver-complete"),
                 }
             elif _is_pull:
                 # Pull: box-out → dump → complete (no box-in)
@@ -4587,12 +4589,21 @@ def driver_route_detail(route_id):
                 _nav_html = _dump_nav_buttons(_dump_loc_text)
                 _workflow_btn_html = _nav_html + _dump_ticket_link
 
-        # Badge on the stop card header showing swap PR mode
-        _swap_badge = (
-            '<span style="font-size:10px;background:rgba(255,200,80,0.22);color:#fde68a;'
-            'padding:2px 8px;border-radius:6px;font-weight:700;letter-spacing:.4px;">'
-            '&#x1F504; SWAP</span> '
-        ) if _is_swap_pr else ""
+        # Badge on the stop card header showing PR mode
+        if _is_swap_pr:
+            _swap_badge = (
+                '<span style="font-size:10px;background:rgba(255,200,80,0.22);color:#fde68a;'
+                'padding:2px 8px;border-radius:6px;font-weight:700;letter-spacing:.4px;">'
+                '&#x1F504; SWAP</span> '
+            )
+        elif _is_pr:
+            _swap_badge = (
+                '<span style="font-size:10px;background:rgba(150,200,255,0.18);color:#93c5fd;'
+                'padding:2px 8px;border-radius:6px;font-weight:700;letter-spacing:.4px;">'
+                '&#x21A9;&#xFE0F; RETURN</span> '
+            )
+        else:
+            _swap_badge = ""
 
         card_class = "driver-stop-card"
         if is_next:
@@ -5369,33 +5380,27 @@ def view_route(route_id):
         if session.get("role") == "boss" and _is_pr_sc:
             if _csb == "empty_can":
                 _swap_badge = (
-                    ' <span title="Swap: driver carries empty can from prior Pull" '
+                    ' <span title="PR Mode: Swap — driver carries empty can from prior Pull" '
                     'style="font-size:11px;background:rgba(97,247,223,0.15);color:#61f7df;'
                     'padding:2px 8px;border-radius:6px;font-weight:700;vertical-align:middle;">'
-                    '&#x1F504; Swap: Yes</span>'
+                    '&#x1F504; PR Mode: Swap</span>'
                 )
                 _swap_warning = ""
             elif _csb == "no_can":
                 _swap_badge = (
-                    ' <span title="No swap — yard empty can required" '
-                    'style="font-size:11px;background:rgba(120,120,140,0.18);color:#9aa5b8;'
+                    ' <span title="PR Mode: Return Same Can — driver boxes out, dumps, returns empty can to site" '
+                    'style="font-size:11px;background:rgba(150,200,255,0.18);color:#93c5fd;'
                     'padding:2px 8px;border-radius:6px;font-weight:700;vertical-align:middle;">'
-                    '&#x1F504; Swap: No</span>'
+                    '&#x21A9;&#xFE0F; PR Mode: Return Same Can</span>'
                 )
-                _swap_warning = (
-                    '<p style="margin:4px 0 0;padding:6px 10px;'
-                    'background:rgba(255,180,50,0.09);border-left:3px solid #fbbf24;'
-                    'border-radius:4px;color:#fbbf24;font-size:12px;">'
-                    '&#x26A0;&#xFE0F; PR has no empty can — check stop order or ensure driver '
-                    'picks up yard empty before this stop.</p>'
-                )
+                _swap_warning = ""
             else:
                 # can_state_before is NULL — route not yet optimized
                 _swap_badge = (
-                    ' <span title="Run Smart Optimize to derive swap status" '
+                    ' <span title="Run Smart Optimize to derive PR mode from stop sequence" '
                     'style="font-size:11px;background:rgba(120,120,140,0.12);color:#6a7a8a;'
                     'padding:2px 8px;border-radius:6px;font-weight:700;vertical-align:middle;">'
-                    '&#x1F504; Swap: ?</span>'
+                    '&#x1F504; PR Mode: ?</span>'
                 )
                 _swap_warning = ""
         else:
@@ -5742,27 +5747,26 @@ def edit_stop(stop_id):
                         background:rgba(97,247,223,0.08);
                         border:1px solid rgba(97,247,223,0.28);border-radius:10px;">
                 <p style="margin:0 0 4px;color:#61f7df;font-size:13px;font-weight:700;">
-                    &#x1F7E2; Swap: Yes &#x2014; auto-derived from route sequence
+                    &#x1F504; PR Mode: Swap
                 </p>
                 <p style="margin:0;color:#7ab8a8;font-size:12px;">
                     A Pull precedes this PR with no Delivery in between.
-                    Driver will carry the emptied can directly to this stop.
-                    Workflow: Arrive &#x2192; Box Out &#x2192; Box In &#x2192; Complete.
+                    Driver carries an empty can to this stop and swaps it for the full one.
+                    Workflow: Arrive &#x2192; Box Out &#x2192; Box In &#x2192; Go To Dump &#x2192; Complete.
                 </p>
             </div>"""
         elif _csb_edit == "no_can":
             _swap_info_block = """
             <div style="margin-top:16px;padding:14px 16px;
-                        background:rgba(255,180,50,0.08);
-                        border:1px solid rgba(255,180,50,0.35);border-radius:10px;">
-                <p style="margin:0 0 4px;color:#fbbf24;font-size:13px;font-weight:700;">
-                    &#x26A0;&#xFE0F; Swap: No &#x2014; auto-derived from route sequence
+                        background:rgba(150,200,255,0.07);
+                        border:1px solid rgba(150,200,255,0.28);border-radius:10px;">
+                <p style="margin:0 0 4px;color:#93c5fd;font-size:13px;font-weight:700;">
+                    &#x21A9;&#xFE0F; PR Mode: Return Same Can
                 </p>
-                <p style="margin:0;color:#b08a40;font-size:12px;">
-                    No empty can available at this point in the route
-                    (a Delivery consumed it, or no prior Pull exists).
-                    Driver will need a yard empty before this stop.
-                    Full PR workflow: Arrive &#x2192; Box Out &#x2192; Dump &#x2192; Box In &#x2192; Complete.
+                <p style="margin:0;color:#7a9ab8;font-size:12px;">
+                    No empty can in sequence &#x2014; driver boxes out the full can, dumps it,
+                    then returns the emptied can to the same site.
+                    Workflow: Arrive &#x2192; Box Out &#x2192; Go To Dump &#x2192; Return &amp; Box In &#x2192; Complete.
                 </p>
             </div>"""
         else:
@@ -5771,11 +5775,11 @@ def edit_stop(stop_id):
                         background:rgba(120,140,160,0.08);
                         border:1px solid rgba(120,140,160,0.25);border-radius:10px;">
                 <p style="margin:0 0 4px;color:#9aa5b8;font-size:13px;font-weight:700;">
-                    &#x26AA; Swap: Unknown &#x2014; run Smart Optimize to calculate
+                    &#x1F504; PR Mode: Unknown
                 </p>
                 <p style="margin:0;color:#6a7a8a;font-size:12px;">
                     Can flow has not been computed for this route yet.
-                    Run Smart Optimize to derive swap status from stop sequence.
+                    Run Smart Optimize to derive PR mode from stop sequence.
                 </p>
             </div>"""
     else:
