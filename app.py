@@ -324,6 +324,26 @@ def _next_can_state(action_lower, can_state):
     return can_state       # dump or unrecognised — no change
 
 
+def _stop_trip_cost(pos, s):
+    """
+    True routing cost from current position to a stop, including the dump leg
+    when the stop requires one.
+
+    For Delivery stops (is_dump=False) or stops with no dump coords:
+        cost = dist(current → customer)
+
+    For Pull / PR stops with a known dump location:
+        cost = dist(current → customer) + dist(customer → dump)
+
+    This prevents the greedy selector from choosing a Pull whose dump site is
+    far off-route simply because the customer address is nearby.
+    """
+    cost = _haversine_mi(pos[0], pos[1], s["lat"], s["lng"])
+    if s["is_dump"] and s["dump_lat"] is not None:
+        cost += _haversine_mi(s["lat"], s["lng"], s["dump_lat"], s["dump_lng"])
+    return cost
+
+
 def _dump_aware_order(stops_data, origin=None, action_map=None, starts_with_can=False):
     """
     Dump-aware greedy nearest-neighbor with optional can-flow constraints.
@@ -384,11 +404,13 @@ def _dump_aware_order(stops_data, origin=None, action_map=None, starts_with_can=
         else:
             valid = remaining
 
-        best = min(valid, key=lambda s: _haversine_mi(pos[0], pos[1], s["lat"], s["lng"]))
+        # Score by full trip leg: customer distance + dump-run distance when applicable.
+        # Delivery stops score by customer distance only (no dump leg).
+        best = min(valid, key=lambda s: _stop_trip_cost(pos, s))
         ordered.append(best)
         remaining.remove(best)
 
-        # Advance position to dump exit when applicable
+        # Advance position to dump exit (truck ends at dump, not at customer)
         if best["is_dump"] and best["dump_lat"] is not None:
             pos = (best["dump_lat"], best["dump_lng"])
         else:
@@ -6545,20 +6567,27 @@ def optimize_route(route_id):
     eod_count        = len(eod_stops)
     first_count      = len(first_pins)
 
+    # Build informative flash message reflecting all active optimization dimensions
     if used_dump_logic or used_yard:
-        parts = []
+        # Core dimensions always active for a smart route
+        core_dims = "stop distance, can-flow, and dump-aware routing"
+        detail_parts = []
         if used_yard:
-            parts.append(f"yard start ({_co.get('yard_city') or 'base'})")
+            detail_parts.append(f"yard start ({_co.get('yard_city') or 'base'})")
         if used_dump_logic:
-            parts.append(f"dump flow for {dump_stop_count} PR/Pull stop{'s' if dump_stop_count != 1 else ''}")
+            detail_parts.append(
+                f"{dump_stop_count} PR/Pull stop{'s' if dump_stop_count != 1 else ''} "
+                f"scored by customer + dump leg"
+            )
         if first_count:
-            parts.append(f"{first_count} stop{'s' if first_count != 1 else ''} pinned first")
+            detail_parts.append(f"{first_count} stop{'s' if first_count != 1 else ''} pinned first")
         if eod_count:
-            parts.append(f"{eod_count} end-of-day stop{'s' if eod_count != 1 else ''} pinned last")
+            detail_parts.append(f"{eod_count} end-of-day stop{'s' if eod_count != 1 else ''} pinned last")
         if skipped:
-            parts.append(f"{skipped} without address appended")
+            detail_parts.append(f"{skipped} without address appended")
+        detail_str = f" ({'; '.join(detail_parts)})" if detail_parts else ""
         flash(
-            "Smart route optimized using " + ", ".join(parts) + ".",
+            f"Smart route optimized using {core_dims}{detail_str}.",
             "success"
         )
     else:
@@ -6570,9 +6599,9 @@ def optimize_route(route_id):
 
     if can_constrained:
         flash(
-            "⚠️ Can-flow constraint: one or more stops had no valid placement "
-            "(e.g. a PR with no empty can available). Those stops were kept in "
-            "their original dispatcher order at the end of the sequence.",
+            "⚠️ Can-flow constraint: one or more stops could not be placed without "
+            "violating truck state (e.g. PR with no empty can loaded). "
+            "Those stops were kept in their original dispatcher order.",
             "warning"
         )
     return redirect(url_for("view_route", route_id=route_id))
