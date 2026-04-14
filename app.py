@@ -600,20 +600,31 @@ def get_pay_period_bounds(company_settings, as_of_date_str=None):
     """
     Return (period_start, period_end) as 'YYYY-MM-DD' strings.
 
-    company_settings: dict with keys pay_period_type, pay_period_end_day.
-    as_of_date_str:   'YYYY-MM-DD'; defaults to today (UTC).
+    Uses the company's configured timezone to determine 'today' so the
+    displayed pay period matches the company's local calendar, not UTC.
 
-    pay_period_end_day is a lowercase weekday name, e.g. 'thursday'.
-    pay_period_type is 'weekly' | 'biweekly'.
+    company_settings: dict with keys pay_period_type, pay_period_end_day, timezone.
+    as_of_date_str:   'YYYY-MM-DD' override; when given, timezone is ignored.
+
+    pay_period_end_day: lowercase weekday name, e.g. 'thursday'.
+    pay_period_type:    'weekly' (7-day) | 'biweekly' (14-day).
+
+    Example — settings: timezone=America/New_York, pay_period_end_day=thursday,
+              pay_period_type=weekly.  On a Monday local date 2026-04-13:
+              end   = 2026-04-09  (most recent Thursday on/before today)
+              start = 2026-04-03  (end - 6 days = Friday)
     """
-    from datetime import date, timedelta
-
     DAYS = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
 
-    as_of = (
-        date.fromisoformat(as_of_date_str)
-        if as_of_date_str else date.today()
-    )
+    if as_of_date_str:
+        as_of = date.fromisoformat(as_of_date_str)
+    else:
+        tz_name = (company_settings.get("timezone") or "America/New_York").strip()
+        try:
+            from zoneinfo import ZoneInfo
+            as_of = datetime.now(ZoneInfo(tz_name)).date()
+        except Exception:
+            as_of = date.today()
 
     ptype  = (company_settings.get("pay_period_type") or "weekly").lower()
     endday = (company_settings.get("pay_period_end_day") or "sunday").lower()
@@ -623,7 +634,7 @@ def get_pay_period_bounds(company_settings, as_of_date_str=None):
     except ValueError:
         target_wd = 6  # default Sunday
 
-    # Find most recent occurrence of target_wd on or before as_of
+    # Most recent occurrence of target_wd on or before as_of
     days_back = (as_of.weekday() - target_wd) % 7
     period_end = as_of - timedelta(days=days_back)
 
@@ -8890,7 +8901,6 @@ def driver_hours_page():
     ).fetchall()
     drivers = [dict(d) for d in drivers]
 
-    # No drivers — show clean empty state, no crash
     if not drivers:
         conn.close()
         body = """
@@ -8906,9 +8916,14 @@ def driver_hours_page():
     if not selected_driver_id:
         selected_driver_id = drivers[0]["id"]
 
+    selected_driver_name = next(
+        (d["username"] for d in drivers if d["id"] == selected_driver_id), ""
+    )
+
+    # get_pay_period_bounds uses company timezone to determine 'today'
     period_start, period_end = get_pay_period_bounds(co_settings)
 
-    # Build list of dates in the pay period
+    # Build ordered list of dates in the pay period
     start_d = date.fromisoformat(period_start)
     end_d   = date.fromisoformat(period_end)
     date_range = []
@@ -8917,7 +8932,7 @@ def driver_hours_page():
         date_range.append(cur_d.isoformat())
         cur_d += timedelta(days=1)
 
-    # Compute hours per day
+    # Main report: per-day hours using configured rule
     day_rows = []
     total_hours = 0.0
     for ds in date_range:
@@ -8926,8 +8941,49 @@ def driver_hours_page():
         if hrs is not None:
             total_hours += hrs
 
+    # Combined clock activity: auto (from completed stops) + manual (driver_clock_entries)
+    activity_rows = []
+    try:
+        for ar in conn.execute(
+            """SELECT date(COALESCE(s.arrived_at, s.completed_at)) AS dy,
+                      MIN(COALESCE(s.arrived_at, s.completed_at))  AS t_start,
+                      MAX(s.completed_at)                          AS t_end
+               FROM stops s
+               JOIN routes r ON s.route_id = r.id
+               WHERE r.assigned_to = ?
+                 AND date(COALESCE(s.arrived_at, s.completed_at)) BETWEEN ? AND ?
+                 AND s.status = 'completed'
+               GROUP BY dy ORDER BY dy DESC""",
+            (selected_driver_id, period_start, period_end)
+        ).fetchall():
+            if ar["dy"] and ar["t_start"]:
+                activity_rows.append({
+                    "day": ar["dy"], "start": ar["t_start"],
+                    "end": ar["t_end"] or "", "source": "auto"
+                })
+    except Exception:
+        pass
+    try:
+        for mr in conn.execute(
+            """SELECT date, clock_in_at, clock_out_at
+               FROM driver_clock_entries
+               WHERE driver_id=? AND date BETWEEN ? AND ?
+               ORDER BY date DESC""",
+            (selected_driver_id, period_start, period_end)
+        ).fetchall():
+            activity_rows.append({
+                "day": mr["date"] or "",
+                "start": mr["clock_in_at"] or "",
+                "end":   mr["clock_out_at"] or "",
+                "source": "manual"
+            })
+    except Exception:
+        pass
+    activity_rows.sort(key=lambda r: r["day"], reverse=True)
+
     conn.close()
 
+    # ── formatting helpers ───────────────────────────────────────────────────
     def _fmt_ts(ts):
         if not ts:
             return '<span class="muted">&#8212;</span>'
@@ -8941,6 +8997,13 @@ def driver_hours_page():
             return '<span class="muted">&#8212;</span>'
         return "%.2f h" % h
 
+    def _day_lbl(ds):
+        try:
+            return date.fromisoformat(ds).strftime("%a %b %d")
+        except Exception:
+            return ds or "—"
+
+    # ── driver selector ──────────────────────────────────────────────────────
     driver_opts = "".join(
         '<option value="%s"%s>%s</option>' % (
             d["id"],
@@ -8950,33 +9013,51 @@ def driver_hours_page():
         for d in drivers
     )
 
+    # ── main report rows ─────────────────────────────────────────────────────
     rows_html = ""
     for ds, st, et, hrs in day_rows:
-        try:
-            _day_label = date.fromisoformat(ds).strftime("%a %b %d")
-        except Exception:
-            _day_label = ds
         rows_html += (
             "<tr>"
-            "<td>%s</td>"
-            "<td>%s</td>"
-            "<td>%s</td>"
+            "<td>%s</td><td>%s</td><td>%s</td>"
             '<td style="text-align:right;font-weight:600;">%s</td>'
-            "</tr>" % (e(_day_label), _fmt_ts(st), _fmt_ts(et), _fmt_h(hrs))
+            "</tr>" % (_day_lbl(ds), _fmt_ts(st), _fmt_ts(et), _fmt_h(hrs))
         )
 
-    ptype = (co_settings.get("pay_period_type") or "weekly").title()
-    payday_raw = co_settings.get("payday") or ""
+    # ── clock activity rows (combined auto + manual) ─────────────────────────
+    _auto_badge   = ('<span style="display:inline-block;padding:1px 8px;border-radius:4px;'
+                     'background:rgba(0,180,255,0.10);color:#3fd2ff;font-size:11px;">Auto</span>')
+    _manual_badge = ('<span style="display:inline-block;padding:1px 8px;border-radius:4px;'
+                     'background:rgba(255,157,0,0.12);color:#fbbf24;font-size:11px;">Manual</span>')
+    activity_html = ""
+    for ar in activity_rows:
+        badge = _manual_badge if ar["source"] == "manual" else _auto_badge
+        activity_html += (
+            "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                _day_lbl(ar["day"]), _fmt_ts(ar["start"]), _fmt_ts(ar["end"]), badge
+            )
+        )
+
+    # ── meta strings ────────────────────────────────────────────────────────
+    ptype       = (co_settings.get("pay_period_type") or "weekly").title()
+    payday_raw  = co_settings.get("payday") or ""
     payday_note = (" &bull; Payday: %s" % e(payday_raw.title())) if payday_raw else ""
     settings_url = url_for("company_settings")
+    start_lbl = ("Manual clock"    if (co_settings.get("driver_day_start_rule") or "") == "manual"
+                 else "First completed stop")
+    end_lbl   = ("Manual clock"    if (co_settings.get("driver_day_end_rule")   or "") == "manual"
+                 else "Last completed stop")
 
-    no_data_row = '<tr><td colspan="4" class="muted">No completed stops in this period.</td></tr>'
+    no_data_row     = ('<tr><td colspan="4" class="muted" style="text-align:center;padding:16px;">'
+                       'No completed stops in this period.</td></tr>')
+    no_activity_row = ('<tr><td colspan="4" class="muted" style="text-align:center;padding:16px;">'
+                       'No clock activity in this period.</td></tr>')
 
     body = """
     <div class="hero">
         <h1>Driver Hours</h1>
         <p>%s pay period: %s &ndash; %s%s</p>
     </div>
+
     <div class="card" style="margin-bottom:16px;">
         <form method="GET" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;">
             <div>
@@ -8985,24 +9066,44 @@ def driver_hours_page():
             </div>
         </form>
     </div>
-    <div class="card">
+
+    <div class="card" style="margin-bottom:16px;">
         <div class="table-wrap">
             <table>
                 <thead>
-                    <tr><th>Date</th><th>Day Start</th><th>Day End</th><th style="text-align:right;">Hours</th></tr>
+                    <tr>
+                        <th>Date</th>
+                        <th>Day Start</th>
+                        <th>Day End</th>
+                        <th style="text-align:right;">Hours</th>
+                    </tr>
                 </thead>
                 <tbody>%s</tbody>
                 <tfoot>
-                    <tr style="border-top:1px solid rgba(255,255,255,0.12);">
+                    <tr style="border-top:1px solid rgba(255,255,255,0.10);">
                         <td colspan="3" style="font-weight:700;">Pay Period Total</td>
                         <td style="text-align:right;font-weight:900;color:#56f0b7;">%.2f h</td>
                     </tr>
                 </tfoot>
             </table>
         </div>
-        <div class="small muted" style="margin-top:12px;">
-            Hours derived from first/last completed stop per day.
-            Configure rules in <a href="%s#work-hours" style="color:#3fd2ff;">Company Settings</a>.
+        <div class="small muted" style="margin-top:10px;">
+            Start: %s &bull; End: %s &bull;
+            <a href="%s#work-hours" style="color:#3fd2ff;">Configure in Company Settings</a>
+        </div>
+    </div>
+
+    <div class="card">
+        <div style="font-size:13px;font-weight:700;color:#3fd2ff;margin-bottom:14px;">
+            Clock Activity &mdash; %s
+        </div>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr><th>Date</th><th>Start</th><th>End</th><th>Source</th></tr>
+                </thead>
+                <tbody>%s</tbody>
+            </table>
         </div>
     </div>
     """ % (
@@ -9010,7 +9111,9 @@ def driver_hours_page():
         driver_opts,
         rows_html if rows_html else no_data_row,
         total_hours,
-        settings_url,
+        e(start_lbl), e(end_lbl), settings_url,
+        e(selected_driver_name),
+        activity_html if activity_html else no_activity_row,
     )
     return render_template_string(shell_page("Driver Hours", body))
 
@@ -9023,21 +9126,27 @@ def driver_hours_page():
 def driver_clock():
     conn = get_db()
     company = conn.execute("SELECT * FROM companies WHERE id=?", (cid(),)).fetchone()
-    co_settings = dict(company) if company else {}
+    co_settings = {k: company[k] for k in company.keys()} if company else {}
 
     start_rule = (co_settings.get("driver_day_start_rule") or "first_action").lower()
     end_rule   = (co_settings.get("driver_day_end_rule")   or "last_action").lower()
 
-    # Only show this page if at least one rule is manual
     if start_rule != "manual" and end_rule != "manual":
         conn.close()
         flash("Manual clock-in is not enabled for your company.", "error")
         return redirect(url_for("driver_dashboard"))
 
-    from datetime import date
-    today = date.today().isoformat()
-    driver_id = session["user_id"]
+    # Use company-local date so the entry matches the pay period
+    tz_name = (co_settings.get("timezone") or "America/New_York").strip()
+    try:
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo(tz_name)).strftime("%Y-%m-%d")
+        day_label = datetime.now(ZoneInfo(tz_name)).strftime("%A, %B %d, %Y")
+    except Exception:
+        today = date.today().isoformat()
+        day_label = date.today().strftime("%A, %B %d, %Y")
 
+    driver_id = session["user_id"]
     entry = conn.execute(
         "SELECT * FROM driver_clock_entries WHERE driver_id=? AND date=?",
         (driver_id, today)
@@ -9056,7 +9165,8 @@ def driver_clock():
                 )
             else:
                 conn.execute(
-                    "INSERT INTO driver_clock_entries (company_id, driver_id, date, clock_in_at, created_at) VALUES (?,?,?,?,?)",
+                    "INSERT INTO driver_clock_entries "
+                    "(company_id, driver_id, date, clock_in_at, created_at) VALUES (?,?,?,?,?)",
                     (cid(), driver_id, today, ts, ts)
                 )
             conn.commit()
@@ -9071,7 +9181,8 @@ def driver_clock():
                 )
             else:
                 conn.execute(
-                    "INSERT INTO driver_clock_entries (company_id, driver_id, date, clock_out_at, created_at) VALUES (?,?,?,?,?)",
+                    "INSERT INTO driver_clock_entries "
+                    "(company_id, driver_id, date, clock_out_at, created_at) VALUES (?,?,?,?,?)",
                     (cid(), driver_id, today, ts, ts)
                 )
             conn.commit()
@@ -9081,58 +9192,130 @@ def driver_clock():
 
     conn.close()
 
-    _entry = dict(entry) if entry else {}
-    _ci    = _entry.get("clock_in_at") or ""
-    _co    = _entry.get("clock_out_at") or ""
+    _entry = {k: entry[k] for k in entry.keys()} if entry else {}
+    _ci = _entry.get("clock_in_at") or ""
+    _co = _entry.get("clock_out_at") or ""
 
     def _fmt(ts):
-        return ts[11:16] if ts and len(ts) >= 16 else "—"
+        return str(ts)[11:16] if ts and len(str(ts)) >= 16 else ""
 
     clocked_in  = bool(_ci)
     clocked_out = bool(_co)
 
-    status_line = ""
+    # Status badge
     if clocked_in and not clocked_out:
-        status_line = f'<div style="color:#56f0b7;font-weight:700;margin-bottom:8px;">&#9899; Clocked in at {_fmt(_ci)}</div>'
+        badge_bg    = "rgba(0,232,125,0.14)"
+        badge_color = "#56f0b7"
+        badge_text  = "&#9899;&nbsp;Clocked In"
     elif clocked_in and clocked_out:
-        status_line = f'<div style="color:#9dc8f0;margin-bottom:8px;">&#10003; Day complete: {_fmt(_ci)} &ndash; {_fmt(_co)}</div>'
+        badge_bg    = "rgba(0,180,255,0.10)"
+        badge_color = "#3fd2ff"
+        badge_text  = "&#10003;&nbsp;Day Complete"
     else:
-        status_line = '<div class="muted small" style="margin-bottom:8px;">No clock entry for today yet.</div>'
+        badge_bg    = "rgba(100,120,150,0.08)"
+        badge_color = "#7a9ab8"
+        badge_text  = "Not Started"
 
+    ci_display = _fmt(_ci) or "&mdash;"
+    co_display = _fmt(_co) or "&mdash;"
+    ci_color   = "#56f0b7" if _ci else "#3d5a74"
+    co_color   = "#fbbf24" if _co else "#3d5a74"
+
+    # Clock In button
     in_btn = ""
-    out_btn = ""
     if start_rule == "manual":
-        _in_style = "btn-driver btn-driver-complete" if not clocked_in else "btn-driver"
-        in_btn = f"""
-        <form method="POST" style="margin-bottom:8px;">
-            <input type="hidden" name="_csrf_token" value="{csrf_tok}">
-            <input type="hidden" name="clock_action" value="clock_in">
-            <button class="{_in_style}" type="submit" style="width:100%;">
-                {'&#9201; Update Clock-In' if clocked_in else '&#9654; Clock In'}
-            </button>
-        </form>"""
-    if end_rule == "manual":
-        _out_style = "btn-driver btn-driver-dump" if clocked_in and not clocked_out else "btn-driver"
-        out_btn = f"""
-        <form method="POST">
-            <input type="hidden" name="_csrf_token" value="{csrf_tok}">
-            <input type="hidden" name="clock_action" value="clock_out">
-            <button class="{_out_style}" type="submit" style="width:100%;">
-                &#9632; Clock Out
-            </button>
-        </form>"""
+        if not clocked_in:
+            in_btn = (
+                '<form method="POST" style="margin-bottom:10px;">'
+                '<input type="hidden" name="_csrf_token" value="' + csrf_tok + '">'
+                '<input type="hidden" name="clock_action" value="clock_in">'
+                '<button type="submit" style="'
+                'width:100%;padding:18px;font-size:17px;font-weight:800;'
+                'border-radius:12px;border:none;cursor:pointer;'
+                'background:linear-gradient(135deg,#00c853,#00e57a);'
+                'color:#001a0a;letter-spacing:.04em;'
+                'box-shadow:0 4px 20px rgba(0,232,125,0.28);">'
+                '&#9654;&nbsp;Clock In'
+                '</button></form>'
+            )
+        else:
+            in_btn = (
+                '<form method="POST" style="margin-bottom:10px;">'
+                '<input type="hidden" name="_csrf_token" value="' + csrf_tok + '">'
+                '<input type="hidden" name="clock_action" value="clock_in">'
+                '<button type="submit" style="'
+                'width:100%;padding:13px;font-size:14px;font-weight:600;'
+                'border-radius:12px;border:1px solid rgba(0,200,255,0.20);cursor:pointer;'
+                'background:rgba(0,200,255,0.06);color:#3fd2ff;">'
+                '&#9201;&nbsp;Update Clock-In Time'
+                '</button></form>'
+            )
 
-    body = f"""
-    <div class="hero">
-        <h1>&#9201; Clock In / Out</h1>
-        <p>{e(today)}</p>
-    </div>
-    <div class="card" style="max-width:400px;">
-        {status_line}
-        {in_btn}
-        {out_btn}
-    </div>
-    """
+    # Clock Out button
+    out_btn = ""
+    if end_rule == "manual":
+        if clocked_in and not clocked_out:
+            out_btn = (
+                '<form method="POST">'
+                '<input type="hidden" name="_csrf_token" value="' + csrf_tok + '">'
+                '<input type="hidden" name="clock_action" value="clock_out">'
+                '<button type="submit" style="'
+                'width:100%;padding:18px;font-size:17px;font-weight:800;'
+                'border-radius:12px;border:none;cursor:pointer;'
+                'background:linear-gradient(135deg,#ff6d00,#ff3b5c);'
+                'color:#fff;letter-spacing:.04em;'
+                'box-shadow:0 4px 20px rgba(255,60,60,0.28);">'
+                '&#9632;&nbsp;Clock Out'
+                '</button></form>'
+            )
+        else:
+            out_btn = (
+                '<form method="POST">'
+                '<input type="hidden" name="_csrf_token" value="' + csrf_tok + '">'
+                '<input type="hidden" name="clock_action" value="clock_out">'
+                '<button type="submit" style="'
+                'width:100%;padding:13px;font-size:14px;font-weight:600;'
+                'border-radius:12px;border:1px solid rgba(255,100,0,0.20);cursor:pointer;'
+                'background:rgba(255,100,0,0.06);color:#fbbf24;">'
+                '&#9632;&nbsp;Clock Out'
+                '</button></form>'
+            )
+
+    body = (
+        '<div class="hero">'
+        '<h1>&#9201; Clock In / Out</h1>'
+        '<p>' + e(day_label) + '</p>'
+        '</div>'
+
+        # Status card
+        '<div class="card" style="max-width:460px;margin:0 auto 16px;">'
+        '<div style="font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;'
+        'color:var(--text-soft);margin-bottom:14px;">Today&rsquo;s Status</div>'
+        '<div style="display:inline-block;padding:8px 22px;border-radius:100px;margin-bottom:18px;'
+        'background:' + badge_bg + ';color:' + badge_color + ';font-weight:700;font-size:15px;">'
+        + badge_text +
+        '</div>'
+        '<div style="display:flex;border:1px solid rgba(0,160,255,0.12);border-radius:10px;overflow:hidden;">'
+        '<div style="flex:1;padding:14px 18px;border-right:1px solid rgba(0,160,255,0.12);">'
+        '<div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;'
+        'color:var(--text-soft);margin-bottom:6px;">Clock In</div>'
+        '<div style="font-size:24px;font-weight:800;color:' + ci_color + ';">' + ci_display + '</div>'
+        '</div>'
+        '<div style="flex:1;padding:14px 18px;">'
+        '<div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;'
+        'color:var(--text-soft);margin-bottom:6px;">Clock Out</div>'
+        '<div style="font-size:24px;font-weight:800;color:' + co_color + ';">' + co_display + '</div>'
+        '</div>'
+        '</div>'
+        '</div>'
+
+        # Action buttons card
+        '<div class="card" style="max-width:460px;margin:0 auto;">'
+        + in_btn + out_btn +
+        ('' if (in_btn or out_btn) else
+         '<p class="muted small">No clock actions available for your company&rsquo;s current configuration.</p>')
+        + '</div>'
+    )
     return render_template_string(shell_page("Clock In / Out", body))
 
 
