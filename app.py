@@ -9001,17 +9001,18 @@ def driver_hours_page():
         pass
     try:
         for mr in conn.execute(
-            """SELECT date, clock_in_at, clock_out_at
+            """SELECT id, date, clock_in_at, clock_out_at
                FROM driver_clock_entries
                WHERE driver_id=? AND date BETWEEN ? AND ?
                ORDER BY date DESC""",
             (selected_driver_id, period_start, period_end)
         ).fetchall():
             activity_rows.append({
-                "day": mr["date"] or "",
-                "start": mr["clock_in_at"] or "",
-                "end":   mr["clock_out_at"] or "",
-                "source": "manual"
+                "day":      mr["date"] or "",
+                "start":    mr["clock_in_at"] or "",
+                "end":      mr["clock_out_at"] or "",
+                "source":   "manual",
+                "entry_id": mr["id"],
             })
     except Exception:
         pass
@@ -9062,12 +9063,32 @@ def driver_hours_page():
                      'background:rgba(0,180,255,0.10);color:#3fd2ff;font-size:11px;">Auto</span>')
     _manual_badge = ('<span style="display:inline-block;padding:1px 8px;border-radius:4px;'
                      'background:rgba(255,157,0,0.12);color:#fbbf24;font-size:11px;">Manual</span>')
+    _csrf_tok = get_csrf_token()
+    _del_btn_style = ('padding:4px 12px;font-size:12px;font-weight:600;border-radius:6px;'
+                      'border:1px solid rgba(255,59,92,0.30);cursor:pointer;'
+                      'background:rgba(255,59,92,0.10);color:#ff3b5c;')
     activity_html = ""
     for ar in activity_rows:
         badge = _manual_badge if ar["source"] == "manual" else _auto_badge
+        if ar["source"] == "manual" and ar.get("entry_id"):
+            _eid = str(ar["entry_id"])
+            _did = str(selected_driver_id)
+            delete_cell = (
+                '<form method="POST" action="/boss/delete-clock-entry" style="margin:0;">'
+                '<input type="hidden" name="_csrf_token" value="' + _csrf_tok + '">'
+                '<input type="hidden" name="entry_id" value="' + _eid + '">'
+                '<input type="hidden" name="driver_id" value="' + _did + '">'
+                '<button type="submit" style="' + _del_btn_style + '" '
+                'onclick="return confirm(\'Delete this clock entry? This cannot be undone.\');">'
+                '&#215; Delete</button>'
+                '</form>'
+            )
+        else:
+            delete_cell = ""
         activity_html += (
-            "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-                _day_lbl(ar["day"]), _fmt_ts(ar["start"]), _fmt_ts(ar["end"]), badge
+            "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                _day_lbl(ar["day"]), _fmt_ts(ar["start"]), _fmt_ts(ar["end"]),
+                badge, delete_cell
             )
         )
 
@@ -9083,7 +9104,7 @@ def driver_hours_page():
 
     no_data_row     = ('<tr><td colspan="4" class="muted" style="text-align:center;padding:16px;">'
                        'No completed stops in this period.</td></tr>')
-    no_activity_row = ('<tr><td colspan="4" class="muted" style="text-align:center;padding:16px;">'
+    no_activity_row = ('<tr><td colspan="5" class="muted" style="text-align:center;padding:16px;">'
                        'No clock activity in this period.</td></tr>')
 
     body = """
@@ -9134,7 +9155,7 @@ def driver_hours_page():
         <div class="table-wrap">
             <table>
                 <thead>
-                    <tr><th>Date</th><th>Start</th><th>End</th><th>Source</th></tr>
+                    <tr><th>Date</th><th>Start</th><th>End</th><th>Source</th><th></th></tr>
                 </thead>
                 <tbody>%s</tbody>
             </table>
@@ -9150,6 +9171,42 @@ def driver_hours_page():
         activity_html if activity_html else no_activity_row,
     )
     return render_template_string(shell_page("Driver Hours", body))
+
+
+# =========================================================
+# PHASE 5B — DELETE CLOCK ENTRY  (/boss/delete-clock-entry)
+# =========================================================
+@app.route("/boss/delete-clock-entry", methods=["POST"])
+@boss_required
+def delete_clock_entry():
+    entry_id  = request.form.get("entry_id",  "").strip()
+    driver_id = request.form.get("driver_id", "").strip()
+
+    if not entry_id or not entry_id.isdigit():
+        flash("Invalid entry.", "error")
+        return redirect(url_for("driver_hours_page"))
+
+    conn = get_db()
+    # Verify the entry belongs to this company before deleting
+    row = conn.execute(
+        "SELECT id FROM driver_clock_entries WHERE id=? AND company_id=?",
+        (int(entry_id), cid())
+    ).fetchone()
+
+    if not row:
+        conn.close()
+        flash("Entry not found.", "error")
+        return redirect(url_for("driver_hours_page"))
+
+    conn.execute("DELETE FROM driver_clock_entries WHERE id=?", (int(entry_id),))
+    conn.commit()
+    conn.close()
+    flash("Clock entry deleted.", "success")
+
+    redir_url = url_for("driver_hours_page")
+    if driver_id and driver_id.isdigit():
+        redir_url += "?driver_id=" + driver_id
+    return redirect(redir_url)
 
 
 # =========================================================
@@ -9170,14 +9227,14 @@ def driver_clock():
         flash("Manual clock-in is not enabled for your company.", "error")
         return redirect(url_for("driver_dashboard"))
 
-    # Use company-local date so the entry matches the pay period
+    # Use company-local date so the entry lands in the correct pay period
     tz_name = (co_settings.get("timezone") or "America/New_York").strip()
     try:
         from zoneinfo import ZoneInfo
-        today = datetime.now(ZoneInfo(tz_name)).strftime("%Y-%m-%d")
+        today     = datetime.now(ZoneInfo(tz_name)).strftime("%Y-%m-%d")
         day_label = datetime.now(ZoneInfo(tz_name)).strftime("%A, %B %d, %Y")
     except Exception:
-        today = date.today().isoformat()
+        today     = date.today().isoformat()
         day_label = date.today().strftime("%A, %B %d, %Y")
 
     driver_id = session["user_id"]
@@ -9188,167 +9245,312 @@ def driver_clock():
 
     csrf_tok = get_csrf_token()
 
+    # ── POST: all clock actions ──────────────────────────────────────────────
     if request.method == "POST":
         action = request.form.get("clock_action", "").strip()
-        ts = now_ts()
-        if action == "clock_in":
+        ts  = now_ts()
+        _e  = {k: entry[k] for k in entry.keys()} if entry else {}
+
+        def _note(base, msg):
+            """Append a timestamped audit line to the notes field."""
+            return (((base or "") + "\n[%s] %s" % (ts, msg)).strip())
+
+        def _upsert_ci(new_ci, notes):
             if entry:
                 conn.execute(
-                    "UPDATE driver_clock_entries SET clock_in_at=? WHERE driver_id=? AND date=?",
-                    (ts, driver_id, today)
+                    "UPDATE driver_clock_entries SET clock_in_at=?, notes=? "
+                    "WHERE driver_id=? AND date=?",
+                    (new_ci, notes, driver_id, today)
                 )
             else:
                 conn.execute(
                     "INSERT INTO driver_clock_entries "
-                    "(company_id, driver_id, date, clock_in_at, created_at) VALUES (?,?,?,?,?)",
-                    (cid(), driver_id, today, ts, ts)
+                    "(company_id, driver_id, date, clock_in_at, notes, created_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (cid(), driver_id, today, new_ci, notes, ts)
                 )
-            conn.commit()
-            conn.close()
+
+        def _upsert_co(new_co, notes):
+            if entry:
+                conn.execute(
+                    "UPDATE driver_clock_entries SET clock_out_at=?, notes=? "
+                    "WHERE driver_id=? AND date=?",
+                    (new_co, notes, driver_id, today)
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO driver_clock_entries "
+                    "(company_id, driver_id, date, clock_out_at, notes, created_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (cid(), driver_id, today, new_co, notes, ts)
+                )
+
+        # ── clock_in ────────────────────────────────────────────────────────
+        if action == "clock_in" and start_rule == "manual":
+            _upsert_ci(ts, _note(_e.get("notes"), "clock_in"))
+            conn.commit(); conn.close()
             flash("Clocked in.", "success")
             return redirect(url_for("driver_clock"))
-        elif action == "clock_out":
-            if entry:
-                conn.execute(
-                    "UPDATE driver_clock_entries SET clock_out_at=? WHERE driver_id=? AND date=?",
-                    (ts, driver_id, today)
-                )
-            else:
-                conn.execute(
-                    "INSERT INTO driver_clock_entries "
-                    "(company_id, driver_id, date, clock_out_at, created_at) VALUES (?,?,?,?,?)",
-                    (cid(), driver_id, today, ts, ts)
-                )
-            conn.commit()
-            conn.close()
+
+        # ── clock_out ───────────────────────────────────────────────────────
+        elif action == "clock_out" and end_rule == "manual":
+            _upsert_co(ts, _note(_e.get("notes"), "clock_out"))
+            conn.commit(); conn.close()
             flash("Clocked out.", "success")
             return redirect(url_for("driver_clock"))
 
+        # ── edit_clock_in ───────────────────────────────────────────────────
+        elif action == "edit_clock_in" and start_rule == "manual":
+            raw = request.form.get("new_time", "").strip()
+            if not raw or ":" not in raw:
+                conn.close(); flash("Invalid time.", "error")
+                return redirect(url_for("driver_clock"))
+            new_ts = "%s %s:00" % (today, raw)
+            old    = _e.get("clock_in_at") or "none"
+            _upsert_ci(new_ts, _note(_e.get("notes"),
+                       "edit_clock_in: %s -> %s" % (old, new_ts)))
+            conn.commit(); conn.close()
+            flash("Clock-in time updated.", "success")
+            return redirect(url_for("driver_clock"))
+
+        # ── edit_clock_out ──────────────────────────────────────────────────
+        elif action == "edit_clock_out" and end_rule == "manual":
+            raw = request.form.get("new_time", "").strip()
+            if not raw or ":" not in raw:
+                conn.close(); flash("Invalid time.", "error")
+                return redirect(url_for("driver_clock"))
+            new_ts = "%s %s:00" % (today, raw)
+            old    = _e.get("clock_out_at") or "none"
+            _upsert_co(new_ts, _note(_e.get("notes"),
+                       "edit_clock_out: %s -> %s" % (old, new_ts)))
+            conn.commit(); conn.close()
+            flash("Clock-out time updated.", "success")
+            return redirect(url_for("driver_clock"))
+
+        # ── undo_clock_in ───────────────────────────────────────────────────
+        elif action == "undo_clock_in" and start_rule == "manual":
+            if entry and not _e.get("clock_out_at"):
+                old       = _e.get("clock_in_at") or "none"
+                new_notes = _note(_e.get("notes"), "undo_clock_in: cleared %s" % old)
+                conn.execute(
+                    "UPDATE driver_clock_entries SET clock_in_at=NULL, notes=? "
+                    "WHERE driver_id=? AND date=?",
+                    (new_notes, driver_id, today)
+                )
+                conn.commit()
+                flash("Clock-in removed.", "success")
+            else:
+                flash("Cannot undo: clock-out already recorded.", "error")
+            conn.close()
+            return redirect(url_for("driver_clock"))
+
+        # ── reopen_day ──────────────────────────────────────────────────────
+        elif action == "reopen_day" and end_rule == "manual":
+            if entry and _e.get("clock_out_at"):
+                old       = _e.get("clock_out_at") or "none"
+                new_notes = _note(_e.get("notes"),
+                                  "reopen_day: cleared clock_out %s" % old)
+                conn.execute(
+                    "UPDATE driver_clock_entries SET clock_out_at=NULL, notes=? "
+                    "WHERE driver_id=? AND date=?",
+                    (new_notes, driver_id, today)
+                )
+                conn.commit()
+                flash("Day reopened. Clock-out cleared.", "success")
+            conn.close()
+            return redirect(url_for("driver_clock"))
+
+        conn.close()
+        return redirect(url_for("driver_clock"))
+
+    # ── GET: render page ─────────────────────────────────────────────────────
     conn.close()
 
     _entry = {k: entry[k] for k in entry.keys()} if entry else {}
-    _ci = _entry.get("clock_in_at") or ""
-    _co = _entry.get("clock_out_at") or ""
+    _ci    = _entry.get("clock_in_at")  or ""
+    _co    = _entry.get("clock_out_at") or ""
 
     def _fmt(ts):
         return _fmt_12h(ts) if ts else ""
 
-    clocked_in  = bool(_ci)
-    clocked_out = bool(_co)
+    has_ci = bool(_ci)
+    has_co = bool(_co)
+
+    can_edit_start = (start_rule == "manual")
+    can_edit_end   = (end_rule   == "manual")
+
+    # 24-hour HH:MM values for <input type="time"> pre-fill
+    _ci_hhmm = str(_ci)[11:16] if _ci and len(str(_ci)) >= 16 else ""
+    _co_hhmm = str(_co)[11:16] if _co and len(str(_co)) >= 16 else ""
 
     # Status badge
-    if clocked_in and not clocked_out:
-        badge_bg    = "rgba(0,232,125,0.14)"
-        badge_color = "#56f0b7"
-        badge_text  = "&#9899;&nbsp;Clocked In"
-    elif clocked_in and clocked_out:
-        badge_bg    = "rgba(0,180,255,0.10)"
-        badge_color = "#3fd2ff"
-        badge_text  = "&#10003;&nbsp;Day Complete"
+    if has_ci and not has_co:
+        badge_bg = "rgba(0,232,125,0.14)"; badge_color = "#56f0b7"
+        badge_text = "&#9899;&nbsp;Clocked In"
+    elif has_co:
+        badge_bg = "rgba(0,180,255,0.10)"; badge_color = "#3fd2ff"
+        badge_text = "&#10003;&nbsp;Day Complete"
     else:
-        badge_bg    = "rgba(100,120,150,0.08)"
-        badge_color = "#7a9ab8"
-        badge_text  = "Not Started"
+        badge_bg = "rgba(100,120,150,0.08)"; badge_color = "#7a9ab8"
+        badge_text = "Not Clocked In"
 
     ci_display = _fmt(_ci) or "&mdash;"
     co_display = _fmt(_co) or "&mdash;"
-    ci_color   = "#56f0b7" if _ci else "#3d5a74"
-    co_color   = "#fbbf24" if _co else "#3d5a74"
+    ci_color   = "#56f0b7" if has_ci else "#3d5a74"
+    co_color   = "#fbbf24" if has_co else "#3d5a74"
 
-    # Clock In button
-    in_btn = ""
-    if start_rule == "manual":
-        if not clocked_in:
-            in_btn = (
-                '<form method="POST" style="margin-bottom:10px;">'
-                '<input type="hidden" name="_csrf_token" value="' + csrf_tok + '">'
-                '<input type="hidden" name="clock_action" value="clock_in">'
-                '<button type="submit" style="'
-                'width:100%;padding:18px;font-size:17px;font-weight:800;'
+    # ── style constants ──────────────────────────────────────────────────────
+    S_GREEN  = ('width:100%;padding:18px;font-size:17px;font-weight:800;'
                 'border-radius:12px;border:none;cursor:pointer;'
                 'background:linear-gradient(135deg,#00c853,#00e57a);'
                 'color:#001a0a;letter-spacing:.04em;'
-                'box-shadow:0 4px 20px rgba(0,232,125,0.28);">'
-                '&#9654;&nbsp;Clock In'
-                '</button></form>'
-            )
-        else:
-            in_btn = (
-                '<form method="POST" style="margin-bottom:10px;">'
-                '<input type="hidden" name="_csrf_token" value="' + csrf_tok + '">'
-                '<input type="hidden" name="clock_action" value="clock_in">'
-                '<button type="submit" style="'
-                'width:100%;padding:13px;font-size:14px;font-weight:600;'
-                'border-radius:12px;border:1px solid rgba(0,200,255,0.20);cursor:pointer;'
-                'background:rgba(0,200,255,0.06);color:#3fd2ff;">'
-                '&#9201;&nbsp;Update Clock-In Time'
-                '</button></form>'
-            )
-
-    # Clock Out button
-    out_btn = ""
-    if end_rule == "manual":
-        if clocked_in and not clocked_out:
-            out_btn = (
-                '<form method="POST">'
-                '<input type="hidden" name="_csrf_token" value="' + csrf_tok + '">'
-                '<input type="hidden" name="clock_action" value="clock_out">'
-                '<button type="submit" style="'
-                'width:100%;padding:18px;font-size:17px;font-weight:800;'
+                'box-shadow:0 4px 20px rgba(0,232,125,0.28);')
+    S_RED    = ('width:100%;padding:18px;font-size:17px;font-weight:800;'
                 'border-radius:12px;border:none;cursor:pointer;'
                 'background:linear-gradient(135deg,#ff6d00,#ff3b5c);'
                 'color:#fff;letter-spacing:.04em;'
-                'box-shadow:0 4px 20px rgba(255,60,60,0.28);">'
-                '&#9632;&nbsp;Clock Out'
-                '</button></form>'
-            )
-        else:
-            out_btn = (
-                '<form method="POST">'
-                '<input type="hidden" name="_csrf_token" value="' + csrf_tok + '">'
-                '<input type="hidden" name="clock_action" value="clock_out">'
-                '<button type="submit" style="'
-                'width:100%;padding:13px;font-size:14px;font-weight:600;'
-                'border-radius:12px;border:1px solid rgba(255,100,0,0.20);cursor:pointer;'
-                'background:rgba(255,100,0,0.06);color:#fbbf24;">'
-                '&#9632;&nbsp;Clock Out'
-                '</button></form>'
-            )
+                'box-shadow:0 4px 20px rgba(255,60,60,0.28);')
+    S_UNDO   = ('width:100%;padding:13px;font-size:14px;font-weight:600;'
+                'border-radius:10px;border:1px solid rgba(255,59,92,0.22);'
+                'cursor:pointer;background:rgba(255,59,92,0.08);color:#ff3b5c;')
+    S_REOPEN = ('width:100%;padding:13px;font-size:14px;font-weight:600;'
+                'border-radius:10px;border:1px solid rgba(255,157,0,0.22);'
+                'cursor:pointer;background:rgba(255,157,0,0.08);color:#ff9d00;')
+    S_UPD    = ('padding:10px 16px;border-radius:8px;font-weight:600;font-size:13px;'
+                'background:rgba(0,200,255,0.10);color:#3fd2ff;'
+                'border:1px solid rgba(0,200,255,0.20);cursor:pointer;white-space:nowrap;')
+    S_TIME   = ('flex:1;padding:10px 12px;background:rgba(255,255,255,0.05);'
+                'border:1px solid rgba(0,160,255,0.20);border-radius:8px;'
+                'color:#e8f2ff;font-size:15px;font-weight:600;')
+    DIVIDER  = '<div style="height:1px;background:rgba(0,160,255,0.10);margin:12px 0;"></div>'
+    LBL      = ('<div style="font-size:11px;color:var(--text-soft);'
+                'text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;">')
 
+    # ── form helpers ─────────────────────────────────────────────────────────
+    def _hid(action_val):
+        return (
+            '<input type="hidden" name="_csrf_token" value="' + csrf_tok + '">'
+            '<input type="hidden" name="clock_action" value="' + action_val + '">'
+        )
+
+    def _btn_form(action_val, btn_html, mb="12px"):
+        return (
+            '<form method="POST" style="margin-bottom:' + mb + ';">'
+            + _hid(action_val) + btn_html + '</form>'
+        )
+
+    def _edit_form(action_val, lbl_text, hhmm_val):
+        return (
+            '<div style="margin-bottom:12px;">'
+            + LBL + lbl_text + '</div>'
+            '<form method="POST" style="display:flex;gap:8px;">'
+            + _hid(action_val)
+            + '<input type="time" name="new_time" value="' + hhmm_val + '" style="' + S_TIME + '">'
+            + '<button type="submit" style="' + S_UPD + '">Update</button>'
+            + '</form></div>'
+        )
+
+    # ── build action buttons by state ────────────────────────────────────────
+    parts = []
+
+    if not has_ci and not has_co:
+        # ── State 1: Nothing recorded yet ───────────────────────────────────
+        if can_edit_start:
+            parts.append(_btn_form(
+                "clock_in",
+                '<button type="submit" style="' + S_GREEN + '">&#9654;&nbsp;Clock In</button>',
+                mb="0"
+            ))
+        elif can_edit_end:
+            # Auto start / manual end only — driver records end time
+            parts.append(_btn_form(
+                "clock_out",
+                '<button type="submit" style="' + S_GREEN + '">&#9632;&nbsp;Clock Out</button>',
+                mb="0"
+            ))
+
+    elif has_ci and not has_co:
+        # ── State 2: Clocked In, waiting for clock-out ───────────────────────
+        if can_edit_end:
+            parts.append(_btn_form(
+                "clock_out",
+                '<button type="submit" style="' + S_RED + '">&#9632;&nbsp;Clock Out</button>'
+            ))
+        if can_edit_start:
+            parts.append(DIVIDER)
+            parts.append(_edit_form("edit_clock_in", "Edit Clock-In Time", _ci_hhmm))
+            parts.append(_btn_form(
+                "undo_clock_in",
+                '<button type="submit" style="' + S_UNDO + '" '
+                'onclick="return confirm(\'Remove clock-in for today?\');">'
+                '&#215;&nbsp;Undo Clock In</button>',
+                mb="0"
+            ))
+
+    elif has_ci and has_co:
+        # ── State 3: Day Complete ────────────────────────────────────────────
+        if can_edit_start:
+            parts.append(_edit_form("edit_clock_in",  "Edit Clock-In Time",  _ci_hhmm))
+        if can_edit_end:
+            parts.append(_edit_form("edit_clock_out", "Edit Clock-Out Time", _co_hhmm))
+        parts.append(DIVIDER)
+        if can_edit_end:
+            parts.append(_btn_form(
+                "reopen_day",
+                '<button type="submit" style="' + S_REOPEN + '" '
+                'onclick="return confirm(\'Clear clock-out and reopen today?\');">'
+                '&#8635;&nbsp;Reopen Day</button>',
+                mb="0"
+            ))
+
+    else:
+        # ── State 4: Auto-start, manual end recorded (clock_out only) ────────
+        if can_edit_end:
+            parts.append(_edit_form("edit_clock_out", "Edit Clock-Out Time", _co_hhmm))
+            parts.append(DIVIDER)
+            parts.append(_btn_form(
+                "reopen_day",
+                '<button type="submit" style="' + S_REOPEN + '" '
+                'onclick="return confirm(\'Clear clock-out and reopen today?\');">'
+                '&#8635;&nbsp;Reopen Day</button>',
+                mb="0"
+            ))
+
+    actions_html = "".join(parts) if parts else (
+        '<p class="muted small">No clock actions are available '
+        'for your company&rsquo;s current configuration.</p>'
+    )
+
+    # ── assemble page ────────────────────────────────────────────────────────
     body = (
         '<div class="hero">'
         '<h1>&#9201; Clock In / Out</h1>'
         '<p>' + e(day_label) + '</p>'
         '</div>'
 
-        # Status card
         '<div class="card" style="max-width:460px;margin:0 auto 16px;">'
         '<div style="font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;'
         'color:var(--text-soft);margin-bottom:14px;">Today&rsquo;s Status</div>'
         '<div style="display:inline-block;padding:8px 22px;border-radius:100px;margin-bottom:18px;'
         'background:' + badge_bg + ';color:' + badge_color + ';font-weight:700;font-size:15px;">'
-        + badge_text +
-        '</div>'
-        '<div style="display:flex;border:1px solid rgba(0,160,255,0.12);border-radius:10px;overflow:hidden;">'
+        + badge_text + '</div>'
+        '<div style="display:flex;border:1px solid rgba(0,160,255,0.12);'
+        'border-radius:10px;overflow:hidden;">'
         '<div style="flex:1;padding:14px 18px;border-right:1px solid rgba(0,160,255,0.12);">'
         '<div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;'
         'color:var(--text-soft);margin-bottom:6px;">Clock In</div>'
-        '<div style="font-size:24px;font-weight:800;color:' + ci_color + ';">' + ci_display + '</div>'
-        '</div>'
+        '<div style="font-size:24px;font-weight:800;color:' + ci_color + ';">'
+        + ci_display + '</div></div>'
         '<div style="flex:1;padding:14px 18px;">'
         '<div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;'
         'color:var(--text-soft);margin-bottom:6px;">Clock Out</div>'
-        '<div style="font-size:24px;font-weight:800;color:' + co_color + ';">' + co_display + '</div>'
-        '</div>'
-        '</div>'
-        '</div>'
+        '<div style="font-size:24px;font-weight:800;color:' + co_color + ';">'
+        + co_display + '</div></div>'
+        '</div></div>'
 
-        # Action buttons card
         '<div class="card" style="max-width:460px;margin:0 auto;">'
-        + in_btn + out_btn +
-        ('' if (in_btn or out_btn) else
-         '<p class="muted small">No clock actions available for your company&rsquo;s current configuration.</p>')
-        + '</div>'
+        + actions_html +
+        '</div>'
     )
     return render_template_string(shell_page("Clock In / Out", body))
 
