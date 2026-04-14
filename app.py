@@ -120,6 +120,37 @@ def today_str():
     return date.today().strftime("%Y-%m-%d")
 
 
+def _fmt_12h(ts):
+    """
+    Convert a stored timestamp (YYYY-MM-DD HH:MM:SS) or bare HH:MM string
+    to 12-hour AM/PM format with no leading zero on the hour.
+
+    Examples:
+        "2026-04-10 00:05:00"  →  "12:05 AM"
+        "2026-04-10 11:20:00"  →  "11:20 AM"
+        "2026-04-10 13:05:00"  →  "1:05 PM"
+        "2026-04-10 23:36:00"  →  "11:36 PM"
+        "12:00"                →  "12:00 PM"
+    Returns "" on any failure so callers can substitute a dash.
+    """
+    if not ts:
+        return ""
+    try:
+        hhmm = str(ts)[11:16]   # slice "HH:MM" from full timestamp
+        if ":" not in hhmm:     # already bare "HH:MM" with no date prefix
+            hhmm = str(ts)[:5]
+        h_str, m_str = hhmm.split(":")
+        h = int(h_str)
+        meridian = "AM" if h < 12 else "PM"
+        if h == 0:
+            h = 12
+        elif h > 12:
+            h -= 12
+        return "%d:%s %s" % (h, m_str, meridian)
+    except Exception:
+        return ""
+
+
 def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
@@ -634,9 +665,14 @@ def get_pay_period_bounds(company_settings, as_of_date_str=None):
     except ValueError:
         target_wd = 6  # default Sunday
 
-    # Most recent occurrence of target_wd on or before as_of
-    days_back = (as_of.weekday() - target_wd) % 7
-    period_end = as_of - timedelta(days=days_back)
+    # Find the end of the CURRENT pay period:
+    # advance forward to the next occurrence of target_wd (0 days if today IS target_wd).
+    # This gives the period that contains today, not the one that just ended.
+    # Example: pay_period_end_day=thursday, today=Monday 2026-04-13
+    #   days_forward = (3 - 0) % 7 = 3  →  period_end = 2026-04-16 (Thu)
+    #   period_start = 2026-04-16 - 6   = 2026-04-10 (Fri)
+    days_forward = (target_wd - as_of.weekday()) % 7
+    period_end = as_of + timedelta(days=days_forward)
 
     span = 6 if ptype == "weekly" else 13
     period_start = period_end - timedelta(days=span)
@@ -8985,12 +9021,10 @@ def driver_hours_page():
 
     # ── formatting helpers ───────────────────────────────────────────────────
     def _fmt_ts(ts):
-        if not ts:
-            return '<span class="muted">&#8212;</span>'
-        try:
-            return e(str(ts)[11:16])
-        except Exception:
-            return e(str(ts))
+        formatted = _fmt_12h(ts)
+        if formatted:
+            return e(formatted)
+        return '<span class="muted">&#8212;</span>'
 
     def _fmt_h(h):
         if h is None:
@@ -9197,7 +9231,7 @@ def driver_clock():
     _co = _entry.get("clock_out_at") or ""
 
     def _fmt(ts):
-        return str(ts)[11:16] if ts and len(str(ts)) >= 16 else ""
+        return _fmt_12h(ts) if ts else ""
 
     clocked_in  = bool(_ci)
     clocked_out = bool(_co)
