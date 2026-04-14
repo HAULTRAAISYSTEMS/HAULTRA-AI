@@ -4426,10 +4426,16 @@ def driver_route_detail(route_id):
         # PR swap flag: driver is carrying empty can from prior Pull — skip dump entirely
         _is_swap_pr   = _is_pr and bool(_s.get("swap_with_prev_pull"))
 
-        # Compact trail of completed workflow steps with times (logical order for PR)
+        # Compact trail of completed workflow steps with times.
+        # Swap PR logical order: Arrived → Box Out → Box In → To Dump
+        # All other: Arrived → Box Out → To Dump → Box In
+        _trail_order = (
+            [("arrived_at","Arrived"),("box_out_at","Box Out"),("box_in_at","Box In"),("go_to_dump_at","To Dump")]
+            if _is_swap_pr else
+            [("arrived_at","Arrived"),("box_out_at","Box Out"),("go_to_dump_at","To Dump"),("box_in_at","Box In")]
+        )
         _trail_parts = []
-        for _tc, _tl in [("arrived_at","Arrived"),("box_out_at","Box Out"),
-                         ("go_to_dump_at","To Dump"),("box_in_at","Box In")]:
+        for _tc, _tl in _trail_order:
             _tv = _s.get(_tc)
             if _tv:
                 _trail_parts.append(
@@ -4445,12 +4451,13 @@ def driver_route_detail(route_id):
         _workflow_btn_html = ""
         if not is_done:
             if _is_swap_pr:
-                # PR swap: driver already has empty from prior Pull — skip dump entirely
+                # Swap PR full workflow: box out old → box in empty → leave with loaded can → dump → complete
                 _wf_map = {
-                    "pending":     ("arrived",      "🚛 Arrived at Stop",           "btn-driver btn-driver-complete"),
-                    "arrived":     ("box_out",       "📦 Box Out — Remove Old Container","btn-driver btn-driver-complete"),
-                    "box_out":     ("need_box_in",   "📦 Box In — Place Empty Can",  "btn-driver btn-driver-complete"),
-                    "need_box_in": ("box_in",        "✅ Confirm Box In",            "btn-driver btn-driver-complete"),
+                    "pending":     ("arrived",       "🚛 Arrived at Stop",               "btn-driver btn-driver-complete"),
+                    "arrived":     ("box_out",       "📦 Box Out — Remove Old Container", "btn-driver btn-driver-complete"),
+                    "box_out":     ("need_box_in",   "📦 Box In — Place Empty Can",       "btn-driver btn-driver-complete"),
+                    "need_box_in": ("box_in",        "✅ Confirm Box In",                 "btn-driver btn-driver-complete"),
+                    "box_in":      ("going_to_dump", "🗑️ Go To Dump",                    "btn-driver btn-driver-dump"),
                 }
             elif _is_pr:
                 # Normal PR: box-out → dump → box-in
@@ -4473,20 +4480,7 @@ def driver_route_detail(route_id):
                     "pending":     ("arrived",       "🚛 Arrived at Stop",           "btn-driver btn-driver-complete"),
                 }
 
-            # "need_box_in" for swap PR is a form action (same driver-action endpoint)
-            # but for swap PR the "going_to_dump" transition is replaced by direct need_box_in
-            if _is_swap_pr and _driver_status == "box_out":
-                # Override: post "need_box_in" as the action so we record it as box_in_pending
-                _workflow_btn_html = (
-                    f'<form method="POST" action="{url_for("stop_driver_action", stop_id=s["id"])}"'
-                    f' style="margin-bottom:8px;">'
-                    f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
-                    f'<input type="hidden" name="action" value="skip_to_box_in">'
-                    f'<button class="btn-driver btn-driver-complete" type="submit" style="width:100%;">'
-                    f'📦 Box In — Place Empty Can</button>'
-                    f'</form>'
-                )
-            elif _driver_status in _wf_map:
+            if _driver_status in _wf_map:
                 _nxt, _lbl, _cls = _wf_map[_driver_status]
                 _workflow_btn_html = (
                     f'<form method="POST" action="{url_for("stop_driver_action", stop_id=s["id"])}"'
@@ -5928,7 +5922,7 @@ def toggle_stop_complete(stop_id):
 @login_required
 def stop_driver_action(stop_id):
     action = request.form.get("action", "").strip()
-    valid_actions = {"arrived", "box_in", "box_out", "going_to_dump", "skip_to_box_in"}
+    valid_actions = {"arrived", "box_in", "box_out", "going_to_dump", "need_box_in", "skip_to_box_in"}
     if action not in valid_actions:
         flash("Invalid action.", "error")
         return redirect(url_for("dashboard"))
@@ -5951,8 +5945,8 @@ def stop_driver_action(stop_id):
 
     ts = now_ts()
 
-    if action == "skip_to_box_in":
-        # Swap PR: driver has empty can from prior Pull — skip dump, go straight to need_box_in
+    if action in ("need_box_in", "skip_to_box_in"):
+        # Transition to box-in pending state — no timestamp column, just update status
         conn.execute(
             "UPDATE stops SET driver_status='need_box_in' WHERE id=?",
             (stop_id,)
@@ -6053,22 +6047,25 @@ def dump_ticket(stop_id):
             )
 
         # After dump ticket saved: decide next state based on job type
-        # - PR (Pickup and Return) / Swap action  → need_box_in (driver must return empty can)
-        # - Pull / everything else               → auto-complete (no box-in needed)
+        # - Normal PR (no swap)  → need_box_in (driver must still return empty can to customer)
+        # - Swap PR              → auto-complete (box_in was already done before the dump run)
+        # - Pull / everything else → auto-complete (no box-in needed)
         _ds = dict(stop).get("driver_status") or "pending"
         _stop_action = (dict(stop).get("action") or "").lower()
-        _pr_needs_box_in = (
+        _is_pr_action = (
             "pickup and return" in _stop_action
             or ("swap" in _stop_action and "pull" not in _stop_action)
         )
+        _is_swap_pr_dump = _is_pr_action and bool(dict(stop).get("swap_with_prev_pull"))
         if _ds == "going_to_dump":
-            if _pr_needs_box_in:
+            if _is_pr_action and not _is_swap_pr_dump:
+                # Normal PR: driver still needs to drop off an empty can at the customer
                 conn.execute(
                     "UPDATE stops SET driver_status='need_box_in' WHERE id=?",
                     (stop_id,)
                 )
             else:
-                # Pull, Dump, or other — complete after dump
+                # Swap PR (box_in already done), Pull, Dump, or other — complete after dump
                 conn.execute(
                     "UPDATE stops SET driver_status='completed', status='completed', completed_at=? WHERE id=?",
                     (now_ts(), stop_id)
