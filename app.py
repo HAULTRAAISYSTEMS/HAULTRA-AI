@@ -1572,64 +1572,6 @@ _DUMP_SITES = {
 }
 
 # Canonical dump site display name → full street address for navigation.
-# Keys must match the VALUES of _DUMP_SITES (lowercased for lookup).
-DUMP_SITE_ADDRESSES = {
-    "dominion": "6000 Sewells Point Rd, Norfolk, VA",
-    "spivey":   "123 Spivey Rd, Suffolk, VA",
-    "spsa":     "1 Bob Foeller Dr, Suffolk, VA",
-    "bay":      "83 Pagan Ave, Smithfield, VA",
-    "holland":  "4801 Nansemond Pkwy, Suffolk, VA",
-    "waterway": "Virginia Beach Waterway Facility, Virginia Beach, VA",
-    "united":   "United Disposal, Virginia Beach, VA",
-    "sykes":    "Sykes Landfill, Virginia Beach, VA",
-    "sb cox":   "SB Cox, Virginia Beach, VA",
-}
-
-
-def _dump_nav_buttons(dump_location_text):
-    """
-    Given a stop's dump_location string (e.g. "Dominion", "Spivey"),
-    return an HTML snippet with Google Maps and Apple Maps navigation buttons.
-
-    Lookup chain:
-      1. Exact canonical name (case-insensitive) in DUMP_SITE_ADDRESSES
-      2. Fall back to using the raw text as the destination address
-
-    Returns empty string if dump_location_text is blank.
-    Returns a muted "address not on file" note if text is present but no address
-    can be resolved.
-    """
-    if not dump_location_text or not dump_location_text.strip():
-        return ""
-
-    key = dump_location_text.strip().lower()
-    address = DUMP_SITE_ADDRESSES.get(key)
-
-    # Also try without punctuation in case of minor variations
-    if not address:
-        for k, v in DUMP_SITE_ADDRESSES.items():
-            if k in key or key in k:
-                address = v
-                break
-
-    # Fall back to using the raw display name as the geocodable destination
-    if not address:
-        address = dump_location_text.strip() + ", Virginia"
-
-    enc = urllib.parse.quote_plus(address)
-    google_url = f"https://www.google.com/maps/dir/?api=1&destination={enc}&travelmode=driving"
-    apple_url  = f"http://maps.apple.com/?daddr={enc}&dirflg=d"
-
-    return (
-        f'<div style="display:flex;gap:8px;margin-bottom:8px;">'
-        f'<a class="btn-driver btn-driver-nav" target="_blank" href="{google_url}" '
-        f'style="flex:1;text-align:center;text-decoration:none;">'
-        f'&#128205; Google Maps</a>'
-        f'<a class="btn-driver btn-driver-apple" target="_blank" href="{apple_url}" '
-        f'style="flex:1;text-align:center;text-decoration:none;">'
-        f'&#63743; Apple Maps</a>'
-        f'</div>'
-    )
 
 
 # Matches a new roll-off stop line: action prefix followed by a house number.
@@ -4360,6 +4302,12 @@ def driver_route_detail(route_id):
             "SELECT * FROM dump_locations WHERE id=?", (route["dump_location_id"],)
         ).fetchone()
 
+    # Load all active dump locations keyed by lowercase name for per-stop nav lookup
+    _dump_loc_rows = conn.execute(
+        "SELECT name, address, city, state, zip_code FROM dump_locations WHERE active=1"
+    ).fetchall()
+    _dump_loc_by_name = {r["name"].lower(): dict(r) for r in _dump_loc_rows}
+
     conn.close()
 
     completed_count = sum(1 for s in stops if s["status"] == "completed")
@@ -4596,8 +4544,43 @@ def driver_route_detail(route_id):
                     f'padding:12px 16px;border-radius:12px;font-weight:700;margin-bottom:8px;">'
                     f'{_dump_label}</a>'
                 )
-                # Navigation buttons to drive to the dump site
-                _nav_html = _dump_nav_buttons(_dump_loc_text)
+                # Navigation buttons to drive to the dump site — resolved from DB
+                _dl_rec = _dump_loc_by_name.get(_dump_loc_text.strip().lower()) if _dump_loc_text else None
+                if _dl_rec:
+                    _dl_addr_parts = [
+                        _dl_rec.get("address") or "",
+                        _dl_rec.get("city") or "",
+                        _dl_rec.get("state") or "",
+                        _dl_rec.get("zip_code") or "",
+                    ]
+                    _dl_addr = " ".join(p for p in _dl_addr_parts if p).strip()
+                else:
+                    _dl_addr = ""
+                if _dl_addr:
+                    _dl_enc = urllib.parse.quote_plus(_dl_addr)
+                    _nav_html = (
+                        f'<div style="display:flex;gap:8px;margin-bottom:8px;">'
+                        f'<a class="btn-driver btn-driver-nav" target="_blank" '
+                        f'href="https://www.google.com/maps/dir/?api=1&destination={_dl_enc}&travelmode=driving" '
+                        f'style="flex:1;text-align:center;text-decoration:none;">&#128205; Google Maps</a>'
+                        f'<a class="btn-driver btn-driver-apple" target="_blank" '
+                        f'href="http://maps.apple.com/?daddr={_dl_enc}&dirflg=d" '
+                        f'style="flex:1;text-align:center;text-decoration:none;">&#63743; Apple Maps</a>'
+                        f'</div>'
+                    )
+                elif _dump_loc_text:
+                    _nav_html = (
+                        f'<div class="small muted" style="margin-bottom:8px;padding:8px;'
+                        f'background:rgba(255,255,255,0.06);border-radius:8px;">'
+                        f'&#9888;&#65039; Dump location &ldquo;{e(_dump_loc_text)}&rdquo; not found &mdash; '
+                        f'update address in Dump Locations.</div>'
+                    )
+                else:
+                    _nav_html = (
+                        f'<div class="small muted" style="margin-bottom:8px;padding:8px;'
+                        f'background:rgba(255,255,255,0.06);border-radius:8px;">'
+                        f'Dump location not set for this stop.</div>'
+                    )
                 _workflow_btn_html = _nav_html + _dump_ticket_link
 
         # Badge on the stop card header showing PR mode
