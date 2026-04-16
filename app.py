@@ -82,6 +82,7 @@ UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", os.path.join("static", "uploads"
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "pdf"}
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # 32 MB upload limit
 
 
 # =========================================================
@@ -387,9 +388,14 @@ def get_csrf_token():
     return session["_csrf_token"]
 
 
+# Endpoints that legitimately receive POST from external servers (no session/CSRF)
+_CSRF_EXEMPT_ENDPOINTS = {"stripe_webhook"}
+
 @app.before_request
 def csrf_protect():
     if request.method == "POST":
+        if request.endpoint in _CSRF_EXEMPT_ENDPOINTS:
+            return
         token = session.get("_csrf_token")
         # Support form data, JSON body, or explicit header
         if request.is_json:
@@ -3402,146 +3408,536 @@ tr.status-in-progress td {{ background: rgba(255,140,0,0.03); }}
     navigator.serviceWorker.register('/sw.js', {{scope: '/'}}).catch(function() {{}});
   }}
 
-  var QUEUE_KEY = 'haultra_offline_queue';
-  /* Routes whose POST actions should be queued when offline */
+  var QUEUE_KEY   = 'haultra_offline_queue';
+  var _SYNCED_KEY = 'haultra_synced_uids';   /* sessionStorage: dedup across reloads */
+
+  /* Routes queued when offline (toggle is handled by the AJAX handler directly) */
   var QUEUE_PAT = [
     /^\\/stop\\/\\d+\\/driver-action$/,
     /^\\/driver\\/clock$/
   ];
 
-  /* 2 ── Offline / syncing banner ─────────────────────────────────── */
-  var banner = document.createElement('div');
-  banner.id = 'haultra-offline-banner';
-  banner.style.cssText = (
-    'position:fixed;top:0;left:0;right:0;z-index:10000;' +
-    'padding:10px 20px;display:none;align-items:center;' +
-    'justify-content:space-between;gap:12px;' +
-    'font-size:13px;font-weight:600;transition:background .3s;'
+  /* ── State ──────────────────────────────────────────────────────── */
+  var _syncState       = 'idle'; /* idle | syncing | success | error | session */
+  var _retryTimer      = null;
+  var _lastSyncTime    = null;   /* ISO string of last attempt */
+  var _lastSyncResult  = null;   /* human-readable result */
+  var _lastSyncSuccess = null;   /* HH:MM of last clean sync, shown in banner */
+
+  /* ── Style constants ─────────────────────────────────────────────── */
+  var _BTN_STYLE = (
+    'background:none;border:1px solid currentColor;border-radius:6px;' +
+    'padding:4px 12px;cursor:pointer;font-size:12px;font-weight:700;' +
+    'color:inherit;flex-shrink:0;'
   );
+  var _BASE_CSS = (
+    'position:fixed;top:0;left:0;right:0;z-index:10000;' +
+    'padding:10px 20px;display:flex;align-items:center;' +
+    'justify-content:space-between;gap:12px;' +
+    'font-size:13px;font-weight:600;'
+  );
+  var _COLORS = {{
+    warn:  'background:#1a0a00;border-bottom:1px solid rgba(255,157,0,.35);color:#fbbf24;',
+    ok:    'background:#001810;border-bottom:1px solid rgba(0,232,125,.30);color:#56f0b7;',
+    error: 'background:#200010;border-bottom:1px solid rgba(255,60,60,.40);color:#ff9a9a;'
+  }};
+
+  /* ── Banner + conflict-box DOM ───────────────────────────────────── */
+  var banner = document.createElement('div');
+  banner.id  = 'haultra-offline-banner';
   document.body.insertBefore(banner, document.body.firstChild);
+
+  /* Conflict strip: per-action Dismiss buttons; sits just below the banner */
+  var _conflictBox = document.createElement('div');
+  _conflictBox.id  = 'haul-conflict-box';
+  _conflictBox.style.cssText = (
+    'display:none;position:fixed;top:44px;left:0;right:0;z-index:9998;' +
+    'background:#1a0010;border-bottom:2px solid rgba(255,60,60,.4);' +
+    'padding:8px 20px;font-size:12px;color:#ff9a9a;line-height:1.8;'
+  );
+  document.body.appendChild(_conflictBox);
+
+  /* ── Queue helpers ───────────────────────────────────────────────── */
+  function _mkUid() {{
+    return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  }}
 
   function queueLen() {{
     return JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]').length;
   }}
 
+  /* Remove one item by uid — safe to call mid-sync */
+  function _removeFromQueue(uid) {{
+    var q = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
+    localStorage.setItem(QUEUE_KEY, JSON.stringify(
+      q.filter(function(i) {{ return i.uid !== uid; }})
+    ));
+  }}
+
+  /* Patch one item in-place by uid */
+  function _updateQueueItem(uid, updates) {{
+    var q = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]').map(function(i) {{
+      return i.uid === uid ? Object.assign({{}}, i, updates) : i;
+    }});
+    localStorage.setItem(QUEUE_KEY, JSON.stringify(q));
+  }}
+
+  /* sessionStorage-backed set of already-synced uids — survives reload, not tab-close */
+  function _getSyncedUids() {{
+    try {{ return new Set(JSON.parse(sessionStorage.getItem(_SYNCED_KEY) || '[]')); }}
+    catch(ex) {{ return new Set(); }}
+  }}
+  function _markSyncedUid(uid) {{
+    try {{
+      var arr = JSON.parse(sessionStorage.getItem(_SYNCED_KEY) || '[]');
+      if (!arr.includes(uid)) {{
+        arr.push(uid);
+        if (arr.length > 300) arr = arr.slice(-300);
+        sessionStorage.setItem(_SYNCED_KEY, JSON.stringify(arr));
+      }}
+    }} catch(ex) {{}}
+  }}
+
+  /* ── Banner render ───────────────────────────────────────────────── */
+  function _setBanner(type, msgHtml, actionHtml) {{
+    banner.style.cssText = _BASE_CSS + (_COLORS[type] || _COLORS.warn);
+    banner.innerHTML = '<span>' + msgHtml + '</span>' + (actionHtml || '');
+  }}
+
   function updateBanner() {{
     var qlen = queueLen();
     if (!navigator.onLine) {{
-      banner.style.cssText += (
-        'background:#1a0a00;border-bottom:1px solid rgba(255,157,0,.35);color:#fbbf24;'
-      );
-      banner.style.display = 'flex';
-      banner.innerHTML = (
-        '<span>&#9888;&nbsp;Offline &mdash; ' +
+      _setBanner('warn',
+        '&#9888;&nbsp;Offline &mdash; ' +
         (qlen
-          ? qlen + ' action' + (qlen !== 1 ? 's' : '') + ' queued'
-          : 'actions will be saved and synced on reconnect') +
-        '</span>'
+          ? qlen + ' action' + (qlen !== 1 ? 's' : '') + ' pending sync'
+          : 'actions will be saved and synced on reconnect')
+      );
+    }} else if (_syncState === 'session') {{
+      _setBanner('error',
+        '&#9888;&nbsp;Login expired &mdash; ' +
+        qlen + ' action' + (qlen !== 1 ? 's' : '') + ' still queued',
+        '<a href="/login" style="' + _BTN_STYLE + 'text-decoration:none;">Log In to Sync</a>'
+      );
+    }} else if (_syncState === 'success') {{
+      _setBanner('ok',
+        '&#10003;&nbsp;Sync complete' +
+        (_lastSyncSuccess ? ' at ' + _lastSyncSuccess : '')
+      );
+    }} else if (_syncState === 'error') {{
+      var _eq   = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
+      var _conf = _eq.filter(function(i) {{ return i.conflict; }}).length;
+      var _ret  = _eq.filter(function(i) {{ return !i.conflict; }}).length;
+      var _msg  = '&#10007;&nbsp;Sync failed &mdash; ' +
+        _eq.length + ' action' + (_eq.length !== 1 ? 's' : '') + ' pending';
+      if (_conf > 0) _msg += ' &bull; ' + _conf + ' conflict' + (_conf !== 1 ? 's' : '');
+      if (_ret  > 0) _msg += ' &bull; retrying in 15 s';
+      _setBanner('error', _msg,
+        (_ret > 0
+          ? '<button onclick="window.__haultraSync()" style="' + _BTN_STYLE + '">Retry Now</button>'
+          : '')
       );
     }} else if (qlen > 0) {{
-      banner.style.cssText += (
-        'background:#001810;border-bottom:1px solid rgba(0,232,125,.30);color:#56f0b7;'
+      var _lsOk = _lastSyncSuccess ? ' &bull; last sync ' + _lastSyncSuccess : '';
+      _setBanner('ok',
+        '&#8635;&nbsp;' + (_syncState === 'syncing'
+          ? 'Syncing ' + qlen + ' action' + (qlen !== 1 ? 's' : '') + '&hellip;'
+          : qlen + ' action' + (qlen !== 1 ? 's' : '') + ' pending' + _lsOk),
+        (_syncState !== 'syncing'
+          ? '<button onclick="window.__haultraSync()" style="' + _BTN_STYLE + '">Sync Now</button>'
+          : '')
       );
-      banner.style.display = 'flex';
-      banner.innerHTML = (
-        '<span>&#8635;&nbsp;Back online &mdash; syncing ' +
-        qlen + ' queued action' + (qlen !== 1 ? 's' : '') + '&hellip;</span>'
-      );
-      doSync();
+      if (_syncState === 'idle') {{
+        _syncState = 'syncing';
+        doSync();
+      }}
     }} else {{
-      banner.style.display = 'none';
+      banner.style.display    = 'none';
+      _conflictBox.style.display = 'none';
+      return;
     }}
+    banner.style.display = 'flex';
+    _updateConflictBox();
   }}
 
-  window.addEventListener('online',  updateBanner);
-  window.addEventListener('offline', updateBanner);
+  /* ── Conflict notification box ───────────────────────────────────── */
+  function _updateConflictBox() {{
+    var q = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
+    var conflicts = q.filter(function(i) {{ return i.conflict; }});
+    if (!conflicts.length) {{ _conflictBox.style.display = 'none'; return; }}
+    var html = (
+      '<b>&#9888; ' + conflicts.length + ' action' +
+      (conflicts.length !== 1 ? 's' : '') +
+      ' need attention &mdash; stop was changed by someone else. Dismiss or reload to see current state.</b><br>'
+    );
+    conflicts.forEach(function(item) {{
+      html += (
+        '<span style="display:inline-flex;align-items:center;gap:6px;' +
+        'margin:3px 8px 3px 0;padding:3px 8px;' +
+        'background:rgba(255,60,60,.12);border:1px solid rgba(255,60,60,.25);border-radius:6px;">' +
+        (item.label || item.url) +
+        '<span style="opacity:.7;">&mdash; ' + (item.sync_error || 'Conflict') + '</span>' +
+        '<button data-uid="' + item.uid + '" ' +
+        'onclick="window.__haultsDismissConflict(this.dataset.uid)" ' +
+        'style="background:none;border:1px solid currentColor;border-radius:4px;' +
+        'padding:1px 6px;cursor:pointer;font-size:11px;color:inherit;">Dismiss &#10005;</button>' +
+        '</span>'
+      );
+    }});
+    _conflictBox.innerHTML = html;
+    _conflictBox.style.display = 'block';
+  }}
+
+  /* ── Auto-retry scheduler ────────────────────────────────────────── */
+  function _scheduleRetry() {{
+    _cancelRetry();
+    if (!navigator.onLine) return;
+    var q = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
+    if (!q.filter(function(i) {{ return !i.conflict; }}).length) return;
+    console.log('[HAULTRA] auto-retry scheduled in 15 s');
+    _retryTimer = setTimeout(function() {{
+      _retryTimer = null;
+      if (navigator.onLine && _syncState !== 'syncing' && _syncState !== 'session') {{
+        console.log('[HAULTRA] auto-retry firing');
+        _syncState = 'syncing';
+        updateBanner();
+        doSync();
+      }}
+    }}, 15000);
+  }}
+
+  function _cancelRetry() {{
+    if (_retryTimer) {{ clearTimeout(_retryTimer); _retryTimer = null; }}
+  }}
+
+  /* ── Online / offline / visibility events ────────────────────────── */
+  window.addEventListener('online', function() {{
+    _syncState = 'idle';
+    _cancelRetry();
+    updateBanner();
+  }});
+  window.addEventListener('offline', function() {{
+    _cancelRetry();
+    updateBanner();
+  }});
+
+  /* iOS/PWA: sync when app comes back to foreground */
+  document.addEventListener('visibilitychange', function() {{
+    if (!document.hidden && navigator.onLine && queueLen() > 0 && _syncState === 'idle') {{
+      console.log('[HAULTRA] visibilitychange — triggering sync');
+      _syncState = 'syncing';
+      doSync();
+    }}
+  }});
+
+  /* Sync on page load — picks up items from a previous session */
+  document.addEventListener('DOMContentLoaded', function() {{
+    if (navigator.onLine && queueLen() > 0 && _syncState === 'idle') {{
+      console.log('[HAULTRA] page load — triggering sync for', queueLen(), 'queued item(s)');
+      _syncState = 'syncing';
+      doSync();
+    }}
+  }});
+
   updateBanner();
 
-  /* 3 ── Intercept driver-relevant forms when offline ─────────────── */
+  /* ── Form interceptor (driver-action, clock) ─────────────────────── */
   document.addEventListener('DOMContentLoaded', function() {{
     document.querySelectorAll('form').forEach(function(form) {{
       if ((form.method || '').toLowerCase() !== 'post') return;
       form.addEventListener('submit', function(evt) {{
-        if (navigator.onLine) return;          /* online: proceed normally */
+        if (navigator.onLine) return;          /* online: submit normally */
 
-        /* resolve the form's target URL */
         var raw = form.getAttribute('action') || window.location.pathname;
         var url = raw;
         try {{ url = new URL(raw, window.location.href).pathname; }} catch(ex) {{}}
 
         var match = QUEUE_PAT.some(function(p) {{ return p.test(url); }});
-        if (!match) return;                    /* not a queued-able action */
+        if (!match) return;
 
         evt.preventDefault();
 
-        /* snapshot form data */
         var data = {{}};
         new FormData(form).forEach(function(v, k) {{ data[k] = v; }});
 
-        /* push to queue */
-        var queue = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
-        queue.push({{
+        /* capture expected state for server-side conflict detection */
+        var isDriverAction = /^\\/stop\\/\\d+\\/driver-action$/.test(url);
+        if (isDriverAction) {{
+          var card = form.closest('[data-stop-id]') || form.closest('.driver-stop-card');
+          if (card && card.dataset.driverStatus) {{
+            data.expected_driver_status = card.dataset.driverStatus;
+          }}
+        }}
+
+        /* dedup: skip if same url+action already queued (double-tap guard) */
+        var existing = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
+        var dup = existing.some(function(x) {{
+          return x.url === url && x.body.action === data.action && !x.conflict;
+        }});
+        if (dup) {{
+          console.log('[HAULTRA] dedup — skipping duplicate', url, data.action);
+          return;
+        }}
+
+        existing.push({{
+          uid:       _mkUid(),
           url:       url,
           body:      data,
           queued_at: new Date().toISOString(),
           label:     data.action || data.clock_action || url
         }});
-        localStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
+        localStorage.setItem(QUEUE_KEY, JSON.stringify(existing));
         updateBanner();
 
-        /* brief visual confirmation on the button */
+        /* visual feedback — persist for workflow actions, brief for others */
         var btn = form.querySelector('button[type=submit], button:not([type])');
         if (btn) {{
-          var orig = btn.innerHTML;
-          btn.innerHTML = '&#10003;&nbsp;Saved offline';
-          btn.disabled = true;
-          setTimeout(function() {{ btn.innerHTML = orig; btn.disabled = false; }}, 2500);
+          btn.innerHTML = '&#8635;&nbsp;Pending Sync';
+          btn.disabled  = true;
+          btn.style.opacity = '0.7';
+          if (!isDriverAction && !/^\\/driver\\/clock$/.test(url)) {{
+            var orig = btn.innerHTML;
+            setTimeout(function() {{
+              btn.innerHTML = orig;
+              btn.disabled  = false;
+              btn.style.opacity = '';
+            }}, 2500);
+          }}
         }}
       }});
     }});
   }});
 
-  /* 4 ── Sync queued actions when back online ─────────────────────── */
+  /* ── doSync ──────────────────────────────────────────────────────── */
   async function doSync() {{
-    var queue = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
-    if (!queue.length) return;
+    _cancelRetry();
+    var queue      = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
+    var syncedUids = _getSyncedUids();
 
-    /* fetch a fresh CSRF token — stored tokens may have expired */
+    /* items to replay: not already flagged conflict, not already synced this session */
+    var toProcess = queue.filter(function(i) {{
+      return !i.conflict && !syncedUids.has(i.uid);
+    }});
+
+    if (!toProcess.length) {{
+      _syncState = (queueLen() > 0) ? 'error' : 'idle';
+      updateBanner();
+      return;
+    }}
+
+    _syncState    = 'syncing';
+    _lastSyncTime = new Date().toISOString();
+    updateBanner();
+    console.log('[HAULTRA] doSync —', toProcess.length, 'item(s) to replay');
+
+    /* fresh CSRF token */
     var freshToken;
     try {{
       var tr = await fetch('/api/csrf-token');
-      if (!tr.ok) return;
+      if (tr.status === 401 || tr.status === 403) {{
+        _syncState      = 'session';
+        _lastSyncResult = 'session_expired';
+        console.warn('[HAULTRA] session expired');
+        updateBanner();
+        return;
+      }}
+      if (!tr.ok) throw new Error('csrf-' + tr.status);
       freshToken = (await tr.json()).token;
-    }} catch(ex) {{ return; }}
+    }} catch(ex) {{
+      _syncState      = 'error';
+      _lastSyncResult = 'csrf_failed: ' + ex.message;
+      console.warn('[HAULTRA] CSRF fetch failed:', ex.message);
+      _scheduleRetry();
+      updateBanner();
+      return;
+    }}
 
-    var failed = [];
-    for (var i = 0; i < queue.length; i++) {{
-      var item = queue[i];
-      item.body['_csrf_token'] = freshToken;
-      var fd = new URLSearchParams();
-      Object.keys(item.body).forEach(function(k) {{ fd.append(k, item.body[k]); }});
+    var syncedCount = 0;
+
+    for (var i = 0; i < toProcess.length; i++) {{
+      var item = toProcess[i];
+      /* build form body with fresh token — do not mutate stored item */
+      var body = Object.assign({{}}, item.body, {{ _csrf_token: freshToken }});
+      var fd   = new URLSearchParams();
+      Object.keys(body).forEach(function(k) {{ fd.append(k, body[k]); }});
+
       try {{
         var r = await fetch(item.url, {{
-          method: 'POST', body: fd, redirect: 'follow'
+          method:   'POST',
+          body:     fd,
+          redirect: 'follow',
+          headers:  {{ 'X-Sync-Replay': '1' }}
         }});
-        /* Flask redirects on success (302→200); non-ok status = failure */
-        if (!r.ok && r.type !== 'opaqueredirect') failed.push(item);
+
+        if (r.status === 409) {{
+          var cj = {{}};
+          try {{ cj = await r.json(); }} catch(_) {{}}
+          var detail = cj.current_status
+            ? 'Stop changed to \u201c' + cj.current_status + '\u201d'
+            : 'Conflict';
+          _updateQueueItem(item.uid, {{ conflict: true, sync_error: detail }});
+          console.warn('[HAULTRA] conflict:', item.label, '\u2014', detail);
+
+        }} else if (!r.ok && r.type !== 'opaqueredirect') {{
+          _updateQueueItem(item.uid, {{ sync_error: 'HTTP ' + r.status }});
+          console.warn('[HAULTRA] error:', item.url, 'HTTP', r.status);
+
+        }} else {{
+          /* success — remove from queue immediately (transaction-safe) */
+          _removeFromQueue(item.uid);
+          _markSyncedUid(item.uid);
+          syncedCount++;
+          console.log('[HAULTRA] synced:', item.label || item.url);
+        }}
+
       }} catch(ex) {{
-        failed.push(item);
+        _updateQueueItem(item.uid, {{ sync_error: 'Network error' }});
+        console.warn('[HAULTRA] network error on', item.url, ex.message);
       }}
     }}
 
-    localStorage.setItem(QUEUE_KEY, JSON.stringify(failed));
-    var synced = queue.length - failed.length;
-    if (synced > 0) {{
-      /* reload the page so stop/clock state reflects synced data */
-      setTimeout(function() {{ location.reload(); }}, 700);
-    }} else {{
+    var remaining  = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
+    var failedNow  = remaining.filter(function(i) {{ return !i.conflict; }}).length;
+    var conflictNow = remaining.filter(function(i) {{ return i.conflict; }}).length;
+    _lastSyncResult = 'synced:' + syncedCount + ' failed:' + failedNow + ' conflicts:' + conflictNow;
+    console.log('[HAULTRA] doSync done —', _lastSyncResult);
+
+    if (syncedCount > 0 && failedNow === 0 && conflictNow === 0) {{
+      /* everything clean */
+      _lastSyncSuccess = new Date().toLocaleTimeString([], {{hour:'2-digit', minute:'2-digit'}});
+      _syncState = 'success';
       updateBanner();
+      setTimeout(function() {{ _syncState = 'idle'; updateBanner(); }}, 3000);
+    }} else if (failedNow > 0) {{
+      /* some non-conflict failures — auto-retry in 15 s */
+      _syncState = 'error';
+      updateBanner();
+      _scheduleRetry();
+    }} else {{
+      /* only conflicts remain — not auto-retried, needs human review */
+      _syncState = 'error';
+      updateBanner();
+    }}
+
+    if (syncedCount > 0) {{
+      setTimeout(function() {{ location.reload(); }}, 700);
     }}
   }}
 
-  window.__haultraSync = doSync;   /* exposed for manual trigger if needed */
+  /* ── Public API ──────────────────────────────────────────────────── */
+  window.__haultraSync = doSync;
+
+  /* Push one item to the offline queue (called by AJAX toggle handler).
+     Adds a uid if missing; deduplicates double-taps by url+action. */
+  window.__haultraOfflineQueue = function(item) {{
+    if (!item.uid) item.uid = _mkUid();
+    var q = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
+    /* dedup guard: same url + same action already pending */
+    var dup = q.some(function(x) {{
+      return x.url === item.url &&
+             (x.body.action || '') === (item.body.action || '') &&
+             !x.conflict;
+    }});
+    if (dup) {{ updateBanner(); return; }}
+    q.push(item);
+    localStorage.setItem(QUEUE_KEY, JSON.stringify(q));
+    updateBanner();
+  }};
+
+  /* Dismiss a conflicted item — removes from queue, hides its conflict row */
+  window.__haultsDismissConflict = function(uid) {{
+    _removeFromQueue(uid);
+    _updateConflictBox();
+    updateBanner();
+  }};
+
+  /* 5 ── Debug panel (Shift+Alt+D) ────────────────────────────────── */
+  (function() {{
+    var panel = document.createElement('div');
+    panel.id  = 'haul-debug-panel';
+    panel.style.cssText = (
+      'display:none;position:fixed;bottom:60px;right:16px;z-index:99999;' +
+      'width:340px;max-height:70vh;overflow-y:auto;' +
+      'background:#060e1e;border:1px solid rgba(0,160,255,.3);border-radius:14px;' +
+      'padding:16px 18px;font-size:12px;color:#b0c4de;font-family:monospace;' +
+      'box-shadow:0 8px 32px rgba(0,0,0,.6);'
+    );
+    document.body.appendChild(panel);
+
+    async function refreshDebug() {{
+      var q = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
+      var syncedUids = [];
+      try {{ syncedUids = JSON.parse(sessionStorage.getItem(_SYNCED_KEY) || '[]'); }} catch(ex) {{}}
+      var cachedUrls = [];
+      try {{
+        var c = await caches.open('haultra-v3');
+        var keys = await c.keys();
+        cachedUrls = keys.map(function(r) {{ return r.url; }});
+      }} catch(ex) {{}}
+
+      var conflicts = q.filter(function(i) {{ return i.conflict; }});
+      var retryable = q.filter(function(i) {{ return !i.conflict; }});
+      var html = (
+        '<div style="font-size:14px;font-weight:700;color:#56f0b7;margin-bottom:10px;">' +
+        '&#128203; HAULTRA Debug' +
+        '<button onclick="document.getElementById(\'haul-debug-panel\').style.display=\'none\'" ' +
+        'style="float:right;background:none;border:none;color:#b0c4de;cursor:pointer;font-size:16px;">&#10005;</button>' +
+        '</div>' +
+        '<b>Online:</b> ' + navigator.onLine + '<br>' +
+        '<b>Sync state:</b> ' + _syncState + '<br>' +
+        '<b>Retry timer:</b> ' + (_retryTimer ? 'scheduled' : 'none') + '<br>' +
+        '<b>Last sync attempt:</b> ' + (_lastSyncTime || 'never') + '<br>' +
+        '<b>Last sync success:</b> ' + (_lastSyncSuccess || 'never') + '<br>' +
+        '<b>Last result:</b> ' + (_lastSyncResult || '\u2014') + '<br>' +
+        '<b>Queue size:</b> ' + q.length +
+        (retryable.length  ? ' (' + retryable.length  + ' retryable)' : '') +
+        (conflicts.length  ? ' (' + conflicts.length  + ' conflicts)' : '') + '<br>' +
+        '<b>Synced this session:</b> ' + syncedUids.length + '<br>' +
+        '<b>Cached pages:</b> ' + cachedUrls.length + '<br><br>'
+      );
+      if (q.length) {{
+        html += '<b>Queue items:</b><br>';
+        q.forEach(function(item, i) {{
+          html += (
+            '<div style="margin:4px 0;padding:4px 6px;background:rgba(255,255,255,.05);border-radius:6px;">' +
+            (i+1) + '. ' + (item.label || item.url) +
+            (item.conflict ? ' <span style="color:#ff9a9a;">[CONFLICT: ' + (item.sync_error||'') + ']</span>' : '') +
+            (item.sync_error && !item.conflict ? ' <span style="color:#fbbf24;">[ERR: ' + item.sync_error + ']</span>' : '') +
+            '<br><span style="opacity:.6;">' + item.queued_at + '</span>' +
+            '</div>'
+          );
+        }});
+        html += (
+          '<button onclick="if(confirm(\'Clear all queued actions?\')){{' +
+          'localStorage.setItem(\'haultra_offline_queue\',\'[]\');' +
+          'window.__haultraSync&&window.__haultraSync();}}" ' +
+          'style="margin-top:8px;background:rgba(255,60,60,.15);border:1px solid rgba(255,60,60,.3);' +
+          'border-radius:6px;padding:4px 10px;color:#ff9a9a;cursor:pointer;font-size:11px;">' +
+          'Clear Queue</button>'
+        );
+      }}
+      if (cachedUrls.length) {{
+        html += '<br><b>Cached URLs:</b><br>';
+        cachedUrls.slice(0,20).forEach(function(u) {{
+          var path = u.replace(location.origin, '');
+          html += '<div style="opacity:.7;word-break:break-all;">' + path + '</div>';
+        }});
+        if (cachedUrls.length > 20) html += '<div style="opacity:.5;">&hellip; +' + (cachedUrls.length-20) + ' more</div>';
+      }}
+      panel.innerHTML = html;
+    }}
+
+    document.addEventListener('keydown', function(ev) {{
+      if (ev.shiftKey && ev.altKey && ev.key === 'D') {{
+        if (panel.style.display === 'none') {{
+          refreshDebug();
+          panel.style.display = 'block';
+        }} else {{
+          panel.style.display = 'none';
+        }}
+      }}
+    }});
+  }})();
 }})();
 </script>
 
@@ -3574,6 +3970,7 @@ def login():
         conn.close()
 
         if user and check_password_hash(user["password_hash"], password):
+            session.clear()
             session["user_id"]       = user["id"]
             session["username"]      = user["username"]
             session["role"]          = user["role"]
@@ -3658,6 +4055,13 @@ def driver_dashboard():
         </tr>
         """
 
+    # Build list of active route URLs to prefetch for offline use
+    _prefetch_urls = json.dumps([
+        url_for('driver_route_detail', route_id=r['id'])
+        for r in routes
+        if r['status'] in ('open', 'in_progress')
+    ])
+
     body = f"""
     <div class="hero">
         <h1>Driver Dashboard</h1>
@@ -3683,6 +4087,28 @@ def driver_dashboard():
             </table>
         </div>
     </div>
+
+    <script>
+    /* Prefetch active route pages into the service-worker cache so they
+       are available if the driver loses signal before opening the route. */
+    (function() {{
+        var urls = {_prefetch_urls};
+        if (!urls.length) return;
+        window.addEventListener('load', function() {{
+            var sw = navigator.serviceWorker && navigator.serviceWorker.controller;
+            urls.forEach(function(url) {{
+                /* Ask SW to cache it via message (no network noise in the tab) */
+                if (sw) {{
+                    sw.postMessage({{ type: 'CACHE_URL', url: url }});
+                }} else {{
+                    /* Fallback: direct fetch — SW fetch handler caches it */
+                    fetch(url, {{ credentials: 'include' }}).catch(function() {{}});
+                }}
+            }});
+            console.log('[HAULTRA] Prefetched', urls.length, 'route page(s) for offline use');
+        }});
+    }})();
+    </script>
     """
     return render_template_string(shell_page("Driver Dashboard", body))
 
@@ -5428,7 +5854,7 @@ def driver_route_detail(route_id):
             stop_address_data.append({"id": stop_key, "address": full_address})
 
         stop_cards += f"""
-<div class="{card_class}" id="{card_id}" data-stop-id="{stop_key}">
+<div class="{card_class}" id="{card_id}" data-stop-id="{stop_key}" data-driver-status="{_driver_status}">
 
   <div class="dsc-header" onclick="toggleStopDetail({stop_key})">
     <div class="dsc-num">#{s['stop_order']}</div>
@@ -5966,10 +6392,58 @@ def driver_route_detail(route_id):
         if (!form.classList.contains('dsc-toggle-form')) return;
         e.preventDefault();
 
-        var stopId = form.dataset.stopId;
-        var btn    = $id('toggle-btn-' + stopId);
+        var stopId      = form.dataset.stopId;
+        var btn         = $id('toggle-btn-' + stopId);
+        var isCompleting = btn && btn.classList.contains('btn-driver-complete');
 
-        // Optimistic disable to prevent double-tap
+        /* ── helper: queue this toggle + apply optimistic UI ─────── */
+        function _queueOffline() {{
+            /* extract pathname from absolute action URL */
+            var togglePath;
+            try {{ togglePath = new URL(form.action).pathname; }}
+            catch(ex) {{ togglePath = '/stop/' + stopId + '/toggle'; }}
+
+            if (typeof window.__haultraOfflineQueue === 'function') {{
+                window.__haultraOfflineQueue({{
+                    url:       togglePath,
+                    body:      {{
+                        _csrf_token:     '',
+                        expected_status: isCompleting ? 'open' : 'completed'
+                    }},
+                    queued_at: new Date().toISOString(),
+                    label:     (isCompleting ? 'Complete' : 'Reopen') + ' Stop #' + stopId
+                }});
+            }}
+
+            /* optimistic DOM update */
+            if (isCompleting) {{
+                markDone(stopId, 'Pending Sync');
+            }} else {{
+                markOpen(stopId);
+            }}
+            /* count updated DOM state for progress bar */
+            var allCards  = document.querySelectorAll('.driver-stop-card');
+            var doneCards = document.querySelectorAll('.driver-stop-card.dsc-done');
+            updateProgress(doneCards.length, allCards.length);
+            highlightNext();
+            updateStickyBtn();
+
+            /* mark button as pending so driver knows it hasn't confirmed yet */
+            var pb = $id('toggle-btn-' + stopId);
+            if (pb) {{
+                pb.innerHTML  = '&#8635; Pending Sync';
+                pb.disabled   = true;
+                pb.style.opacity = '0.65';
+            }}
+        }}
+
+        /* ── Offline: queue immediately, no network attempt ─────── */
+        if (!navigator.onLine) {{
+            _queueOffline();
+            return;
+        }}
+
+        /* ── Online: AJAX attempt ───────────────────────────────── */
         if (btn) {{ btn.disabled = true; btn.textContent = 'Saving\u2026'; }}
 
         var fd = new FormData();
@@ -6002,9 +6476,18 @@ def driver_route_detail(route_id):
             }}
         }})
         .catch(function() {{
-            // Network/server error — fall back to a normal page reload submit
-            if (btn) {{ btn.disabled = false; btn.textContent = btn.dataset.label || 'Complete Stop'; }}
-            form.submit();
+            if (!navigator.onLine) {{
+                /* connection dropped mid-request — queue + optimistic UI */
+                _queueOffline();
+            }} else {{
+                /* server error — re-enable button, show brief error highlight */
+                if (btn) {{
+                    btn.disabled = false;
+                    btn.textContent = isCompleting ? 'Complete Stop' : 'Reopen Stop';
+                    btn.style.boxShadow = '0 0 0 2px #ff6b6b';
+                    setTimeout(function() {{ btn.style.boxShadow = ''; }}, 3000);
+                }}
+            }}
         }});
     }});
 
@@ -6044,6 +6527,52 @@ def driver_route_detail(route_id):
             }})();
         }}, function() {{}}, {{ timeout: 8000 }});
     }}
+
+    // ================================================================
+    // Photo upload offline guard
+    // Photo files cannot be serialised to localStorage, so we cannot
+    // queue them. Instead, block the submit and give a clear message.
+    // ================================================================
+    document.querySelectorAll('.upload-details form').forEach(function(upForm) {{
+        upForm.addEventListener('submit', function(evt) {{
+            if (navigator.onLine) return;    /* online: let it submit */
+            evt.preventDefault();
+            evt.stopImmediatePropagation();
+
+            var uploadBtn = upForm.querySelector('button[type=submit]');
+            var origLabel = uploadBtn ? uploadBtn.textContent : 'Upload';
+
+            /* Show an inline warning inside the form */
+            if (!upForm.querySelector('.photo-offline-warn')) {{
+                var warn = document.createElement('p');
+                warn.className = 'photo-offline-warn';
+                warn.style.cssText = (
+                    'color:#fbbf24;font-size:13px;margin:8px 0 0;' +
+                    'padding:8px 10px;background:rgba(255,180,0,.1);' +
+                    'border:1px solid rgba(255,180,0,.25);border-radius:8px;'
+                );
+                warn.textContent = (
+                    '\u26a0 You are offline. Photos cannot be saved to your device ' +
+                    'and cannot be queued for upload. Keep this tab open — the Upload ' +
+                    'button will re-enable when your connection returns.'
+                );
+                upForm.appendChild(warn);
+            }}
+
+            if (uploadBtn) {{
+                uploadBtn.disabled = true;
+                uploadBtn.textContent = '\u23f3 Waiting for connection\u2026';
+                /* re-enable and restore label when connection returns */
+                window.addEventListener('online', function _onlineOnce() {{
+                    uploadBtn.disabled = false;
+                    uploadBtn.textContent = origLabel;
+                    var w = upForm.querySelector('.photo-offline-warn');
+                    if (w) w.remove();
+                    window.removeEventListener('online', _onlineOnce);
+                }});
+            }}
+        }});
+    }});
 }})();
 </script>
 """
@@ -6352,7 +6881,7 @@ _PASTE_ROUTE_CSS = """<style>
 .pr-tip-item strong{color:#8fd3ff}
 .pr-tip-code{font-family:monospace;background:rgba(0,0,0,.3);border-radius:4px;padding:2px 6px;color:#8fd3ff;font-size:11px}
 #pr-mobile-bar{display:none;position:fixed;bottom:0;left:0;right:0;z-index:1200;background:rgba(4,10,28,.97);border-top:1px solid rgba(0,160,255,.2);padding:12px 16px;gap:10px}
-@media(max-width:820px){#pr-mobile-bar.pr-show{display:flex}}
+@media(max-width:820px){ #pr-mobile-bar.pr-show{display:flex} }
 </style>"""
 
 
@@ -7581,6 +8110,18 @@ def toggle_stop_complete(stop_id):
         flash("Access denied.", "error")
         return redirect(url_for("dashboard"))
 
+    # Conflict detection for offline sync replays
+    is_replay = (request.headers.get("X-Sync-Replay") == "1" or
+                 request.headers.get("X-Requested-With") == "XMLHttpRequest")
+    expected_status = request.form.get("expected_status", "").strip()
+    if is_replay and expected_status and stop["status"] != expected_status:
+        conn.close()
+        return jsonify({
+            "conflict": True,
+            "current_status": stop["status"],
+            "stop_id": stop_id,
+        }), 409
+
     new_status = "completed" if stop["status"] == "open" else "open"
     completed_at = now_ts() if new_status == "completed" else None
     new_driver_status = "completed" if new_status == "completed" else "pending"
@@ -7636,6 +8177,17 @@ def stop_driver_action(stop_id):
         flash("Access denied.", "error")
         return redirect(url_for("dashboard"))
 
+    # Conflict detection for offline sync replays
+    is_replay = request.headers.get("X-Sync-Replay") == "1"
+    expected_driver_status = request.form.get("expected_driver_status", "").strip()
+    if is_replay and expected_driver_status and stop["driver_status"] != expected_driver_status:
+        conn.close()
+        return jsonify({
+            "conflict": True,
+            "current_status": stop["driver_status"],
+            "stop_id": stop_id,
+        }), 409
+
     ts = now_ts()
 
     if action in ("need_box_in", "skip_to_box_in"):
@@ -7660,6 +8212,9 @@ def stop_driver_action(stop_id):
     conn.commit()
     route_id = stop["rid"]
     conn.close()
+
+    if is_replay:
+        return jsonify({"success": True, "stop_id": stop_id, "new_status": action})
     return redirect(url_for("driver_route_detail", route_id=route_id))
 
 
@@ -7735,8 +8290,9 @@ def dump_ticket(stop_id):
             fname = f"dt_{stop_id}_{uid}_{secure_filename(photo.filename)}"
             path = os.path.join(app.config["UPLOAD_FOLDER"], fname)
             photo.save(path)
+            db_path = os.path.join("static", "uploads", fname)
             conn.execute(
-                "UPDATE dump_tickets SET photo_path=? WHERE stop_id=?", (path, stop_id)
+                "UPDATE dump_tickets SET photo_path=? WHERE stop_id=?", (db_path, stop_id)
             )
 
         # After dump ticket saved: decide next state based on job type
@@ -8048,8 +8604,8 @@ def reorder_stops(route_id):
         conn.close()
         return jsonify({"success": False, "error": "not found"}), 404
 
-    data = request.get_json()
-    ids = data.get("stop_ids", [])
+    data = request.get_json(silent=True) or {}
+    ids = [int(x) for x in data.get("stop_ids", []) if str(x).isdigit()]
 
     for i, sid in enumerate(ids, start=1):
         # scope update to stops that actually belong to this route
@@ -8317,9 +8873,12 @@ def upload_stop_photo(stop_id):
         filename = f"{stop_id}_{uid}_{secure_filename(file.filename)}"
         path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
         file.save(path)
+        # Always store a web-relative path so the URL builder at load_stop_photos works
+        # regardless of whether UPLOAD_FOLDER is absolute or relative.
+        db_path = os.path.join("static", "uploads", filename)
         conn.execute(
             "INSERT INTO route_photos (stop_id, file_path, uploaded_at, uploaded_by) VALUES (?,?,?,?)",
-            (stop_id, path, now_ts(), session.get("user_id")),
+            (stop_id, db_path, now_ts(), session.get("user_id")),
         )
         saved += 1
 
@@ -8339,6 +8898,11 @@ def upload_stop_photo(stop_id):
 @login_required
 def export_route_csv(route_id):
     conn = get_db()
+    if not conn.execute(
+        "SELECT id FROM routes WHERE id=? AND company_id=?", (route_id, cid())
+    ).fetchone():
+        conn.close()
+        abort(404)
     stops = conn.execute("SELECT * FROM stops WHERE route_id=?", (route_id,)).fetchall()
     conn.close()
 
@@ -10216,8 +10780,9 @@ def driver_hours_page():
         """
         return render_template_string(shell_page("Driver Hours", body))
 
+    _allowed_driver_ids = {d["id"] for d in drivers}
     selected_driver_id = request.args.get("driver_id", type=int)
-    if not selected_driver_id:
+    if not selected_driver_id or selected_driver_id not in _allowed_driver_ids:
         selected_driver_id = drivers[0]["id"]
 
     selected_driver_name = next(
@@ -10845,7 +11410,7 @@ def driver_clock():
 
 # Service-worker source (raw string — no f-string escaping needed)
 _SW_JS = r"""
-const CACHE   = 'haultra-v1';
+const CACHE   = 'haultra-v3';
 const OFFLINE = '/offline';
 
 // Pages pre-cached at install so drivers can use them without network
@@ -10875,15 +11440,47 @@ self.addEventListener('activate', e => {
   );
 });
 
+// Cache a specific URL on demand (used by driver dashboard prefetch)
+self.addEventListener('message', e => {
+  if (e.data && e.data.type === 'CACHE_URL') {
+    caches.open(CACHE).then(c =>
+      fetch(e.data.url, {credentials: 'include'})
+        .then(r => { if (r.ok) c.put(e.data.url, r); })
+        .catch(() => {})
+    );
+  }
+});
+
+// Only cache driver-relevant paths — ignore boss/admin pages
+const CACHE_PATHS  = ['/driver', '/stop/', '/offline', '/sw.js'];
+const MAX_ENTRIES  = 50;   // maximum cached pages before eviction
+
+function isCacheable(url) {
+  try {
+    const path = new URL(url).pathname;
+    return CACHE_PATHS.some(p => path.startsWith(p));
+  } catch { return false; }
+}
+
+function evictOld(cache) {
+  cache.keys().then(keys => {
+    const nonPrecache = keys.filter(r => !PRECACHE.includes(new URL(r.url).pathname));
+    if (nonPrecache.length > MAX_ENTRIES) {
+      nonPrecache.slice(0, nonPrecache.length - MAX_ENTRIES)
+        .forEach(k => cache.delete(k));
+    }
+  });
+}
+
 // Network-first for all GET requests; cache as we go; serve cache when offline
 self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET') return;   // POSTs handled by page JS
   const nav = e.request.mode === 'navigate';
   e.respondWith(
     fetch(e.request).then(res => {
-      if (res.ok) {
+      if (res.ok && isCacheable(e.request.url)) {
         const clone = res.clone();
-        caches.open(CACHE).then(c => c.put(e.request, clone));
+        caches.open(CACHE).then(c => { c.put(e.request, clone); evictOld(c); });
       }
       return res;
     }).catch(() =>
