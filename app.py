@@ -38,13 +38,6 @@ STRIPE_PRICE_STARTER  = os.getenv("STRIPE_PRICE_STARTER")
 STRIPE_PRICE_PRO      = os.getenv("STRIPE_PRICE_PRO")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-print("=== STRIPE CHECK ===")
-print("SECRET:",  STRIPE_SECRET_KEY)
-print("STARTER:", STRIPE_PRICE_STARTER)
-print("PRO:",     STRIPE_PRICE_PRO)
-print("WEBHOOK:", STRIPE_WEBHOOK_SECRET)
-print("====================")
-
 STRIPE_ENABLED = True
 try:
     import stripe
@@ -684,24 +677,35 @@ def get_driver_day_hours(conn, driver_id, date_str, company_settings):
     """
     Return (start_ts, end_ts, hours_float) for a driver on a given calendar date.
 
+    Manual clock entries always override auto (stop-based) times for any date
+    on which they exist, regardless of the configured start/end rules.
+
     company_settings: dict with driver_day_start_rule / driver_day_end_rule.
-    date_str: 'YYYY-MM-DD' in the company's local time (caller is responsible
-              for any TZ conversion before calling).
-
-    Returns (None, None, None) if insufficient data exists or any query fails.
-
-    first_action: uses COALESCE(arrived_at, completed_at) so the report shows
-                  data even when drivers have not yet tapped the Arrived button.
-    last_action:  uses completed_at (always populated for completed stops).
+    date_str: 'YYYY-MM-DD' in the company's local time.
+    Returns (None, None, None) if insufficient data or any query fails.
     """
     try:
         start_rule = (company_settings.get("driver_day_start_rule") or "first_action").lower()
         end_rule   = (company_settings.get("driver_day_end_rule")   or "last_action").lower()
 
-        start_ts = end_ts = None
+        # Manual entry takes priority over any auto (stop-based) time
+        manual_ci = manual_co = None
+        try:
+            mrow = conn.execute(
+                "SELECT clock_in_at, clock_out_at FROM driver_clock_entries "
+                "WHERE driver_id=? AND date=?",
+                (driver_id, date_str)
+            ).fetchone()
+            if mrow:
+                manual_ci = mrow["clock_in_at"] or None
+                manual_co = mrow["clock_out_at"] or None
+        except Exception:
+            pass
 
-        if start_rule == "first_action":
-            # COALESCE: prefer arrived_at, fall back to completed_at
+        # ── start timestamp ──────────────────────────────────────────────────
+        if manual_ci:
+            start_ts = manual_ci                         # manual always wins
+        elif start_rule == "first_action":
             row = conn.execute(
                 """SELECT MIN(COALESCE(arrived_at, completed_at)) AS t
                    FROM stops s
@@ -714,16 +718,12 @@ def get_driver_day_hours(conn, driver_id, date_str, company_settings):
             ).fetchone()
             start_ts = row["t"] if row else None
         else:
-            try:
-                row = conn.execute(
-                    "SELECT clock_in_at FROM driver_clock_entries WHERE driver_id=? AND date=?",
-                    (driver_id, date_str)
-                ).fetchone()
-                start_ts = row["clock_in_at"] if row else None
-            except Exception:
-                start_ts = None
+            start_ts = None                              # manual rule, no entry yet
 
-        if end_rule == "last_action":
+        # ── end timestamp ────────────────────────────────────────────────────
+        if manual_co:
+            end_ts = manual_co                           # manual always wins
+        elif end_rule == "last_action":
             row = conn.execute(
                 """SELECT MAX(completed_at) AS t
                    FROM stops s
@@ -736,21 +736,14 @@ def get_driver_day_hours(conn, driver_id, date_str, company_settings):
             ).fetchone()
             end_ts = row["t"] if row else None
         else:
-            try:
-                row = conn.execute(
-                    "SELECT clock_out_at FROM driver_clock_entries WHERE driver_id=? AND date=?",
-                    (driver_id, date_str)
-                ).fetchone()
-                end_ts = row["clock_out_at"] if row else None
-            except Exception:
-                end_ts = None
+            end_ts = None                                # manual rule, no entry yet
 
         if not start_ts or not end_ts:
             return None, None, None
 
         from datetime import datetime
         fmt = "%Y-%m-%d %H:%M:%S"
-        s = datetime.strptime(start_ts[:19], fmt)
+        s  = datetime.strptime(start_ts[:19], fmt)
         e_ = datetime.strptime(end_ts[:19], fmt)
         hours = max(0.0, (e_ - s).total_seconds() / 3600)
         return start_ts, end_ts, round(hours, 2)
@@ -3064,7 +3057,231 @@ tr.status-in-progress td {{ background: rgba(255,140,0,0.03); }}
 
 }});
 </script>
-        
+
+<script>
+/* ── HAULTRA auto-save: persist & restore form inputs via localStorage ── */
+(function(){{
+  var PAGE = window.location.pathname;
+  var SKIP = {{password:1,hidden:1,submit:1,reset:1,button:1,file:1,image:1}};
+
+  function saveable(el) {{
+    if (SKIP[el.type]) return false;
+    var tag = el.tagName.toLowerCase();
+    if (tag === 'select') {{
+      /* skip navigation selects that auto-submit the form on change */
+      var oc = el.getAttribute('onchange') || '';
+      if (oc.indexOf('submit') !== -1) return false;
+    }}
+    return tag === 'input' || tag === 'textarea' || tag === 'select';
+  }}
+
+  function mkKey(formIdx, el, elIdx) {{
+    return 'haultra:' + PAGE + ':f' + formIdx + ':' + (el.name || el.id || ('i' + elIdx));
+  }}
+
+  function getVal(el) {{
+    if (el.type === 'checkbox' || el.type === 'radio') return el.checked ? '1' : '0';
+    return el.value;
+  }}
+
+  function setVal(el, v) {{
+    if (el.type === 'checkbox' || el.type === 'radio') {{
+      el.checked = (v === '1');
+    }} else if (el.tagName.toLowerCase() === 'select') {{
+      for (var i = 0; i < el.options.length; i++) {{
+        if (el.options[i].value === v) {{ el.selectedIndex = i; break; }}
+      }}
+    }} else {{
+      el.value = v;
+    }}
+  }}
+
+  document.addEventListener('DOMContentLoaded', function() {{
+    document.querySelectorAll('form').forEach(function(form, fi) {{
+      var els = form.querySelectorAll('input,textarea,select');
+
+      /* restore */
+      els.forEach(function(el, ei) {{
+        if (!saveable(el)) return;
+        var v = localStorage.getItem(mkKey(fi, el, ei));
+        if (v !== null) setVal(el, v);
+      }});
+
+      /* save on every keystroke / change */
+      els.forEach(function(el, ei) {{
+        if (!saveable(el)) return;
+        var k = mkKey(fi, el, ei);
+        var ev = (el.tagName.toLowerCase() === 'select' ||
+                  el.type === 'checkbox' || el.type === 'radio') ? 'change' : 'input';
+        el.addEventListener(ev, function() {{
+          try {{ localStorage.setItem(k, getVal(el)); }} catch(ex) {{}}
+        }});
+      }});
+
+      /* clear this form's keys on successful submit */
+      form.addEventListener('submit', function() {{
+        els.forEach(function(el, ei) {{
+          if (!saveable(el)) return;
+          localStorage.removeItem(mkKey(fi, el, ei));
+        }});
+      }});
+    }});
+  }});
+}})();
+</script>
+
+<script>
+/* ── HAULTRA offline support: SW registration, queue, sync ─────────── */
+(function(){{
+
+  /* 1 ── Register service worker ──────────────────────────────────── */
+  if ('serviceWorker' in navigator) {{
+    navigator.serviceWorker.register('/sw.js', {{scope: '/'}}).catch(function() {{}});
+  }}
+
+  var QUEUE_KEY = 'haultra_offline_queue';
+  /* Routes whose POST actions should be queued when offline */
+  var QUEUE_PAT = [
+    /^\\/stop\\/\\d+\\/driver-action$/,
+    /^\\/driver\\/clock$/
+  ];
+
+  /* 2 ── Offline / syncing banner ─────────────────────────────────── */
+  var banner = document.createElement('div');
+  banner.id = 'haultra-offline-banner';
+  banner.style.cssText = (
+    'position:fixed;top:0;left:0;right:0;z-index:10000;' +
+    'padding:10px 20px;display:none;align-items:center;' +
+    'justify-content:space-between;gap:12px;' +
+    'font-size:13px;font-weight:600;transition:background .3s;'
+  );
+  document.body.insertBefore(banner, document.body.firstChild);
+
+  function queueLen() {{
+    return JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]').length;
+  }}
+
+  function updateBanner() {{
+    var qlen = queueLen();
+    if (!navigator.onLine) {{
+      banner.style.cssText += (
+        'background:#1a0a00;border-bottom:1px solid rgba(255,157,0,.35);color:#fbbf24;'
+      );
+      banner.style.display = 'flex';
+      banner.innerHTML = (
+        '<span>&#9888;&nbsp;Offline &mdash; ' +
+        (qlen
+          ? qlen + ' action' + (qlen !== 1 ? 's' : '') + ' queued'
+          : 'actions will be saved and synced on reconnect') +
+        '</span>'
+      );
+    }} else if (qlen > 0) {{
+      banner.style.cssText += (
+        'background:#001810;border-bottom:1px solid rgba(0,232,125,.30);color:#56f0b7;'
+      );
+      banner.style.display = 'flex';
+      banner.innerHTML = (
+        '<span>&#8635;&nbsp;Back online &mdash; syncing ' +
+        qlen + ' queued action' + (qlen !== 1 ? 's' : '') + '&hellip;</span>'
+      );
+      doSync();
+    }} else {{
+      banner.style.display = 'none';
+    }}
+  }}
+
+  window.addEventListener('online',  updateBanner);
+  window.addEventListener('offline', updateBanner);
+  updateBanner();
+
+  /* 3 ── Intercept driver-relevant forms when offline ─────────────── */
+  document.addEventListener('DOMContentLoaded', function() {{
+    document.querySelectorAll('form').forEach(function(form) {{
+      if ((form.method || '').toLowerCase() !== 'post') return;
+      form.addEventListener('submit', function(evt) {{
+        if (navigator.onLine) return;          /* online: proceed normally */
+
+        /* resolve the form's target URL */
+        var raw = form.getAttribute('action') || window.location.pathname;
+        var url = raw;
+        try {{ url = new URL(raw, window.location.href).pathname; }} catch(ex) {{}}
+
+        var match = QUEUE_PAT.some(function(p) {{ return p.test(url); }});
+        if (!match) return;                    /* not a queued-able action */
+
+        evt.preventDefault();
+
+        /* snapshot form data */
+        var data = {{}};
+        new FormData(form).forEach(function(v, k) {{ data[k] = v; }});
+
+        /* push to queue */
+        var queue = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
+        queue.push({{
+          url:       url,
+          body:      data,
+          queued_at: new Date().toISOString(),
+          label:     data.action || data.clock_action || url
+        }});
+        localStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
+        updateBanner();
+
+        /* brief visual confirmation on the button */
+        var btn = form.querySelector('button[type=submit], button:not([type])');
+        if (btn) {{
+          var orig = btn.innerHTML;
+          btn.innerHTML = '&#10003;&nbsp;Saved offline';
+          btn.disabled = true;
+          setTimeout(function() {{ btn.innerHTML = orig; btn.disabled = false; }}, 2500);
+        }}
+      }});
+    }});
+  }});
+
+  /* 4 ── Sync queued actions when back online ─────────────────────── */
+  async function doSync() {{
+    var queue = JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]');
+    if (!queue.length) return;
+
+    /* fetch a fresh CSRF token — stored tokens may have expired */
+    var freshToken;
+    try {{
+      var tr = await fetch('/api/csrf-token');
+      if (!tr.ok) return;
+      freshToken = (await tr.json()).token;
+    }} catch(ex) {{ return; }}
+
+    var failed = [];
+    for (var i = 0; i < queue.length; i++) {{
+      var item = queue[i];
+      item.body['_csrf_token'] = freshToken;
+      var fd = new URLSearchParams();
+      Object.keys(item.body).forEach(function(k) {{ fd.append(k, item.body[k]); }});
+      try {{
+        var r = await fetch(item.url, {{
+          method: 'POST', body: fd, redirect: 'follow'
+        }});
+        /* Flask redirects on success (302→200); non-ok status = failure */
+        if (!r.ok && r.type !== 'opaqueredirect') failed.push(item);
+      }} catch(ex) {{
+        failed.push(item);
+      }}
+    }}
+
+    localStorage.setItem(QUEUE_KEY, JSON.stringify(failed));
+    var synced = queue.length - failed.length;
+    if (synced > 0) {{
+      /* reload the page so stop/clock state reflects synced data */
+      setTimeout(function() {{ location.reload(); }}, 700);
+    }} else {{
+      updateBanner();
+    }}
+  }}
+
+  window.__haultraSync = doSync;   /* exposed for manual trigger if needed */
+}})();
+</script>
+
     </body>
     </html>
     """
@@ -8977,28 +9194,14 @@ def driver_hours_page():
         if hrs is not None:
             total_hours += hrs
 
-    # Combined clock activity: auto (from completed stops) + manual (driver_clock_entries)
+    # Determine whether any manual mode is active for this company
+    _start_rule      = (co_settings.get("driver_day_start_rule") or "first_action").lower()
+    _end_rule        = (co_settings.get("driver_day_end_rule")   or "last_action").lower()
+    any_manual_mode  = (_start_rule == "manual" or _end_rule == "manual")
+
+    # ── Collect manual entries first; build a date-presence set for override lookup
     activity_rows = []
-    try:
-        for ar in conn.execute(
-            """SELECT date(COALESCE(s.arrived_at, s.completed_at)) AS dy,
-                      MIN(COALESCE(s.arrived_at, s.completed_at))  AS t_start,
-                      MAX(s.completed_at)                          AS t_end
-               FROM stops s
-               JOIN routes r ON s.route_id = r.id
-               WHERE r.assigned_to = ?
-                 AND date(COALESCE(s.arrived_at, s.completed_at)) BETWEEN ? AND ?
-                 AND s.status = 'completed'
-               GROUP BY dy ORDER BY dy DESC""",
-            (selected_driver_id, period_start, period_end)
-        ).fetchall():
-            if ar["dy"] and ar["t_start"]:
-                activity_rows.append({
-                    "day": ar["dy"], "start": ar["t_start"],
-                    "end": ar["t_end"] or "", "source": "auto"
-                })
-    except Exception:
-        pass
+    manual_dates  = set()
     try:
         for mr in conn.execute(
             """SELECT id, date, clock_in_at, clock_out_at
@@ -9007,15 +9210,45 @@ def driver_hours_page():
                ORDER BY date DESC""",
             (selected_driver_id, period_start, period_end)
         ).fetchall():
+            d = mr["date"] or ""
+            if d:
+                manual_dates.add(d)
             activity_rows.append({
-                "day":      mr["date"] or "",
-                "start":    mr["clock_in_at"] or "",
+                "day":      d,
+                "start":    mr["clock_in_at"]  or "",
                 "end":      mr["clock_out_at"] or "",
                 "source":   "manual",
                 "entry_id": mr["id"],
             })
     except Exception:
         pass
+
+    # ── Auto entries: omitted entirely when manual mode is on;
+    #    otherwise only included for dates that have no manual entry
+    if not any_manual_mode:
+        try:
+            for ar in conn.execute(
+                """SELECT date(COALESCE(s.arrived_at, s.completed_at)) AS dy,
+                          MIN(COALESCE(s.arrived_at, s.completed_at))  AS t_start,
+                          MAX(s.completed_at)                          AS t_end
+                   FROM stops s
+                   JOIN routes r ON s.route_id = r.id
+                   WHERE r.assigned_to = ?
+                     AND date(COALESCE(s.arrived_at, s.completed_at)) BETWEEN ? AND ?
+                     AND s.status = 'completed'
+                   GROUP BY dy ORDER BY dy DESC""",
+                (selected_driver_id, period_start, period_end)
+            ).fetchall():
+                if ar["dy"] and ar["t_start"] and ar["dy"] not in manual_dates:
+                    activity_rows.append({
+                        "day":    ar["dy"],
+                        "start":  ar["t_start"],
+                        "end":    ar["t_end"] or "",
+                        "source": "auto",
+                    })
+        except Exception:
+            pass
+
     activity_rows.sort(key=lambda r: r["day"], reverse=True)
 
     conn.close()
@@ -9553,6 +9786,112 @@ def driver_clock():
         '</div>'
     )
     return render_template_string(shell_page("Clock In / Out", body))
+
+
+# =========================================================
+# OFFLINE / PWA  — service worker, offline page, CSRF helper
+# =========================================================
+
+# Service-worker source (raw string — no f-string escaping needed)
+_SW_JS = r"""
+const CACHE   = 'haultra-v1';
+const OFFLINE = '/offline';
+
+// Pages pre-cached at install so drivers can use them without network
+const PRECACHE = ['/driver', '/driver/clock', '/offline'];
+
+self.addEventListener('install', e => {
+  e.waitUntil(
+    caches.open(CACHE).then(c =>
+      Promise.all(
+        PRECACHE.map(url =>
+          fetch(url, {credentials: 'include'})
+            .then(r => { if (r.ok) c.put(url, r); })
+            .catch(() => {})
+        )
+      )
+    ).then(() => self.skipWaiting())
+  );
+});
+
+self.addEventListener('activate', e => {
+  e.waitUntil(
+    caches.keys()
+      .then(keys => Promise.all(
+        keys.filter(k => k !== CACHE).map(k => caches.delete(k))
+      ))
+      .then(() => self.clients.claim())
+  );
+});
+
+// Network-first for all GET requests; cache as we go; serve cache when offline
+self.addEventListener('fetch', e => {
+  if (e.request.method !== 'GET') return;   // POSTs handled by page JS
+  const nav = e.request.mode === 'navigate';
+  e.respondWith(
+    fetch(e.request).then(res => {
+      if (res.ok) {
+        const clone = res.clone();
+        caches.open(CACHE).then(c => c.put(e.request, clone));
+      }
+      return res;
+    }).catch(() =>
+      caches.match(e.request).then(cached =>
+        cached || (nav ? caches.match(OFFLINE) : new Response('', {status: 503}))
+      )
+    )
+  );
+});
+"""
+
+
+@app.route('/sw.js')
+def service_worker():
+    from flask import Response
+    return Response(
+        _SW_JS, mimetype='text/javascript',
+        headers={'Service-Worker-Allowed': '/'}
+    )
+
+
+@app.route('/offline')
+def offline_page():
+    body = """
+    <div class="hero" style="text-align:center;">
+        <h1 style="color:#fbbf24;">&#9888; No Connection</h1>
+        <p>You are currently offline.</p>
+    </div>
+    <div class="card" style="max-width:460px;margin:0 auto;text-align:center;">
+        <p style="color:var(--text-soft);margin-bottom:20px;">
+            Your driver dashboard and clock pages are still available.<br>
+            Clock&nbsp;in/out and stop actions will be saved here and synced
+            automatically when your connection returns.
+        </p>
+        <button onclick="location.reload()"
+                style="padding:12px 28px;border-radius:10px;border:none;
+                       background:linear-gradient(135deg,#00c853,#00e57a);
+                       color:#001a0a;font-weight:700;cursor:pointer;font-size:15px;">
+            &#8635;&nbsp;Try Again
+        </button>
+        <div id="qs" style="margin-top:16px;color:#fbbf24;font-size:13px;"></div>
+    </div>
+    <script>
+    var q = JSON.parse(localStorage.getItem('haultra_offline_queue') || '[]');
+    if (q.length) {
+        document.getElementById('qs').textContent =
+            q.length + ' action' + (q.length > 1 ? 's' : '') + ' queued \u2014 will sync on reconnect.';
+    }
+    </script>
+    """
+    return render_template_string(shell_page("Offline", body))
+
+
+@app.route('/api/csrf-token')
+@login_required
+def api_csrf_token():
+    """Return a fresh CSRF token so the offline sync replay can re-stamp queued POSTs."""
+    from flask import jsonify
+    return jsonify({'token': get_csrf_token()})
 
 
 # =========================================================
