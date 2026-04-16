@@ -71,14 +71,11 @@ if not _secret_key:
 app.secret_key = _secret_key
 
 # DATABASE_PATH must be set explicitly — no fallbacks, no hidden paths.
-# Set this env var to the full path of your haultra.db file before starting.
 _db_env = os.environ.get("DATABASE_PATH", "").strip()
+_on_render = bool(os.environ.get("RENDER", ""))
+print(f"DATABASE_PATH={_db_env!r}  on_render={_on_render}", flush=True)
 if not _db_env:
-    raise RuntimeError(
-        "DATABASE_PATH environment variable is not set. "
-        "Set it to the full path of your haultra.db file and restart the app. "
-        "Example: DATABASE_PATH=/data/haultra.db"
-    )
+    raise RuntimeError("DATABASE_PATH is not set. Add it as an environment variable.")
 DATABASE = _db_env
 print("Using database:", DATABASE, flush=True)
 UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", os.path.join("static", "uploads"))
@@ -145,7 +142,240 @@ def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
+# ── Abbreviation expansion ───────────────────────────────────────────────────
+_ABBREV_MAP = {
+    "dom":  "Dominion",
+    "wat":  "Waterway",
+    "vb":   "Virginia Beach",
+    "ches": "Chesapeake",
+    "norf": "Norfolk",
+}
+
+def expand_abbrev(value):
+    """Expand a known abbreviation only when the whole trimmed value matches (case-insensitive).
+    Full values are returned unchanged — 'Virginia Beach' stays 'Virginia Beach'.
+    None / empty strings are returned as-is.
+    """
+    if not value:
+        return value
+    stripped = value.strip()
+    expanded = _ABBREV_MAP.get(stripped.lower())
+    return expanded if expanded else stripped
+
+
+# ── Route text paste parser ───────────────────────────────────────────────────
+# Ordered most-specific → least-specific; first match wins.
+_ACTION_PATTERNS = [
+    (re.compile(r'\b(?:pickup\s*(?:and|&)\s*return|p\s*[&/]\s*r)\b', re.I), "Pickup and Return"),
+    (re.compile(r'\bpr\b',                                               re.I), "Pickup and Return"),
+    (re.compile(r'\bswap\b',                                             re.I), "Swap"),
+    (re.compile(r'\bpull\b',                                             re.I), "Pull"),
+    (re.compile(r'\bmove\b',                                             re.I), "Move"),
+    (re.compile(r'\b(?:delivery|deliver|del)\b',                         re.I), "Delivery"),
+    (re.compile(r'(?:(?<=\s)|^)p(?=\s|$)',                               re.I), "Pull"),
+    (re.compile(r'(?:(?<=\s)|^)d(?=\s|$)',                               re.I), "Delivery"),
+]
+_CONTAINER_RE = re.compile(r'\b(\d+)\s*(?:yds?|yards?)\b', re.I)
+_PARSE_DUMP_MAP = {
+    "dom":      "Dominion",
+    "dominion": "Dominion",
+    "wat":      "Waterway",
+    "waterway": "Waterway",
+    "bay":      "Bay",
+    "spsa":     "SPSA Landfill",
+    "holland":  "Holland",
+    "spivey":   "Spivey",
+    "cox":      "SB Cox",
+    "united":   "United",
+    "sykes":    "Sykes",
+}
+_PARSE_CITY_MAP = {
+    "vb":           "Virginia Beach",
+    "ches":         "Chesapeake",
+    "norf":         "Norfolk",
+    "norfolk":      "Norfolk",
+    "chesapeake":   "Chesapeake",
+    "smithfield":   "Smithfield",
+    "suffolk":      "Suffolk",
+    "hampton":      "Hampton",
+    "nn":           "Newport News",
+    "portsmouth":   "Portsmouth",
+    "williamsburg": "Williamsburg",
+}
+
+
+def parse_route_text(text, conn, company_id):
+    """Parse pasted multi-line route text. Each non-blank line → one stop attempt.
+    Returns a list of stop dicts with confidence scores.
+    Does NOT write to the database.
+    """
+    results = []
+    for raw in text.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        parsed = _parse_one_line(raw, conn, company_id)
+        if parsed:
+            results.append(parsed)
+    return results
+
+
+def _parse_one_line(raw, conn, company_id):
+    """Parse one text line into a structured stop dict. Returns None for blank lines."""
+    work = raw.strip()
+    if not work:
+        return None
+
+    conf = 10
+    conf_reasons = []
+
+    # ── normalize separators: " - ", "|", "\" → space; "/" only when not between digits
+    work = re.sub(r'\s*[|\\]\s*', ' ', work)
+    work = re.sub(r'(?<!\d)/(?!\d)', ' ', work)
+    work = re.sub(r'\s+-\s+', ' ', work)
+    work = re.sub(r'\s+', ' ', work).strip()
+
+    # ── 1. extract action ────────────────────────────────────────────────────
+    action = ""
+    for pat, canonical in _ACTION_PATTERNS:
+        m = pat.search(work)
+        if m:
+            action = canonical
+            work = (work[:m.start()] + " " + work[m.end():])
+            work = re.sub(r'\s+', ' ', work).strip()
+            conf += 20
+            conf_reasons.append("action")
+            break
+
+    # ── 2. extract container size (Nyd / N yd / N yard) ─────────────────────
+    container_size = ""
+    m = _CONTAINER_RE.search(work)
+    if m:
+        container_size = m.group(1) + "yd"
+        work = work[:m.start()] + " " + work[m.end():]
+        work = re.sub(r'\s+', ' ', work).strip()
+        conf += 10
+        conf_reasons.append("container")
+
+    # ── 3. extract dump location ─────────────────────────────────────────────
+    dump_location = ""
+    for token, fullname in _PARSE_DUMP_MAP.items():
+        pat = re.compile(r'(?:(?<=\s)|^)' + re.escape(token) + r'(?=\s|$)', re.I)
+        m = pat.search(work)
+        if m:
+            dump_location = fullname
+            work = work[:m.start()] + " " + work[m.end():]
+            work = re.sub(r'\s+', ' ', work).strip()
+            conf += 10
+            conf_reasons.append("dump")
+            break
+
+    # ── 4. extract city abbreviation/name ────────────────────────────────────
+    city = ""
+    for token, fullname in _PARSE_CITY_MAP.items():
+        pat = re.compile(r'(?:(?<=\s)|^)' + re.escape(token) + r'(?=\s|$)', re.I)
+        m = pat.search(work)
+        if m:
+            city = fullname
+            work = work[:m.start()] + " " + work[m.end():]
+            work = re.sub(r'\s+', ' ', work).strip()
+            conf += 5
+            conf_reasons.append("city")
+            break
+    state = "VA" if city else ""
+
+    # ── 5. split remaining into customer name + address ──────────────────────
+    work = work.strip()
+    customer_name = ""
+    address = ""
+
+    if "," in work:
+        # "Customer Name, 123 Street" explicit CSV split
+        parts = work.split(",", 1)
+        customer_name = parts[0].strip()
+        address = parts[1].strip()
+        conf += 15
+        conf_reasons.append("csv-split")
+    else:
+        # Find first occurrence of a street number (digit(s) + space + word)
+        m = re.search(r'(?:(?<=\s)|^)(\d+\s+\w)', work)
+        if m:
+            pos = m.start() if work[m.start()].isdigit() else m.start() + 1
+            customer_name = work[:pos].strip()
+            address = work[pos:].strip()
+            conf += 10
+            conf_reasons.append("addr-num")
+        else:
+            customer_name = work
+            conf += 5
+            conf_reasons.append("name-only")
+
+    # ── 6. saved addresses lookup ─────────────────────────────────────────────
+    zip_code = ""
+    matched_saved = False
+    if conn and company_id:
+        try:
+            saved = None
+            if customer_name:
+                saved = conn.execute(
+                    """SELECT * FROM saved_addresses
+                       WHERE company_id=? AND LOWER(customer_name) LIKE ?
+                       ORDER BY times_used DESC LIMIT 1""",
+                    (company_id, "%" + customer_name.lower() + "%")
+                ).fetchone()
+            if not saved and address:
+                saved = conn.execute(
+                    """SELECT * FROM saved_addresses
+                       WHERE company_id=? AND LOWER(address) LIKE ?
+                       ORDER BY times_used DESC LIMIT 1""",
+                    (company_id, "%" + address.lower() + "%")
+                ).fetchone()
+            if saved:
+                matched_saved = True
+                conf += 20
+                conf_reasons.append("saved")
+                if not city:
+                    city  = saved["city"]  or ""
+                    state = saved["state"] or ""
+                zip_code = saved["zip"] or ""
+                if not customer_name and saved["customer_name"]:
+                    customer_name = saved["customer_name"]
+                if not address and saved["address"]:
+                    address = saved["address"]
+                if not action and saved["default_action"]:
+                    action = saved["default_action"]
+                    conf_reasons.append("saved-action")
+                if not container_size and saved["default_container_size"]:
+                    container_size = saved["default_container_size"]
+                    conf_reasons.append("saved-container")
+                if not dump_location and saved["default_dump_location"]:
+                    dump_location = saved["default_dump_location"]
+                    conf_reasons.append("saved-dump")
+        except Exception:
+            pass
+
+    conf = min(100, conf)
+    conf_label = "high" if conf >= 75 else ("medium" if conf >= 45 else "low")
+
+    return {
+        "original_line":   raw,
+        "customer_name":   customer_name,
+        "address":         address,
+        "city":            city,
+        "state":           state,
+        "zip_code":        zip_code,
+        "action":          action,
+        "container_size":  container_size,
+        "dump_location":   dump_location,
+        "notes":           "",
+        "confidence":      conf,
+        "confidence_label": conf_label,
+        "matched_saved":   matched_saved,
+    }
+
+
 def get_db():
+    os.makedirs(os.path.dirname(DATABASE), exist_ok=True)
     conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
     return conn
@@ -1076,6 +1306,42 @@ def init_db():
         notes        TEXT,
         created_at   TEXT NOT NULL,
         FOREIGN KEY (driver_id) REFERENCES users(id)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS saved_addresses (
+        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id             INTEGER NOT NULL,
+        customer_name          TEXT,
+        address                TEXT,
+        city                   TEXT,
+        state                  TEXT,
+        zip                    TEXT,
+        full_address           TEXT,
+        lat                    REAL,
+        lng                    REAL,
+        default_action         TEXT,
+        default_container_size TEXT,
+        default_dump_location  TEXT,
+        times_used             INTEGER NOT NULL DEFAULT 1,
+        last_used_at           TEXT NOT NULL,
+        created_at             TEXT NOT NULL,
+        UNIQUE(company_id, customer_name, address)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS saved_address_details (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        saved_address_id INTEGER NOT NULL,
+        action           TEXT NOT NULL DEFAULT '',
+        container_size   TEXT NOT NULL DEFAULT '',
+        dump_location    TEXT NOT NULL DEFAULT '',
+        times_used       INTEGER NOT NULL DEFAULT 1,
+        last_used_at     TEXT NOT NULL,
+        UNIQUE(saved_address_id, action, container_size, dump_location),
+        FOREIGN KEY (saved_address_id) REFERENCES saved_addresses(id)
     )
     """)
 
@@ -3278,6 +3544,8 @@ tr.status-in-progress td {{ background: rgba(255,140,0,0.03); }}
   window.__haultraSync = doSync;   /* exposed for manual trigger if needed */
 }})();
 </script>
+
+<script>{_ABBREV_EXPAND_JS}</script>
 
     </body>
     </html>
@@ -5782,6 +6050,651 @@ def driver_route_detail(route_id):
     return render_template_string(shell_page("Driver Route", body, extra_head))
 
 
+# =========================================================
+# ADDRESS MEMORY — autocomplete JS + upsert helper
+# =========================================================
+_AUTOCOMPLETE_JS = """
+(function() {
+  'use strict';
+  function buildSuggest(input) {
+    var form = input.closest ? input.closest('form') : null;
+    if (!form) return;
+    var wrap = input.parentNode;
+    if (window.getComputedStyle(wrap).position === 'static') wrap.style.position = 'relative';
+    var box = document.createElement('div');
+    box.style.cssText = [
+      'position:absolute','left:0','right:0','top:100%','z-index:9999',
+      'background:#0a1826','border:1px solid #1e3a52','border-top:none',
+      'border-radius:0 0 10px 10px','max-height:260px','overflow-y:auto',
+      'display:none','box-shadow:0 8px 32px rgba(0,0,0,.7)'
+    ].join(';');
+    wrap.appendChild(box);
+    var timer = null;
+    input.addEventListener('input', function() {
+      clearTimeout(timer);
+      var q = this.value.trim();
+      if (q.length < 2) { box.style.display = 'none'; return; }
+      timer = setTimeout(function() {
+        fetch('/api/address-suggestions?q=' + encodeURIComponent(q))
+          .then(function(r) { return r.json(); })
+          .then(function(data) {
+            box.innerHTML = '';
+            if (!data.length) { box.style.display = 'none'; return; }
+            data.forEach(function(d) {
+              var item = document.createElement('div');
+              item.style.cssText = [
+                'padding:10px 14px','cursor:pointer',
+                'border-bottom:1px solid rgba(30,58,82,.6)',
+                'font-size:13px','line-height:1.4'
+              ].join(';');
+              var line2 = [d.address, d.city, d.state].filter(Boolean).join(', ');
+              item.innerHTML =
+                '<div style="color:#61f7df;font-weight:600;">' + _esc(d.customer_name) + '</div>' +
+                (line2 ? '<div style="color:#6a8aa8;font-size:11px;margin-top:2px;">' + _esc(line2) + '</div>' : '');
+              item.addEventListener('mouseenter', function() { this.style.background = 'rgba(97,247,223,.08)'; });
+              item.addEventListener('mouseleave', function() { this.style.background = ''; });
+              item.addEventListener('mousedown', function(ev) {
+                ev.preventDefault();
+                _fill(form, d);
+                box.style.display = 'none';
+              });
+              box.appendChild(item);
+            });
+            box.style.display = 'block';
+          })
+          .catch(function() { box.style.display = 'none'; });
+      }, 220);
+    });
+    input.addEventListener('blur', function() {
+      setTimeout(function() { box.style.display = 'none'; }, 200);
+    });
+    input.addEventListener('focus', function() {
+      if (box.children.length) box.style.display = 'block';
+    });
+  }
+  function _esc(s) {
+    return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+  function _fill(form, d) {
+    /* Always fill address identity fields */
+    var set = function(name, val) {
+      if (!val) return;
+      var el = form.querySelector('[name="' + name + '"]');
+      if (el) el.value = val;
+    };
+    set('customer_name', d.customer_name);
+    set('address',       d.address);
+    set('city',          d.city);
+    set('state',         d.state);
+    set('zip_code',      d.zip);
+    /* Smart defaults — only fill if the field is currently empty */
+    var setIfEmpty = function(name, val) {
+      if (!val) return;
+      var el = form.querySelector('[name="' + name + '"]');
+      if (el && !el.value.trim()) el.value = val;
+    };
+    setIfEmpty('action',         d.default_action);
+    setIfEmpty('container_size', d.default_container_size);
+    if (d.default_dump_location) {
+      var dl = form.querySelector('[name="dump_location"]');
+      if (dl && !dl.value.trim()) dl.value = d.default_dump_location;
+    }
+  }
+  document.addEventListener('DOMContentLoaded', function() {
+    document.querySelectorAll('[data-hac]').forEach(function(inp) {
+      buildSuggest(inp);
+    });
+  });
+})();
+"""
+
+
+_STOP_WARNINGS_JS = """
+(function() {
+  'use strict';
+  var existingStops = window._HAULTRA_STOPS || [];
+
+  var DUMP_NEEDED  = ['pickup and return', 'pull', 'swap'];
+  var PICKUP_TYPES = ['pickup and return', 'pull', 'swap'];
+  var KNOWN        = ['pickup and return', 'pull', 'delivery', 'dump run', 'swap'];
+  var ABBREVS      = ['pr', 'p', 'd'];
+
+  function has(str, keywords) {
+    return keywords.some(function(k) { return str.indexOf(k) >= 0; });
+  }
+  function isKnown(a) {
+    if (!a) return true;
+    if (ABBREVS.indexOf(a) >= 0) return true;
+    return has(a, KNOWN);
+  }
+
+  function check(form) {
+    var g = function(n) {
+      var el = form.querySelector('[name="' + n + '"]');
+      return el ? (el.value || '').trim() : '';
+    };
+    var action   = g('action').toLowerCase();
+    var address  = g('address');
+    var city     = g('city');
+    var state    = g('state');
+    var dumpLoc  = g('dump_location');
+    var customer = g('customer_name');
+    var warns    = [];
+
+    /* 1 — Missing dump location */
+    if (action && has(action, DUMP_NEEDED) && !dumpLoc) {
+      warns.push({ level: 'yellow',
+        msg: 'Missing dump location \u2014 ' + action + ' stops require a dump site.' });
+    }
+
+    /* 2 — Incomplete address */
+    if (address) {
+      var missing = [];
+      if (!city)  missing.push('city');
+      if (!state) missing.push('state');
+      if (missing.length) {
+        warns.push({ level: 'yellow',
+          msg: 'Incomplete address \u2014 missing ' + missing.join(' and ') + '.' });
+      }
+    }
+
+    /* 3 — Duplicate stop */
+    if (customer || address) {
+      var cl = customer.toLowerCase();
+      var al = address.toLowerCase();
+      var dup = existingStops.some(function(s) {
+        var sc = (s.customer_name || '').toLowerCase();
+        var sa = (s.address || '').toLowerCase();
+        return (cl && sc && sc === cl) || (al && sa && sa === al);
+      });
+      if (dup) {
+        warns.push({ level: 'yellow',
+          msg: 'Duplicate \u2014 a stop for this customer or address already exists on this route.' });
+      }
+    }
+
+    /* 4 — Invalid service flow: consecutive pickups */
+    if (action && existingStops.length > 0) {
+      var lastA = (existingStops[existingStops.length - 1].action || '').toLowerCase();
+      if (has(action, PICKUP_TYPES) && has(lastA, PICKUP_TYPES)) {
+        warns.push({ level: 'red',
+          msg: 'Service flow issue \u2014 consecutive pickup actions (' +
+               lastA + ' \u2192 ' + action + '). Verify route logic.' });
+      }
+    }
+
+    /* 5 — Unknown abbreviation */
+    if (action && !isKnown(action)) {
+      warns.push({ level: 'yellow',
+        msg: 'Unknown action \u201c' + action + '\u201d \u2014 expected: PR, Pull, Delivery, Dump Run, or Swap.' });
+    }
+
+    return warns;
+  }
+
+  function render(box, warns) {
+    if (!warns.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+    box.innerHTML = warns.map(function(w) {
+      var bg  = w.level === 'red' ? 'rgba(255,59,92,.10)'  : 'rgba(255,157,0,.09)';
+      var bdr = w.level === 'red' ? 'rgba(255,59,92,.35)'  : 'rgba(255,157,0,.32)';
+      var col = w.level === 'red' ? '#ff8099'              : '#fbbf24';
+      return (
+        '<div style="display:flex;gap:8px;align-items:flex-start;padding:9px 13px;' +
+        'background:' + bg + ';border:1px solid ' + bdr + ';border-radius:8px;' +
+        'font-size:12px;line-height:1.45;color:' + col + ';">' +
+        '<span style="flex-shrink:0;">&#9888;</span>' +
+        '<span>' + w.msg + '</span></div>'
+      );
+    }).join('');
+    box.style.cssText = 'display:flex;flex-direction:column;gap:6px;margin-top:12px;';
+  }
+
+  document.addEventListener('DOMContentLoaded', function() {
+    document.querySelectorAll('form').forEach(function(form) {
+      if (!form.querySelector('[name="action"]')) return;
+
+      var box = document.createElement('div');
+      box.className = 'haultra-stop-warnings';
+      box.style.display = 'none';
+
+      /* insert just before the submit-button row */
+      var submitRow = null;
+      form.querySelectorAll('div').forEach(function(d) {
+        if (!submitRow && d.querySelector('button[type="submit"]')) submitRow = d;
+      });
+      if (submitRow) form.insertBefore(box, submitRow);
+      else form.appendChild(box);
+
+      var WATCH = ['action','customer_name','address','city','state','dump_location','container_size'];
+      WATCH.forEach(function(n) {
+        var el = form.querySelector('[name="' + n + '"]');
+        if (!el) return;
+        el.addEventListener(el.tagName.toLowerCase() === 'select' ? 'change' : 'input',
+          function() { render(box, check(form)); });
+      });
+
+      /* run immediately for pre-filled edit forms */
+      render(box, check(form));
+    });
+  });
+})();
+"""
+
+
+_ABBREV_EXPAND_JS = """
+(function() {
+  var MAP = {
+    'dom':  'Dominion',
+    'wat':  'Waterway',
+    'vb':   'Virginia Beach',
+    'ches': 'Chesapeake',
+    'norf': 'Norfolk'
+  };
+  /* Exposed globally so other scripts can reuse the same map */
+  window._haultraExpand = function(v) {
+    var t = (v || '').trim();
+    return MAP[t.toLowerCase()] || t;
+  };
+  document.addEventListener('DOMContentLoaded', function() {
+    document.querySelectorAll('input[name], textarea[name]').forEach(function(el) {
+      if (['password','hidden','file','submit','reset','button'].indexOf(el.type) >= 0) return;
+      el.addEventListener('blur', function() {
+        var expanded = window._haultraExpand(this.value);
+        if (expanded !== (this.value || '').trim()) this.value = expanded;
+      });
+    });
+  });
+})();
+"""
+
+
+_PASTE_ROUTE_CSS = """<style>
+/* ── Paste Route Panel ───────────────────────────────────────────── */
+.pr-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start}
+@media(max-width:820px){.pr-grid{grid-template-columns:1fr}}
+.pr-card{background:rgba(4,20,45,.55);border:1px solid rgba(0,160,255,.12);border-radius:14px;padding:20px 22px;margin-bottom:18px}
+.pr-card h3{margin:0 0 4px;font-size:15px;color:#c8dff0;font-weight:800;letter-spacing:.3px}
+.pr-card .pr-sub{font-size:12px;color:#4a6a88;margin:0 0 14px}
+.pr-stop{border-radius:10px;padding:15px;margin-bottom:12px;position:relative;transition:opacity .2s,height .2s,padding .2s,margin .2s}
+.pr-stop.h{background:rgba(0,232,125,.04);border:1px solid rgba(0,232,125,.18)}
+.pr-stop.m{background:rgba(255,157,0,.05);border:1px solid rgba(255,157,0,.20)}
+.pr-stop.l{background:rgba(255,59,92,.05);border:1px solid rgba(255,59,92,.20)}
+.pr-badge{display:inline-flex;align-items:center;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;letter-spacing:.3px;margin-right:4px}
+.pr-b-pr{background:rgba(97,247,223,.12);color:#61f7df}
+.pr-b-p{background:rgba(251,191,36,.12);color:#fbbf24}
+.pr-b-d{background:rgba(96,165,250,.12);color:#60a5fa}
+.pr-b-swap{background:rgba(167,139,250,.12);color:#a78bfa}
+.pr-b-move{background:rgba(244,114,182,.12);color:#f472b6}
+.pr-b-other{background:rgba(120,120,150,.12);color:#9aa5b8}
+.pr-ch{background:rgba(0,232,125,.10);color:#00e87d}
+.pr-cm{background:rgba(251,191,36,.10);color:#fbbf24}
+.pr-cl{background:rgba(255,59,92,.10);color:#ff7090}
+.pr-saved{background:rgba(97,247,223,.08);color:#61f7df;border:1px solid rgba(97,247,223,.2)}
+.pr-lbl{display:block;font-size:10px;color:#4a6a88;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px}
+.pr-inp{width:100%;background:rgba(0,0,0,.35);border:1px solid rgba(0,160,255,.13);border-radius:7px;color:#c8dff0;padding:7px 10px;font-size:13px;box-sizing:border-box;font-family:inherit}
+.pr-inp:focus{outline:none;border-color:rgba(0,200,255,.38)}
+.pr-miss .pr-inp{border-color:rgba(251,191,36,.4)!important;background:rgba(251,191,36,.03)!important}
+.pr-miss .pr-lbl{color:#fbbf24}
+.pr-orig{font-size:11px;color:#3d5564;font-style:italic;font-family:monospace;background:rgba(0,0,0,.18);border-radius:5px;padding:5px 9px;margin-bottom:12px}
+.pr-warn-strip{margin-top:10px;padding:6px 12px;border-radius:6px;font-size:12px;background:rgba(251,191,36,.07);border:1px solid rgba(251,191,36,.2);color:#fbbf24}
+.pr-card-acts{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+.pr-btn-sm{font-size:12px;padding:5px 12px;border-radius:6px;border:none;cursor:pointer;font-weight:600;font-family:inherit}
+.pr-btn-remove{background:rgba(255,59,92,.10);color:#ff7090}
+.pr-btn-remove:hover{background:rgba(255,59,92,.22)}
+.pr-sugg{padding:9px 13px;border-radius:8px;margin-bottom:8px;font-size:13px;line-height:1.4;display:flex;align-items:flex-start;gap:8px}
+.pr-sw{background:rgba(251,191,36,.07);border:1px solid rgba(251,191,36,.18);color:#fbbf24}
+.pr-si{background:rgba(97,247,223,.05);border:1px solid rgba(97,247,223,.15);color:#61f7df}
+.pr-se{background:rgba(255,59,92,.07);border:1px solid rgba(255,59,92,.18);color:#ff7090}
+.pr-footer-bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:14px 0 2px;border-top:1px solid rgba(0,160,255,.1);margin-top:10px}
+.pr-footer-count{font-size:13px;color:#4a6a88;flex:1}
+.pr-tip-item{font-size:12px;color:#6a8aa8;padding:7px 0;border-bottom:1px solid rgba(0,100,160,.1)}
+.pr-tip-item:last-child{border-bottom:none}
+.pr-tip-item strong{color:#8fd3ff}
+.pr-tip-code{font-family:monospace;background:rgba(0,0,0,.3);border-radius:4px;padding:2px 6px;color:#8fd3ff;font-size:11px}
+#pr-mobile-bar{display:none;position:fixed;bottom:0;left:0;right:0;z-index:1200;background:rgba(4,10,28,.97);border-top:1px solid rgba(0,160,255,.2);padding:12px 16px;gap:10px}
+@media(max-width:820px){#pr-mobile-bar.pr-show{display:flex}}
+</style>"""
+
+
+_PASTE_ROUTE_JS = """
+(function() {
+  'use strict';
+  var csrf  = (document.querySelector('meta[name="csrf-token"]')||{}).getAttribute('content')||'';
+  var RID   = window._HAULTRA_ROUTE_ID  || 0;
+  var DUMPS = window._HAULTRA_DUMP_LOCS || [];
+
+  var _stops = [], _removed = {};
+  var $       = function(id) { return document.getElementById(id); };
+  var ta       = $('pr-textarea');
+  var parseBtn = $('pr-parse-btn');
+  var clearBtn = $('pr-clear-btn');
+  var closeBtn = $('pr-close-btn');
+  var preview  = $('pr-preview');
+  var suggCard = $('pr-sugg-card');
+  var suggInner= $('pr-sugg-inner');
+  var footer   = $('pr-footer-bar');
+  var buildBtn = $('pr-build-btn');
+  var cancelBtn= $('pr-cancel-btn');
+  var panel    = $('paste-route-panel');
+  var mobileBar= $('pr-mobile-bar');
+
+  /* ── Toggle (called from hero button) ─────────────────────────────────── */
+  window._haulsTogglePaste = function() {
+    if (!panel) return;
+    var open = panel.style.display !== 'none';
+    panel.style.display = open ? 'none' : 'block';
+    if (!open) { setTimeout(function(){ panel.scrollIntoView({behavior:'smooth',block:'start'}); }, 60); }
+  };
+
+  if (!parseBtn) return;
+
+  /* ── Parse button ─────────────────────────────────────────────────────── */
+  parseBtn.addEventListener('click', function() {
+    var text = ta.value.trim();
+    if (!text) { ta.focus(); return; }
+    parseBtn.disabled = true; parseBtn.textContent = 'Parsing\u2026';
+    preview.innerHTML = '<p style="color:#5a7a9a;padding:24px 0;font-size:13px;text-align:center;">Analyzing route lines\u2026</p>';
+    if (footer) footer.style.display = 'none';
+    if (mobileBar) mobileBar.classList.remove('pr-show');
+    if (suggCard) suggCard.style.display = 'none';
+    fetch('/api/parse-route-text', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({_csrf_token: csrf, text: text, route_id: RID})
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      parseBtn.disabled = false; parseBtn.textContent = 'Parse Route';
+      if (d.error) { preview.innerHTML = '<p style="color:#ff7090;padding:12px 0;">' + _esc(d.error) + '</p>'; return; }
+      _stops = (d.stops || []).slice(); _removed = {};
+      renderAll();
+    })
+    .catch(function() {
+      parseBtn.disabled = false; parseBtn.textContent = 'Parse Route';
+      preview.innerHTML = '<p style="color:#ff7090;padding:12px 0;">Request failed \u2014 check connection.</p>';
+    });
+  });
+
+  /* ── Clear ────────────────────────────────────────────────────────────── */
+  if (clearBtn) clearBtn.addEventListener('click', function() {
+    ta.value = ''; preview.innerHTML = '';
+    if (footer) footer.style.display = 'none';
+    if (mobileBar) mobileBar.classList.remove('pr-show');
+    if (suggCard) suggCard.style.display = 'none';
+    _stops = []; _removed = {}; ta.focus();
+  });
+
+  /* ── Close / Cancel ───────────────────────────────────────────────────── */
+  if (closeBtn)  closeBtn.addEventListener('click',  function() { if (panel) panel.style.display = 'none'; });
+  if (cancelBtn) cancelBtn.addEventListener('click', function() { if (panel) panel.style.display = 'none'; });
+
+  /* ── Render all ───────────────────────────────────────────────────────── */
+  function renderAll() {
+    var vis = _stops.filter(function(_, i) { return !_removed[i]; });
+    if (!vis.length) {
+      preview.innerHTML = '<p style="color:#5a7a9a;padding:16px 0;font-size:13px;">No stops detected. Try one stop per line.</p>';
+      if (footer) footer.style.display = 'none';
+      if (mobileBar) mobileBar.classList.remove('pr-show');
+      if (suggCard) suggCard.style.display = 'none';
+      return;
+    }
+    preview.innerHTML = _stops.map(function(s, i) { return _removed[i] ? '' : cardHTML(s, i); }).join('');
+    renderSuggestions();
+    if (footer) footer.style.display = 'flex';
+    if (mobileBar) mobileBar.classList.add('pr-show');
+    updateCount();
+  }
+
+  /* ── Remove card ──────────────────────────────────────────────────────── */
+  window._haulsRemoveCard = function(i) {
+    _removed[i] = true;
+    var c = $('pr-card-' + i);
+    if (c) { c.style.opacity = '0'; c.style.height = '0'; c.style.overflow = 'hidden'; c.style.padding = '0'; c.style.margin = '0'; }
+    renderSuggestions(); updateCount();
+    if (!_stops.some(function(_, idx) { return !_removed[idx]; })) {
+      if (footer) footer.style.display = 'none';
+      if (mobileBar) mobileBar.classList.remove('pr-show');
+    }
+  };
+
+  /* ── Confidence helpers ───────────────────────────────────────────────── */
+  function confCls(s)  { return s.confidence >= 75 ? 'h' : s.confidence >= 45 ? 'm' : 'l'; }
+  function confBCls(s) { return s.confidence >= 75 ? 'pr-ch' : s.confidence >= 45 ? 'pr-cm' : 'pr-cl'; }
+  function confLbl(s)  { return s.confidence >= 75 ? 'High' : s.confidence >= 45 ? 'Medium' : 'Low'; }
+
+  /* ── Action badge ─────────────────────────────────────────────────────── */
+  function actionBadge(action) {
+    var a = (action || '').trim().toUpperCase();
+    var cls = 'pr-b-other', lbl = a || '?';
+    if (/PICKUP.*RETURN/.test(a) || a === 'PR' || /P.*&.*R/.test(a)) { cls = 'pr-b-pr'; lbl = 'PR'; }
+    else if (/^PULL$|^P$/.test(a))   { cls = 'pr-b-p';    lbl = 'Pull'; }
+    else if (/^DELIVERY$|^D$/.test(a)){ cls = 'pr-b-d';   lbl = 'Delivery'; }
+    else if (/SWAP/.test(a))          { cls = 'pr-b-swap'; lbl = 'Swap'; }
+    else if (/MOVE/.test(a))          { cls = 'pr-b-move'; lbl = 'Move'; }
+    return '<span class="pr-badge ' + cls + '">' + _esc(lbl) + '</span>';
+  }
+
+  /* ── Missing field check ──────────────────────────────────────────────── */
+  function missFlds(s) {
+    var m = [];
+    if (!s.dump_location) m.push('dump');
+    if (!s.address)       m.push('address');
+    if (!s.customer_name) m.push('customer');
+    if (!s.action)        m.push('action');
+    return m;
+  }
+
+  /* ── Dump select options ──────────────────────────────────────────────── */
+  function dumpOpts(val) {
+    return '<option value="">-- None --</option>' +
+      DUMPS.map(function(n) {
+        return '<option value="' + _esc(n) + '"' + (n === val ? ' selected' : '') + '>' + _esc(n) + '</option>';
+      }).join('');
+  }
+
+  /* ── Field builder helpers ────────────────────────────────────────────── */
+  function fld(lbl, id, val, col, miss) {
+    var cs = col ? 'grid-column:' + col + ';' : '';
+    return '<div style="' + cs + '"' + (miss ? ' class="pr-miss"' : '') + '>'
+      + '<label class="pr-lbl" for="' + id + '">' + lbl + '</label>'
+      + '<input id="' + id + '" class="pr-inp" value="' + _esc(val) + '">'
+      + '</div>';
+  }
+  function dumpFld(id, val, miss) {
+    return '<div' + (miss ? ' class="pr-miss"' : '') + '>'
+      + '<label class="pr-lbl" for="' + id + '">Dump Location</label>'
+      + '<select id="' + id + '" class="pr-inp">' + dumpOpts(val) + '</select>'
+      + '</div>';
+  }
+
+  /* ── Card HTML ────────────────────────────────────────────────────────── */
+  function cardHTML(s, i) {
+    var miss = missFlds(s);
+    var savedBadge = s.matched_saved ? '<span class="pr-badge pr-saved">&#11042; Saved</span>' : '';
+    var warnStrip = '';
+    if (miss.length) {
+      var wMsgs = miss.map(function(f) {
+        return {dump: 'Missing dump location', address: 'No address', customer: 'No customer name', action: 'Action unknown'}[f] || ('Missing: ' + f);
+      });
+      warnStrip = '<div class="pr-warn-strip">&#9888; ' + wMsgs.join(' &bull; ') + '</div>';
+    }
+    var mIdx = function(f) { return miss.indexOf(f) >= 0; };
+    return (
+      '<div class="pr-stop ' + confCls(s) + '" id="pr-card-' + i + '">'
+      /* header */
+      + '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">'
+        + '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">'
+          + '<label style="display:flex;align-items:center;gap:7px;cursor:pointer;font-size:12px;color:#7aaac8;font-weight:700;">'
+            + '<input type="checkbox" id="pr-chk-' + i + '" checked style="width:15px;height:15px;accent-color:#00ccff;"> Stop ' + (i + 1)
+          + '</label>'
+          + actionBadge(s.action)
+        + '</div>'
+        + '<div style="display:flex;align-items:center;gap:6px;">'
+          + savedBadge
+          + '<span class="pr-badge ' + confBCls(s) + '">' + confLbl(s) + ' (' + s.confidence + '%)</span>'
+        + '</div>'
+      + '</div>'
+      /* original line */
+      + '<div class="pr-orig">&ldquo;' + _esc(s.original_line) + '&rdquo;</div>'
+      /* fields grid */
+      + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">'
+        + fld('Customer', 'pr-cust-' + i,   s.customer_name,  '1/-1', mIdx('customer'))
+        + fld('Address',  'pr-addr-' + i,   s.address,        '1/-1', mIdx('address'))
+        + fld('City',     'pr-city-' + i,   s.city,           null,   false)
+        + fld('State',    'pr-state-' + i,  s.state,          null,   false)
+        + fld('Action',   'pr-action-' + i, s.action,         null,   mIdx('action'))
+        + fld('Container','pr-cont-' + i,   s.container_size, null,   false)
+        + dumpFld('pr-dump-' + i, s.dump_location, mIdx('dump'))
+        + fld('ZIP',      'pr-zip-' + i,    s.zip_code,       null,   false)
+      + '</div>'
+      + warnStrip
+      + '<div class="pr-card-acts">'
+        + '<button class="pr-btn-sm pr-btn-remove" type="button" onclick="_haulsRemoveCard(' + i + ')">&#x2715; Remove</button>'
+      + '</div>'
+      + '</div>'
+    );
+  }
+
+  /* ── Suggestions panel ────────────────────────────────────────────────── */
+  function renderSuggestions() {
+    if (!suggCard || !suggInner) return;
+    var items = [];
+    _stops.forEach(function(s, i) {
+      if (_removed[i]) return;
+      var n = i + 1;
+      if (!s.dump_location) items.push({t: 'w', msg: 'Stop ' + n + ': Missing dump location'});
+      if (!s.address)       items.push({t: 'e', msg: 'Stop ' + n + ': No address found \u2014 review before saving'});
+      if (s.confidence < 45)items.push({t: 'e', msg: 'Stop ' + n + ': Low confidence \u2014 manual review recommended'});
+      if (s.matched_saved)  items.push({t: 'i', msg: 'Stop ' + n + ': &#11042; Auto-filled from address history'});
+      if (!s.action)        items.push({t: 'w', msg: 'Stop ' + n + ': Action not detected (enter P, D, PR, Swap, or Move)'});
+    });
+    if (!items.length) { suggCard.style.display = 'none'; return; }
+    suggCard.style.display = 'block';
+    suggInner.innerHTML = items.map(function(it) {
+      var cls = it.t === 'e' ? 'pr-sugg pr-se' : it.t === 'i' ? 'pr-sugg pr-si' : 'pr-sugg pr-sw';
+      var ic  = it.t === 'i' ? '&#10003;' : '&#9888;';
+      return '<div class="' + cls + '"><span>' + ic + '</span><span>' + it.msg + '</span></div>';
+    }).join('');
+  }
+
+  /* ── Stop count display ───────────────────────────────────────────────── */
+  function updateCount() {
+    var el = $('pr-stop-count'); if (!el) return;
+    var n = _stops.filter(function(_, i) { return !_removed[i]; }).length;
+    el.textContent = n + ' stop' + (n !== 1 ? 's' : '') + ' ready to add';
+  }
+
+  /* ── Build Route ──────────────────────────────────────────────────────── */
+  if (buildBtn) buildBtn.addEventListener('click', function() {
+    var toAdd = [], hasLow = false, hasMissReq = false;
+    _stops.forEach(function(s, i) {
+      if (_removed[i]) return;
+      var chk = $('pr-chk-' + i);
+      if (chk && !chk.checked) return;
+      var stop = {
+        customer_name: _v('pr-cust-' + i),   address:        _v('pr-addr-' + i),
+        city:          _v('pr-city-' + i),    state:          _v('pr-state-' + i),
+        zip_code:      _v('pr-zip-' + i),     action:         _v('pr-action-' + i),
+        container_size:_v('pr-cont-' + i),    dump_location:  _v('pr-dump-' + i),
+      };
+      if (s.confidence < 45)                     hasLow = true;
+      if (!stop.address || !stop.customer_name)  hasMissReq = true;
+      toAdd.push(stop);
+    });
+    if (!toAdd.length) { alert('No stops selected.'); return; }
+    if (hasLow || hasMissReq) {
+      var msg = 'Some stops need review:\n';
+      if (hasMissReq) msg += '\u2022 One or more stops missing address or customer name.\n';
+      if (hasLow)     msg += '\u2022 One or more stops have low confidence.\n';
+      msg += '\nContinue and add ' + toAdd.length + ' stop' + (toAdd.length !== 1 ? 's' : '') + ' anyway?';
+      if (!confirm(msg)) return;
+    }
+    buildBtn.disabled = true; buildBtn.textContent = 'Adding\u2026';
+    fetch('/route/' + RID + '/add-parsed-stops', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({_csrf_token: csrf, stops: toAdd})
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.added) { location.reload(); }
+      else { buildBtn.disabled = false; buildBtn.textContent = 'Build Route'; alert(d.error || 'Failed to add stops.'); }
+    })
+    .catch(function() { buildBtn.disabled = false; buildBtn.textContent = 'Build Route'; alert('Network error \u2014 try again.'); });
+  });
+
+  function _v(id) { var el = $(id); return el ? el.value.trim() : ''; }
+  function _esc(s) {
+    return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+})();
+"""
+
+
+def upsert_saved_address(conn, company_id, customer_name, address,
+                          city, state, zip_code, action, container_size, dump_location):
+    """Save or update a customer address in saved_addresses for autocomplete.
+    Also tracks each (action, container_size, dump_location) combination in
+    saved_address_details so the API can return the most-frequently-used defaults.
+    """
+    if not company_id:
+        return
+    cname = (customer_name or "").strip()
+    addr  = (address or "").strip()
+    if not cname:
+        return
+    ts   = now_ts()
+    full = ", ".join(p for p in [addr, city or "", state or "", zip_code or ""] if p.strip())
+    try:
+        existing = conn.execute(
+            "SELECT id FROM saved_addresses WHERE company_id=? AND customer_name=? AND address=?",
+            (company_id, cname, addr)
+        ).fetchone()
+        if existing:
+            sa_id = existing["id"]
+            conn.execute("""
+                UPDATE saved_addresses SET
+                    city=?, state=?, zip=?, full_address=?,
+                    times_used=times_used+1, last_used_at=?
+                WHERE id=?
+            """, (city or "", state or "", zip_code or "", full, ts, sa_id))
+        else:
+            conn.execute("""
+                INSERT INTO saved_addresses
+                    (company_id, customer_name, address, city, state, zip, full_address,
+                     default_action, default_container_size, default_dump_location,
+                     times_used, last_used_at, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)
+            """, (company_id, cname, addr, city or "", state or "", zip_code or "", full,
+                  action or "", container_size or "", dump_location or "", ts, ts))
+            sa_id = conn.execute(
+                "SELECT id FROM saved_addresses WHERE company_id=? AND customer_name=? AND address=?",
+                (company_id, cname, addr)
+            ).fetchone()["id"]
+
+        # Track this specific combination for frequency-based smart defaults
+        act = (action or "").strip()
+        cs  = (container_size or "").strip()
+        dl  = (dump_location or "").strip()
+        det = conn.execute(
+            """SELECT id FROM saved_address_details
+               WHERE saved_address_id=? AND action=? AND container_size=? AND dump_location=?""",
+            (sa_id, act, cs, dl)
+        ).fetchone()
+        if det:
+            conn.execute(
+                "UPDATE saved_address_details SET times_used=times_used+1, last_used_at=? WHERE id=?",
+                (ts, det["id"])
+            )
+        else:
+            conn.execute(
+                """INSERT INTO saved_address_details
+                   (saved_address_id, action, container_size, dump_location, times_used, last_used_at)
+                   VALUES (?,?,?,?,1,?)""",
+                (sa_id, act, cs, dl, ts)
+            )
+    except Exception:
+        pass
+
+
 @app.route("/route/<int:route_id>")
 @login_required
 def view_route(route_id):
@@ -5845,6 +6758,7 @@ def view_route(route_id):
 
     if session.get("role") == "boss":
         route_action_buttons += f"""
+    <button class="btn" type="button" onclick="_haulsTogglePaste()" style="background:linear-gradient(135deg,#004e8c,#003060);border:1px solid rgba(0,160,255,.3);">&#x1F4CB; Paste Route</button>
     <a class="btn secondary" href="{url_for('route_daily_log', route_id=route_id)}">&#x1F4CB; Daily Log</a>
     <form class="inline" method="POST" action="{url_for('optimize_route', route_id=route_id)}"
           id="optimize-form"
@@ -5990,15 +6904,128 @@ def view_route(route_id):
         </div>
         """
 
+    paste_panel_block = ""
+    if session.get("role") == "boss":
+        _dump_locs_json = json.dumps([dl["name"] for dl in dump_locs_for_form])
+        paste_panel_block = f"""
+        {_PASTE_ROUTE_CSS}
+        <div id="paste-route-panel" style="display:none;margin-bottom:24px;">
+
+            <!-- Panel header -->
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;padding-bottom:16px;border-bottom:1px solid rgba(0,160,255,.1);">
+                <div>
+                    <h2 style="margin:0 0 4px;font-size:20px;color:#e5eefc;">&#x1F4CB; Paste Route</h2>
+                    <p style="margin:0;font-size:13px;color:#4a6a88;">Paste messy route text &mdash; HAULTRA structures it into stops.</p>
+                </div>
+                <button id="pr-close-btn" type="button" style="background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:8px;color:#7a9ab8;padding:7px 14px;cursor:pointer;font-size:13px;font-family:inherit;">&#x2715; Close</button>
+            </div>
+
+            <!-- 2-column grid -->
+            <div class="pr-grid">
+
+                <!-- LEFT: Input + Tips -->
+                <div>
+                    <!-- A: Paste Input -->
+                    <div class="pr-card">
+                        <h3>Paste Route Text</h3>
+                        <p class="pr-sub">Paste one stop per line. HAULTRA will structure the route.</p>
+                        <div style="margin-bottom:14px;padding:10px 14px;background:rgba(0,0,0,.2);border-radius:8px;border-left:3px solid rgba(0,160,255,.3);">
+                            <div style="font-size:10px;color:#3d5a74;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:7px;">Examples</div>
+                            <div class="pr-tip-code" style="display:block;margin-bottom:4px;">PR 515 central dr talent 30 dom</div>
+                            <div class="pr-tip-code" style="display:block;margin-bottom:4px;">P 224 golden maple bartlett 20 wat</div>
+                            <div class="pr-tip-code" style="display:block;">D 900 tidewater quick demo 20</div>
+                        </div>
+                        <textarea id="pr-textarea" rows="8" placeholder="Paste route here &mdash; one stop per line&hellip;" style="width:100%;background:rgba(0,0,0,.4);border:1px solid rgba(0,160,255,.15);border-radius:9px;color:#c8dff0;padding:12px 14px;font-size:13px;line-height:1.7;resize:vertical;box-sizing:border-box;font-family:monospace;"></textarea>
+                        <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap;">
+                            <button id="pr-parse-btn" class="btn" type="button" style="padding:9px 22px;">Parse Route</button>
+                            <button id="pr-clear-btn" class="btn secondary" type="button" style="padding:9px 16px;">Clear</button>
+                        </div>
+                    </div>
+
+                    <!-- B: Parsing Tips -->
+                    <div class="pr-card">
+                        <h3 style="margin-bottom:12px;">Parsing Tips</h3>
+                        <div class="pr-tip-item">
+                            <strong>Service Types</strong><br>
+                            <span class="pr-tip-code">P</span> Pull &nbsp;
+                            <span class="pr-tip-code">D</span> Delivery &nbsp;
+                            <span class="pr-tip-code">PR</span> Pickup &amp; Return &nbsp;
+                            <span class="pr-tip-code">Swap</span> &nbsp;
+                            <span class="pr-tip-code">Move</span>
+                        </div>
+                        <div class="pr-tip-item">
+                            <strong>City Abbreviations</strong><br>
+                            <span class="pr-tip-code">vb</span> Virginia Beach &nbsp;
+                            <span class="pr-tip-code">ches</span> Chesapeake &nbsp;
+                            <span class="pr-tip-code">norf</span> Norfolk
+                        </div>
+                        <div class="pr-tip-item">
+                            <strong>Dump Abbreviations</strong><br>
+                            <span class="pr-tip-code">dom</span> Dominion &nbsp;
+                            <span class="pr-tip-code">wat</span> Waterway &nbsp;
+                            <span class="pr-tip-code">bay</span> Bay &nbsp;
+                            <span class="pr-tip-code">spsa</span> SPSA Landfill
+                        </div>
+                        <div class="pr-tip-item">
+                            <strong>Container Sizes</strong><br>
+                            Include <span class="pr-tip-code">20yd</span> or <span class="pr-tip-code">30 yards</span> anywhere in the line
+                        </div>
+                        <div class="pr-tip-item">
+                            <strong>Confidence Scores</strong><br>
+                            <span class="pr-badge pr-ch" style="font-size:10px;">High</span> All fields found &nbsp;
+                            <span class="pr-badge pr-cm" style="font-size:10px;">Medium</span> Some fields guessed &nbsp;
+                            <span class="pr-badge pr-cl" style="font-size:10px;">Low</span> Needs review
+                        </div>
+                    </div>
+                </div>
+
+                <!-- RIGHT: Preview + Suggestions -->
+                <div>
+                    <!-- C: Parsed Stops Preview -->
+                    <div class="pr-card">
+                        <h3>Parsed Stops Preview</h3>
+                        <p class="pr-sub" id="pr-preview-sub">Click <strong style="color:#7aaac8;">Parse Route</strong> to analyze your pasted text.</p>
+                        <div id="pr-preview"></div>
+                        <div class="pr-footer-bar" id="pr-footer-bar" style="display:none;">
+                            <span class="pr-footer-count" id="pr-stop-count"></span>
+                            <button id="pr-build-btn" class="btn green" type="button" style="padding:10px 24px;font-weight:800;font-size:14px;">Build Route</button>
+                            <button id="pr-cancel-btn" class="btn secondary" type="button">Cancel</button>
+                        </div>
+                    </div>
+
+                    <!-- D: Suggestions & Warnings -->
+                    <div class="pr-card" id="pr-sugg-card" style="display:none;">
+                        <h3 style="margin-bottom:12px;">&#x1F4A1; Suggestions &amp; Warnings</h3>
+                        <div id="pr-sugg-inner"></div>
+                    </div>
+                </div>
+
+            </div><!-- end pr-grid -->
+        </div><!-- end paste-route-panel -->
+
+        <!-- Mobile sticky bottom bar -->
+        <div id="pr-mobile-bar">
+            <button type="button" onclick="document.getElementById('pr-parse-btn').click()" class="btn" style="flex:1;">Parse Route</button>
+            <button type="button" onclick="var b=document.getElementById('pr-build-btn');if(b)b.click();" class="btn green" style="flex:1;">Build Route</button>
+        </div>
+
+        <script>var _HAULTRA_ROUTE_ID = {route_id}; var _HAULTRA_DUMP_LOCS = {_dump_locs_json};</script>
+        <script>{_PASTE_ROUTE_JS}</script>
+        """
+
     add_stop_block = ""
     if session.get("role") == "boss":
+        _existing_stops_json = json.dumps([
+            {"customer_name": s["customer_name"] or "", "address": s["address"] or "", "action": s["action"] or ""}
+            for s in stops
+        ])
         add_stop_block = f"""
         <div class="card">
             <h2>Add Manual Stop</h2>
             <form method="POST" action="{url_for('add_stop', route_id=route_id)}">
                 <div class="grid">
-                    <div><label>Customer</label><input name="customer_name"></div>
-                    <div><label>Address</label><input name="address"></div>
+                    <div style="position:relative;"><label>Customer</label><input name="customer_name" data-hac="1" autocomplete="off"></div>
+                    <div style="position:relative;"><label>Address</label><input name="address" data-hac="1" autocomplete="off"></div>
                     <div><label>City</label><input name="city"></div>
                     <div><label>State</label><input name="state"></div>
                     <div><label>ZIP</label><input name="zip_code"></div>
@@ -6019,6 +7046,9 @@ def view_route(route_id):
                 <div style="margin-top:6px;"><button type="submit">Add Stop</button></div>
             </form>
         </div>
+        <script>{_AUTOCOMPLETE_JS}</script>
+        <script>var _HAULTRA_STOPS = {_existing_stops_json};</script>
+        <script>{_STOP_WARNINGS_JS}</script>
         """
 
     body = f"""
@@ -6036,6 +7066,7 @@ def view_route(route_id):
         {stop_cards}
     </div>
 
+    {paste_panel_block}
     {add_stop_block}
     {reorder_script}
 
@@ -6202,16 +7233,16 @@ def add_stop(route_id):
     """, (
         route_id,
         last + 1,
-        request.form.get("customer_name"),
-        request.form.get("address"),
-        request.form.get("city"),
-        request.form.get("state"),
-        request.form.get("zip_code"),
-        request.form.get("action"),
-        request.form.get("container_size"),
+        expand_abbrev(request.form.get("customer_name")),
+        expand_abbrev(request.form.get("address")),
+        expand_abbrev(request.form.get("city")),
+        expand_abbrev(request.form.get("state")),
+        expand_abbrev(request.form.get("zip_code")),
+        expand_abbrev(request.form.get("action")),
+        expand_abbrev(request.form.get("container_size")),
         request.form.get("ticket_number"),
         request.form.get("reference_number"),
-        request.form.get("dump_location", ""),
+        expand_abbrev(request.form.get("dump_location", "")),
         request.form.get("notes"),
         now_ts()
     ))
@@ -6219,6 +7250,12 @@ def add_stop(route_id):
     conn.commit()
     # Recompute can flow so the new stop gets swap_with_prev_pull derived from sequence
     compute_can_flow(conn, route_id)
+    conn.commit()
+    upsert_saved_address(conn, cid(),
+        expand_abbrev(request.form.get("customer_name")), expand_abbrev(request.form.get("address")),
+        expand_abbrev(request.form.get("city")), expand_abbrev(request.form.get("state")),
+        expand_abbrev(request.form.get("zip_code")), expand_abbrev(request.form.get("action")),
+        expand_abbrev(request.form.get("container_size")), expand_abbrev(request.form.get("dump_location", "")))
     conn.commit()
     conn.close()
     flash("Stop added.", "success")
@@ -6251,16 +7288,16 @@ def edit_stop(stop_id):
                 dump_location=?, notes=?
             WHERE id=?
         """, (
-            request.form.get("customer_name"),
-            request.form.get("address"),
-            request.form.get("city"),
-            request.form.get("state"),
-            request.form.get("zip_code"),
-            request.form.get("action"),
-            request.form.get("container_size"),
+            expand_abbrev(request.form.get("customer_name")),
+            expand_abbrev(request.form.get("address")),
+            expand_abbrev(request.form.get("city")),
+            expand_abbrev(request.form.get("state")),
+            expand_abbrev(request.form.get("zip_code")),
+            expand_abbrev(request.form.get("action")),
+            expand_abbrev(request.form.get("container_size")),
             request.form.get("ticket_number"),
             request.form.get("reference_number"),
-            request.form.get("dump_location", ""),
+            expand_abbrev(request.form.get("dump_location", "")),
             request.form.get("notes"),
             stop_id
         ))
@@ -6268,6 +7305,12 @@ def edit_stop(stop_id):
         route_id = ownership["route_id"]
         # Recompute can flow and derive swap_with_prev_pull from sequence
         compute_can_flow(conn, route_id)
+        conn.commit()
+        upsert_saved_address(conn, cid(),
+            expand_abbrev(request.form.get("customer_name")), expand_abbrev(request.form.get("address")),
+            expand_abbrev(request.form.get("city")), expand_abbrev(request.form.get("state")),
+            expand_abbrev(request.form.get("zip_code")), expand_abbrev(request.form.get("action")),
+            expand_abbrev(request.form.get("container_size")), expand_abbrev(request.form.get("dump_location", "")))
         conn.commit()
         conn.close()
         flash("Stop updated.", "success")
@@ -6278,7 +7321,15 @@ def edit_stop(stop_id):
     _edit_dump_locs = conn.execute(
         "SELECT name FROM dump_locations WHERE active=1 ORDER BY name"
     ).fetchall()
+    _sibling_stops = conn.execute(
+        "SELECT customer_name, address, action FROM stops WHERE route_id=? AND id!=? ORDER BY stop_order",
+        (ownership["route_id"], stop_id)
+    ).fetchall()
     conn.close()
+    _sibling_json = json.dumps([
+        {"customer_name": s["customer_name"] or "", "address": s["address"] or "", "action": s["action"] or ""}
+        for s in _sibling_stops
+    ])
 
     # Derive swap display for read-only info panel
     _csb_edit   = _stop.get("can_state_before") or ""
@@ -6350,11 +7401,11 @@ def edit_stop(stop_id):
             <div class="grid" style="grid-template-columns:1fr 1fr;gap:12px 16px;">
                 <div style="grid-column:1/-1;">
                     <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Customer Name</label>
-                    <input name="customer_name" value="{e(_stop['customer_name'])}">
+                    <input name="customer_name" value="{e(_stop['customer_name'])}" data-hac="1" autocomplete="off">
                 </div>
                 <div style="grid-column:1/-1;">
                     <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Address</label>
-                    <input name="address" value="{e(_stop['address'])}">
+                    <input name="address" value="{e(_stop['address'])}" data-hac="1" autocomplete="off">
                 </div>
                 <div>
                     <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">City</label>
@@ -6403,6 +7454,9 @@ def edit_stop(stop_id):
         </form>
     </div>
     """
+    body += "<script>" + _AUTOCOMPLETE_JS + "</script>"
+    body += '<script>var _HAULTRA_STOPS = ' + _sibling_json + ';</script>'
+    body += '<script>' + _STOP_WARNINGS_JS + '</script>'
     return render_template_string(shell_page("Edit Stop", body))
 
 # =========================================================
@@ -9889,6 +10943,117 @@ def api_csrf_token():
     """Return a fresh CSRF token so the offline sync replay can re-stamp queued POSTs."""
     from flask import jsonify
     return jsonify({'token': get_csrf_token()})
+
+
+# =========================================================
+# PASTE ROUTE — PARSE API
+# =========================================================
+@app.route("/api/parse-route-text", methods=["POST"])
+@login_required
+def parse_route_text_api():
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"stops": []})
+    conn = get_db()
+    try:
+        stops = parse_route_text(text, conn, cid())
+    finally:
+        conn.close()
+    return jsonify({"stops": stops})
+
+
+# =========================================================
+# PASTE ROUTE — ADD CONFIRMED STOPS
+# =========================================================
+@app.route("/route/<int:route_id>/add-parsed-stops", methods=["POST"])
+@boss_required
+def add_parsed_stops(route_id):
+    conn = get_db()
+    if not conn.execute(
+        "SELECT id FROM routes WHERE id=? AND company_id=?", (route_id, cid())
+    ).fetchone():
+        conn.close()
+        return jsonify({"error": "Route not found."}), 404
+
+    data  = request.get_json(silent=True) or {}
+    stops = data.get("stops") or []
+    if not stops:
+        conn.close()
+        return jsonify({"error": "No stops provided."})
+
+    last = conn.execute(
+        "SELECT MAX(stop_order) as m FROM stops WHERE route_id=?", (route_id,)
+    ).fetchone()["m"] or 0
+
+    added = 0
+    for stop in stops:
+        if not isinstance(stop, dict):
+            continue
+        # Apply abbreviation expansion before inserting
+        customer_name  = expand_abbrev(stop.get("customer_name")  or "")
+        address        = expand_abbrev(stop.get("address")         or "")
+        city           = expand_abbrev(stop.get("city")            or "")
+        state          = expand_abbrev(stop.get("state")           or "")
+        zip_code       = expand_abbrev(stop.get("zip_code")        or "")
+        action         = expand_abbrev(stop.get("action")          or "")
+        container_size = expand_abbrev(stop.get("container_size")  or "")
+        dump_location  = expand_abbrev(stop.get("dump_location")   or "")
+        last += 1
+        conn.execute("""
+            INSERT INTO stops (
+                route_id, stop_order, customer_name, address, city, state, zip_code,
+                action, container_size, dump_location,
+                swap_with_prev_pull, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'open', ?)
+        """, (route_id, last, customer_name, address, city, state, zip_code,
+              action, container_size, dump_location, now_ts()))
+        added += 1
+        upsert_saved_address(conn, cid(),
+            customer_name, address, city, state, zip_code,
+            action, container_size, dump_location)
+
+    if added:
+        conn.commit()
+        compute_can_flow(conn, route_id)
+        conn.commit()
+
+    conn.close()
+    return jsonify({"added": added})
+
+
+# =========================================================
+# ADDRESS AUTOCOMPLETE API
+# =========================================================
+@app.route("/api/address-suggestions")
+@login_required
+def address_suggestions():
+    q = expand_abbrev((request.args.get("q") or "").strip())
+    if len(q) < 2:
+        return jsonify([])
+    conn = get_db()
+    like = "%" + q + "%"
+    rows = conn.execute("""
+        SELECT sa.customer_name, sa.address, sa.city, sa.state, sa.zip,
+               COALESCE(sad.action, '')         AS default_action,
+               COALESCE(sad.container_size, '') AS default_container_size,
+               COALESCE(sad.dump_location, '')  AS default_dump_location
+        FROM saved_addresses sa
+        LEFT JOIN saved_address_details sad
+               ON sad.saved_address_id = sa.id
+              AND sad.id = (
+                      SELECT id FROM saved_address_details
+                      WHERE saved_address_id = sa.id
+                        AND (action != '' OR container_size != '' OR dump_location != '')
+                      ORDER BY times_used DESC, last_used_at DESC
+                      LIMIT 1
+                  )
+        WHERE sa.company_id=? AND (sa.customer_name LIKE ? OR sa.address LIKE ?)
+        ORDER BY sa.times_used DESC, sa.last_used_at DESC
+        LIMIT 10
+    """, (cid(), like, like)).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
 
 
 # =========================================================
