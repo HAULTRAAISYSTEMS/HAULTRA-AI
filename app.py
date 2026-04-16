@@ -171,17 +171,28 @@ _ACTION_PATTERNS = [
     (re.compile(r'\b(?:pickup\s*(?:and|&)\s*return|p\s*[&/]\s*r)\b',    re.I), "Pickup and Return"),
     (re.compile(r'\b(?:pull\s*(?:and|&)\s*return)\b',                    re.I), "Pickup and Return"),
     (re.compile(r'\b(?:dump\s*(?:and|&)\s*return)\b',                    re.I), "Pickup and Return"),
+    (re.compile(r'\b(?:p\s+and\s+r)\b',                                  re.I), "Pickup and Return"),
     (re.compile(r'\bpr\b',                                                re.I), "Pickup and Return"),
     (re.compile(r'\bswap\b',                                              re.I), "Swap"),
+    # Relocate checked before bare "move" so "move can" wins
     (re.compile(r'\b(?:relocate|reloc|move\s+can)\b',                    re.I), "Relocate"),
     (re.compile(r'\bpull\b',                                              re.I), "Pull"),
+    (re.compile(r'\b(?:pick\s+up|pickup)\b',                              re.I), "Pull"),
     (re.compile(r'\bmove\b',                                              re.I), "Move"),
+    (re.compile(r'\b(?:drop\s*off)\b',                                    re.I), "Delivery"),
     (re.compile(r'\b(?:delivery|deliver|del)\b',                          re.I), "Delivery"),
+    # Bare single-letter tokens (must be at word boundary, not inside words)
     (re.compile(r'(?:(?<=\s)|^)p(?=\s|$)',                                re.I), "Pull"),
     (re.compile(r'(?:(?<=\s)|^)d(?=\s|$)',                                re.I), "Delivery"),
     (re.compile(r'(?:(?<=\s)|^)r(?=\s|$)',                                re.I), "Relocate"),
 ]
 _CONTAINER_RE = re.compile(r'\b(\d+)\s*(?:yds?|yards?)\b', re.I)
+# Ticket / reference number: "TKT#1234", "#1234", "ticket 55", "ref 999", "order 77"
+_TICKET_RE = re.compile(
+    r'\b(?:tkt|ticket|ref|reference|ord|order)\s*#?\s*(\w+)\b'
+    r'|#(\d{3,})',
+    re.I,
+)
 # Two-word dump phrases — checked BEFORE the single-token loop in _parse_one_line
 _TWO_WORD_DUMP_MAP = {
     "sb cox": "SB Cox",
@@ -212,6 +223,8 @@ _PARSE_CITY_MAP = {
     "hampton":      "Hampton",
     "nn":           "Newport News",
     "portsmouth":   "Portsmouth",
+    "ports":        "Portsmouth",
+    "port":         "Portsmouth",
     "prt":          "Portsmouth",
     "williamsburg": "Williamsburg",
     "hamp":         "Hampton",
@@ -334,6 +347,12 @@ def _parse_one_line(raw, conn, company_id):
     if raw.count("|") >= 2:
         return _parse_pipe_line(raw, conn, company_id)
 
+    # ── Relocate from/to format ───────────────────────────────────────────────
+    rel = _parse_relocate_line(work, order_num=1)
+    if rel:
+        rel["original_line"] = raw
+        return rel
+
     conf = 10
     conf_reasons = []
 
@@ -342,6 +361,15 @@ def _parse_one_line(raw, conn, company_id):
     work = re.sub(r'(?<!\d)/(?!\d)', ' ', work)
     work = re.sub(r'\s+-\s+', ' ', work)
     work = re.sub(r'\s+', ' ', work).strip()
+
+    # ── 0. extract ticket / reference number ─────────────────────────────────
+    ticket_number = ""
+    tm = _TICKET_RE.search(work)
+    if tm:
+        ticket_number = (tm.group(1) or tm.group(2) or "").strip()
+        work = re.sub(r'\s+', ' ', work[:tm.start()] + " " + work[tm.end():]).strip()
+        conf += 5
+        conf_reasons.append("ticket")
 
     # ── 1. extract action ────────────────────────────────────────────────────
     action = ""
@@ -408,6 +436,7 @@ def _parse_one_line(raw, conn, company_id):
     work = work.strip()
     customer_name = ""
     address = ""
+    notes   = ""
 
     if "," in work:
         # "Customer Name, 123 Street" explicit CSV split
@@ -425,6 +454,16 @@ def _parse_one_line(raw, conn, company_id):
             address = work[pos:].strip()
             conf += 10
             conf_reasons.append("addr-num")
+            # If address contains trailing words past a street suffix, split to notes
+            sfx_m = None
+            for sfx_hit in _STREET_SFX_RE.finditer(address):
+                sfx_m = sfx_hit
+            if sfx_m and sfx_m.end() < len(address):
+                trailing = address[sfx_m.end():].strip()
+                address  = address[:sfx_m.end()].strip()
+                # Only promote to notes if it looks like free text, not a unit/apt
+                if trailing and not re.match(r'^(?:apt|unit|ste|#)\s*\w+', trailing, re.I):
+                    notes = trailing
         else:
             customer_name = work
             conf += 5
@@ -478,19 +517,24 @@ def _parse_one_line(raw, conn, company_id):
     conf_label = "high" if conf >= 75 else ("medium" if conf >= 45 else "low")
 
     return {
-        "original_line":   raw,
-        "customer_name":   customer_name,
-        "address":         address,
-        "city":            city,
-        "state":           state,
-        "zip_code":        zip_code,
-        "action":          action,
-        "container_size":  container_size,
-        "dump_location":   dump_location,
-        "notes":           "",
-        "confidence":      conf,
-        "confidence_label": conf_label,
-        "matched_saved":   matched_saved,
+        "original_line":         raw,
+        "customer_name":         customer_name,
+        "address":               address,
+        "city":                  city,
+        "state":                 state,
+        "zip_code":              zip_code,
+        "action":                action,
+        "container_size":        container_size,
+        "dump_location":         dump_location,
+        "notes":                 notes,
+        "ticket_number":         ticket_number,
+        "reference_number":      "",
+        "relocate_from_address": "",
+        "relocate_to_address":   "",
+        "confidence":            conf,
+        "confidence_label":      conf_label,
+        "matched_saved":         matched_saved,
+        "conf_reasons":          conf_reasons,
     }
 
 
@@ -2071,20 +2115,35 @@ def parse_stop_block(lines, order_num):
 
     notes = "\n".join(extra_lines).strip()
 
+    # Confidence scoring for legacy block stops
+    _conf = 10  # base: we had to guess at stop boundaries
+    _conf += 20 if address        else 0
+    _conf += 15 if city           else 0
+    _conf += 10 if customer_name  else 0
+    _conf += 15 if container_size else 0
+    _conf += 10 if action and action != "Service" else 0
+    _conf  = min(100, _conf)
+    _conf_label = "high" if _conf >= 75 else ("medium" if _conf >= 45 else "low")
+
     return {
-        "stop_order":       order_num,
-        "customer_name":    customer_name,
-        "address":          address,
-        "city":             city,
-        "state":            state,
-        "zip_code":         zip_code,
-        "action":           action,
-        "container_size":   container_size,
-        "ticket_number":    ticket_number,
-        "reference_number": reference_number,
-        "phone":            "",
-        "dump_location":    "",
-        "notes":            notes,
+        "stop_order":            order_num,
+        "original_line":         cleaned_lines[0] if cleaned_lines else "",
+        "customer_name":         customer_name,
+        "address":               address,
+        "city":                  city,
+        "state":                 state,
+        "zip_code":              zip_code,
+        "action":                action,
+        "container_size":        container_size,
+        "ticket_number":         ticket_number,
+        "reference_number":      reference_number,
+        "phone":                 "",
+        "dump_location":         "",
+        "notes":                 notes,
+        "relocate_from_address": "",
+        "relocate_to_address":   "",
+        "confidence":            _conf,
+        "confidence_label":      _conf_label,
     }
 
 
@@ -2177,20 +2236,35 @@ def _parse_wo_line(line, order_num):
         notes_body = re.sub(r"\bdump\s+\w+\b",       "", notes_body, flags=re.IGNORECASE)
         notes      = re.sub(r"\s+", " ", notes_body).strip()
 
+    # Confidence scoring for work-order stops
+    _conf = 30  # base: structured format gives us action implicitly
+    _conf += 20 if address        else 0
+    _conf += 15 if city           else 0
+    _conf += 10 if customer_name  else 0
+    _conf += 15 if container_size else 0
+    _conf += 10 if dump_location  else 0
+    _conf = min(100, _conf)
+    _conf_label = "high" if _conf >= 75 else ("medium" if _conf >= 45 else "low")
+
     return {
-        "stop_order":       order_num,
-        "wo_type":          wo_type,
-        "customer_name":    customer_name,
-        "address":          address,
-        "city":             city,
-        "state":            state,
-        "zip_code":         "",
-        "action":           _WO_ACTION.get(wo_type, "Service"),
-        "container_size":   container_size,
-        "ticket_number":    "",
-        "reference_number": "",
-        "dump_location":    dump_location,
-        "notes":            notes,
+        "stop_order":            order_num,
+        "original_line":         None,
+        "wo_type":               wo_type,
+        "customer_name":         customer_name,
+        "address":               address,
+        "city":                  city,
+        "state":                 state,
+        "zip_code":              "",
+        "action":                _WO_ACTION.get(wo_type, "Service"),
+        "container_size":        container_size,
+        "ticket_number":         "",
+        "reference_number":      "",
+        "dump_location":         dump_location,
+        "notes":                 notes,
+        "relocate_from_address": "",
+        "relocate_to_address":   "",
+        "confidence":            _conf,
+        "confidence_label":      _conf_label,
     }
 
 
@@ -2259,6 +2333,7 @@ _CITY_CODES = {
     "suff":  ("Suffolk",        "VA"),
     "ches":  ("Chesapeake",     "VA"),
     "port":  ("Portsmouth",     "VA"),
+    "ports": ("Portsmouth",     "VA"),
     "prt":   ("Portsmouth",     "VA"),
     "smith": ("Smithfield",     "VA"),
     "hamp":  ("Hampton",        "VA"),
@@ -2295,7 +2370,7 @@ _ROLLOFF_LINE_RE = re.compile(r"^(PR|PULL|DEL|DELIVERY|RELOCATE|RELOC|D|P|R)\s+(
 
 # Matches the city-shorthand pattern that confirms roll-off format
 _ROLLOFF_CITY_RE = re.compile(
-    r",\s*(orf|norf|vb|nb|suff|ches|port|prt|smith|hamp|nn|york|isle)\s*,",
+    r",\s*(orf|norf|vb|nb|suff|ches|port|ports|prt|smith|hamp|nn|york|isle)\s*,",
     re.IGNORECASE
 )
 
@@ -2420,20 +2495,35 @@ def _parse_rolloff_stop(block_lines, order_num):
     # Split remaining text into customer name and driver notes
     customer_name, instruction_notes = _split_rolloff_customer_notes(rest)
 
+    # Confidence scoring for rolloff stops
+    _conf = 30  # base: we know action+address from the line structure
+    _conf += 20 if address   else 0
+    _conf += 15 if city      else 0
+    _conf += 15 if container_size else 0
+    _conf += 10 if customer_name  else 0
+    _conf += 10 if dump_site      else 0
+    _conf = min(100, _conf)
+    _conf_label = "high" if _conf >= 75 else ("medium" if _conf >= 45 else "low")
+
     return {
-        "stop_order":       order_num,
-        "customer_name":    customer_name,
-        "address":          address,
-        "city":             city,
-        "state":            state,
-        "zip_code":         "",
-        "action":           action,
-        "container_size":   container_size,
-        "ticket_number":    "",
-        "reference_number": "",
-        "phone":            "",
-        "dump_location":    dump_site,
-        "notes":            instruction_notes,
+        "stop_order":            order_num,
+        "original_line":         " ".join(block_lines),
+        "customer_name":         customer_name,
+        "address":               address,
+        "city":                  city,
+        "state":                 state,
+        "zip_code":              "",
+        "action":                action,
+        "container_size":        container_size,
+        "ticket_number":         "",
+        "reference_number":      "",
+        "phone":                 "",
+        "dump_location":         dump_site,
+        "notes":                 instruction_notes,
+        "relocate_from_address": "",
+        "relocate_to_address":   "",
+        "confidence":            _conf,
+        "confidence_label":      _conf_label,
     }
 
 
@@ -2564,19 +2654,36 @@ def _parse_inline_stop(line, order_num):
     else:
         customer_name = body
 
+    # Confidence scoring for inline-shorthand stops
+    _addr    = address.strip()
+    _cust    = customer_name.strip()
+    _conf    = 30  # base: action prefix detected
+    _conf   += 20 if _addr          else 0
+    _conf   += 15 if city           else 0
+    _conf   += 15 if container_size else 0
+    _conf   += 10 if _cust          else 0
+    _conf   += 10 if dump_location  else 0
+    _conf    = min(100, _conf)
+    _conf_label = "high" if _conf >= 75 else ("medium" if _conf >= 45 else "low")
+
     return {
-        "stop_order":       order_num,
-        "customer_name":    customer_name.strip(),
-        "address":          address.strip(),
-        "city":             city,
-        "state":            state,
-        "zip_code":         "",
-        "action":           action,
-        "container_size":   container_size,
-        "ticket_number":    "",
-        "reference_number": "",
-        "dump_location":    dump_location,
-        "notes":            notes.strip(),
+        "stop_order":            order_num,
+        "original_line":         None,
+        "customer_name":         _cust,
+        "address":               _addr,
+        "city":                  city,
+        "state":                 state,
+        "zip_code":              "",
+        "action":                action,
+        "container_size":        container_size,
+        "ticket_number":         "",
+        "reference_number":      "",
+        "dump_location":         dump_location,
+        "notes":                 notes.strip(),
+        "relocate_from_address": "",
+        "relocate_to_address":   "",
+        "confidence":            _conf,
+        "confidence_label":      _conf_label,
     }
 
 
@@ -2594,7 +2701,115 @@ def _parse_inline_shorthand(lines):
     return stops, ""
 
 
+# ─── Relocate from/to parser ──────────────────────────────────────────────────
+# Matches: "relocate [can] <from_address> to <to_address> [size] [dump site]"
+_RELOCATE_TO_RE = re.compile(
+    r"^(?:relocate|reloc|move\s+can)\s+(.+?)\s+to\s+(.+)$",
+    re.IGNORECASE,
+)
+
+
+def _parse_relocate_line(raw, order_num=1):
+    """
+    Parse a relocate-style line:
+      relocate can 222 industrial rd norf to 333 yard st norf 30yd
+      relocate 100 main st vb to 200 back lot vb 20yd dump dominion
+
+    Returns a stop dict with:
+      - action = "Relocate"
+      - address = from_address (primary, shown on stop card)
+      - relocate_from_address = same as address
+      - relocate_to_address  = destination address
+      - can_size, dump_location, city/state from from_address side
+      - notes = "From: <from> → To: <to>" for driver reference
+    Returns None if the pattern does not match.
+    """
+    work = raw.strip()
+    # Strip leading "can" after relocate keyword so the address starts at house #
+    work = re.sub(r"^(relocate|reloc|move\s+can)\s+can\s+", r"\1 ", work, flags=re.I)
+    m = _RELOCATE_TO_RE.match(work)
+    if not m:
+        return None
+
+    from_raw = m.group(1).strip()
+    to_raw   = m.group(2).strip()
+
+    def _extract_fields(text):
+        """Pull size, dump site, and city from an address fragment."""
+        sz = ""
+        sz_m = re.search(r"\b(\d{1,2})\s*yd\b", text, re.I)
+        if sz_m:
+            sz   = sz_m.group(1)
+            text = re.sub(r"\s+", " ", text[:sz_m.start()] + " " + text[sz_m.end():]).strip()
+
+        dump = ""
+        # Two-word dump first
+        for phrase, fullname in _TWO_WORD_DUMP_MAP.items():
+            if re.search(r"(?:^|\s)" + re.escape(phrase) + r"(?:\s|$)", text, re.I):
+                dump = fullname
+                text = re.sub(re.escape(phrase), "", text, flags=re.I)
+                text = re.sub(r"\s+", " ", text).strip()
+                break
+        if not dump:
+            dm = re.search(r"\bdump\s+(\w+)", text, re.I)
+            if dm:
+                dump = _DUMP_SITES.get(dm.group(1).lower(), dm.group(1).title())
+                text = re.sub(r"\s+", " ", text[:dm.start()] + " " + text[dm.end():]).strip()
+
+        city = state = ""
+        for code, (city_name, state_code) in _CITY_CODES.items():
+            mc = re.search(r"(?:(?<=\s)|^)" + re.escape(code) + r"(?=\s|$)", text, re.I)
+            if mc:
+                city  = city_name
+                state = state_code
+                text  = re.sub(r"\s+", " ", text[:mc.start()] + " " + text[mc.end():]).strip()
+                break
+        return text.strip(), sz, dump, city, state
+
+    from_addr, from_sz, from_dump, from_city, from_state = _extract_fields(from_raw)
+    to_addr,   to_sz,   to_dump,   to_city,   _          = _extract_fields(to_raw)
+
+    # Prefer size / dump from whichever side had them; from-side wins ties
+    container_size = from_sz   or to_sz
+    dump_location  = from_dump or to_dump
+    city           = from_city or to_city
+    state          = from_state
+
+    # Build driver-facing note
+    notes = f"From: {from_addr} → To: {to_addr}"
+    if to_city:
+        notes = f"From: {from_addr} ({from_city}) → To: {to_addr} ({to_city})"
+
+    return {
+        "stop_order":            order_num,
+        "original_line":         raw,
+        "customer_name":         "",
+        "address":               from_addr,
+        "city":                  city,
+        "state":                 state,
+        "zip_code":              "",
+        "action":                "Relocate",
+        "container_size":        container_size,
+        "ticket_number":         "",
+        "reference_number":      "",
+        "dump_location":         dump_location,
+        "notes":                 notes,
+        "relocate_from_address": from_addr,
+        "relocate_to_address":   to_addr,
+        "confidence":            75,
+        "confidence_label":      "high",
+    }
+
+
 # ─── Top-level parser dispatcher ──────────────────────────────────────────────
+
+def _is_relocate_format(lines):
+    """Return True when ALL non-empty lines are relocate-style (relocate X to Y)."""
+    return (
+        lines
+        and all(_RELOCATE_TO_RE.match(l) for l in lines)
+    )
+
 
 def parse_boss_text(raw_text):
     """
@@ -2603,29 +2818,79 @@ def parse_boss_text(raw_text):
     Format detection priority:
       1. Roll-off shorthand  — boss compressed format (Pr/Pull/Del + comma city code)
       2. Work-order format   — PR/P/D with full address, city, state, customer
-      3. Inline shorthand    — action + house number + space-separated city code (no commas)
-      4. Numbered/dash-delimited legacy format
+      3. Relocate from/to    — "relocate can X to Y"
+      4. Inline shorthand    — action + house number + space-separated city code (no commas)
+      5. Numbered/dash-delimited legacy format
     """
     lines          = [clean_line(x) for x in raw_text.splitlines()]
     lines_nonempty = [l for l in lines if l]
 
+    detected_format = "unknown"
+
     if _is_rolloff_format(lines_nonempty):
-        return _parse_rolloff_shorthand(lines)
+        detected_format = "rolloff"
+        stops, dump = _parse_rolloff_shorthand(lines)
+    elif any(_is_wo_line(l) for l in lines_nonempty):
+        detected_format = "workorder"
+        stops, dump = _parse_workorder_format(lines_nonempty)
+    elif _is_relocate_format(lines_nonempty):
+        detected_format = "relocate"
+        stops = []
+        for idx, line in enumerate(lines_nonempty, start=1):
+            stop = _parse_relocate_line(line, idx)
+            if stop:
+                stops.append(stop)
+        dump = ""
+    elif _is_inline_shorthand(lines_nonempty):
+        detected_format = "inline"
+        stops, dump = _parse_inline_shorthand(lines_nonempty)
+    else:
+        # Legacy numbered-list / dash-delimited fallback.
+        # Also try per-line relocate detection inside mixed text.
+        detected_format = "legacy"
+        blocks = split_into_stop_blocks(raw_text)
+        stops  = []
+        for idx, block in enumerate(blocks, start=1):
+            merged = " ".join(block).strip()
+            rel = _parse_relocate_line(merged, idx)
+            if rel:
+                stops.append(rel)
+                continue
+            stop = parse_stop_block(block, idx)
+            if stop["customer_name"] or stop["address"]:
+                stops.append(stop)
+        dump = ""
 
-    if any(_is_wo_line(l) for l in lines_nonempty):
-        return _parse_workorder_format(lines_nonempty)
+    # ── Debug logging (visible in Flask dev logs / gunicorn stderr) ──────────
+    app.logger.debug(
+        "[parse_boss_text] format=%s  stops=%d",
+        detected_format, len(stops)
+    )
+    for i, s in enumerate(stops, start=1):
+        unmatched = []
+        if not s.get("address"):
+            unmatched.append("address")
+        if not s.get("action"):
+            unmatched.append("action")
+        if not s.get("container_size"):
+            unmatched.append("size")
+        app.logger.debug(
+            "  stop %d | conf=%s(%s) | cust=%r addr=%r city=%r "
+            "action=%r size=%r dump=%r | unmatched=%s | raw=%r",
+            i,
+            s.get("confidence", "?"),
+            s.get("confidence_label", "?"),
+            s.get("customer_name", ""),
+            s.get("address", ""),
+            s.get("city", ""),
+            s.get("action", ""),
+            s.get("container_size", ""),
+            s.get("dump_location", ""),
+            unmatched or "none",
+            (s.get("original_line") or "")[:80],
+        )
 
-    if _is_inline_shorthand(lines_nonempty):
-        return _parse_inline_shorthand(lines_nonempty)
-
-    # Legacy numbered-list / dash-delimited fallback
-    blocks = split_into_stop_blocks(raw_text)
-    stops  = []
-    for idx, block in enumerate(blocks, start=1):
-        stop = parse_stop_block(block, idx)
-        if stop["customer_name"] or stop["address"]:
-            stops.append(stop)
-    return stops, ""
+    return stops, dump
 
 # =========================================================
 # LOAD SCORING / AI SIDE
@@ -5454,6 +5719,7 @@ def text_to_route():
                     "action":         request.form.get(f"stop_{i}_action",  "Service").strip(),
                     "container_size": request.form.get(f"stop_{i}_container_size", "").strip(),
                     "dump_location":  request.form.get(f"stop_{i}_dump_location",  "").strip(),
+                    "ticket_number":  request.form.get(f"stop_{i}_ticket_number",  "").strip(),
                     "notes":          request.form.get(f"stop_{i}_notes",          "").strip(),
                 })
 
@@ -5479,11 +5745,11 @@ def text_to_route():
                         route_id, stop_order, customer_name, address, city, state, zip_code,
                         action, container_size, ticket_number, reference_number,
                         dump_location, notes, status, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, 'open', ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, 'open', ?)
                 """, (route_id, order_num, stop["customer_name"], stop["address"],
                       stop["city"], stop["state"], stop["zip_code"], stop["action"],
-                      stop["container_size"], stop["dump_location"], stop["notes"],
-                      now_ts()))
+                      stop["container_size"], stop.get("ticket_number", ""),
+                      stop["dump_location"], stop["notes"], now_ts()))
 
             conn.commit()
             conn.close()
@@ -5520,24 +5786,30 @@ def text_to_route():
             "Swap", "Move", "Service", "Dump",
         ]
 
+        # Confidence counts for summary bar
+        _conf_counts = {"high": 0, "medium": 0, "low": 0}
+        for s in parsed_stops:
+            _conf_counts[s.get("confidence_label", "low")] = \
+                _conf_counts.get(s.get("confidence_label", "low"), 0) + 1
+
         # Build per-stop editable cards
         stop_cards_html = ""
         for i, stop in enumerate(parsed_stops):
             orig_text = e(stop.get("original_line") or "")
             orig_html = (
-                f'<div style="font-size:11px;color:#7a9ab8;margin-bottom:8px;">'
-                f'Parsed from: &ldquo;{orig_text}&rdquo;</div>'
+                f'<div class="p-orig">Parsed from: &ldquo;{orig_text}&rdquo;</div>'
             ) if orig_text else ""
 
-            conf_label = stop.get("confidence_label", "")
+            conf_label = stop.get("confidence_label", "low")
             if conf_label == "high":
-                conf_badge = '<span style="color:#56f0b7;font-size:11px;font-weight:600;margin-left:8px;">HIGH</span>'
+                conf_badge = '<span class="p-badge p-badge-hi">&#10003; HIGH</span>'
+                card_border = "rgba(86,240,183,0.35)"
             elif conf_label == "medium":
-                conf_badge = '<span style="color:#f0c056;font-size:11px;font-weight:600;margin-left:8px;">MED</span>'
-            elif conf_label == "low":
-                conf_badge = '<span style="color:#f07056;font-size:11px;font-weight:600;margin-left:8px;">? LOW</span>'
+                conf_badge = '<span class="p-badge p-badge-med">&#9888; MED</span>'
+                card_border = "rgba(240,192,86,0.35)"
             else:
-                conf_badge = ""
+                conf_badge = '<span class="p-badge p-badge-low">? LOW &#8212; review</span>'
+                card_border = "rgba(240,112,86,0.55)"
 
             action_val = stop.get("action") or "Service"
             act_opts = ""
@@ -5545,10 +5817,31 @@ def text_to_route():
                 sel = "selected" if opt.lower() == action_val.lower() else ""
                 act_opts += f'<option value="{e(opt)}" {sel}>{e(opt)}</option>'
 
+            # Relocate from/to row (only shown when present)
+            rel_from = e(stop.get("relocate_from_address", "") or "")
+            rel_to   = e(stop.get("relocate_to_address",   "") or "")
+            relocate_row = ""
+            if rel_from or rel_to:
+                relocate_row = f"""
+    <div class="p-col-full" style="background:rgba(120,100,240,0.10);border-radius:6px;padding:8px 10px;">
+      <span class="p-lbl">Relocate: FROM</span>
+      <span style="font-size:13px;color:#c0b8f8;">{rel_from or "(see address)"}</span>
+      <span style="margin:0 8px;color:#7a9ab8;">&#8594;</span>
+      <span class="p-lbl" style="display:inline;">TO&nbsp;</span>
+      <span style="font-size:13px;color:#c0b8f8;">{rel_to or "(not detected)"}</span>
+    </div>"""
+
+            # Ticket number display
+            ticket_val = e(stop.get("ticket_number") or "")
+            ticket_row = (
+                f'<div><label class="p-lbl">Ticket #</label>'
+                f'<input name="stop_{i}_ticket_number" value="{ticket_val}" placeholder="TKT#"></div>'
+            ) if ticket_val else ""
+
             stop_cards_html += f"""
-<div class="p-stop-card" id="psc-{i}">
+<div class="p-stop-card" id="psc-{i}" style="border-color:{card_border};">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-    <div style="font-weight:700;font-size:14px;">Stop {i + 1}{conf_badge}</div>
+    <div style="font-weight:700;font-size:14px;">Stop {i + 1}&nbsp;{conf_badge}</div>
     <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:12px;color:#f07056;">
       <input type="checkbox" name="stop_{i}_skip" value="1"
              onchange="document.getElementById('psc-{i}').style.opacity=this.checked?'0.35':'1'">
@@ -5556,6 +5849,7 @@ def text_to_route():
     </label>
   </div>
   {orig_html}
+  {relocate_row}
   <div class="p-stop-grid">
     <div class="p-col-wide">
       <label class="p-lbl">Customer Name</label>
@@ -5585,6 +5879,7 @@ def text_to_route():
       <label class="p-lbl">Dump Location</label>
       <input name="stop_{i}_dump_location" value="{e(stop.get('dump_location',''))}" placeholder="Dominion">
     </div>
+    {ticket_row}
     <div class="p-col-wide">
       <label class="p-lbl">Notes</label>
       <input name="stop_{i}_notes" value="{e(stop.get('notes',''))}" placeholder="Gate code, instructions...">
@@ -5595,21 +5890,32 @@ def text_to_route():
 
         conn.close()
 
+        _n_low = _conf_counts["low"]
+        _low_warning = (
+            f'<div style="background:rgba(240,112,86,0.12);border:1px solid rgba(240,112,86,0.4);'
+            f'border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px;">'
+            f'&#9888;&nbsp;<strong>{_n_low} stop{"s" if _n_low != 1 else ""} need review</strong>'
+            f' &mdash; low-confidence fields are highlighted in orange. Edit before saving.</div>'
+        ) if _n_low else ""
+
         body = f"""
 <style>
 .p-stop-card {{
   background: var(--card-bg, #1a2235);
-  border: 1px solid var(--border, rgba(255,255,255,0.07));
+  border: 1px solid rgba(255,255,255,0.07);
   border-radius: 10px;
   padding: 16px;
   margin-bottom: 10px;
+  transition: opacity 0.2s;
 }}
 .p-stop-grid {{
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 8px 10px;
+  margin-top: 10px;
 }}
 .p-col-wide {{ grid-column: span 2; }}
+.p-col-full {{ grid-column: 1 / -1; margin-bottom: 6px; }}
 @media (min-width: 680px) {{
   .p-stop-grid {{ grid-template-columns: 1fr 1fr 1fr; }}
   .p-col-wide {{ grid-column: span 2; }}
@@ -5624,32 +5930,58 @@ def text_to_route():
   padding: 7px 10px;
   font-size: 14px;
 }}
+.p-badge {{
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 4px;
+  vertical-align: middle;
+}}
+.p-badge-hi  {{ background: rgba(86,240,183,0.15); color: #56f0b7; }}
+.p-badge-med {{ background: rgba(240,192,86,0.15);  color: #f0c056; }}
+.p-badge-low {{ background: rgba(240,112,86,0.18);  color: #f07056; }}
+.p-orig {{
+  font-size: 11px;
+  color: #7a9ab8;
+  font-style: italic;
+  margin-bottom: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}}
 </style>
 <div class="hero">
   <h1>Preview Route</h1>
-  <p>Review and edit each stop before saving. Check &ldquo;Skip&rdquo; to exclude a stop.</p>
+  <p>Review and edit each stop before saving. Orange border = low confidence &mdash; check those fields.</p>
 </div>
 <div class="card" style="margin-bottom:12px;padding:14px 18px;">
-  <div style="display:flex;gap:20px;flex-wrap:wrap;">
+  <div style="display:flex;gap:20px;flex-wrap:wrap;align-items:flex-start;">
     <div><span style="font-size:11px;color:#7a9ab8;">Route</span><br><strong>{e(route_name)}</strong></div>
     <div><span style="font-size:11px;color:#7a9ab8;">Date</span><br><strong>{route_date}</strong></div>
     <div><span style="font-size:11px;color:#7a9ab8;">Driver</span><br><strong>{e(assigned_name) or "Unassigned"}</strong></div>
     <div><span style="font-size:11px;color:#7a9ab8;">Stops detected</span><br><strong>{len(parsed_stops)}</strong></div>
+    <div><span style="font-size:11px;color:#56f0b7;">&#10003; High</span>&nbsp;
+         <strong style="color:#56f0b7;">{_conf_counts["high"]}</strong>&ensp;
+         <span style="font-size:11px;color:#f0c056;">&#9888; Med</span>&nbsp;
+         <strong style="color:#f0c056;">{_conf_counts["medium"]}</strong>&ensp;
+         <span style="font-size:11px;color:#f07056;">? Low</span>&nbsp;
+         <strong style="color:#f07056;">{_conf_counts["low"]}</strong></div>
   </div>
 </div>
+{_low_warning}
 <form method="POST">
-  <input type="hidden" name="parse_step"       value="confirm">
-  <input type="hidden" name="route_name"        value="{e(route_name)}">
-  <input type="hidden" name="route_date"        value="{e(route_date)}">
-  <input type="hidden" name="assigned_to"       value="{e(assigned_to_raw)}">
-  <input type="hidden" name="route_notes"       value="{e(route_notes)}">
-  <input type="hidden" name="dump_location_id"  value="{e(dump_location_id)}">
-  <input type="hidden" name="raw_text_hidden"   value="{e(raw_text)}">
-  <input type="hidden" name="stop_count"        value="{len(parsed_stops)}">
+  <input type="hidden" name="parse_step"      value="confirm">
+  <input type="hidden" name="route_name"       value="{e(route_name)}">
+  <input type="hidden" name="route_date"       value="{e(route_date)}">
+  <input type="hidden" name="assigned_to"      value="{e(assigned_to_raw)}">
+  <input type="hidden" name="route_notes"      value="{e(route_notes)}">
+  <input type="hidden" name="dump_location_id" value="{e(dump_location_id)}">
+  <input type="hidden" name="raw_text_hidden"  value="{e(raw_text)}">
+  <input type="hidden" name="stop_count"       value="{len(parsed_stops)}">
   {stop_cards_html}
   <div style="display:flex;gap:10px;margin-top:16px;flex-wrap:wrap;">
     <button type="submit" class="btn green" style="flex:1;min-width:200px;">
-      &#10003; Create Route
+      &#10003; Create Route ({len(parsed_stops)} stops)
     </button>
     <a href="{url_for('text_to_route')}" class="btn secondary">&#8592; Back</a>
   </div>
