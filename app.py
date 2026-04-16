@@ -167,16 +167,25 @@ def expand_abbrev(value):
 # ── Route text paste parser ───────────────────────────────────────────────────
 # Ordered most-specific → least-specific; first match wins.
 _ACTION_PATTERNS = [
-    (re.compile(r'\b(?:pickup\s*(?:and|&)\s*return|p\s*[&/]\s*r)\b', re.I), "Pickup and Return"),
-    (re.compile(r'\bpr\b',                                               re.I), "Pickup and Return"),
-    (re.compile(r'\bswap\b',                                             re.I), "Swap"),
-    (re.compile(r'\bpull\b',                                             re.I), "Pull"),
-    (re.compile(r'\bmove\b',                                             re.I), "Move"),
-    (re.compile(r'\b(?:delivery|deliver|del)\b',                         re.I), "Delivery"),
-    (re.compile(r'(?:(?<=\s)|^)p(?=\s|$)',                               re.I), "Pull"),
-    (re.compile(r'(?:(?<=\s)|^)d(?=\s|$)',                               re.I), "Delivery"),
+    # Most specific multi-word variants first
+    (re.compile(r'\b(?:pickup\s*(?:and|&)\s*return|p\s*[&/]\s*r)\b',    re.I), "Pickup and Return"),
+    (re.compile(r'\b(?:pull\s*(?:and|&)\s*return)\b',                    re.I), "Pickup and Return"),
+    (re.compile(r'\b(?:dump\s*(?:and|&)\s*return)\b',                    re.I), "Pickup and Return"),
+    (re.compile(r'\bpr\b',                                                re.I), "Pickup and Return"),
+    (re.compile(r'\bswap\b',                                              re.I), "Swap"),
+    (re.compile(r'\b(?:relocate|reloc|move\s+can)\b',                    re.I), "Relocate"),
+    (re.compile(r'\bpull\b',                                              re.I), "Pull"),
+    (re.compile(r'\bmove\b',                                              re.I), "Move"),
+    (re.compile(r'\b(?:delivery|deliver|del)\b',                          re.I), "Delivery"),
+    (re.compile(r'(?:(?<=\s)|^)p(?=\s|$)',                                re.I), "Pull"),
+    (re.compile(r'(?:(?<=\s)|^)d(?=\s|$)',                                re.I), "Delivery"),
+    (re.compile(r'(?:(?<=\s)|^)r(?=\s|$)',                                re.I), "Relocate"),
 ]
 _CONTAINER_RE = re.compile(r'\b(\d+)\s*(?:yds?|yards?)\b', re.I)
+# Two-word dump phrases — checked BEFORE the single-token loop in _parse_one_line
+_TWO_WORD_DUMP_MAP = {
+    "sb cox": "SB Cox",
+}
 _PARSE_DUMP_MAP = {
     "dom":      "Dominion",
     "dominion": "Dominion",
@@ -187,6 +196,7 @@ _PARSE_DUMP_MAP = {
     "holland":  "Holland",
     "spivey":   "Spivey",
     "cox":      "SB Cox",
+    "sb":       "SB Cox",
     "united":   "United",
     "sykes":    "Sykes",
 }
@@ -198,10 +208,13 @@ _PARSE_CITY_MAP = {
     "chesapeake":   "Chesapeake",
     "smithfield":   "Smithfield",
     "suffolk":      "Suffolk",
+    "suff":         "Suffolk",
     "hampton":      "Hampton",
     "nn":           "Newport News",
     "portsmouth":   "Portsmouth",
+    "prt":          "Portsmouth",
     "williamsburg": "Williamsburg",
+    "hamp":         "Hampton",
 }
 
 
@@ -221,11 +234,105 @@ def parse_route_text(text, conn, company_id):
     return results
 
 
+def _parse_pipe_line(raw, conn, company_id):
+    """
+    Parse a pipe-delimited line: Customer | Address | Service Type | Can Size
+    Fields are classified by content — order does not matter.
+    """
+    parts = [p.strip() for p in raw.split("|") if p.strip()]
+    result = {
+        "original_line":    raw,
+        "customer_name":    "",
+        "address":          "",
+        "city":             "",
+        "state":            "",
+        "zip_code":         "",
+        "action":           "",
+        "container_size":   "",
+        "dump_location":    "",
+        "notes":            "",
+        "confidence":       20,
+        "confidence_label": "low",
+        "matched_saved":    False,
+    }
+    unclassified = []
+    for part in parts:
+        # Container size?
+        size_m = _CONTAINER_RE.search(part)
+        if size_m and not result["container_size"]:
+            result["container_size"] = size_m.group(1) + "yd"
+            result["confidence"] += 10
+            continue
+        # Action keyword?
+        found_action = ""
+        for pat, canonical in _ACTION_PATTERNS:
+            if pat.search(part):
+                found_action = canonical
+                break
+        if found_action and not result["action"]:
+            result["action"] = found_action
+            result["confidence"] += 20
+            continue
+        # Two-word dump phrase?
+        found_dump = ""
+        for phrase, fullname in _TWO_WORD_DUMP_MAP.items():
+            if re.search(r'(?:^|\s)' + re.escape(phrase) + r'(?:\s|$)', part, re.I):
+                found_dump = fullname
+                break
+        if not found_dump:
+            for token, fullname in _PARSE_DUMP_MAP.items():
+                tok_pat = re.compile(r'(?:(?<=\s)|^)' + re.escape(token) + r'(?=\s|$)', re.I)
+                if tok_pat.search(part) and len(part.split()) <= 2:
+                    found_dump = fullname
+                    break
+        if found_dump and not result["dump_location"]:
+            result["dump_location"] = found_dump
+            result["confidence"] += 10
+            continue
+        # Address? (starts with a house number)
+        if re.match(r'^\d+\s+\w', part) and not result["address"]:
+            from_structured = _parse_structured_addr(part)
+            result["address"]  = from_structured[0] or part
+            result["city"]     = result["city"]     or from_structured[1]
+            result["state"]    = result["state"]    or from_structured[2]
+            result["zip_code"] = result["zip_code"] or from_structured[3]
+            result["confidence"] += 15
+            continue
+        # City abbreviation?
+        found_city = ""
+        part_lo = part.strip().lower()
+        if part_lo in _PARSE_CITY_MAP:
+            found_city = _PARSE_CITY_MAP[part_lo]
+        if found_city and not result["city"]:
+            result["city"]  = found_city
+            result["state"] = "VA"
+            result["confidence"] += 5
+            continue
+        # Customer name (first unclassified segment)
+        if not result["customer_name"]:
+            result["customer_name"] = part
+            result["confidence"] += 10
+        else:
+            unclassified.append(part)
+    if unclassified:
+        result["notes"] = "; ".join(unclassified)
+    result["confidence"] = min(100, result["confidence"])
+    result["confidence_label"] = (
+        "high" if result["confidence"] >= 75 else
+        ("medium" if result["confidence"] >= 45 else "low")
+    )
+    return result
+
+
 def _parse_one_line(raw, conn, company_id):
     """Parse one text line into a structured stop dict. Returns None for blank lines."""
     work = raw.strip()
     if not work:
         return None
+
+    # ── Pipe-delimited format: Customer | Address | Service | Size ───────────
+    if raw.count("|") >= 2:
+        return _parse_pipe_line(raw, conn, company_id)
 
     conf = 10
     conf_reasons = []
@@ -259,9 +366,10 @@ def _parse_one_line(raw, conn, company_id):
         conf_reasons.append("container")
 
     # ── 3. extract dump location ─────────────────────────────────────────────
+    # Check two-word phrases first (e.g. "sb cox") before single-token loop
     dump_location = ""
-    for token, fullname in _PARSE_DUMP_MAP.items():
-        pat = re.compile(r'(?:(?<=\s)|^)' + re.escape(token) + r'(?=\s|$)', re.I)
+    for phrase, fullname in _TWO_WORD_DUMP_MAP.items():
+        pat = re.compile(r'(?:(?<=\s)|^)' + re.escape(phrase) + r'(?=\s|$)', re.I)
         m = pat.search(work)
         if m:
             dump_location = fullname
@@ -270,6 +378,17 @@ def _parse_one_line(raw, conn, company_id):
             conf += 10
             conf_reasons.append("dump")
             break
+    if not dump_location:
+        for token, fullname in _PARSE_DUMP_MAP.items():
+            pat = re.compile(r'(?:(?<=\s)|^)' + re.escape(token) + r'(?=\s|$)', re.I)
+            m = pat.search(work)
+            if m:
+                dump_location = fullname
+                work = work[:m.start()] + " " + work[m.end():]
+                work = re.sub(r'\s+', ' ', work).strip()
+                conf += 10
+                conf_reasons.append("dump")
+                break
 
     # ── 4. extract city abbreviation/name ────────────────────────────────────
     city = ""
@@ -2120,11 +2239,15 @@ def _parse_workorder_format(lines):
 
 # Roll-off action prefix → canonical action label
 _ROLLOFF_PREFIXES = {
-    "PR":   "Pickup and Return",
-    "PULL": "Pull",
-    "DEL":  "Delivery",
-    "D":    "Delivery",
-    "P":    "Pull",
+    "PR":       "Pickup and Return",
+    "PULL":     "Pull",
+    "DEL":      "Delivery",
+    "DELIVERY": "Delivery",
+    "D":        "Delivery",
+    "P":        "Pull",
+    "RELOCATE": "Relocate",
+    "RELOC":    "Relocate",
+    "R":        "Relocate",
 }
 
 # City shorthand codes (Hampton Roads / Tidewater Virginia)
@@ -2154,8 +2277,10 @@ _DUMP_SITES = {
     "spsa":     "SPSA",
     "spivey":   "Spivey",
     "cox":      "SB Cox",
+    "sb":       "SB Cox",
     "united":   "United",
     "waterway": "Waterway",
+    "wat":      "Waterway",
     "sykes":    "Sykes",
     "mm":       "MM GU2737",
 }
@@ -2166,7 +2291,7 @@ _DUMP_SITES = {
 # Matches a new roll-off stop line: action prefix followed by a house number.
 # Uses (?=\d) lookahead so the digit is NOT consumed — m.end() lands right
 # before the house number and body = merged[m.end():] keeps the full address.
-_ROLLOFF_LINE_RE = re.compile(r"^(PR|PULL|DEL|D|P)\s+(?=\d)", re.IGNORECASE)
+_ROLLOFF_LINE_RE = re.compile(r"^(PR|PULL|DEL|DELIVERY|RELOCATE|RELOC|D|P|R)\s+(?=\d)", re.IGNORECASE)
 
 # Matches the city-shorthand pattern that confirms roll-off format
 _ROLLOFF_CITY_RE = re.compile(
@@ -2357,6 +2482,118 @@ def _parse_rolloff_shorthand(lines):
     return stops, ""
 
 
+# ─── Inline shorthand (freeform, no commas) ───────────────────────────────────
+#
+# Handles: ACTION HOUSE_NUM STREET [CITY_CODE] [CUSTOMER] [SIZEyd] [dump SITE]
+# Example: Pull 4915 Broad St vb rhr 30yd dump dominion
+#          R 7801 Shore Dr norf smith 20yd dump dominion
+#
+# Differs from roll-off: NO commas required. City code is space-separated.
+
+_INLINE_PREFIX_RE = re.compile(
+    r"^(PR|PULL|DEL|DELIVERY|RELOCATE|RELOC|P|D|R)\s+(?=\d)",
+    re.IGNORECASE,
+)
+
+
+def _is_inline_shorthand(lines):
+    """Return True when any line has an action prefix + house number, no commas, and
+    a known city shorthand code somewhere on the line."""
+    for line in lines:
+        if _INLINE_PREFIX_RE.match(line) and "," not in line:
+            for code in _CITY_CODES:
+                if re.search(r'\b' + re.escape(code) + r'\b', line, re.IGNORECASE):
+                    return True
+    return False
+
+
+def _parse_inline_stop(line, order_num):
+    """
+    Parse one inline-shorthand line.
+    Structure: ACTION  HOUSE_NUM STREET [CITY_CODE] [CUSTOMER] [SIZEyd] [dump SITE] [notes]
+    """
+    m = _INLINE_PREFIX_RE.match(line)
+    if not m:
+        return None
+    prefix = m.group(1).upper()
+    action = _ROLLOFF_PREFIXES.get(prefix, "Service")
+    body   = line[m.end():].strip()
+
+    # 1. Extract container size
+    container_size = ""
+    sz = re.search(r'\b(\d{1,2})\s*yd\b', body, re.IGNORECASE)
+    if sz:
+        container_size = sz.group(1)
+        body = re.sub(r'\s+', ' ', (body[:sz.start()] + " " + body[sz.end():])).strip()
+
+    # 2. Extract dump site
+    dump_location = ""
+    dm = re.search(r'\bdump\s+(\w+)', body, re.IGNORECASE)
+    if dm:
+        key = dm.group(1).lower()
+        dump_location = _DUMP_SITES.get(key, dm.group(1).title())
+        body = re.sub(r'\s+', ' ', (body[:dm.start()] + " " + body[dm.end():])).strip()
+
+    # 3. Find and remove city code
+    city = state = ""
+    for code, (city_name, state_code) in _CITY_CODES.items():
+        mc = re.search(r'\b' + re.escape(code) + r'\b', body, re.IGNORECASE)
+        if mc:
+            city  = city_name
+            state = state_code
+            body  = re.sub(r'\s+', ' ', (body[:mc.start()] + " " + body[mc.end():])).strip()
+            break
+
+    # 4. Split remaining "HOUSE_NUM STREET [CUSTOMER notes]" at last street suffix
+    address = customer_name = notes = ""
+    house_m = re.match(r'\d+\s+', body)
+    if house_m:
+        sfx_m = None
+        for sfx in _STREET_SFX_RE.finditer(body):
+            sfx_m = sfx
+        if sfx_m:
+            address = body[:sfx_m.end()].strip()
+            rest    = body[sfx_m.end():].strip()
+        else:
+            # No street suffix: first 4 tokens → address, rest → customer
+            words   = body.split()
+            n       = min(4, len(words))
+            address = " ".join(words[:n])
+            rest    = " ".join(words[n:])
+        customer_name, notes = _split_rolloff_customer_notes(rest)
+    else:
+        customer_name = body
+
+    return {
+        "stop_order":       order_num,
+        "customer_name":    customer_name.strip(),
+        "address":          address.strip(),
+        "city":             city,
+        "state":            state,
+        "zip_code":         "",
+        "action":           action,
+        "container_size":   container_size,
+        "ticket_number":    "",
+        "reference_number": "",
+        "dump_location":    dump_location,
+        "notes":            notes.strip(),
+    }
+
+
+def _parse_inline_shorthand(lines):
+    """Parse all inline-shorthand stops from a line list. Returns (stops, "")."""
+    stops     = []
+    order_num = 1
+    for line in lines:
+        if not line:
+            continue
+        stop = _parse_inline_stop(line, order_num)
+        if stop and (stop["address"] or stop["customer_name"]):
+            stops.append(stop)
+            order_num += 1
+    return stops, ""
+
+
 # ─── Top-level parser dispatcher ──────────────────────────────────────────────
 
 def parse_boss_text(raw_text):
@@ -2364,9 +2601,10 @@ def parse_boss_text(raw_text):
     Parse pasted route text into (stops_list, dump_site_str).
 
     Format detection priority:
-      1. Roll-off shorthand  — boss compressed format (Pr/Pull/Del + city code)
+      1. Roll-off shorthand  — boss compressed format (Pr/Pull/Del + comma city code)
       2. Work-order format   — PR/P/D with full address, city, state, customer
-      3. Numbered/dash-delimited legacy format
+      3. Inline shorthand    — action + house number + space-separated city code (no commas)
+      4. Numbered/dash-delimited legacy format
     """
     lines          = [clean_line(x) for x in raw_text.splitlines()]
     lines_nonempty = [l for l in lines if l]
@@ -2376,6 +2614,9 @@ def parse_boss_text(raw_text):
 
     if any(_is_wo_line(l) for l in lines_nonempty):
         return _parse_workorder_format(lines_nonempty)
+
+    if _is_inline_shorthand(lines_nonempty):
+        return _parse_inline_shorthand(lines_nonempty)
 
     # Legacy numbered-list / dash-delimited fallback
     blocks = split_into_stop_blocks(raw_text)
@@ -5158,7 +5399,7 @@ def reassign_route(route_id):
 
 
 # =========================================
-# TEXT TO ROUTE
+# TEXT TO ROUTE  (parse → preview → confirm)
 # =========================================
 
 @app.route("/text-to-route", methods=["GET", "POST"])
@@ -5175,78 +5416,247 @@ def text_to_route():
     ).fetchall()
 
     if request.method == "POST":
-        route_date       = request.form.get("route_date", "").strip() or today_str()
-        route_name       = request.form.get("route_name", "").strip()
-        raw_text         = request.form.get("raw_text", "").strip()
-        assigned_to_raw  = request.form.get("assigned_to", "").strip()
-        notes            = request.form.get("notes", "").strip()
-        dump_location_id = request.form.get("dump_location_id", "").strip()
+        parse_step = request.form.get("parse_step", "preview")
 
-        assigned_to       = int(assigned_to_raw) if assigned_to_raw.isdigit() else None
-        dump_location_val = int(dump_location_id) if dump_location_id.isdigit() else None
+        # ── CONFIRM: save the route from the edited preview ──────────────────
+        if parse_step == "confirm":
+            route_date       = request.form.get("route_date",       "").strip() or today_str()
+            route_name       = request.form.get("route_name",       "").strip()
+            assigned_to_raw  = request.form.get("assigned_to",      "").strip()
+            route_notes      = request.form.get("route_notes",      "").strip()
+            dump_location_id = request.form.get("dump_location_id", "").strip()
+            raw_text_hidden  = request.form.get("raw_text_hidden",  "").strip()
+            stop_count_raw   = request.form.get("stop_count",       "0")
+
+            assigned_to       = int(assigned_to_raw)  if assigned_to_raw.isdigit()  else None
+            dump_location_val = int(dump_location_id) if dump_location_id.isdigit() else None
+            stop_count        = int(stop_count_raw)   if stop_count_raw.isdigit()   else 0
+
+            if not route_name:
+                conn.close()
+                flash("Route name is required.", "error")
+                return redirect(url_for("text_to_route"))
+
+            final_stops = []
+            for i in range(stop_count):
+                if request.form.get(f"stop_{i}_skip"):
+                    continue
+                cust = request.form.get(f"stop_{i}_customer_name", "").strip()
+                addr = request.form.get(f"stop_{i}_address",       "").strip()
+                if not cust and not addr:
+                    continue
+                final_stops.append({
+                    "customer_name":  cust,
+                    "address":        addr,
+                    "city":           request.form.get(f"stop_{i}_city",           "").strip(),
+                    "state":          request.form.get(f"stop_{i}_state",          "").strip(),
+                    "zip_code":       request.form.get(f"stop_{i}_zip_code",       "").strip(),
+                    "action":         request.form.get(f"stop_{i}_action",  "Service").strip(),
+                    "container_size": request.form.get(f"stop_{i}_container_size", "").strip(),
+                    "dump_location":  request.form.get(f"stop_{i}_dump_location",  "").strip(),
+                    "notes":          request.form.get(f"stop_{i}_notes",          "").strip(),
+                })
+
+            if not final_stops:
+                conn.close()
+                flash("No stops to save.", "error")
+                return redirect(url_for("text_to_route"))
+
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO routes (
+                    route_date, route_name, raw_text, assigned_to, created_by,
+                    status, notes, dump_location_id, company_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
+            """, (route_date, route_name, raw_text_hidden, assigned_to,
+                  session["user_id"], route_notes, dump_location_val,
+                  company_id, now_ts()))
+            route_id = cur.lastrowid
+
+            for order_num, stop in enumerate(final_stops, start=1):
+                cur.execute("""
+                    INSERT INTO stops (
+                        route_id, stop_order, customer_name, address, city, state, zip_code,
+                        action, container_size, ticket_number, reference_number,
+                        dump_location, notes, status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, 'open', ?)
+                """, (route_id, order_num, stop["customer_name"], stop["address"],
+                      stop["city"], stop["state"], stop["zip_code"], stop["action"],
+                      stop["container_size"], stop["dump_location"], stop["notes"],
+                      now_ts()))
+
+            conn.commit()
+            conn.close()
+            flash(f"Route created with {len(final_stops)} stop(s).", "success")
+            return redirect(url_for("view_route", route_id=route_id))
+
+        # ── PREVIEW: parse text, show editable stop cards ────────────────────
+        route_date       = request.form.get("route_date",       "").strip() or today_str()
+        route_name       = request.form.get("route_name",       "").strip()
+        raw_text         = request.form.get("raw_text",         "").strip()
+        assigned_to_raw  = request.form.get("assigned_to",      "").strip()
+        route_notes      = request.form.get("notes",            "").strip()
+        dump_location_id = request.form.get("dump_location_id", "").strip()
 
         if not route_name or not raw_text:
             conn.close()
             flash("Route name and pasted text are required.", "error")
             return redirect(url_for("text_to_route"))
 
-        parsed_stops, _parsed_dump = parse_boss_text(raw_text)
+        parsed_stops, _dump = parse_boss_text(raw_text)
 
         if not parsed_stops:
             conn.close()
-            flash("No stops could be parsed.", "error")
+            flash("No stops could be parsed from the text. Check format and try again.", "error")
             return redirect(url_for("text_to_route"))
 
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO routes (
-                route_date, route_name, raw_text, assigned_to, created_by,
-                status, notes, dump_location_id, company_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
-        """, (
-            route_date,
-            route_name,
-            raw_text,
-            assigned_to,
-            session["user_id"],
-            notes,
-            dump_location_val,
-            company_id,
-            now_ts()
-        ))
+        # Driver name for summary bar
+        assigned_name = next(
+            (d["username"] for d in drivers if str(d["id"]) == assigned_to_raw), ""
+        )
 
-        route_id = cur.lastrowid
+        _STOP_ACTION_OPTS = [
+            "Pull", "Pickup and Return", "Delivery", "Relocate",
+            "Swap", "Move", "Service", "Dump",
+        ]
 
-        for stop in parsed_stops:
-            cur.execute("""
-                INSERT INTO stops (
-                    route_id, stop_order, customer_name, address, city, state, zip_code,
-                    action, container_size, ticket_number, reference_number, dump_location, notes,
-                    status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
-            """, (
-                route_id,
-                stop["stop_order"],
-                stop["customer_name"],
-                stop["address"],
-                stop["city"],
-                stop["state"],
-                stop["zip_code"],
-                stop["action"],
-                stop["container_size"],
-                stop["ticket_number"],
-                stop["reference_number"],
-                stop.get("dump_location", ""),
-                stop["notes"],
-                now_ts()
-            ))
+        # Build per-stop editable cards
+        stop_cards_html = ""
+        for i, stop in enumerate(parsed_stops):
+            orig_text = e(stop.get("original_line") or "")
+            orig_html = (
+                f'<div style="font-size:11px;color:#7a9ab8;margin-bottom:8px;">'
+                f'Parsed from: &ldquo;{orig_text}&rdquo;</div>'
+            ) if orig_text else ""
 
-        conn.commit()
+            conf_label = stop.get("confidence_label", "")
+            if conf_label == "high":
+                conf_badge = '<span style="color:#56f0b7;font-size:11px;font-weight:600;margin-left:8px;">HIGH</span>'
+            elif conf_label == "medium":
+                conf_badge = '<span style="color:#f0c056;font-size:11px;font-weight:600;margin-left:8px;">MED</span>'
+            elif conf_label == "low":
+                conf_badge = '<span style="color:#f07056;font-size:11px;font-weight:600;margin-left:8px;">? LOW</span>'
+            else:
+                conf_badge = ""
+
+            action_val = stop.get("action") or "Service"
+            act_opts = ""
+            for opt in _STOP_ACTION_OPTS:
+                sel = "selected" if opt.lower() == action_val.lower() else ""
+                act_opts += f'<option value="{e(opt)}" {sel}>{e(opt)}</option>'
+
+            stop_cards_html += f"""
+<div class="p-stop-card" id="psc-{i}">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <div style="font-weight:700;font-size:14px;">Stop {i + 1}{conf_badge}</div>
+    <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:12px;color:#f07056;">
+      <input type="checkbox" name="stop_{i}_skip" value="1"
+             onchange="document.getElementById('psc-{i}').style.opacity=this.checked?'0.35':'1'">
+      Skip
+    </label>
+  </div>
+  {orig_html}
+  <div class="p-stop-grid">
+    <div class="p-col-wide">
+      <label class="p-lbl">Customer Name</label>
+      <input name="stop_{i}_customer_name" value="{e(stop.get('customer_name',''))}" placeholder="Customer name">
+    </div>
+    <div class="p-col-wide">
+      <label class="p-lbl">Address</label>
+      <input name="stop_{i}_address" value="{e(stop.get('address',''))}" placeholder="Street address">
+    </div>
+    <div>
+      <label class="p-lbl">City</label>
+      <input name="stop_{i}_city" value="{e(stop.get('city',''))}">
+    </div>
+    <div>
+      <label class="p-lbl">State</label>
+      <input name="stop_{i}_state" value="{e(stop.get('state','VA'))}" maxlength="2" style="width:60px;">
+    </div>
+    <div>
+      <label class="p-lbl">Service Type</label>
+      <select name="stop_{i}_action" class="p-sel">{act_opts}</select>
+    </div>
+    <div>
+      <label class="p-lbl">Can Size</label>
+      <input name="stop_{i}_container_size" value="{e(stop.get('container_size',''))}" placeholder="30yd" style="width:80px;">
+    </div>
+    <div>
+      <label class="p-lbl">Dump Location</label>
+      <input name="stop_{i}_dump_location" value="{e(stop.get('dump_location',''))}" placeholder="Dominion">
+    </div>
+    <div class="p-col-wide">
+      <label class="p-lbl">Notes</label>
+      <input name="stop_{i}_notes" value="{e(stop.get('notes',''))}" placeholder="Gate code, instructions...">
+    </div>
+  </div>
+  <input type="hidden" name="stop_{i}_zip_code" value="{e(stop.get('zip_code',''))}">
+</div>"""
+
         conn.close()
 
-        flash(f"Route created with {len(parsed_stops)} stops.", "success")
-        return redirect(url_for("view_route", route_id=route_id))
+        body = f"""
+<style>
+.p-stop-card {{
+  background: var(--card-bg, #1a2235);
+  border: 1px solid var(--border, rgba(255,255,255,0.07));
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 10px;
+}}
+.p-stop-grid {{
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 10px;
+}}
+.p-col-wide {{ grid-column: span 2; }}
+@media (min-width: 680px) {{
+  .p-stop-grid {{ grid-template-columns: 1fr 1fr 1fr; }}
+  .p-col-wide {{ grid-column: span 2; }}
+}}
+.p-lbl {{ font-size: 11px; color: #7a9ab8; display: block; margin-bottom: 3px; }}
+.p-sel {{
+  width: 100%;
+  background: var(--input-bg, #0f1724);
+  color: inherit;
+  border: 1px solid var(--border, rgba(255,255,255,0.1));
+  border-radius: 6px;
+  padding: 7px 10px;
+  font-size: 14px;
+}}
+</style>
+<div class="hero">
+  <h1>Preview Route</h1>
+  <p>Review and edit each stop before saving. Check &ldquo;Skip&rdquo; to exclude a stop.</p>
+</div>
+<div class="card" style="margin-bottom:12px;padding:14px 18px;">
+  <div style="display:flex;gap:20px;flex-wrap:wrap;">
+    <div><span style="font-size:11px;color:#7a9ab8;">Route</span><br><strong>{e(route_name)}</strong></div>
+    <div><span style="font-size:11px;color:#7a9ab8;">Date</span><br><strong>{route_date}</strong></div>
+    <div><span style="font-size:11px;color:#7a9ab8;">Driver</span><br><strong>{e(assigned_name) or "Unassigned"}</strong></div>
+    <div><span style="font-size:11px;color:#7a9ab8;">Stops detected</span><br><strong>{len(parsed_stops)}</strong></div>
+  </div>
+</div>
+<form method="POST">
+  <input type="hidden" name="parse_step"       value="confirm">
+  <input type="hidden" name="route_name"        value="{e(route_name)}">
+  <input type="hidden" name="route_date"        value="{e(route_date)}">
+  <input type="hidden" name="assigned_to"       value="{e(assigned_to_raw)}">
+  <input type="hidden" name="route_notes"       value="{e(route_notes)}">
+  <input type="hidden" name="dump_location_id"  value="{e(dump_location_id)}">
+  <input type="hidden" name="raw_text_hidden"   value="{e(raw_text)}">
+  <input type="hidden" name="stop_count"        value="{len(parsed_stops)}">
+  {stop_cards_html}
+  <div style="display:flex;gap:10px;margin-top:16px;flex-wrap:wrap;">
+    <button type="submit" class="btn green" style="flex:1;min-width:200px;">
+      &#10003; Create Route
+    </button>
+    <a href="{url_for('text_to_route')}" class="btn secondary">&#8592; Back</a>
+  </div>
+</form>"""
+        return render_template_string(shell_page("Preview Route", body))
 
+    # ── GET: show the paste form ──────────────────────────────────────────────
     driver_options = '<option value="">Unassigned</option>'
     for d in drivers:
         driver_options += f'<option value="{d["id"]}">{e(d["username"])}</option>'
@@ -5259,29 +5669,59 @@ def text_to_route():
     conn.close()
 
     body = f"""
-    <div class="hero">
-        <h1>Text to Route</h1>
-        <p>Paste dispatch text and convert it instantly.</p>
+<div class="hero">
+  <h1>Text to Route</h1>
+  <p>Paste route text in any format. HAULTRA detects stops automatically.</p>
+</div>
+<div class="card">
+  <form method="POST">
+    <label>Route Name</label>
+    <input name="route_name" placeholder="Friday Roll Off Route" required>
+    <label>Route Date</label>
+    <input type="date" name="route_date" value="{today_str()}" required>
+    <label>Assign Driver</label>
+    <select name="assigned_to">{driver_options}</select>
+    <label>Route-level Dump Location</label>
+    <select name="dump_location_id">{dump_options}</select>
+    <label>Route Text</label>
+    <textarea name="raw_text" rows="10"
+      placeholder="Paste boss text here..."
+      required
+      style="font-family:monospace;font-size:13px;min-height:160px;"></textarea>
+    <label>Notes</label>
+    <textarea name="notes" placeholder="Extra route instructions..."></textarea>
+    <div style="margin-top:10px;">
+      <button type="submit" name="parse_step" value="preview" class="btn green">
+        Preview Stops &rarr;
+      </button>
     </div>
-
-    <div class="card">
-        <form method="POST">
-            <label>Route Name</label>
-            <input name="route_name" placeholder="Friday Roll Off Route" required>
-            <label>Route Date</label>
-            <input type="date" name="route_date" value="{today_str()}" required>
-            <label>Assign Driver</label>
-            <select name="assigned_to">{driver_options}</select>
-            <label>Dump Location</label>
-            <select name="dump_location_id">{dump_options}</select>
-            <label>Route Text</label>
-            <textarea name="raw_text" placeholder="Paste boss text here..." required></textarea>
-            <label>Notes</label>
-            <textarea name="notes" placeholder="Extra route instructions..."></textarea>
-            <div style="margin-top:10px;"><button type="submit" class="btn green">Create Route from Text</button></div>
-        </form>
+  </form>
+</div>
+<div class="card">
+  <div style="font-size:12px;font-weight:600;color:#7a9ab8;margin-bottom:10px;">SUPPORTED FORMATS</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+    <div style="background:rgba(255,255,255,0.03);border-radius:8px;padding:12px;">
+      <div style="font-size:10px;color:#7a9ab8;font-weight:700;margin-bottom:5px;">ROLL-OFF (commas)</div>
+      <code style="font-size:12px;color:#56f0b7;display:block;">Pr 5660 lowery rd,vb, jaswal 30yd dump dom</code>
+      <code style="font-size:12px;color:#56f0b7;display:block;">Pull 280 benton,suff, power bolt 20yd</code>
     </div>
-    """
+    <div style="background:rgba(255,255,255,0.03);border-radius:8px;padding:12px;">
+      <div style="font-size:10px;color:#7a9ab8;font-weight:700;margin-bottom:5px;">FREEFORM (no commas)</div>
+      <code style="font-size:12px;color:#56f0b7;display:block;">Pull 4915 Broad St vb rhr 30yd dump dom</code>
+      <code style="font-size:12px;color:#56f0b7;display:block;">R 7801 Shore Dr norf smith 20yd</code>
+    </div>
+    <div style="background:rgba(255,255,255,0.03);border-radius:8px;padding:12px;">
+      <div style="font-size:10px;color:#7a9ab8;font-weight:700;margin-bottom:5px;">PIPE / STRUCTURED</div>
+      <code style="font-size:12px;color:#56f0b7;display:block;">Smith | 123 Main St Norfolk | PR | 30yd</code>
+      <code style="font-size:12px;color:#56f0b7;display:block;">Jones | 4100 Holland Rd VB | Delivery | 20yd</code>
+    </div>
+    <div style="background:rgba(255,255,255,0.03);border-radius:8px;padding:12px;">
+      <div style="font-size:10px;color:#7a9ab8;font-weight:700;margin-bottom:5px;">WORK ORDER (typed)</div>
+      <code style="font-size:12px;color:#56f0b7;display:block;">PR 1233 Westover Ave, Norfolk, VA, ringen 30yd</code>
+      <code style="font-size:12px;color:#56f0b7;display:block;">D 2431 Southern Pines, Chesapeake, Roof Joe 20yd</code>
+    </div>
+  </div>
+</div>"""
     return render_template_string(shell_page("Text to Route", body))
 
 # =========================================================
