@@ -70,20 +70,17 @@ if not _secret_key:
     _secret_key = "haultra-super-secret-key-change-me"
 app.secret_key = _secret_key
 
-# On Windows the database must live OUTSIDE the OneDrive folder.
-# On Render / Linux the DATABASE_PATH env var must point to a persistent disk mount.
-# If neither is set, fall back to a safe local-app-data path on Windows,
-# or the current directory on Linux (suitable only for dev).
-_db_env = os.environ.get("DATABASE_PATH", "")
-if _db_env:
-    DATABASE = _db_env
-elif os.name == "nt":  # Windows local dev — store outside OneDrive
-    _local_data = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
-    _db_dir = os.path.join(_local_data, "haultra")
-    os.makedirs(_db_dir, exist_ok=True)
-    DATABASE = os.path.join(_db_dir, "haultra.db")
-else:
-    DATABASE = "haultra.db"
+# DATABASE_PATH must be set explicitly — no fallbacks, no hidden paths.
+# Set this env var to the full path of your haultra.db file before starting.
+_db_env = os.environ.get("DATABASE_PATH", "").strip()
+if not _db_env:
+    raise RuntimeError(
+        "DATABASE_PATH environment variable is not set. "
+        "Set it to the full path of your haultra.db file and restart the app. "
+        "Example: DATABASE_PATH=/data/haultra.db"
+    )
+DATABASE = _db_env
+print("Using database:", DATABASE, flush=True)
 UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", os.path.join("static", "uploads"))
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "pdf"}
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -9895,9 +9892,33 @@ def api_csrf_token():
 
 
 # =========================================================
+# DEBUG — temporary DB inspection route
+# =========================================================
+@app.route("/debug/db")
+@boss_required
+def debug_db():
+    from flask import jsonify
+    conn = get_db()
+    total = conn.execute("SELECT COUNT(*) FROM routes").fetchone()[0]
+    rows  = conn.execute(
+        "SELECT id, route_date, route_name, status FROM routes ORDER BY route_date DESC, id DESC"
+    ).fetchall()
+    conn.close()
+    return jsonify({
+        "DATABASE_PATH": DATABASE,
+        "total_routes":  total,
+        "routes": [
+            {"id": r["id"], "date": r["route_date"], "name": r["route_name"], "status": r["status"]}
+            for r in rows
+        ],
+    })
+
+
+# =========================================================
 # STARTUP — initialize DB before gunicorn serves any request
 # =========================================================
 init_db()
+print("Startup complete. DATABASE_PATH =", DATABASE, flush=True)
 
 # =========================================================
 # RUN APP
