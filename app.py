@@ -8981,6 +8981,25 @@ def stop_driver_action(stop_id):
             "stop_id": stop_id,
         }), 409
 
+    # State machine guard — prevent backwards/invalid transitions
+    _VALID_TRANSITIONS = {
+        None:            {"arrived"},
+        "pending":       {"arrived"},
+        "arrived":       {"box_out", "going_to_dump", "need_box_in", "skip_to_box_in"},
+        "box_out":       {"going_to_dump", "need_box_in", "skip_to_box_in"},
+        "going_to_dump": {"need_box_in", "skip_to_box_in"},
+        "need_box_in":   {"box_in", "skip_to_box_in"},
+        "box_in":        set(),
+    }
+    current_status = stop["driver_status"]
+    allowed = _VALID_TRANSITIONS.get(current_status, set())
+    if action not in allowed:
+        conn.close()
+        if is_replay:
+            return jsonify({"conflict": True, "current_status": current_status, "stop_id": stop_id}), 409
+        flash(f"Cannot apply '{action}' — stop is already '{current_status}'.", "error")
+        return redirect(url_for("driver_route_detail", route_id=stop["rid"]))
+
     ts = now_ts()
 
     if action in ("need_box_in", "skip_to_box_in"):
