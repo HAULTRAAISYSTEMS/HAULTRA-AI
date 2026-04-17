@@ -8869,6 +8869,7 @@ def delete_stop(stop_id):
     route_id = row["route_id"]
 
     conn.execute("DELETE FROM route_photos WHERE stop_id=?", (stop_id,))
+    conn.execute("DELETE FROM dump_tickets WHERE stop_id=?", (stop_id,))
     conn.execute("DELETE FROM stops WHERE id=?", (stop_id,))
     conn.commit()
     # Recompute can flow with the stop removed
