@@ -8012,8 +8012,8 @@ def upsert_saved_address(conn, company_id, customer_name, address,
                    VALUES (?,?,?,?,1,?)""",
                 (sa_id, act, cs, dl, ts)
             )
-    except Exception:
-        pass
+    except Exception as e:
+        app.logger.warning("upsert_saved_address failed for %r: %s", addr, e)
 
 
 @app.route("/route/<int:route_id>")
