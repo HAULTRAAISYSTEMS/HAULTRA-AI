@@ -8928,8 +8928,11 @@ def toggle_stop_complete(stop_id):
     conn.commit()
 
     if request.headers.get("X-Requested-With") == "XMLHttpRequest":
-        total     = conn.execute("SELECT COUNT(*) n FROM stops WHERE route_id=?", (stop["route_id"],)).fetchone()["n"]
-        completed = conn.execute("SELECT COUNT(*) n FROM stops WHERE route_id=? AND status='completed'", (stop["route_id"],)).fetchone()["n"]
+        prog      = conn.execute(
+            "SELECT COUNT(*) AS total, SUM(status='completed') AS completed FROM stops WHERE route_id=?",
+            (stop["route_id"],)
+        ).fetchone()
+        total, completed = prog["total"], prog["completed"] or 0
         conn.close()
         return jsonify({
             "success": True,
@@ -9595,6 +9598,16 @@ def optimize_route(route_id):
         + no_address
         + eod_stops
     )
+
+    # Verify no stops were added or deleted during geocoding
+    current_stop_ids = {r["id"] for r in conn.execute(
+        "SELECT id FROM stops WHERE route_id=?", (route_id,)
+    ).fetchall()}
+    snapshotted_ids = {s["id"] for s in stops}
+    if current_stop_ids != snapshotted_ids:
+        conn.close()
+        flash("Route was modified while optimizing. Please try again.", "error")
+        return redirect(url_for("view_route", route_id=route_id))
 
     for new_order, stop_id in enumerate(final_order, start=1):
         conn.execute("UPDATE stops SET stop_order=? WHERE id=?", (new_order, stop_id))
