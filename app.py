@@ -8777,6 +8777,7 @@ def delete_route(route_id):
 
     # delete child records first
     conn.execute("DELETE FROM route_photos WHERE stop_id IN (SELECT id FROM stops WHERE route_id=?)", (route_id,))
+    conn.execute("DELETE FROM dump_tickets WHERE stop_id IN (SELECT id FROM stops WHERE route_id=?)", (route_id,))
     conn.execute("DELETE FROM stops WHERE route_id=?", (route_id,))
     conn.execute("DELETE FROM routes WHERE id=? AND company_id=?", (route_id, cid()))
 
