@@ -3918,9 +3918,10 @@ tr.status-in-progress td {{ background: rgba(255,140,0,0.03); }}
   var QUEUE_KEY   = 'haultra_offline_queue';
   var _SYNCED_KEY = 'haultra_synced_uids';   /* sessionStorage: dedup across reloads */
 
-  /* Routes queued when offline (toggle is handled by the AJAX handler directly) */
+  /* Routes queued when offline */
   var QUEUE_PAT = [
     /^\\/stop\\/\\d+\\/driver-action$/,
+    /^\\/stop\\/\\d+\\/toggle$/,
     /^\\/driver\\/clock$/
   ];
 
