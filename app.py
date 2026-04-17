@@ -9003,10 +9003,9 @@ def stop_driver_action(stop_id):
     ts = now_ts()
 
     if action in ("need_box_in", "skip_to_box_in"):
-        # Transition to box-in pending state — no timestamp column, just update status
         conn.execute(
-            "UPDATE stops SET driver_status='need_box_in' WHERE id=?",
-            (stop_id,)
+            "UPDATE stops SET driver_status='need_box_in' WHERE id=? AND driver_status=?",
+            (stop_id, current_status)
         )
     else:
         col_map = {
@@ -9017,9 +9016,16 @@ def stop_driver_action(stop_id):
         }
         time_col = col_map[action]
         conn.execute(
-            f"UPDATE stops SET driver_status=?, {time_col}=? WHERE id=?",
-            (action, ts, stop_id)
+            f"UPDATE stops SET driver_status=?, {time_col}=? WHERE id=? AND driver_status=?",
+            (action, ts, stop_id, current_status)
         )
+
+    if conn.total_changes == 0:
+        conn.close()
+        if is_replay:
+            return jsonify({"conflict": True, "current_status": current_status, "stop_id": stop_id}), 409
+        flash(f"Stop was already updated by another action. Current status: '{current_status}'.", "error")
+        return redirect(url_for("driver_route_detail", route_id=stop["rid"]))
 
     conn.commit()
     route_id = stop["rid"]
