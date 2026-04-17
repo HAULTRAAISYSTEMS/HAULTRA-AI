@@ -579,16 +579,32 @@ _SUBSCRIPTION_EXEMPT = {
     "privacy_policy", "terms_of_service",
 }
 
+_SUB_CACHE_TTL = 60  # seconds between DB re-checks per company
+
 @app.before_request
 def subscription_enforce():
     """
     Auto-suspend expired trials, then block suspended/cancelled accounts.
-    Runs on every request after login.
+    Runs on every request after login, with a 60-second session cache to avoid
+    hitting the DB on every single request.
     """
     if request.endpoint in _SUBSCRIPTION_EXEMPT or not session.get("company_id"):
         return
 
     company_id = session["company_id"]
+
+    import time as _time
+    now_ts_float = _time.time()
+    cache_checked_at = session.get("_sub_checked_at", 0)
+
+    if now_ts_float - cache_checked_at < _SUB_CACHE_TTL:
+        cached_status = session.get("_sub_status")
+        if cached_status in ("suspended", "cancelled"):
+            if request.endpoint in ("company_subscription", "company_settings"):
+                return
+            return redirect(url_for("subscription_blocked"))
+        return
+
     conn = get_db()
     co = conn.execute(
         "SELECT subscription_plan, subscription_status, trial_ends_at FROM companies WHERE id=?",
@@ -623,8 +639,10 @@ def subscription_enforce():
             _conn.close()
             co = {"subscription_status": "suspended", "subscription_plan": "trial"}
 
+    session["_sub_status"] = co["subscription_status"]
+    session["_sub_checked_at"] = now_ts_float
+
     if co["subscription_status"] in ("suspended", "cancelled"):
-        # Allow boss to view subscription page so they can act
         if request.endpoint in ("company_subscription", "company_settings"):
             return
         return redirect(url_for("subscription_blocked"))
