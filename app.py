@@ -1009,8 +1009,8 @@ def update_container_flow(conn, stop_id):
                    VALUES (?,?,?,?,?,?,?,'on_site',?)""",
                 (co_id, addr, city, state, size, stop_id, ts, ts)
             )
-    except Exception:
-        pass  # Never abort a driver completion due to tracking failure
+    except Exception as e:
+        app.logger.error("Container flow tracking failed for stop %s: %s", stop_id, e)
 
 
 # =============================================================
