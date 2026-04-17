@@ -539,7 +539,9 @@ def _parse_one_line(raw, conn, company_id):
 
 
 def get_db():
-    os.makedirs(os.path.dirname(DATABASE), exist_ok=True)
+    db_dir = os.path.dirname(DATABASE)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
     return conn
