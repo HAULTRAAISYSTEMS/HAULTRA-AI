@@ -63,11 +63,10 @@ STRIPE_PURCHASABLE_PLANS = {"starter", "pro"}
 app = Flask(__name__)
 _secret_key = os.environ.get("SECRET_KEY", "")
 if not _secret_key:
-    warnings.warn(
-        "SECRET_KEY env var not set — using an insecure default. Set SECRET_KEY before deploying.",
-        stacklevel=2,
+    raise RuntimeError(
+        "SECRET_KEY env var not set. "
+        "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
     )
-    _secret_key = "haultra-super-secret-key-change-me"
 app.secret_key = _secret_key
 
 # DATABASE_PATH must be set explicitly — no fallbacks, no hidden paths.
