@@ -3029,15 +3029,8 @@ def shell_page(title, body, extra_head=""):
         # resolve company name for sidebar display
         _co_name = ""
         if user["company_id"]:
-            _co_conn = get_db()
-            _co_row = _co_conn.execute(
-                "SELECT name, subscription_plan FROM companies WHERE id=?",
-                (user["company_id"],)
-            ).fetchone()
-            _co_conn.close()
-            if _co_row:
-                _co_name = _co_row["name"]
-                _co_plan = _co_row["subscription_plan"].title()
+            _co_name = session.get("company_name", "")
+            _co_plan = session.get("company_plan", "").title()
 
         boss_only = ""
         if user["role"] == "boss":
@@ -4502,6 +4495,15 @@ def login():
             session["role"]          = user["role"]
             session["company_id"]    = user["company_id"]
             session["is_superadmin"] = bool(user["is_superadmin"])
+            _co_conn = get_db()
+            _co_row = _co_conn.execute(
+                "SELECT name, subscription_plan FROM companies WHERE id=?",
+                (user["company_id"],)
+            ).fetchone()
+            _co_conn.close()
+            if _co_row:
+                session["company_name"] = _co_row["name"]
+                session["company_plan"] = _co_row["subscription_plan"]
             flash("Logged in.", "success")
 
             if user["role"] == "driver":
@@ -6126,8 +6128,8 @@ def routes_page():
         params.append(user["id"])
 
     if q:
-        sql += " AND (r.route_name LIKE ? OR r.notes LIKE ? OR r.raw_text LIKE ?)"
-        like_q = f"%{q}%"
+        sql += " AND (r.route_name LIKE ? ESCAPE '\\' OR r.notes LIKE ? ESCAPE '\\' OR r.raw_text LIKE ? ESCAPE '\\')"
+        like_q = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         params.extend([like_q, like_q, like_q])
 
     if status in ("open", "in_progress", "completed"):
