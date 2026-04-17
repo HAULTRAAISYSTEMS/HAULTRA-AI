@@ -509,8 +509,8 @@ def _parse_one_line(raw, conn, company_id):
                 if not dump_location and saved["default_dump_location"]:
                     dump_location = saved["default_dump_location"]
                     conf_reasons.append("saved-dump")
-        except Exception:
-            pass
+        except Exception as e:
+            app.logger.warning("Address lookup DB error for %r: %s", raw, e)
 
     conf = min(100, conf)
     conf_label = "high" if conf >= 75 else ("medium" if conf >= 45 else "low")
