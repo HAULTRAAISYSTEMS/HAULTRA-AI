@@ -104,7 +104,7 @@ def now_ts():
 
 
 def today_str():
-    return date.today().strftime("%Y-%m-%d")
+    return datetime.now(_EASTERN).strftime("%Y-%m-%d")
 
 
 def _fmt_12h(ts):
