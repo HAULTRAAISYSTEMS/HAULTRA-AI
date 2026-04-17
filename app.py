@@ -6280,8 +6280,8 @@ def driver_route_detail(route_id):
         SELECT r.*, u.username AS assigned_username
         FROM routes r
         LEFT JOIN users u ON r.assigned_to = u.id
-        WHERE r.id = ? AND r.assigned_to = ?
-    """, (route_id, session["user_id"])).fetchone()
+        WHERE r.id = ? AND r.assigned_to = ? AND r.company_id = ?
+    """, (route_id, session["user_id"], session["company_id"])).fetchone()
 
     if not route:
         conn.close()
