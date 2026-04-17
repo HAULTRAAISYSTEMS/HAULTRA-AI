@@ -4668,19 +4668,31 @@ def dashboard():
         """, (user["id"], company_id)).fetchall()
 
     if user["role"] == "boss":
-        route_total      = conn.execute("SELECT COUNT(*) n FROM routes WHERE company_id=?", (company_id,)).fetchone()["n"]
-        open_routes      = conn.execute("SELECT COUNT(*) n FROM routes WHERE company_id=? AND status='open'", (company_id,)).fetchone()["n"]
-        progress_routes  = conn.execute("SELECT COUNT(*) n FROM routes WHERE company_id=? AND status='in_progress'", (company_id,)).fetchone()["n"]
-        completed_routes = conn.execute("SELECT COUNT(*) n FROM routes WHERE company_id=? AND status='completed'", (company_id,)).fetchone()["n"]
-        stop_total       = conn.execute("SELECT COUNT(*) n FROM stops s JOIN routes r ON s.route_id=r.id WHERE r.company_id=?", (company_id,)).fetchone()["n"]
-        total_loads      = conn.execute("SELECT COUNT(*) n FROM load_scores WHERE company_id=?", (company_id,)).fetchone()["n"]
+        _rc = conn.execute("""
+            SELECT COUNT(*) AS total,
+                   SUM(status='open') AS open,
+                   SUM(status='in_progress') AS progress,
+                   SUM(status='completed') AS completed
+            FROM routes WHERE company_id=?
+        """, (company_id,)).fetchone()
+        route_total, open_routes, progress_routes, completed_routes = (
+            _rc["total"], _rc["open"] or 0, _rc["progress"] or 0, _rc["completed"] or 0
+        )
+        stop_total  = conn.execute("SELECT COUNT(*) n FROM stops s JOIN routes r ON s.route_id=r.id WHERE r.company_id=?", (company_id,)).fetchone()["n"]
+        total_loads = conn.execute("SELECT COUNT(*) n FROM load_scores WHERE company_id=?", (company_id,)).fetchone()["n"]
     else:
-        route_total      = conn.execute("SELECT COUNT(*) n FROM routes WHERE assigned_to=? AND company_id=?", (user["id"], company_id)).fetchone()["n"]
-        open_routes      = conn.execute("SELECT COUNT(*) n FROM routes WHERE assigned_to=? AND company_id=? AND status='open'", (user["id"], company_id)).fetchone()["n"]
-        progress_routes  = conn.execute("SELECT COUNT(*) n FROM routes WHERE assigned_to=? AND company_id=? AND status='in_progress'", (user["id"], company_id)).fetchone()["n"]
-        completed_routes = conn.execute("SELECT COUNT(*) n FROM routes WHERE assigned_to=? AND company_id=? AND status='completed'", (user["id"], company_id)).fetchone()["n"]
-        stop_total       = conn.execute("SELECT COUNT(*) n FROM stops s JOIN routes r ON s.route_id=r.id WHERE r.assigned_to=? AND r.company_id=?", (user["id"], company_id)).fetchone()["n"]
-        total_loads      = conn.execute("SELECT COUNT(*) n FROM load_scores WHERE created_by=? AND company_id=?", (user["id"], company_id)).fetchone()["n"]
+        _rc = conn.execute("""
+            SELECT COUNT(*) AS total,
+                   SUM(status='open') AS open,
+                   SUM(status='in_progress') AS progress,
+                   SUM(status='completed') AS completed
+            FROM routes WHERE assigned_to=? AND company_id=?
+        """, (user["id"], company_id)).fetchone()
+        route_total, open_routes, progress_routes, completed_routes = (
+            _rc["total"], _rc["open"] or 0, _rc["progress"] or 0, _rc["completed"] or 0
+        )
+        stop_total  = conn.execute("SELECT COUNT(*) n FROM stops s JOIN routes r ON s.route_id=r.id WHERE r.assigned_to=? AND r.company_id=?", (user["id"], company_id)).fetchone()["n"]
+        total_loads = conn.execute("SELECT COUNT(*) n FROM load_scores WHERE created_by=? AND company_id=?", (user["id"], company_id)).fetchone()["n"]
 
     top_load = conn.execute("SELECT * FROM load_scores WHERE company_id=? ORDER BY score DESC, estimated_profit DESC LIMIT 1", (company_id,)).fetchone()
     conn.close()
@@ -5454,14 +5466,27 @@ def boss_dashboard():
     company_id = cid()
 
     # --- summary counts ---
-    total_routes    = conn.execute("SELECT COUNT(*) AS n FROM routes WHERE company_id=?", (company_id,)).fetchone()["n"]
-    open_routes     = conn.execute("SELECT COUNT(*) AS n FROM routes WHERE company_id=? AND status='open'", (company_id,)).fetchone()["n"]
-    progress_routes = conn.execute("SELECT COUNT(*) AS n FROM routes WHERE company_id=? AND status='in_progress'", (company_id,)).fetchone()["n"]
-    completed_routes= conn.execute("SELECT COUNT(*) AS n FROM routes WHERE company_id=? AND status='completed'", (company_id,)).fetchone()["n"]
-    total_stops     = conn.execute("SELECT COUNT(*) AS n FROM stops s JOIN routes r ON s.route_id=r.id WHERE r.company_id=?", (company_id,)).fetchone()["n"]
-    completed_stops = conn.execute("SELECT COUNT(*) AS n FROM stops s JOIN routes r ON s.route_id=r.id WHERE r.company_id=? AND s.status='completed'", (company_id,)).fetchone()["n"]
-    drivers_count   = conn.execute("SELECT COUNT(*) AS n FROM users WHERE role='driver' AND company_id=?", (company_id,)).fetchone()["n"]
-    new_orders      = conn.execute("SELECT COUNT(*) AS n FROM orders WHERE status='new' AND company_id=?", (company_id,)).fetchone()["n"]
+    _rc = conn.execute("""
+        SELECT COUNT(*) AS total,
+               SUM(status='open') AS open,
+               SUM(status='in_progress') AS progress,
+               SUM(status='completed') AS completed
+        FROM routes WHERE company_id=?
+    """, (company_id,)).fetchone()
+    total_routes     = _rc["total"]
+    open_routes      = _rc["open"] or 0
+    progress_routes  = _rc["progress"] or 0
+    completed_routes = _rc["completed"] or 0
+
+    _sc = conn.execute("""
+        SELECT COUNT(*) AS total, SUM(s.status='completed') AS completed
+        FROM stops s JOIN routes r ON s.route_id=r.id WHERE r.company_id=?
+    """, (company_id,)).fetchone()
+    total_stops     = _sc["total"]
+    completed_stops = _sc["completed"] or 0
+
+    drivers_count = conn.execute("SELECT COUNT(*) AS n FROM users WHERE role='driver' AND company_id=?", (company_id,)).fetchone()["n"]
+    new_orders    = conn.execute("SELECT COUNT(*) AS n FROM orders WHERE status='new' AND company_id=?", (company_id,)).fetchone()["n"]
 
     # --- active routes (open + in_progress) with per-route stop progress ---
     active_routes = conn.execute("""
@@ -8038,11 +8063,8 @@ def view_route(route_id):
 
     stops = conn.execute("SELECT * FROM stops WHERE route_id = ? ORDER BY stop_order ASC, id ASC", (route_id,)).fetchall()
 
-    # Ensure can_state_before is populated so PR mode always shows correctly
-    if stops and any(s["can_state_before"] is None for s in stops):
-        compute_can_flow(conn, route_id)
-        conn.commit()
-        stops = conn.execute("SELECT * FROM stops WHERE route_id = ? ORDER BY stop_order ASC, id ASC", (route_id,)).fetchall()
+    # can_state_before is populated by write operations (add/edit/reorder/optimize).
+    # Legacy routes with null values are repaired on the next explicit write, not here.
 
     stop_ids = [s["id"] for s in stops]
     photos_by_stop = load_stop_photos(conn, stop_ids)
