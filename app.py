@@ -474,19 +474,21 @@ def _parse_one_line(raw, conn, company_id):
     if conn and company_id:
         try:
             saved = None
+            def _esc_like(s):
+                return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             if customer_name:
                 saved = conn.execute(
                     """SELECT * FROM saved_addresses
-                       WHERE company_id=? AND LOWER(customer_name) LIKE ?
+                       WHERE company_id=? AND LOWER(customer_name) LIKE ? ESCAPE '\\'
                        ORDER BY times_used DESC LIMIT 1""",
-                    (company_id, "%" + customer_name.lower() + "%")
+                    (company_id, "%" + _esc_like(customer_name.lower()) + "%")
                 ).fetchone()
             if not saved and address:
                 saved = conn.execute(
                     """SELECT * FROM saved_addresses
-                       WHERE company_id=? AND LOWER(address) LIKE ?
+                       WHERE company_id=? AND LOWER(address) LIKE ? ESCAPE '\\'
                        ORDER BY times_used DESC LIMIT 1""",
-                    (company_id, "%" + address.lower() + "%")
+                    (company_id, "%" + _esc_like(address.lower()) + "%")
                 ).fetchone()
             if saved:
                 matched_saved = True
@@ -8013,10 +8015,13 @@ def upsert_saved_address(conn, company_id, customer_name, address,
                 VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)
             """, (company_id, cname, addr, city or "", state or "", zip_code or "", full,
                   action or "", container_size or "", dump_location or "", ts, ts))
-            sa_id = conn.execute(
+            _sarow = conn.execute(
                 "SELECT id FROM saved_addresses WHERE company_id=? AND customer_name=? AND address=?",
                 (company_id, cname, addr)
-            ).fetchone()["id"]
+            ).fetchone()
+            if not _sarow:
+                return
+            sa_id = _sarow["id"]
 
         # Track this specific combination for frequency-based smart defaults
         act = (action or "").strip()
@@ -12495,7 +12500,7 @@ def address_suggestions():
     if len(q) < 2:
         return jsonify([])
     conn = get_db()
-    like = "%" + q + "%"
+    like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
     rows = conn.execute("""
         SELECT sa.customer_name, sa.address, sa.city, sa.state, sa.zip,
                COALESCE(sad.action, '')         AS default_action,
@@ -12511,7 +12516,7 @@ def address_suggestions():
                       ORDER BY times_used DESC, last_used_at DESC
                       LIMIT 1
                   )
-        WHERE sa.company_id=? AND (sa.customer_name LIKE ? OR sa.address LIKE ?)
+        WHERE sa.company_id=? AND (sa.customer_name LIKE ? ESCAPE '\\' OR sa.address LIKE ? ESCAPE '\\')
         ORDER BY sa.times_used DESC, sa.last_used_at DESC
         LIMIT 10
     """, (cid(), like, like)).fetchall()
