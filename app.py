@@ -9882,7 +9882,12 @@ def company_register():
                 (company_name, slug, "trial", "active", 5, trial_ends, now_ts())
             )
             conn.commit()
-            company_id = conn.execute("SELECT id FROM companies WHERE slug=?", (slug,)).fetchone()["id"]
+            _crow = conn.execute("SELECT id FROM companies WHERE slug=?", (slug,)).fetchone()
+            if not _crow:
+                conn.close()
+                flash("Company creation failed. Please try again.", "error")
+                return redirect(url_for("company_register"))
+            company_id = _crow["id"]
 
             conn.execute(
                 """INSERT INTO users (username, password_hash, role, full_name, phone,
@@ -9891,8 +9896,13 @@ def company_register():
                  full_name, phone, company_id, now_ts())
             )
             conn.commit()
-            owner_id = conn.execute("SELECT id FROM users WHERE username=? AND company_id=?",
-                                    (username, company_id)).fetchone()["id"]
+            _urow = conn.execute("SELECT id FROM users WHERE username=? AND company_id=?",
+                                 (username, company_id)).fetchone()
+            if not _urow:
+                conn.close()
+                flash("User creation failed. Please try again.", "error")
+                return redirect(url_for("company_register"))
+            owner_id = _urow["id"]
             conn.execute("UPDATE companies SET owner_id=? WHERE id=?", (owner_id, company_id))
 
             # record initial trial subscription
