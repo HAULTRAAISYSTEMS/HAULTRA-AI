@@ -12517,9 +12517,12 @@ def address_suggestions():
 def debug_db():
     from flask import jsonify
     conn = get_db()
-    total = conn.execute("SELECT COUNT(*) FROM routes").fetchone()[0]
+    total = conn.execute(
+        "SELECT COUNT(*) FROM routes WHERE company_id=?", (cid(),)
+    ).fetchone()[0]
     rows  = conn.execute(
-        "SELECT id, route_date, route_name, status FROM routes ORDER BY route_date DESC, id DESC"
+        "SELECT id, route_date, route_name, status FROM routes WHERE company_id=? ORDER BY route_date DESC, id DESC",
+        (cid(),)
     ).fetchall()
     conn.close()
     return jsonify({
