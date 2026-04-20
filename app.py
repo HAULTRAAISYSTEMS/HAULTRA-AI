@@ -12513,7 +12513,7 @@ def address_suggestions():
 # DEBUG — temporary DB inspection route
 # =========================================================
 @app.route("/debug/db")
-@boss_required
+@superadmin_required
 def debug_db():
     from flask import jsonify
     conn = get_db()
