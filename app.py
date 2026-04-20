@@ -12526,7 +12526,6 @@ def debug_db():
     ).fetchall()
     conn.close()
     return jsonify({
-        "DATABASE_PATH": DATABASE,
         "total_routes":  total,
         "routes": [
             {"id": r["id"], "date": r["route_date"], "name": r["route_name"], "status": r["status"]}
