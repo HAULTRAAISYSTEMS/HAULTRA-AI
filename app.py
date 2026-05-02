@@ -173,12 +173,13 @@ _ACTION_PATTERNS = [
     (re.compile(r'\b(?:p\s+and\s+r)\b',                                  re.I), "Pickup and Return"),
     (re.compile(r'\bpr\b',                                                re.I), "Pickup and Return"),
     (re.compile(r'\bswap\b',                                              re.I), "Swap"),
-    # Relocate checked before bare "move" so "move can" wins
+    # Relocate/Move-on-site — checked before bare "move" so specific wins
     (re.compile(r'\b(?:relocate|reloc|move\s+can)\b',                    re.I), "Relocate"),
+    (re.compile(r'\breposition\b',                                        re.I), "Move"),
     (re.compile(r'\bpull\b',                                              re.I), "Pull"),
-    (re.compile(r'\b(?:pick\s+up|pickup)\b',                              re.I), "Pull"),
+    (re.compile(r'\b(?:pick\s*up|pickup)\b',                              re.I), "Pull"),
     (re.compile(r'\bmove\b',                                              re.I), "Move"),
-    (re.compile(r'\b(?:drop\s*off)\b',                                    re.I), "Delivery"),
+    (re.compile(r'\b(?:drop\s*off|drop)\b',                               re.I), "Delivery"),
     (re.compile(r'\b(?:delivery|deliver|del)\b',                          re.I), "Delivery"),
     # Bare single-letter tokens (must be at word boundary, not inside words)
     (re.compile(r'(?:(?<=\s)|^)p(?=\s|$)',                                re.I), "Pull"),
@@ -243,6 +244,7 @@ def parse_route_text(text, conn, company_id):
         parsed = _parse_one_line(raw, conn, company_id)
         if parsed:
             results.append(parsed)
+    results = _apply_swap_inference(results)
     return results
 
 
@@ -351,6 +353,12 @@ def _parse_one_line(raw, conn, company_id):
     if rel:
         rel["original_line"] = raw
         return rel
+
+    # ── Move on-site format ───────────────────────────────────────────────────
+    mv = _parse_move_line(work, order_num=1)
+    if mv:
+        mv["original_line"] = raw
+        return mv
 
     conf = 10
     conf_reasons = []
@@ -518,24 +526,35 @@ def _parse_one_line(raw, conn, company_id):
     conf_label = "high" if conf >= 75 else ("medium" if conf >= 45 else "low")
 
     return {
-        "original_line":         raw,
-        "customer_name":         customer_name,
-        "address":               address,
-        "city":                  city,
-        "state":                 state,
-        "zip_code":              zip_code,
-        "action":                action,
-        "container_size":        container_size,
-        "dump_location":         dump_location,
-        "notes":                 notes,
-        "ticket_number":         ticket_number,
-        "reference_number":      "",
-        "relocate_from_address": "",
-        "relocate_to_address":   "",
-        "confidence":            conf,
-        "confidence_label":      conf_label,
-        "matched_saved":         matched_saved,
-        "conf_reasons":          conf_reasons,
+        "original_line":                raw,
+        "customer_name":                customer_name,
+        "address":                      address,
+        "city":                         city,
+        "state":                        state,
+        "zip_code":                     zip_code,
+        "action":                       action,
+        "service_type":                 action,
+        "container_size":               container_size,
+        "dump_location":                dump_location,
+        "notes":                        notes,
+        "placement_note":               "",
+        "ticket_number":                ticket_number,
+        "reference_number":             "",
+        "relocate_from_address":        "",
+        "relocate_to_address":          "",
+        "from_address":                 "",
+        "from_city":                    "",
+        "to_address":                   "",
+        "to_city":                      "",
+        "return_destination":           "",
+        "pr_mode":                      "",
+        "swap_with_previous_empty":     False,
+        "pending_empty_can_for_next_pr": False,
+        "warnings":                     [],
+        "confidence":                   conf,
+        "confidence_label":             conf_label,
+        "matched_saved":                matched_saved,
+        "conf_reasons":                 conf_reasons,
     }
 
 
@@ -1474,6 +1493,10 @@ def init_db():
     safe_add_column(conn, "companies", "yard_state TEXT")
     safe_add_column(conn, "companies", "yard_zip TEXT")
     safe_add_column(conn, "stops", "can_state_before TEXT")
+    safe_add_column(conn, "stops", "placement_note TEXT")
+    safe_add_column(conn, "stops", "relocate_to_address TEXT")
+    safe_add_column(conn, "stops", "return_destination TEXT")
+    safe_add_column(conn, "stops", "pr_mode TEXT")
 
     # --- Phase 5B: company work hours / pay cycle ---
     safe_add_column(conn, "companies", "timezone TEXT")
@@ -2343,24 +2366,39 @@ _ROLLOFF_PREFIXES = {
     "RELOCATE": "Relocate",
     "RELOC":    "Relocate",
     "R":        "Relocate",
+    "SWAP":     "Swap",
+    "MOVE":     "Move",
 }
 
 # City shorthand codes (Hampton Roads / Tidewater Virginia)
+# Short codes first so they match before full-name variants in linear lookups
 _CITY_CODES = {
-    "orf":   ("Norfolk",        "VA"),
-    "norf":  ("Norfolk",        "VA"),
-    "vb":    ("Virginia Beach", "VA"),
-    "nb":    ("Virginia Beach", "VA"),
-    "suff":  ("Suffolk",        "VA"),
-    "ches":  ("Chesapeake",     "VA"),
-    "port":  ("Portsmouth",     "VA"),
-    "ports": ("Portsmouth",     "VA"),
-    "prt":   ("Portsmouth",     "VA"),
-    "smith": ("Smithfield",     "VA"),
-    "hamp":  ("Hampton",        "VA"),
-    "nn":    ("Newport News",   "VA"),
-    "york":  ("Yorktown",       "VA"),
-    "isle":  ("Isle of Wight",  "VA"),
+    "orf":         ("Norfolk",        "VA"),
+    "norf":        ("Norfolk",        "VA"),
+    "vb":          ("Virginia Beach", "VA"),
+    "nb":          ("Virginia Beach", "VA"),
+    "suff":        ("Suffolk",        "VA"),
+    "ches":        ("Chesapeake",     "VA"),
+    "port":        ("Portsmouth",     "VA"),
+    "ports":       ("Portsmouth",     "VA"),
+    "prt":         ("Portsmouth",     "VA"),
+    "smith":       ("Smithfield",     "VA"),
+    "hamp":        ("Hampton",        "VA"),
+    "nn":          ("Newport News",   "VA"),
+    "york":        ("Yorktown",       "VA"),
+    "isle":        ("Isle of Wight",  "VA"),
+    # Full city names (used in free-form text like RELOCATE lines)
+    "norfolk":       ("Norfolk",        "VA"),
+    "chesapeake":    ("Chesapeake",     "VA"),
+    "portsmouth":    ("Portsmouth",     "VA"),
+    "suffolk":       ("Suffolk",        "VA"),
+    "hampton":       ("Hampton",        "VA"),
+    "williamsburg":  ("Williamsburg",   "VA"),
+    "smithfield":    ("Smithfield",     "VA"),
+    "yorktown":      ("Yorktown",       "VA"),
+    "gloucester":    ("Gloucester",     "VA"),
+    "camden":        ("Camden",         "NC"),
+    "currituck":     ("Currituck",      "NC"),
 }
 
 # Dump site short names → canonical display names
@@ -2387,7 +2425,7 @@ _DUMP_SITES = {
 # Matches a new roll-off stop line: action prefix followed by a house number.
 # Uses (?=\d) lookahead so the digit is NOT consumed — m.end() lands right
 # before the house number and body = merged[m.end():] keeps the full address.
-_ROLLOFF_LINE_RE = re.compile(r"^(PR|PULL|DEL|DELIVERY|RELOCATE|RELOC|D|P|R)\s+(?=\d)", re.IGNORECASE)
+_ROLLOFF_LINE_RE = re.compile(r"^(PR|PULL|DEL|DELIVERY|SWAP|MOVE|RELOCATE|RELOC|D|P|R)\s+(?=\d)", re.IGNORECASE)
 
 # Matches the city-shorthand pattern that confirms roll-off format
 _ROLLOFF_CITY_RE = re.compile(
@@ -2413,6 +2451,12 @@ _ROLLOFF_NOTES_RE = re.compile(
     r"|to\s+end\s+the"
     r"|do\s+the\s+two"
     r"|leave\s"
+    r"|use\s+it\s+to\b"
+    r"|use\s+this\s+(?:empty|can)\b"
+    r"|use\s+the\s+can\s+to\b"
+    r"|before\s+you\s+return\b"
+    r"|return\s+to\b"
+    r"|take\s+empty\b"
     r")\b",
     re.IGNORECASE
 )
@@ -2496,7 +2540,7 @@ def _parse_rolloff_stop(block_lines, order_num):
 
     # Split at the first two commas to isolate: [street, city_code, customer+rest]
     parts     = body.split(",", 2)
-    address   = parts[0].strip()
+    address   = parts[0].strip().title()
     city_code = parts[1].strip().lower() if len(parts) > 1 else ""
     rest      = parts[2].strip()         if len(parts) > 2 else ""
 
@@ -2506,7 +2550,7 @@ def _parse_rolloff_stop(block_lines, order_num):
     container_size = ""
     size_m = re.search(r"\b(\d{1,2})\s*yd\b", rest, re.IGNORECASE)
     if size_m:
-        container_size = size_m.group(1)
+        container_size = size_m.group(1) + "yd"
         rest = (rest[:size_m.start()] + " " + rest[size_m.end():]).strip()
         rest = re.sub(r"\s+", " ", rest)
 
@@ -2515,6 +2559,7 @@ def _parse_rolloff_stop(block_lines, order_num):
 
     # Split remaining text into customer name and driver notes
     customer_name, instruction_notes = _split_rolloff_customer_notes(rest)
+    customer_name = customer_name.title() if customer_name else customer_name
 
     # Confidence scoring for rolloff stops
     _conf = 30  # base: we know action+address from the line structure
@@ -2527,24 +2572,37 @@ def _parse_rolloff_stop(block_lines, order_num):
     _conf_label = "high" if _conf >= 75 else ("medium" if _conf >= 45 else "low")
 
     return {
-        "stop_order":            order_num,
-        "original_line":         " ".join(block_lines),
-        "customer_name":         customer_name,
-        "address":               address,
-        "city":                  city,
-        "state":                 state,
-        "zip_code":              "",
-        "action":                action,
-        "container_size":        container_size,
-        "ticket_number":         "",
-        "reference_number":      "",
-        "phone":                 "",
-        "dump_location":         dump_site,
-        "notes":                 instruction_notes,
-        "relocate_from_address": "",
-        "relocate_to_address":   "",
-        "confidence":            _conf,
-        "confidence_label":      _conf_label,
+        "stop_order":                   order_num,
+        "original_line":                " ".join(block_lines),
+        "customer_name":                customer_name,
+        "address":                      address,
+        "city":                         city,
+        "state":                        state,
+        "zip_code":                     "",
+        "action":                       action,
+        "service_type":                 action,
+        "container_size":               container_size,
+        "ticket_number":                "",
+        "reference_number":             "",
+        "phone":                        "",
+        "dump_location":                dump_site,
+        "notes":                        instruction_notes,
+        "placement_note":               "",
+        "relocate_from_address":        "",
+        "relocate_to_address":          "",
+        "from_address":                 "",
+        "from_city":                    "",
+        "to_address":                   "",
+        "to_city":                      "",
+        "return_destination":           "",
+        "pr_mode":                      "",
+        "swap_with_previous_empty":     False,
+        "pending_empty_can_for_next_pr": False,
+        "warnings":                     [],
+        "confidence":                   _conf,
+        "confidence_label":             _conf_label,
+        "matched_saved":                False,
+        "conf_reasons":                 ["rolloff"],
     }
 
 
@@ -2602,7 +2660,7 @@ def _parse_rolloff_shorthand(lines):
 # Differs from roll-off: NO commas required. City code is space-separated.
 
 _INLINE_PREFIX_RE = re.compile(
-    r"^(PR|PULL|DEL|DELIVERY|RELOCATE|RELOC|P|D|R)\s+(?=\d)",
+    r"^(PR|PULL|DEL|DELIVERY|SWAP|MOVE|RELOCATE|RELOC|P|D|R)\s+(?=\d)",
     re.IGNORECASE,
 )
 
@@ -2634,7 +2692,7 @@ def _parse_inline_stop(line, order_num):
     container_size = ""
     sz = re.search(r'\b(\d{1,2})\s*yd\b', body, re.IGNORECASE)
     if sz:
-        container_size = sz.group(1)
+        container_size = sz.group(1) + "yd"
         body = re.sub(r'\s+', ' ', (body[:sz.start()] + " " + body[sz.end():])).strip()
 
     # 2. Extract dump site
@@ -2688,23 +2746,36 @@ def _parse_inline_stop(line, order_num):
     _conf_label = "high" if _conf >= 75 else ("medium" if _conf >= 45 else "low")
 
     return {
-        "stop_order":            order_num,
-        "original_line":         None,
-        "customer_name":         _cust,
-        "address":               _addr,
-        "city":                  city,
-        "state":                 state,
-        "zip_code":              "",
-        "action":                action,
-        "container_size":        container_size,
-        "ticket_number":         "",
-        "reference_number":      "",
-        "dump_location":         dump_location,
-        "notes":                 notes.strip(),
-        "relocate_from_address": "",
-        "relocate_to_address":   "",
-        "confidence":            _conf,
-        "confidence_label":      _conf_label,
+        "stop_order":                   order_num,
+        "original_line":                None,
+        "customer_name":                _cust,
+        "address":                      _addr,
+        "city":                         city,
+        "state":                        state,
+        "zip_code":                     "",
+        "action":                       action,
+        "service_type":                 action,
+        "container_size":               container_size,
+        "ticket_number":                "",
+        "reference_number":             "",
+        "dump_location":                dump_location,
+        "notes":                        notes.strip(),
+        "placement_note":               "",
+        "relocate_from_address":        "",
+        "relocate_to_address":          "",
+        "from_address":                 "",
+        "from_city":                    "",
+        "to_address":                   "",
+        "to_city":                      "",
+        "return_destination":           "",
+        "pr_mode":                      "",
+        "swap_with_previous_empty":     False,
+        "pending_empty_can_for_next_pr": False,
+        "warnings":                     [],
+        "confidence":                   _conf,
+        "confidence_label":             _conf_label,
+        "matched_saved":                False,
+        "conf_reasons":                 ["inline"],
     }
 
 
@@ -2756,11 +2827,16 @@ def _parse_relocate_line(raw, order_num=1):
     to_raw   = m.group(2).strip()
 
     def _extract_fields(text):
-        """Pull size, dump site, and city from an address fragment."""
+        """Pull size, dump site, city, and placement note from an address fragment."""
+        # Container size: "30yd", "30 yd", or "one of the 20s" / "20s" with prefix
         sz = ""
-        sz_m = re.search(r"\b(\d{1,2})\s*yd\b", text, re.I)
+        sz_m = re.search(
+            r"\b(\d{1,2})\s*(?:yd|yds|yards?)\b"
+            r"|\bone\s+of\s+the\s+(\d{1,2})s\b",
+            text, re.I
+        )
         if sz_m:
-            sz   = sz_m.group(1)
+            sz = (sz_m.group(1) or sz_m.group(2)) + "yd"
             text = re.sub(r"\s+", " ", text[:sz_m.start()] + " " + text[sz_m.end():]).strip()
 
         dump = ""
@@ -2777,6 +2853,17 @@ def _parse_relocate_line(raw, order_num=1):
                 dump = _DUMP_SITES.get(dm.group(1).lower(), dm.group(1).title())
                 text = re.sub(r"\s+", " ", text[:dm.start()] + " " + text[dm.end():]).strip()
 
+        # Placement note: "place it on the street", "place it in gated lot", etc.
+        placement_note = ""
+        pm = re.search(
+            r"\bplace\s+it\s+(?:on|in|at)\s+(?:the\s+)?(?:street|gated\s+lot|lot|driveway|yard|alley|curb|road|side\s+lot|back\s+lot)\b"
+            r"|\bplace\s+(?:it\s+)?(?:on|in)\s+(?:the\s+)?(?:street|gated\s+lot|lot|driveway|yard|alley|curb)\b",
+            text, re.I
+        )
+        if pm:
+            placement_note = pm.group(0).strip()
+            text = re.sub(r"\s+", " ", text[:pm.start()] + " " + text[pm.end():]).strip()
+
         city = state = ""
         for code, (city_name, state_code) in _CITY_CODES.items():
             mc = re.search(r"(?:(?<=\s)|^)" + re.escape(code) + r"(?=\s|$)", text, re.I)
@@ -2785,40 +2872,177 @@ def _parse_relocate_line(raw, order_num=1):
                 state = state_code
                 text  = re.sub(r"\s+", " ", text[:mc.start()] + " " + text[mc.end():]).strip()
                 break
-        return text.strip(), sz, dump, city, state
 
-    from_addr, from_sz, from_dump, from_city, from_state = _extract_fields(from_raw)
-    to_addr,   to_sz,   to_dump,   to_city,   _          = _extract_fields(to_raw)
+        # Strip leading "from" or "at" preposition left after size/city extraction
+        text = re.sub(r"^(?:from|at)\s+", "", text.strip(), flags=re.I)
+
+        return text.strip(), sz, dump, city, state, placement_note
+
+    from_addr, from_sz, from_dump, from_city, from_state, from_note = _extract_fields(from_raw)
+    to_addr,   to_sz,   to_dump,   to_city,   _,           to_note   = _extract_fields(to_raw)
 
     # Prefer size / dump from whichever side had them; from-side wins ties
     container_size = from_sz   or to_sz
     dump_location  = from_dump or to_dump
     city           = from_city or to_city
     state          = from_state
+    placement_note = to_note   or from_note
 
     # Build driver-facing note
-    notes = f"From: {from_addr} → To: {to_addr}"
-    if to_city:
-        notes = f"From: {from_addr} ({from_city}) → To: {to_addr} ({to_city})"
+    loc_from = f"{from_addr} ({from_city})" if from_city else from_addr
+    loc_to   = f"{to_addr} ({to_city})"     if to_city   else to_addr
+    notes = f"From: {loc_from} → To: {loc_to}"
+    if placement_note:
+        notes += f" | {placement_note}"
 
     return {
-        "stop_order":            order_num,
-        "original_line":         raw,
-        "customer_name":         "",
-        "address":               from_addr,
-        "city":                  city,
-        "state":                 state,
-        "zip_code":              "",
-        "action":                "Relocate",
-        "container_size":        container_size,
-        "ticket_number":         "",
-        "reference_number":      "",
-        "dump_location":         dump_location,
-        "notes":                 notes,
-        "relocate_from_address": from_addr,
-        "relocate_to_address":   to_addr,
-        "confidence":            75,
-        "confidence_label":      "high",
+        "stop_order":                   order_num,
+        "original_line":                raw,
+        "customer_name":                "",
+        "address":                      from_addr,
+        "city":                         city,
+        "state":                        state,
+        "zip_code":                     "",
+        "action":                       "Relocate",
+        "service_type":                 "Relocate",
+        "container_size":               container_size,
+        "ticket_number":                "",
+        "reference_number":             "",
+        "dump_location":                dump_location,
+        "notes":                        notes,
+        "placement_note":               placement_note,
+        "relocate_from_address":        from_addr,
+        "relocate_to_address":          to_addr,
+        "from_address":                 from_addr,
+        "from_city":                    from_city,
+        "to_address":                   to_addr,
+        "to_city":                      to_city,
+        "return_destination":           "",
+        "pr_mode":                      "",
+        "swap_with_previous_empty":     False,
+        "pending_empty_can_for_next_pr": False,
+        "warnings":                     [],
+        "confidence":                   75,
+        "confidence_label":             "high",
+        "matched_saved":                False,
+        "conf_reasons":                 ["relocate"],
+    }
+
+
+# ─── Move on-site parser ─────────────────────────────────────────────────────
+# Handles: "Move the can into gated lot at 744 E 25th St Norfolk SICE 30yd"
+#          "Reposition the container onto the street at 100 Main St vb customer 20yd"
+_MOVE_LINE_RE = re.compile(
+    r"^(?:move\s+(?:the\s+)?(?:can|it|container)\s+|reposition\s+(?:(?:the|it|can|container)\s+)?)",
+    re.I,
+)
+_PLACEMENT_RE = re.compile(
+    r"\b(?:into|onto|on|in)\s+(?:the\s+)?(?:gated\s+lot|lot|street|driveway|yard|side\s+lot|"
+    r"back\s+lot|alley|curb|road|front|right\s+side|left\s+side)\b",
+    re.I,
+)
+
+
+def _parse_move_line(raw, order_num=1):
+    """Parse a MOVE-on-site line (can repositioned within the same property/area).
+
+    Structure: MOVE [the can/it] [placement phrase] [at] [address] [customer] [size]
+
+    Returns a stop dict with action='Move' and placement_note set, or None if
+    the line does not look like a MOVE instruction.
+    """
+    work = raw.strip()
+    m_start = _MOVE_LINE_RE.match(work)
+    if not m_start:
+        return None
+    body = work[m_start.end():].strip()
+
+    # Extract container size
+    container_size = ""
+    sz_m = re.search(r"\b(\d{1,2})\s*(?:yd|yds|yards?)\b|\bone\s+of\s+the\s+(\d{1,2})s\b", body, re.I)
+    if sz_m:
+        container_size = (sz_m.group(1) or sz_m.group(2)) + "yd"
+        body = re.sub(r"\s+", " ", body[:sz_m.start()] + " " + body[sz_m.end():]).strip()
+
+    # Extract placement note (e.g. "into the gated lot")
+    placement_note = ""
+    pm = _PLACEMENT_RE.search(body)
+    if pm:
+        placement_note = pm.group(0).strip()
+        body = re.sub(r"\s+", " ", body[:pm.start()] + " " + body[pm.end():]).strip()
+
+    # Strip leading "at" preposition before address
+    body = re.sub(r"^at\s+", "", body, flags=re.I).strip()
+
+    # City extraction
+    city = state = ""
+    for code, (city_name, state_code) in _CITY_CODES.items():
+        mc = re.search(r"(?:(?<=\s)|^)" + re.escape(code) + r"(?=\s|$)", body, re.I)
+        if mc:
+            city  = city_name
+            state = state_code
+            body  = re.sub(r"\s+", " ", body[:mc.start()] + " " + body[mc.end():]).strip()
+            break
+
+    # Split "HOUSE_NUM STREET [CUSTOMER]" at last street suffix
+    address = customer_name = ""
+    house_m = re.match(r"\d+\s+", body)
+    if house_m:
+        sfx_m = None
+        for sfx in _STREET_SFX_RE.finditer(body):
+            sfx_m = sfx
+        if sfx_m:
+            address  = body[:sfx_m.end()].strip()
+            rest     = body[sfx_m.end():].strip()
+        else:
+            words    = body.split()
+            n        = min(4, len(words))
+            address  = " ".join(words[:n])
+            rest     = " ".join(words[n:])
+        customer_name = rest.strip()
+    else:
+        customer_name = body
+
+    notes = f"Move on-site: {placement_note}" if placement_note else "Move on-site"
+
+    conf = 50
+    if address:        conf += 15
+    if city:           conf += 10
+    if customer_name:  conf += 10
+    if container_size: conf += 10
+    conf = min(100, conf)
+
+    return {
+        "stop_order":                   order_num,
+        "original_line":                raw,
+        "customer_name":                customer_name,
+        "address":                      address,
+        "city":                         city,
+        "state":                        state,
+        "zip_code":                     "",
+        "action":                       "Move",
+        "service_type":                 "Move",
+        "container_size":               container_size,
+        "ticket_number":                "",
+        "reference_number":             "",
+        "dump_location":                "",
+        "notes":                        notes,
+        "placement_note":               placement_note,
+        "relocate_from_address":        "",
+        "relocate_to_address":          "",
+        "from_address":                 "",
+        "from_city":                    "",
+        "to_address":                   "",
+        "to_city":                      "",
+        "return_destination":           "",
+        "pr_mode":                      "",
+        "swap_with_previous_empty":     False,
+        "pending_empty_can_for_next_pr": False,
+        "warnings":                     [],
+        "confidence":                   conf,
+        "confidence_label":             "high" if conf >= 75 else ("medium" if conf >= 45 else "low"),
+        "matched_saved":                False,
+        "conf_reasons":                 ["move-action"],
     }
 
 
@@ -2830,6 +3054,49 @@ def _is_relocate_format(lines):
         lines
         and all(_RELOCATE_TO_RE.match(l) for l in lines)
     )
+
+
+# Patterns that signal "use this empty can for the NEXT PR stop"
+_PENDING_EMPTY_RE = re.compile(
+    r"\b(?:use\s+it\s+to\b|use\s+this\s+(?:empty|can)\b|use\s+the\s+can\s+to\b"
+    r"|before\s+you\s+return\b|take\s+empty\b)\b",
+    re.I,
+)
+# Pattern for "return to <destination>" in notes
+_RETURN_TO_RE = re.compile(r"\breturn\s+to\s+(.+)", re.I)
+
+
+def _apply_swap_inference(stops):
+    """Post-process a stop list to detect cross-stop SWAP / pending-empty patterns.
+
+    Rules:
+    - If stop N notes contain a "use it to / before you return" phrase → set
+      pending_empty_can_for_next_pr=True on stop N.
+    - If stop N+1 notes contain "return to <dest>" AND stop N had pending_empty flag
+      → set swap_with_previous_empty=True, pr_mode="swap", return_destination on N+1.
+    - swap_with_prev_pull (DB column) is also set to 1 when swap_with_previous_empty
+      is True so the existing driver workflow sees it immediately.
+    """
+    for i, stop in enumerate(stops):
+        notes_lc = (stop.get("notes") or "").lower()
+
+        # Detect pending-empty signal on this stop
+        if _PENDING_EMPTY_RE.search(notes_lc):
+            stop["pending_empty_can_for_next_pr"] = True
+
+        # Detect "return to <dest>" on this stop
+        rt = _RETURN_TO_RE.search(stop.get("notes") or "", re.I)
+        if rt:
+            stop["return_destination"] = rt.group(1).strip().rstrip(".")
+
+        # If previous stop set pending_empty flag → mark this stop as SWAP
+        if i > 0 and stops[i - 1].get("pending_empty_can_for_next_pr"):
+            stop["swap_with_previous_empty"] = True
+            stop["pr_mode"] = "swap"
+            # Mirror to existing DB flag so driver workflow fires correctly
+            stop["swap_with_prev_pull"] = 1
+
+    return stops
 
 
 def parse_boss_text(raw_text):
@@ -2877,6 +3144,10 @@ def parse_boss_text(raw_text):
             if rel:
                 stops.append(rel)
                 continue
+            mv = _parse_move_line(merged, idx)
+            if mv:
+                stops.append(mv)
+                continue
             stop = parse_stop_block(block, idx)
             if stop["customer_name"] or stop["address"]:
                 stops.append(stop)
@@ -2911,6 +3182,7 @@ def parse_boss_text(raw_text):
             (s.get("original_line") or "")[:80],
         )
 
+    stops = _apply_swap_inference(stops)
     return stops, dump
 
 # =========================================================
@@ -7675,6 +7947,7 @@ _PASTE_ROUTE_CSS = """<style>
 .pr-b-d{background:rgba(96,165,250,.12);color:#60a5fa}
 .pr-b-swap{background:rgba(167,139,250,.12);color:#a78bfa}
 .pr-b-move{background:rgba(244,114,182,.12);color:#f472b6}
+.pr-b-relocate{background:rgba(251,146,60,.12);color:#fb923c}
 .pr-b-other{background:rgba(120,120,150,.12);color:#9aa5b8}
 .pr-ch{background:rgba(0,232,125,.10);color:#00e87d}
 .pr-cm{background:rgba(251,191,36,.10);color:#fbbf24}
@@ -7812,23 +8085,29 @@ _PASTE_ROUTE_JS = """
   function confLbl(s)  { return s.confidence >= 75 ? 'High' : s.confidence >= 45 ? 'Medium' : 'Low'; }
 
   /* ── Action badge ─────────────────────────────────────────────────────── */
-  function actionBadge(action) {
+  function actionBadge(action, prMode) {
     var a = (action || '').trim().toUpperCase();
     var cls = 'pr-b-other', lbl = a || '?';
-    if (/PICKUP.*RETURN/.test(a) || a === 'PR' || /P.*&.*R/.test(a)) { cls = 'pr-b-pr'; lbl = 'PR'; }
-    else if (/^PULL$|^P$/.test(a))   { cls = 'pr-b-p';    lbl = 'Pull'; }
-    else if (/^DELIVERY$|^D$/.test(a)){ cls = 'pr-b-d';   lbl = 'Delivery'; }
-    else if (/SWAP/.test(a))          { cls = 'pr-b-swap'; lbl = 'Swap'; }
-    else if (/MOVE/.test(a))          { cls = 'pr-b-move'; lbl = 'Move'; }
+    if (/PICKUP.*RETURN|^PICKUP AND RETURN$/.test(a) || a === 'PR' || /P.*&.*R/.test(a)) {
+      cls = 'pr-b-pr';
+      lbl = (prMode === 'swap') ? 'PR • Swap' : 'Pickup & Return';
+    }
+    else if (/^PULL$|^P$/.test(a))    { cls = 'pr-b-p';        lbl = 'Pull'; }
+    else if (/^DELIVERY$|^D$/.test(a)){ cls = 'pr-b-d';        lbl = 'Delivery'; }
+    else if (/^SWAP$/.test(a))        { cls = 'pr-b-swap';     lbl = 'Swap'; }
+    else if (/^MOVE$/.test(a))        { cls = 'pr-b-move';     lbl = 'Move'; }
+    else if (/^RELOCATE$/.test(a))    { cls = 'pr-b-relocate'; lbl = 'Relocate'; }
     return '<span class="pr-badge ' + cls + '">' + _esc(lbl) + '</span>';
   }
 
   /* ── Missing field check ──────────────────────────────────────────────── */
   function missFlds(s) {
     var m = [];
-    if (!s.dump_location) m.push('dump');
-    if (!s.address)       m.push('address');
-    if (!s.customer_name) m.push('customer');
+    var a = (s.action || '').toUpperCase();
+    var noDump = /^(MOVE|RELOCATE)$/.test(a);
+    if (!noDump && !s.dump_location) m.push('dump');
+    if (!s.address && !s.from_address) m.push('address');
+    if (!s.customer_name && a !== 'RELOCATE' && a !== 'MOVE') m.push('customer');
     if (!s.action)        m.push('action');
     return m;
   }
@@ -7859,41 +8138,75 @@ _PASTE_ROUTE_JS = """
   /* ── Card HTML ────────────────────────────────────────────────────────── */
   function cardHTML(s, i) {
     var miss = missFlds(s);
+    var a = (s.action || '').toUpperCase();
+    var isRelocate = a === 'RELOCATE';
+    var isMove     = a === 'MOVE';
     var savedBadge = s.matched_saved ? '<span class="pr-badge pr-saved">&#11042; Saved</span>' : '';
-    var warnStrip = '';
-    if (miss.length) {
-      var wMsgs = miss.map(function(f) {
-        return {dump: 'Missing dump location', address: 'No address', customer: 'No customer name', action: 'Action unknown'}[f] || ('Missing: ' + f);
-      });
-      warnStrip = '<div class="pr-warn-strip">&#9888; ' + wMsgs.join(' &bull; ') + '</div>';
-    }
+
+    // Warnings
+    var warnMsgs = miss.map(function(f) {
+      return {dump:'Missing dump location', address:'No address', customer:'No customer name', action:'Action unknown'}[f] || ('Missing: ' + f);
+    });
+    if (s.warnings && s.warnings.length) warnMsgs = warnMsgs.concat(s.warnings);
+    var warnStrip = warnMsgs.length ? '<div class="pr-warn-strip">&#9888; ' + warnMsgs.join(' &bull; ') + '</div>' : '';
+
     var mIdx = function(f) { return miss.indexOf(f) >= 0; };
+
+    // Extra info strip (RELOCATE from/to, return destination, placement note)
+    var extraInfo = '';
+    if (isRelocate && (s.from_address || s.to_address)) {
+      extraInfo += '<div style="font-size:11px;color:#7aaac8;margin-bottom:6px;">'
+        + '&#8680; From: <b>' + _esc(s.from_address || s.address) + (s.from_city ? ' (' + _esc(s.from_city) + ')' : '') + '</b>'
+        + ' &nbsp;&#8594;&nbsp; To: <b>' + _esc(s.to_address) + (s.to_city ? ' (' + _esc(s.to_city) + ')' : '') + '</b>'
+        + '</div>';
+    }
+    if (s.placement_note) {
+      extraInfo += '<div style="font-size:11px;color:#fbbf24;margin-bottom:6px;">&#128204; Placement: ' + _esc(s.placement_note) + '</div>';
+    }
+    if (s.return_destination) {
+      extraInfo += '<div style="font-size:11px;color:#56f0b7;margin-bottom:6px;">&#8617; Return to: <b>' + _esc(s.return_destination) + '</b></div>';
+    }
+    if (s.swap_with_previous_empty) {
+      extraInfo += '<div style="font-size:11px;color:#ff9d00;margin-bottom:6px;">&#9654; SWAP — uses empty can from previous stop</div>';
+    }
+    if (s.pending_empty_can_for_next_pr) {
+      extraInfo += '<div style="font-size:11px;color:#ff9d00;margin-bottom:6px;">&#9654; Empty can held for next PR stop</div>';
+    }
+
+    // For RELOCATE: show from/to address fields; for others: show normal address
+    var addrFields = isRelocate
+      ? fld('From Address', 'pr-addr-' + i,  s.from_address || s.address, '1/-1', mIdx('address'))
+        + fld('To Address',   'pr-toaddr-' + i, s.to_address,              '1/-1', false)
+      : fld('Address', 'pr-addr-' + i, s.address, '1/-1', mIdx('address'));
+
+    var dumpField = (isMove || isRelocate)
+      ? fld('Placement Note', 'pr-place-' + i, s.placement_note, '1/-1', false)
+      : dumpFld('pr-dump-' + i, s.dump_location, mIdx('dump'));
+
     return (
       '<div class="pr-stop ' + confCls(s) + '" id="pr-card-' + i + '">'
-      /* header */
       + '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">'
         + '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">'
           + '<label style="display:flex;align-items:center;gap:7px;cursor:pointer;font-size:12px;color:#7aaac8;font-weight:700;">'
             + '<input type="checkbox" id="pr-chk-' + i + '" checked style="width:15px;height:15px;accent-color:#00ccff;"> Stop ' + (i + 1)
           + '</label>'
-          + actionBadge(s.action)
+          + actionBadge(s.action, s.pr_mode)
         + '</div>'
         + '<div style="display:flex;align-items:center;gap:6px;">'
           + savedBadge
           + '<span class="pr-badge ' + confBCls(s) + '">' + confLbl(s) + ' (' + s.confidence + '%)</span>'
         + '</div>'
       + '</div>'
-      /* original line */
-      + '<div class="pr-orig">&ldquo;' + _esc(s.original_line) + '&rdquo;</div>'
-      /* fields grid */
+      + '<div class="pr-orig">&ldquo;' + _esc(s.original_line || '') + '&rdquo;</div>'
+      + extraInfo
       + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">'
         + fld('Customer', 'pr-cust-' + i,   s.customer_name,  '1/-1', mIdx('customer'))
-        + fld('Address',  'pr-addr-' + i,   s.address,        '1/-1', mIdx('address'))
+        + addrFields
         + fld('City',     'pr-city-' + i,   s.city,           null,   false)
         + fld('State',    'pr-state-' + i,  s.state,          null,   false)
         + fld('Action',   'pr-action-' + i, s.action,         null,   mIdx('action'))
         + fld('Container','pr-cont-' + i,   s.container_size, null,   false)
-        + dumpFld('pr-dump-' + i, s.dump_location, mIdx('dump'))
+        + dumpField
         + fld('ZIP',      'pr-zip-' + i,    s.zip_code,       null,   false)
       + '</div>'
       + warnStrip
@@ -12468,14 +12781,23 @@ def add_parsed_stops(route_id):
         container_size = expand_abbrev(stop.get("container_size")  or "")
         dump_location  = expand_abbrev(stop.get("dump_location")   or "")
         last += 1
+        placement_note     = expand_abbrev(stop.get("placement_note")     or "")
+        relocate_to_addr   = expand_abbrev(stop.get("relocate_to_address") or
+                                           stop.get("to_address")           or "")
+        return_destination = expand_abbrev(stop.get("return_destination")  or "")
+        pr_mode            = (stop.get("pr_mode") or "").strip()
+        swap_flag          = 1 if stop.get("swap_with_previous_empty") or stop.get("swap_with_prev_pull") else 0
         conn.execute("""
             INSERT INTO stops (
                 route_id, stop_order, customer_name, address, city, state, zip_code,
                 action, container_size, dump_location,
+                placement_note, relocate_to_address, return_destination, pr_mode,
                 swap_with_prev_pull, status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'open', ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
         """, (route_id, last, customer_name, address, city, state, zip_code,
-              action, container_size, dump_location, now_ts()))
+              action, container_size, dump_location,
+              placement_note, relocate_to_addr, return_destination, pr_mode,
+              swap_flag, now_ts()))
         added += 1
         upsert_saved_address(conn, cid(),
             customer_name, address, city, state, zip_code,
