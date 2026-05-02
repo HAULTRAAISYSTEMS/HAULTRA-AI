@@ -11707,8 +11707,8 @@ def driver_hours_page():
                 "source":   "manual",
                 "entry_id": mr["id"],
             })
-    except Exception as e:
-        app.logger.error("Manual clock entries fetch failed driver=%s: %s", selected_driver_id, e)
+    except Exception as _exc:
+        app.logger.error("Manual clock entries fetch failed driver=%s: %s", selected_driver_id, _exc)
 
     # ── Auto entries: omitted entirely when manual mode is on;
     #    otherwise only included for dates that have no manual entry
@@ -11733,8 +11733,8 @@ def driver_hours_page():
                         "end":    ar["t_end"] or "",
                         "source": "auto",
                     })
-        except Exception as e:
-            app.logger.error("Auto clock entries fetch failed driver=%s: %s", selected_driver_id, e)
+        except Exception as _exc:
+            app.logger.error("Auto clock entries fetch failed driver=%s: %s", selected_driver_id, _exc)
 
     activity_rows.sort(key=lambda r: r["day"], reverse=True)
 
