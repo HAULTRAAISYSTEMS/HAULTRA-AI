@@ -933,14 +933,15 @@ def compute_can_flow(conn, route_id, starts_with_can=False):
     Caller is responsible for conn.commit().
     """
     stops = conn.execute(
-        "SELECT id, action FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
+        "SELECT id, action, pr_mode FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
         (route_id,)
     ).fetchall()
 
     can_state = "empty_can" if starts_with_can else "no_can"
 
     for s in stops:
-        action_lower = (s["action"] or "").lower().strip()
+        action_lower   = (s["action"]  or "").lower().strip()
+        parser_pr_mode = (s["pr_mode"] or "").lower().strip()
 
         # Is this a PR-type stop (Pickup and Return or Swap-only)?
         is_pr = (
@@ -949,21 +950,20 @@ def compute_can_flow(conn, route_id, starts_with_can=False):
         )
 
         if is_pr:
-            # Derive swap from whether truck arrives carrying an empty can
-            derived_swap = 1 if can_state == "empty_can" else 0
+            # Boss language (pr_mode="swap") overrides sequence-derived can state.
+            # This fires when the parser detected "use it to / before you return" etc.
+            effective_state = "empty_can" if parser_pr_mode == "swap" else can_state
+            derived_swap    = 1 if effective_state == "empty_can" else 0
             conn.execute(
                 "UPDATE stops SET can_state_before=?, swap_with_prev_pull=? WHERE id=?",
-                (can_state, derived_swap, s["id"])
+                (effective_state, derived_swap, s["id"])
             )
-            # PR swap (empty_can): dropped off empty, dumped full → truck holds empty
-            # PR return-same (no_can): dumped full, returned empty to customer → truck empty
-            can_state = _next_can_state(action_lower, can_state)
+            can_state = _next_can_state(action_lower, effective_state)
         else:
             conn.execute(
                 "UPDATE stops SET can_state_before=? WHERE id=?",
                 (can_state, s["id"])
             )
-            # Compute state AFTER this stop using shared helper
             can_state = _next_can_state(action_lower, can_state)
 
 
@@ -2454,6 +2454,7 @@ _ROLLOFF_NOTES_RE = re.compile(
     r"|use\s+it\s+to\b"
     r"|use\s+this\s+(?:empty|can)\b"
     r"|use\s+the\s+can\s+to\b"
+    r"|use\s+for\s+next\b"
     r"|before\s+you\s+return\b"
     r"|return\s+to\b"
     r"|take\s+empty\b"
@@ -3058,8 +3059,12 @@ def _is_relocate_format(lines):
 
 # Patterns that signal "use this empty can for the NEXT PR stop"
 _PENDING_EMPTY_RE = re.compile(
-    r"\b(?:use\s+it\s+to\b|use\s+this\s+(?:empty|can)\b|use\s+the\s+can\s+to\b"
-    r"|before\s+you\s+return\b|take\s+empty\b)\b",
+    r"\b(?:use\s+it\s+to\b"
+    r"|use\s+this\s+(?:empty|can)\b"
+    r"|use\s+the\s+can\s+to\b"
+    r"|use\s+for\s+next\b"
+    r"|before\s+you\s+return\b"
+    r"|take\s+empty\b)\b",
     re.I,
 )
 # Pattern for "return to <destination>" in notes
@@ -8508,40 +8513,28 @@ def view_route(route_id):
             or ("swap" in _action_sc and "pull" not in _action_sc)
         )
         if session.get("role") == "boss" and _is_pr_sc:
-            if _csb == "empty_can":
+            _pr_mode_col = (dict(s).get("pr_mode") or "").lower().strip()
+            # Priority: 1) parser-set pr_mode  2) sequence-derived can_state_before  3) swap_with_prev_pull fallback
+            _is_swap_sc = (
+                _pr_mode_col == "swap"
+                or _csb == "empty_can"
+                or (_csb not in ("empty_can", "no_can") and bool(int(dict(s).get("swap_with_prev_pull") or 0)))
+            )
+            if _is_swap_sc:
                 _swap_badge = (
                     ' <span title="PR Mode: Swap — driver carries empty can from prior Pull" '
                     'style="font-size:11px;background:rgba(97,247,223,0.15);color:#61f7df;'
                     'padding:2px 8px;border-radius:6px;font-weight:700;vertical-align:middle;">'
                     '&#x1F504; PR Mode: Swap</span>'
                 )
-                _swap_warning = ""
-            elif _csb == "no_can":
+            else:
                 _swap_badge = (
                     ' <span title="PR Mode: Return Same Can — driver boxes out, dumps, returns empty can to site" '
                     'style="font-size:11px;background:rgba(150,200,255,0.18);color:#93c5fd;'
                     'padding:2px 8px;border-radius:6px;font-weight:700;vertical-align:middle;">'
                     '&#x21A9;&#xFE0F; PR Mode: Return Same Can</span>'
                 )
-                _swap_warning = ""
-            else:
-                # can_state_before is NULL — derive from swap_with_prev_pull flag
-                _is_swap_flag = bool(int(dict(s).get("swap_with_prev_pull") or 0))
-                if _is_swap_flag:
-                    _swap_badge = (
-                        ' <span title="PR Mode: Swap — driver carries empty can from prior Pull" '
-                        'style="font-size:11px;background:rgba(97,247,223,0.15);color:#61f7df;'
-                        'padding:2px 8px;border-radius:6px;font-weight:700;vertical-align:middle;">'
-                        '&#x1F504; PR Mode: Swap</span>'
-                    )
-                else:
-                    _swap_badge = (
-                        ' <span title="PR Mode: Return Same Can — driver boxes out, dumps, returns empty can to site" '
-                        'style="font-size:11px;background:rgba(150,200,255,0.18);color:#93c5fd;'
-                        'padding:2px 8px;border-radius:6px;font-weight:700;vertical-align:middle;">'
-                        '&#x21A9;&#xFE0F; PR Mode: Return Same Can</span>'
-                    )
-                _swap_warning = ""
+            _swap_warning = ""
         else:
             _swap_badge   = ""
             _swap_warning = ""
@@ -9055,7 +9048,14 @@ def edit_stop(stop_id):
         or ("swap" in _action_edit and "pull" not in _action_edit)
     )
     if _is_pr_edit:
-        if _csb_edit == "empty_can":
+        _pr_mode_edit = (_stop.get("pr_mode") or "").lower().strip()
+        # Priority: 1) parser-set pr_mode  2) sequence-derived can_state_before  3) swap_with_prev_pull fallback
+        _is_swap_edit = (
+            _pr_mode_edit == "swap"
+            or _csb_edit == "empty_can"
+            or (_csb_edit not in ("empty_can", "no_can") and bool(int(_stop.get("swap_with_prev_pull") or 0)))
+        )
+        if _is_swap_edit:
             _swap_info_block = """
             <div style="margin-top:16px;padding:14px 16px;
                         background:rgba(97,247,223,0.08);
@@ -9064,43 +9064,12 @@ def edit_stop(stop_id):
                     &#x1F504; PR Mode: Swap
                 </p>
                 <p style="margin:0;color:#7ab8a8;font-size:12px;">
-                    A Pull precedes this PR with no Delivery in between.
                     Driver carries an empty can to this stop and swaps it for the full one.
                     Workflow: Arrive &#x2192; Box Out &#x2192; Box In &#x2192; Go To Dump &#x2192; Complete.
                 </p>
             </div>"""
-        elif _csb_edit == "no_can":
-            _swap_info_block = """
-            <div style="margin-top:16px;padding:14px 16px;
-                        background:rgba(150,200,255,0.07);
-                        border:1px solid rgba(150,200,255,0.28);border-radius:10px;">
-                <p style="margin:0 0 4px;color:#93c5fd;font-size:13px;font-weight:700;">
-                    &#x21A9;&#xFE0F; PR Mode: Return Same Can
-                </p>
-                <p style="margin:0;color:#7a9ab8;font-size:12px;">
-                    No empty can in sequence &#x2014; driver boxes out the full can, dumps it,
-                    then returns the emptied can to the same site.
-                    Workflow: Arrive &#x2192; Box Out &#x2192; Go To Dump &#x2192; Return &amp; Box In &#x2192; Complete.
-                </p>
-            </div>"""
         else:
-            # can_state_before is NULL — derive from swap_with_prev_pull flag
-            _is_swap_edit = bool(int(_stop.get("swap_with_prev_pull") or 0))
-            if _is_swap_edit:
-                _swap_info_block = """
-            <div style="margin-top:16px;padding:14px 16px;
-                        background:rgba(97,247,223,0.08);
-                        border:1px solid rgba(97,247,223,0.28);border-radius:10px;">
-                <p style="margin:0 0 4px;color:#61f7df;font-size:13px;font-weight:700;">
-                    &#x1F504; PR Mode: Swap
-                </p>
-                <p style="margin:0;color:#7ab8a8;font-size:12px;">
-                    A Pull precedes this PR with no Delivery in between.
-                    Driver carries an empty can to this stop and swaps it for the full one.
-                </p>
-            </div>"""
-            else:
-                _swap_info_block = """
+            _swap_info_block = """
             <div style="margin-top:16px;padding:14px 16px;
                         background:rgba(150,200,255,0.07);
                         border:1px solid rgba(150,200,255,0.28);border-radius:10px;">
@@ -9109,6 +9078,7 @@ def edit_stop(stop_id):
                 </p>
                 <p style="margin:0;color:#7a9ab8;font-size:12px;">
                     Driver boxes out the full can, dumps it, then returns the emptied can to the same site.
+                    Workflow: Arrive &#x2192; Box Out &#x2192; Go To Dump &#x2192; Return &amp; Box In &#x2192; Complete.
                 </p>
             </div>"""
     else:
