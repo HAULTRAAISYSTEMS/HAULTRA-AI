@@ -3085,7 +3085,7 @@ def _apply_swap_inference(stops):
             stop["pending_empty_can_for_next_pr"] = True
 
         # Detect "return to <dest>" on this stop
-        rt = _RETURN_TO_RE.search(stop.get("notes") or "", re.I)
+        rt = _RETURN_TO_RE.search(stop.get("notes") or "")
         if rt:
             stop["return_destination"] = rt.group(1).strip().rstrip(".")
 
@@ -8254,10 +8254,16 @@ _PASTE_ROUTE_JS = """
       var chk = $('pr-chk-' + i);
       if (chk && !chk.checked) return;
       var stop = {
-        customer_name: _v('pr-cust-' + i),   address:        _v('pr-addr-' + i),
-        city:          _v('pr-city-' + i),    state:          _v('pr-state-' + i),
-        zip_code:      _v('pr-zip-' + i),     action:         _v('pr-action-' + i),
-        container_size:_v('pr-cont-' + i),    dump_location:  _v('pr-dump-' + i),
+        customer_name:       _v('pr-cust-'   + i),
+        address:             _v('pr-addr-'   + i),
+        city:                _v('pr-city-'   + i),
+        state:               _v('pr-state-'  + i),
+        zip_code:            _v('pr-zip-'    + i),
+        action:              _v('pr-action-' + i),
+        container_size:      _v('pr-cont-'   + i),
+        dump_location:       _v('pr-dump-'   + i),
+        placement_note:      _v('pr-place-'  + i),
+        relocate_to_address: _v('pr-toaddr-' + i),
       };
       if (s.confidence < 45)                     hasLow = true;
       if (!stop.address || !stop.customer_name)  hasMissReq = true;
@@ -8519,17 +8525,59 @@ def view_route(route_id):
                 )
                 _swap_warning = ""
             else:
-                # can_state_before is NULL — route not yet optimized
-                _swap_badge = (
-                    ' <span title="Run Smart Optimize to derive PR mode from stop sequence" '
-                    'style="font-size:11px;background:rgba(120,120,140,0.12);color:#6a7a8a;'
-                    'padding:2px 8px;border-radius:6px;font-weight:700;vertical-align:middle;">'
-                    '&#x1F504; PR Mode: ?</span>'
-                )
+                # can_state_before is NULL — derive from swap_with_prev_pull flag
+                _is_swap_flag = bool(int(dict(s).get("swap_with_prev_pull") or 0))
+                if _is_swap_flag:
+                    _swap_badge = (
+                        ' <span title="PR Mode: Swap — driver carries empty can from prior Pull" '
+                        'style="font-size:11px;background:rgba(97,247,223,0.15);color:#61f7df;'
+                        'padding:2px 8px;border-radius:6px;font-weight:700;vertical-align:middle;">'
+                        '&#x1F504; PR Mode: Swap</span>'
+                    )
+                else:
+                    _swap_badge = (
+                        ' <span title="PR Mode: Return Same Can — driver boxes out, dumps, returns empty can to site" '
+                        'style="font-size:11px;background:rgba(150,200,255,0.18);color:#93c5fd;'
+                        'padding:2px 8px;border-radius:6px;font-weight:700;vertical-align:middle;">'
+                        '&#x21A9;&#xFE0F; PR Mode: Return Same Can</span>'
+                    )
                 _swap_warning = ""
         else:
             _swap_badge   = ""
             _swap_warning = ""
+
+        # Build address/service display for this stop
+        _s_action_lc   = (dict(s).get("action") or "").lower()
+        _is_relocate_s = "relocate" in _s_action_lc
+        _is_move_s     = _s_action_lc == "move"
+
+        _dump_ticket_btn = (
+            f'<a class="btn secondary" href="{url_for("dump_ticket", stop_id=s["id"])}" style="font-size:13px;">&#x1F9FE; Dump Ticket</a>'
+            if (dict(s).get("dump_location") or "").strip() else ""
+        )
+
+        if _is_relocate_s:
+            _rel_to   = e(dict(s).get("relocate_to_address") or "")
+            _ret_dest = e(dict(s).get("return_destination") or "")
+            _place_nt = e(dict(s).get("placement_note") or "")
+            _addr_block = (
+                f'<p><strong>From:</strong> {e(s["address"] or "")} {e(s["city"] or "")} {e(s["state"] or "")}</p>'
+                + (f'<p><strong>To:</strong> {_rel_to}</p>' if _rel_to else "")
+                + (f'<p><strong>Placement:</strong> {_place_nt}</p>' if _place_nt else "")
+                + (f'<p><strong>Return To:</strong> {_ret_dest}</p>' if _ret_dest else "")
+            )
+        elif _is_move_s:
+            _place_nt   = e(dict(s).get("placement_note") or "")
+            _addr_block = (
+                f'<p><strong>Address:</strong> {e(s["address"] or "")} {e(s["city"] or "")} {e(s["state"] or "")} {e(s["zip_code"] or "")}</p>'
+                + (f'<p><strong>Placement:</strong> {_place_nt}</p>' if _place_nt else "")
+            )
+        else:
+            _ret_dest   = e(dict(s).get("return_destination") or "")
+            _addr_block = (
+                f'<p><strong>Address:</strong> {e(s["address"] or "")} {e(s["city"] or "")} {e(s["state"] or "")} {e(s["zip_code"] or "")}</p>'
+                + (f'<p><strong>Return To:</strong> {_ret_dest}</p>' if _ret_dest else "")
+            )
 
         stop_cards += f"""
         <div class="stop-card" data-stop-id="{s['id']}">
@@ -8542,14 +8590,14 @@ def view_route(route_id):
                 <div class="row">
                     {edit_button}
                     {delete_button}
-                    <a class="btn secondary" href="{url_for('dump_ticket', stop_id=s['id'])}" style="font-size:13px;">&#x1F9FE; Dump Ticket</a>
+                    {_dump_ticket_btn}
                     <form class="inline" method="POST" action="{url_for('toggle_stop_complete', stop_id=s['id'])}">
                         <button class="btn green" type="submit">{'Reopen Stop' if s['status']=='completed' else 'Complete Stop'}</button>
                     </form>
                 </div>
             </div>
             <p><strong>Customer:</strong> {e(s['customer_name'] or '')}</p>
-            <p><strong>Address:</strong> {e(s['address'] or '')} {e(s['city'] or '')} {e(s['state'] or '')} {e(s['zip_code'] or '')}</p>
+            {_addr_block}
             <p><strong>Action:</strong> {e(s['action'] or '')}{_can_pill}{_swap_badge}</p>
             {_swap_warning}
             <p><strong>Container:</strong> {e(s['container_size'] or '')}</p>
@@ -8596,7 +8644,12 @@ def view_route(route_id):
                             <div style="font-size:10px;color:#3d5a74;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:7px;">Examples</div>
                             <div class="pr-tip-code" style="display:block;margin-bottom:4px;">PR 515 central dr talent 30 dom</div>
                             <div class="pr-tip-code" style="display:block;margin-bottom:4px;">P 224 golden maple bartlett 20 wat</div>
-                            <div class="pr-tip-code" style="display:block;">D 900 tidewater quick demo 20</div>
+                            <div class="pr-tip-code" style="display:block;margin-bottom:4px;">D 900 tidewater quick demo 20</div>
+                            <div style="font-size:10px;color:#3d5a74;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin:10px 0 5px;">Swap Example</div>
+                            <div class="pr-tip-code" style="display:block;margin-bottom:2px;">PR 101 N Dogwood Rd, VB, Bishard 30yd dump dominion and before you return it use it to</div>
+                            <div class="pr-tip-code" style="display:block;margin-bottom:4px;">PR 114 Sawyers Creek, Camden, Heartland 30yd dump dominion and return to Dogwood</div>
+                            <div style="font-size:10px;color:#3d5a74;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin:10px 0 5px;">Relocate Example</div>
+                            <div class="pr-tip-code" style="display:block;">Relocate one of the 20s from 224 Golden Maple Dr Chesapeake to 416 Maple Shore Dr Chesapeake place it on the street</div>
                         </div>
                         <textarea id="pr-textarea" rows="8" placeholder="Paste route here &mdash; one stop per line&hellip;" style="width:100%;background:rgba(0,0,0,.4);border:1px solid rgba(0,160,255,.15);border-radius:9px;color:#c8dff0;padding:12px 14px;font-size:13px;line-height:1.7;resize:vertical;box-sizing:border-box;font-family:monospace;"></textarea>
                         <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap;">
@@ -9031,16 +9084,31 @@ def edit_stop(stop_id):
                 </p>
             </div>"""
         else:
-            _swap_info_block = """
+            # can_state_before is NULL — derive from swap_with_prev_pull flag
+            _is_swap_edit = bool(int(_stop.get("swap_with_prev_pull") or 0))
+            if _is_swap_edit:
+                _swap_info_block = """
             <div style="margin-top:16px;padding:14px 16px;
-                        background:rgba(120,140,160,0.08);
-                        border:1px solid rgba(120,140,160,0.25);border-radius:10px;">
-                <p style="margin:0 0 4px;color:#9aa5b8;font-size:13px;font-weight:700;">
-                    &#x1F504; PR Mode: Unknown
+                        background:rgba(97,247,223,0.08);
+                        border:1px solid rgba(97,247,223,0.28);border-radius:10px;">
+                <p style="margin:0 0 4px;color:#61f7df;font-size:13px;font-weight:700;">
+                    &#x1F504; PR Mode: Swap
                 </p>
-                <p style="margin:0;color:#6a7a8a;font-size:12px;">
-                    Can flow has not been computed for this route yet.
-                    Run Smart Optimize to derive PR mode from stop sequence.
+                <p style="margin:0;color:#7ab8a8;font-size:12px;">
+                    A Pull precedes this PR with no Delivery in between.
+                    Driver carries an empty can to this stop and swaps it for the full one.
+                </p>
+            </div>"""
+            else:
+                _swap_info_block = """
+            <div style="margin-top:16px;padding:14px 16px;
+                        background:rgba(150,200,255,0.07);
+                        border:1px solid rgba(150,200,255,0.28);border-radius:10px;">
+                <p style="margin:0 0 4px;color:#93c5fd;font-size:13px;font-weight:700;">
+                    &#x21A9;&#xFE0F; PR Mode: Return Same Can
+                </p>
+                <p style="margin:0;color:#7a9ab8;font-size:12px;">
+                    Driver boxes out the full can, dumps it, then returns the emptied can to the same site.
                 </p>
             </div>"""
     else:
