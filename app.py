@@ -236,15 +236,41 @@ def parse_route_text(text, conn, company_id):
     Returns a list of stop dicts with confidence scores.
     Does NOT write to the database.
     """
-    results = []
+    results      = []
+    use_for_next = False  # carries swap-trigger past non-PR stops until consumed
+
     for raw in text.splitlines():
         raw = raw.strip()
         if not raw:
             continue
         parsed = _parse_one_line(raw, conn, company_id)
-        if parsed:
-            results.append(parsed)
-    results = _apply_swap_inference(results)
+        if not parsed:
+            continue
+
+        action_lc = (parsed.get("action") or "").lower()
+        notes     = parsed.get("notes") or ""
+        notes_lc  = notes.lower()
+        is_pr     = "pickup and return" in action_lc
+
+        # Apply pending swap from a previous stop to this PR stop
+        if use_for_next and is_pr:
+            parsed["pr_mode"]                  = "swap"
+            parsed["swap_with_prev_pull"]      = 1
+            parsed["swap_with_previous_empty"] = True
+            use_for_next = False
+
+        # Detect swap trigger phrase on this stop
+        if _PENDING_EMPTY_RE.search(notes_lc):
+            parsed["pending_empty_can_for_next_pr"] = True
+            use_for_next = True
+
+        # Detect "return to <dest>"
+        rt = _RETURN_TO_RE.search(notes)
+        if rt:
+            parsed["return_destination"] = rt.group(1).strip().rstrip(".")
+
+        results.append(parsed)
+
     return results
 
 
@@ -3074,32 +3100,36 @@ _RETURN_TO_RE = re.compile(r"\breturn\s+to\s+(.+)", re.I)
 def _apply_swap_inference(stops):
     """Post-process a stop list to detect cross-stop SWAP / pending-empty patterns.
 
-    Rules:
-    - If stop N notes contain a "use it to / before you return" phrase → set
-      pending_empty_can_for_next_pr=True on stop N.
-    - If stop N+1 notes contain "return to <dest>" AND stop N had pending_empty flag
-      → set swap_with_previous_empty=True, pr_mode="swap", return_destination on N+1.
-    - swap_with_prev_pull (DB column) is also set to 1 when swap_with_previous_empty
-      is True so the existing driver workflow sees it immediately.
+    Carries a pending_swap flag past non-PR stops so the NEXT PR stop after a
+    trigger phrase receives the SWAP mark, regardless of intervening stops.
     """
-    for i, stop in enumerate(stops):
-        notes_lc = (stop.get("notes") or "").lower()
+    pending_swap = False  # carries until consumed by a PR stop
 
-        # Detect pending-empty signal on this stop
-        if _PENDING_EMPTY_RE.search(notes_lc):
-            stop["pending_empty_can_for_next_pr"] = True
+    for stop in stops:
+        notes     = stop.get("notes") or ""
+        notes_lc  = notes.lower()
+        action_lc = (stop.get("action") or "").lower()
+        is_pr     = "pickup and return" in action_lc
 
-        # Detect "return to <dest>" on this stop
-        rt = _RETURN_TO_RE.search(stop.get("notes") or "")
+        # Detect "return to <dest>"
+        rt = _RETURN_TO_RE.search(notes)
         if rt:
             stop["return_destination"] = rt.group(1).strip().rstrip(".")
 
-        # If previous stop set pending_empty flag → mark this stop as SWAP
-        if i > 0 and stops[i - 1].get("pending_empty_can_for_next_pr"):
+        # Check for trigger phrase before applying swap (order matters for chaining)
+        this_triggers = bool(_PENDING_EMPTY_RE.search(notes_lc))
+
+        # Apply pending swap to the next PR stop
+        if is_pr and pending_swap:
             stop["swap_with_previous_empty"] = True
-            stop["pr_mode"] = "swap"
-            # Mirror to existing DB flag so driver workflow fires correctly
-            stop["swap_with_prev_pull"] = 1
+            stop["pr_mode"]                  = "swap"
+            stop["swap_with_prev_pull"]      = 1
+            pending_swap = False
+
+        # Set pending if this stop has a trigger phrase
+        if this_triggers:
+            stop["pending_empty_can_for_next_pr"] = True
+            pending_swap = True
 
     return stops
 
