@@ -239,12 +239,13 @@ def parse_route_text(text, conn, company_id):
     results      = []
     use_for_next = False  # carries swap-trigger past non-PR stops until consumed
 
-    for raw in text.splitlines():
-        raw = raw.strip()
-        if not raw:
-            continue
+    input_lines = [l.strip() for l in text.splitlines() if l.strip()]
+    print(f"[PARSER] Input lines: {len(input_lines)}", flush=True)
+
+    for raw in input_lines:
         parsed = _parse_one_line(raw, conn, company_id)
         if not parsed:
+            print(f"[PARSER] SKIP (unparseable): {raw!r}", flush=True)
             continue
 
         action_lc = (parsed.get("action") or "").lower()
@@ -270,7 +271,15 @@ def parse_route_text(text, conn, company_id):
             parsed["return_destination"] = rt.group(1).strip().rstrip(".")
 
         results.append(parsed)
+        print(
+            f"[PARSER] Stop {len(results)}: action={parsed.get('action')!r}"
+            f"  addr={parsed.get('address')!r}"
+            f"  customer={parsed.get('customer_name')!r}"
+            f"  conf={parsed.get('confidence')}",
+            flush=True,
+        )
 
+    print(f"[PARSER] Total parsed stops: {len(results)}", flush=True)
     return results
 
 
@@ -818,8 +827,9 @@ def _next_can_state(action_lower, can_state):
         return "no_can"   # left the can at the site; truck is empty
 
     if is_pull:
-        # Truck returns same dumped-empty can to customer — truck leaves empty
-        return "no_can"
+        # After dump the driver keeps the emptied can on the truck.
+        # That empty can is available for a swap on the very next PR stop.
+        return "empty_can"
 
     if is_pr:
         if can_state == "empty_can":
@@ -2821,9 +2831,15 @@ def _parse_inline_shorthand(lines):
 
 
 # ─── Relocate from/to parser ──────────────────────────────────────────────────
-# Matches: "relocate [can] <from_address> to <to_address> [size] [dump site]"
+# Matches: "relocate [can] <from> to <to>"
+#          "move one [of the Xs] [from] <from> to <to>"
+#          "move the can/container <from> to <to>"
 _RELOCATE_TO_RE = re.compile(
-    r"^(?:relocate|reloc|move\s+can)\s+(.+?)\s+to\s+(.+)$",
+    r"^(?:relocate|reloc"
+    r"|move\s+one"
+    r"|move\s+the\s+(?:can|container)"
+    r"|move\s+can"
+    r")\s+(.+?)\s+to\s+(.+)$",
     re.IGNORECASE,
 )
 
@@ -2844,8 +2860,12 @@ def _parse_relocate_line(raw, order_num=1):
     Returns None if the pattern does not match.
     """
     work = raw.strip()
-    # Strip leading "can" after relocate keyword so the address starts at house #
-    work = re.sub(r"^(relocate|reloc|move\s+can)\s+can\s+", r"\1 ", work, flags=re.I)
+    # Strip a redundant "can" token that sometimes appears between the keyword
+    # and the address, e.g. "relocate can 100 main st" → "relocate 100 main st"
+    work = re.sub(
+        r"^(relocate|reloc|move\s+one|move\s+the\s+(?:can|container)|move\s+can)\s+can\s+",
+        r"\1 ", work, flags=re.I
+    )
     m = _RELOCATE_TO_RE.match(work)
     if not m:
         return None
@@ -3086,7 +3106,9 @@ def _is_relocate_format(lines):
 # Patterns that signal "use this empty can for the NEXT PR stop"
 _PENDING_EMPTY_RE = re.compile(
     r"\b(?:use\s+it\s+to\b"
+    r"|use\s+it\s+for\s+next\b"
     r"|use\s+this\s+(?:empty|can)\b"
+    r"|use\s+this\s+can\s+to\b"
     r"|use\s+the\s+can\s+to\b"
     r"|use\s+for\s+next\b"
     r"|before\s+you\s+return\b"
