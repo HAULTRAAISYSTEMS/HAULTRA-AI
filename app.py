@@ -243,7 +243,24 @@ def parse_route_text(text, conn, company_id):
     print(f"[PARSER] Input lines: {len(input_lines)}", flush=True)
 
     for raw in input_lines:
-        parsed = _parse_one_line(raw, conn, company_id)
+        raw_lo = raw.lower()
+
+        # ── Annotation lines: attach to previous stop as notes, set swap trigger ──
+        if _ANNOTATION_LINE_RE.match(raw) or _PENDING_EMPTY_RE.search(raw_lo):
+            if results:
+                prev_notes = results[-1].get("notes") or ""
+                results[-1]["notes"] = (prev_notes + ("  " if prev_notes else "") + raw).strip()
+                results[-1]["pending_empty_can_for_next_pr"] = True
+            use_for_next = True
+            print(f"[PARSER] Annotation line → attached to previous stop: {raw!r}", flush=True)
+            continue
+
+        try:
+            parsed = _parse_one_line(raw, conn, company_id)
+        except Exception as exc:
+            print(f"[PARSER] ERROR parsing {raw!r}: {exc}", flush=True)
+            continue
+
         if not parsed:
             print(f"[PARSER] SKIP (unparseable): {raw!r}", flush=True)
             continue
@@ -260,7 +277,7 @@ def parse_route_text(text, conn, company_id):
             parsed["swap_with_previous_empty"] = True
             use_for_next = False
 
-        # Detect swap trigger phrase on this stop
+        # Detect swap trigger phrase in this stop's notes
         if _PENDING_EMPTY_RE.search(notes_lc):
             parsed["pending_empty_can_for_next_pr"] = True
             use_for_next = True
@@ -1531,6 +1548,7 @@ def init_db():
     safe_add_column(conn, "stops", "can_state_before TEXT")
     safe_add_column(conn, "stops", "placement_note TEXT")
     safe_add_column(conn, "stops", "relocate_to_address TEXT")
+    safe_add_column(conn, "stops", "relocate_to_city TEXT")
     safe_add_column(conn, "stops", "return_destination TEXT")
     safe_add_column(conn, "stops", "pr_mode TEXT")
 
@@ -3113,6 +3131,18 @@ _PENDING_EMPTY_RE = re.compile(
     r"|use\s+for\s+next\b"
     r"|before\s+you\s+return\b"
     r"|take\s+empty\b)\b",
+    re.I,
+)
+# Matches whole annotation lines that should NOT become stops
+# e.g. "Use pulled can from previous stop", "use it for the swap"
+_ANNOTATION_LINE_RE = re.compile(
+    r"^\s*(?:use\s+(?:pulled\s+)?can\b"
+    r"|use\s+(?:it|this|the)\s+(?:pulled\s+)?can\b"
+    r"|use\s+(?:it|this)\s+(?:to|for)\b"
+    r"|use\s+for\s+next\b"
+    r"|before\s+you\s+return\b"
+    r"|take\s+(?:the\s+)?empty\b"
+    r"|leave\s+(?:the\s+)?(?:can|empty)\b)",
     re.I,
 )
 # Pattern for "return to <destination>" in notes
@@ -8117,7 +8147,18 @@ _PASTE_ROUTE_JS = """
       if (suggCard) suggCard.style.display = 'none';
       return;
     }
-    preview.innerHTML = _stops.map(function(s, i) { return _removed[i] ? '' : cardHTML(s, i); }).join('');
+    var _cards = [];
+    _stops.forEach(function(s, i) {
+      if (_removed[i]) { _cards.push(''); return; }
+      try { _cards.push(cardHTML(s, i)); }
+      catch(e) {
+        console.error('pr card render error stop ' + i, e);
+        _cards.push('<div class="pr-stop l" id="pr-card-' + i + '" style="padding:12px;">'
+          + '<p style="color:#ff7090;margin:0;">Stop ' + (i+1) + ' render error: ' + String(e) + '</p>'
+          + '</div>');
+      }
+    });
+    preview.innerHTML = _cards.join('');
     renderSuggestions();
     if (footer) footer.style.display = 'flex';
     if (mobileBar) mobileBar.classList.add('pr-show');
@@ -8310,6 +8351,7 @@ _PASTE_ROUTE_JS = """
       if (_removed[i]) return;
       var chk = $('pr-chk-' + i);
       if (chk && !chk.checked) return;
+      var isRel = (s.action || '').toUpperCase() === 'RELOCATE';
       var stop = {
         customer_name:       _v('pr-cust-'   + i),
         address:             _v('pr-addr-'   + i),
@@ -8321,9 +8363,16 @@ _PASTE_ROUTE_JS = """
         dump_location:       _v('pr-dump-'   + i),
         placement_note:      _v('pr-place-'  + i),
         relocate_to_address: _v('pr-toaddr-' + i),
+        // preserve parser-detected flags through to the backend
+        pr_mode:             s.pr_mode             || '',
+        swap_with_prev_pull: s.swap_with_prev_pull || 0,
+        swap_with_previous_empty: s.swap_with_previous_empty || false,
+        return_destination:  s.return_destination  || '',
+        relocate_to_city:    s.to_city             || '',
       };
-      if (s.confidence < 45)                     hasLow = true;
-      if (!stop.address || !stop.customer_name)  hasMissReq = true;
+      if (s.confidence < 45)                           hasLow = true;
+      var addrOk = stop.address || (isRel && _v('pr-toaddr-' + i));
+      if (!addrOk || (!stop.customer_name && !isRel))  hasMissReq = true;
       toAdd.push(stop);
     });
     if (!toAdd.length) { alert('No stops selected.'); return; }
@@ -12874,29 +12923,40 @@ def add_parsed_stops(route_id):
         placement_note     = expand_abbrev(stop.get("placement_note")     or "")
         relocate_to_addr   = expand_abbrev(stop.get("relocate_to_address") or
                                            stop.get("to_address")           or "")
+        relocate_to_city   = expand_abbrev(stop.get("relocate_to_city")    or
+                                           stop.get("to_city")              or "")
         return_destination = expand_abbrev(stop.get("return_destination")  or "")
         pr_mode            = (stop.get("pr_mode") or "").strip()
         swap_flag          = 1 if stop.get("swap_with_previous_empty") or stop.get("swap_with_prev_pull") else 0
-        conn.execute("""
-            INSERT INTO stops (
-                route_id, stop_order, customer_name, address, city, state, zip_code,
-                action, container_size, dump_location,
-                placement_note, relocate_to_address, return_destination, pr_mode,
-                swap_with_prev_pull, status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
-        """, (route_id, last, customer_name, address, city, state, zip_code,
-              action, container_size, dump_location,
-              placement_note, relocate_to_addr, return_destination, pr_mode,
-              swap_flag, now_ts()))
-        added += 1
-        upsert_saved_address(conn, cid(),
-            customer_name, address, city, state, zip_code,
-            action, container_size, dump_location)
+        try:
+            conn.execute("""
+                INSERT INTO stops (
+                    route_id, stop_order, customer_name, address, city, state, zip_code,
+                    action, container_size, dump_location,
+                    placement_note, relocate_to_address, relocate_to_city,
+                    return_destination, pr_mode,
+                    swap_with_prev_pull, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+            """, (route_id, last, customer_name, address, city, state, zip_code,
+                  action, container_size, dump_location,
+                  placement_note, relocate_to_addr, relocate_to_city,
+                  return_destination, pr_mode,
+                  swap_flag, now_ts()))
+            added += 1
+            upsert_saved_address(conn, cid(),
+                customer_name, address, city, state, zip_code,
+                action, container_size, dump_location)
+        except Exception as exc:
+            app.logger.warning("add_parsed_stops: insert failed for stop %d: %s", last, exc)
+            last -= 1  # reclaim the order slot so next stop doesn't skip a number
 
     if added:
         conn.commit()
-        compute_can_flow(conn, route_id)
-        conn.commit()
+        try:
+            compute_can_flow(conn, route_id)
+            conn.commit()
+        except Exception as exc:
+            app.logger.warning("add_parsed_stops: compute_can_flow error: %s", exc)
 
     conn.close()
     return jsonify({"added": added})
