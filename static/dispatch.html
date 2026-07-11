@@ -222,7 +222,7 @@ import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged }
 import { getFirestore, collection, doc, addDoc, updateDoc, onSnapshot,
          query, where, orderBy, serverTimestamp, getDoc, Timestamp }
                                 from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
-import { firebaseConfig, COMPANY_ID } from './firebase-config.js';
+import { firebaseConfig, COMPANY_ID } from '/static/firebase-config.js';
 
 const fbApp = initializeApp(firebaseConfig);
 const auth  = getAuth(fbApp);
