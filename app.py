@@ -3404,6 +3404,7 @@ def shell_page(title, body, extra_head=""):
     {driver_hours}
     {co_settings}
     {subscription}
+    {live_dispatch}
 """.format(
     boss_panel=nav_link(url_for("boss_dashboard"), "📊 Boss Panel", path),
     orders=nav_link(url_for("orders_page"), "🧾 Orders", path),
@@ -3413,6 +3414,7 @@ def shell_page(title, body, extra_head=""):
     driver_hours=nav_link(url_for("driver_hours_page"), "⏱ Driver Hours", path),
     co_settings=nav_link(url_for("company_settings"), "⚙ Company Settings", path),
     subscription=nav_link(url_for("company_subscription"), "💳 Subscription", path),
+    live_dispatch=nav_link('/dispatch', '🚛 Live Dispatch', path),
 )
 
         superadmin_link = nav_link(url_for("superadmin_panel"), "🔧 Superadmin", path) \
