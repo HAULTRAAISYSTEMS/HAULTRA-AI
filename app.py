@@ -1,6 +1,6 @@
 from flask import (
     Flask, request, redirect, url_for, session, flash,
-    render_template_string, send_file, abort, jsonify
+    render_template_string, send_file, send_from_directory, abort, jsonify
 )
 import sqlite3
 import os
@@ -13024,6 +13024,25 @@ def debug_db():
 # =========================================================
 # STARTUP — initialize DB before gunicorn serves any request
 # =========================================================
+
+# =========================================================
+# DISPATCH ROUTES — Firebase live dispatch feature
+# =========================================================
+@app.route('/dispatch')
+def dispatch_view():
+    return send_from_directory('static', 'dispatch.html')
+
+@app.route('/route')
+def route_view():
+    return send_from_directory('static', 'route.html')
+
+@app.route('/service-worker.js')
+def service_worker():
+    response = send_from_directory('static', 'service-worker.js')
+    response.headers['Service-Worker-Allowed'] = '/'
+    return response
+
+
 init_db()
 print("Startup complete. DATABASE_PATH =", DATABASE, flush=True)
 
