@@ -1,0 +1,49 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper: is the requester the company owner?
+    function isOwner(companyId) {
+      return request.auth != null &&
+        get(/databases/$(database)/documents/companies/$(companyId)).data.ownerUid == request.auth.uid;
+    }
+
+    // Helper: is the requester an active driver in this company?
+    function isDriver(companyId) {
+      return request.auth != null &&
+        exists(/databases/$(database)/documents/companies/$(companyId)/drivers/$(request.auth.uid));
+    }
+
+    // Companies collection
+    match /companies/{companyId} {
+      allow read: if isOwner(companyId) || isDriver(companyId);
+      allow write: if isOwner(companyId);
+
+      // Drivers subcollection
+      match /drivers/{driverUid} {
+        allow read: if isOwner(companyId) || request.auth.uid == driverUid;
+        allow write: if isOwner(companyId);
+        // Driver can update their own fcmToken and lastSeen only
+        allow update: if request.auth.uid == driverUid &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['fcmToken', 'lastSeen']);
+      }
+
+      // Stops subcollection
+      match /stops/{stopId} {
+        // Owner can read/write everything
+        allow read, write: if isOwner(companyId);
+
+        // Driver: can only read their own stops
+        allow read: if isDriver(companyId) &&
+          resource.data.driverUid == request.auth.uid;
+
+        // Driver: can only update status + statusHistory (pending->accepted->in_progress->done)
+        allow update: if isDriver(companyId) &&
+          resource.data.driverUid == request.auth.uid &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'statusHistory', 'updatedAt']) &&
+          request.resource.data.status in ['accepted', 'in_progress', 'done'] &&
+          resource.data.status != 'cancelled';
+      }
+    }
+  }
+}
