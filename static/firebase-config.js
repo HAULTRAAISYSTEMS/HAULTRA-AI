@@ -1,21 +1,17 @@
-// firebase-config.js
-// TODO: Replace these placeholder values with your actual Firebase project config.
-// Get them from: Firebase Console → Project Settings → Your Apps → Web App → Config
+// firebase-config.js — HAULTRA Dispatch Firebase Configuration
 
 export const firebaseConfig = {
-  apiKey: "YOUR_API_KEY",
-  authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
-  projectId: "YOUR_PROJECT_ID",
-  storageBucket: "YOUR_PROJECT_ID.appspot.com",
-  messagingSenderId: "YOUR_SENDER_ID",
-  appId: "YOUR_APP_ID",
-  measurementId: "YOUR_MEASUREMENT_ID"
+  apiKey: "AIzaSyBAWm08bVHH5uia21H5VPd1mAW0Ei0MnV4",
+  authDomain: "haultra-dispatch.firebaseapp.com",
+  projectId: "haultra-dispatch",
+  storageBucket: "haultra-dispatch.firebasestorage.app",
+  messagingSenderId: "66096047367",
+  appId: "1:66096047367:web:a7a3da473ba9d0bf5b51a2",
+  measurementId: "G-4SGZVSD07X"
 };
 
-// Your VAPID key for FCM Web Push
-// Get from: Firebase Console → Project Settings → Cloud Messaging → Web Push Certificates
-export const VAPID_KEY = "YOUR_VAPID_KEY";
+// VAPID key for FCM Web Push notifications
+export const VAPID_KEY = "BLrT9eGjQ6txVegBkgQthXk4LhujoQyMCKTg-62-WOMzhrposzRCT0vTgxRrzTOmd-KBIeQdIWG1YQ-yQYGdvFw";
 
-// Your company ID in Firestore (set after creating the company document)
-// This is a fixed value per deployment — one company per hosted instance
-export const COMPANY_ID = "YOUR_COMPANY_ID";
+// Company ID in Firestore (document ID under companies/)
+export const COMPANY_ID = "haultra";
