@@ -13037,7 +13037,7 @@ def route_view():
     return send_from_directory('static', 'route.html')
 
 @app.route('/service-worker.js')
-def service_worker():
+def service_worker_file():
     response = send_from_directory('static', 'service-worker.js')
     response.headers['Service-Worker-Allowed'] = '/'
     return response
