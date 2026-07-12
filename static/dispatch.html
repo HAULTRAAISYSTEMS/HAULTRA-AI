@@ -3,31 +3,38 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="theme-color" content="#1a1a2e">
+  <meta name="theme-color" content="#121212">
   <title>HAULTRA Dispatch</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/haultra-theme.css">
   <style>
     /* === RESET & BASE === */
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
-      --bg: #0d0d1a;
-      --surface: #1a1a2e;
-      --surface2: #252540;
-      --accent: #00c8ff;
-      --accent2: #7c3aed;
-      --text: #f0f0ff;
-      --text-muted: #9090b0;
-      --success: #22c55e;
-      --warning: #f59e0b;
-      --danger: #ef4444;
-      --pending: #6366f1;
-      --accepted: #3b82f6;
-      --in-progress: #f59e0b;
-      --done: #22c55e;
-      --cancelled: #6b7280;
+      --bg: #121212;
+      --surface: #171717;
+      --surface2: #1A1A1A;
+      /* "accent" here is the app's primary (safety orange) — this board uses a
+         local regex preview, not the Anthropic-backed parser, so it is not
+         AI-touched and must not be teal. */
+      --accent: #FF6B1A;
+      --accent2: #FF8A42;
+      --text: #F5F5F0;
+      --text-muted: #78786F;
+      --success: #3DDC84;
+      --warning: #FF9D5C;
+      --danger: #FF5252;
+      --pending: #8CA0B3;
+      --accepted: #C97A3D;
+      --in-progress: #FF6B1A;
+      --done: #3DDC84;
+      --cancelled: #6B6B62;
       --radius: 12px;
       --radius-sm: 8px;
     }
-    html, body { height: 100%; font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); }
+    html, body { height: 100%; font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color: var(--text); }
     body { display: flex; flex-direction: column; }
     #login-screen {
       display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -35,14 +42,14 @@
     }
     .login-card {
       background: var(--surface); border-radius: var(--radius); padding: 32px;
-      width: 100%; max-width: 400px; box-shadow: 0 8px 32px rgba(0,0,255,0.15);
+      width: 100%; max-width: 400px; box-shadow: 0 8px 32px rgba(255,107,26,0.12);
     }
-    .login-card h1 { font-size: 1.8rem; margin-bottom: 8px; color: var(--accent); }
+    .login-card h1 { font-family: 'Bebas Neue', 'Anton', sans-serif; font-size: 2.6rem; letter-spacing: 2px; margin-bottom: 8px; color: var(--text); }
     .login-card p { color: var(--text-muted); margin-bottom: 24px; }
     .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
     .field label { font-size: 0.85rem; color: var(--text-muted); }
     .field input {
-      padding: 14px 16px; background: var(--surface2); border: 1px solid #333355;
+      padding: 14px 16px; background: var(--surface2); border: 1px solid #2A2A2A;
       border-radius: var(--radius-sm); color: var(--text); font-size: 1rem;
       min-height: 48px; outline: none; transition: border-color 0.2s;
     }
@@ -54,7 +61,7 @@
       text-decoration: none; width: 100%;
     }
     .btn:active { transform: scale(0.97); }
-    .btn-primary { background: var(--accent); color: #000; }
+    .btn-primary { background: var(--accent); color: #1A1000; }
     .btn-danger { background: var(--danger); color: #fff; }
     .btn-sm { padding: 8px 14px; min-height: 36px; font-size: 0.85rem; width: auto; }
     .error-msg { color: var(--danger); font-size: 0.85rem; margin-top: 8px; min-height: 20px; }
@@ -62,9 +69,9 @@
     .topbar {
       display: flex; align-items: center; justify-content: space-between;
       padding: 12px 16px; background: var(--surface);
-      border-bottom: 1px solid #252540; flex-shrink: 0;
+      border-bottom: 1px solid #242424; flex-shrink: 0;
     }
-    .topbar h1 { font-size: 1.2rem; color: var(--accent); letter-spacing: 1px; }
+    .topbar h1 { font-family: 'Bebas Neue', 'Anton', sans-serif; font-size: 1.6rem; color: var(--text); letter-spacing: 2px; }
     .topbar-right { display: flex; align-items: center; gap: 12px; }
     .user-chip {
       font-size: 0.8rem; color: var(--text-muted); background: var(--surface2);
@@ -73,7 +80,7 @@
     .main-layout { display: flex; flex: 1; overflow: hidden; }
     .driver-sidebar {
       width: 220px; flex-shrink: 0; background: var(--surface);
-      border-right: 1px solid #252540; overflow-y: auto; padding: 16px 12px;
+      border-right: 1px solid #242424; overflow-y: auto; padding: 16px 12px;
     }
     .driver-sidebar h2 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 12px; }
     .driver-btn {
@@ -89,18 +96,18 @@
     .dot-idle { background: var(--text-muted); }
     .dispatch-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
     .dispatch-input-area {
-      padding: 16px; background: var(--surface); border-bottom: 1px solid #252540; flex-shrink: 0;
+      padding: 16px; background: var(--surface); border-bottom: 1px solid #242424; flex-shrink: 0;
     }
     .dispatch-input-area h2 { font-size: 0.95rem; color: var(--text-muted); margin-bottom: 10px; }
     .dispatch-row { display: flex; gap: 10px; }
     .dispatch-row textarea {
-      flex: 1; padding: 12px; background: var(--surface2); border: 1px solid #333355;
+      flex: 1; padding: 12px; background: var(--surface2); border: 1px solid #2A2A2A;
       border-radius: var(--radius-sm); color: var(--text); font-size: 1rem; resize: vertical;
       min-height: 80px; outline: none; font-family: inherit;
     }
     .dispatch-row textarea:focus { border-color: var(--accent); }
     .dispatch-row .btn-send {
-      align-self: flex-end; background: var(--accent); color: #000; padding: 14px 20px;
+      align-self: flex-end; background: var(--accent); color: #1A1000; padding: 14px 20px;
       border-radius: var(--radius-sm); border: none; cursor: pointer; font-weight: 700;
       font-size: 1rem; min-height: 48px; white-space: nowrap; min-width: 80px;
     }
@@ -130,14 +137,14 @@
       color: var(--accent); border: 1px solid var(--accent);
     }
     .stop-info { flex: 1; }
-    .stop-address { font-weight: 600; font-size: 0.95rem; margin-bottom: 4px; }
+    .stop-address { font-family: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace; font-weight: 600; font-size: 0.9rem; margin-bottom: 4px; }
     .stop-meta { font-size: 0.8rem; color: var(--text-muted); display: flex; gap: 10px; flex-wrap: wrap; }
     .status-pill { padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; font-weight: 600; }
-    .pill-pending     { background: #312e81; color: #a5b4fc; }
-    .pill-accepted    { background: #1e3a5f; color: #93c5fd; }
-    .pill-in_progress { background: #451a03; color: #fcd34d; }
-    .pill-done        { background: #14532d; color: #86efac; }
-    .pill-cancelled   { background: #1f2937; color: #9ca3af; }
+    .pill-pending     { background: rgba(140,160,179,0.16); color: #ADC0D1; }
+    .pill-accepted    { background: rgba(201,122,61,0.20); color: #E0A876; }
+    .pill-in_progress { background: rgba(255,107,26,0.16); color: #FF9D5C; }
+    .pill-done        { background: rgba(61,220,132,0.16); color: #3DDC84; }
+    .pill-cancelled   { background: rgba(107,107,98,0.20); color: #A6A69E; }
     .cancel-btn {
       background: none; border: 1px solid var(--danger); color: var(--danger);
       padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 0.8rem;
@@ -149,7 +156,7 @@
     .driver-group-header {
       font-size: 0.8rem; text-transform: uppercase; letter-spacing: 1px;
       color: var(--text-muted); margin-bottom: 8px; padding-bottom: 4px;
-      border-bottom: 1px solid #252540;
+      border-bottom: 1px solid #242424;
     }
     .empty-state { text-align: center; color: var(--text-muted); padding: 48px 24px; }
     .empty-state .icon { font-size: 3rem; margin-bottom: 12px; }
@@ -178,7 +185,7 @@
 </div>
 <div id="app">
   <div class="topbar">
-    <a href="/" style="color:var(--text-muted);text-decoration:none;font-size:0.85rem;letter-spacing:0.5px;display:flex;align-items:center;gap:4px;padding:6px 10px;border-radius:6px;border:1px solid #333355;transition:background 0.15s;" onmouseover="this.style.background='var(--surface2)'" onmouseout="this.style.background=''">&#8592; App</a><h1>HAULTRA DISPATCH</h1>
+    <a href="/" style="color:var(--text-muted);text-decoration:none;font-size:0.85rem;letter-spacing:0.5px;display:flex;align-items:center;gap:4px;padding:6px 10px;border-radius:6px;border:1px solid #2A2A2A;transition:background 0.15s;" onmouseover="this.style.background='var(--surface2)'" onmouseout="this.style.background=''">&#8592; App</a><h1>HAULTRA DISPATCH</h1>
     <div class="topbar-right">
       <span class="user-chip" id="user-chip">Loading...</span>
       <button class="btn btn-danger btn-sm" onclick="doLogout()">Logout</button>
