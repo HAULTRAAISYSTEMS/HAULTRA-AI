@@ -1,0 +1,91 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   HAULTRA DESIGN SYSTEM — shared tokens
+   Source of truth for the palette introduced on /parser, now applied
+   app-wide. Loaded by shell_page() and by every standalone page
+   (parser.html, dispatch.html, route.html, login).
+
+   Rules:
+   - Dark mode only. Backgrounds #121212–#1A1A1A, off-white text #F5F5F0.
+   - --orange (#FF6B1A) = primary / commit actions + key stats.
+   - --teal (#00E5CC) = AI-touched elements ONLY (Ask HAULTRA AI, AI Parser
+     nav link, AI-parsed content). Never used for anything else.
+   - --red = urgent / overdue / errors only.
+   - --slate = drop/swap badges + other neutral status (the only place
+     "blue" survives in this app).
+   - --green = success / completed only.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+:root {
+  --bg-0: #121212;
+  --bg-1: #171717;
+  --bg-2: #1A1A1A;
+
+  --text: #F5F5F0;
+  --text-dim: #A6A69E;
+  --text-faint: #78786F;
+
+  --orange: #FF6B1A;
+  --orange-dim: rgba(255, 107, 26, 0.14);
+  --orange-border: rgba(255, 107, 26, 0.55);
+
+  --teal: #00E5CC;
+  --teal-dim: rgba(0, 229, 204, 0.10);
+  --teal-border: rgba(0, 229, 204, 0.45);
+
+  --red: #FF5252;
+  --red-dim: rgba(255, 82, 82, 0.14);
+
+  --green: #3DDC84;
+  --green-dim: rgba(61, 220, 132, 0.14);
+
+  --slate: #8CA0B3;
+  --slate-dim: rgba(140, 160, 179, 0.16);
+  --slate-border: rgba(140, 160, 179, 0.45);
+
+  --radius: 14px;
+  --radius-sm: 9px;
+
+  --font-head: 'Bebas Neue', 'Anton', sans-serif;
+  --font-body: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+}
+
+/* ── Utility classes available to any page that loads this stylesheet ── */
+.haultra-headline { font-family: var(--font-head); letter-spacing: 1px; }
+.haultra-mono      { font-family: var(--font-mono); }
+
+/* AI-touched elements — teal is reserved for these */
+.haultra-ai-accent { color: var(--teal); }
+
+/* ── Sidebar/nav: the AI Parser link is the one nav item allowed to be teal ── */
+.nav-item[href="/parser"] {
+  color: var(--teal);
+}
+.nav-item[href="/parser"]:hover {
+  background: var(--teal-dim);
+  border-color: var(--teal-border);
+  color: var(--teal);
+}
+.nav-item[href="/parser"].active {
+  background: var(--teal-dim);
+  border-color: var(--teal-border);
+  color: var(--teal);
+}
+.nav-item[href="/parser"].active::before {
+  background: var(--teal);
+  box-shadow: 0 0 8px var(--teal);
+}
+
+/* ── Drop/swap badges — the one place "blue" survives, as slate ── */
+.badge-dropswap, .action-badge.dropswap {
+  background: var(--slate-dim);
+  border: 1px solid var(--slate-border);
+  color: var(--slate);
+}
+.action-badge.pickup {
+  background: var(--orange-dim);
+  border: 1px solid var(--orange-border);
+  color: var(--orange);
+}
