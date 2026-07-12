@@ -13,6 +13,8 @@ services:
         value: haultra.db
       - key: UPLOAD_FOLDER
         value: static/uploads
+      - key: NEBIUS_API_KEY
+        sync: false   # set manually in Render dashboard — never commit the value
     disk:
       name: haultra-data
       mountPath: /opt/render/project/src

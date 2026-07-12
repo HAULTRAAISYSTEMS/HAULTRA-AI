@@ -600,7 +600,7 @@ def get_csrf_token():
 
 
 # Endpoints that legitimately receive POST from external servers (no session/CSRF)
-_CSRF_EXEMPT_ENDPOINTS = {"stripe_webhook"}
+_CSRF_EXEMPT_ENDPOINTS = {"stripe_webhook", "api_ask"}
 
 @app.before_request
 def csrf_protect():
@@ -4770,6 +4770,113 @@ tr.status-in-progress td {{ background: rgba(255,140,0,0.03); }}
 </script>
 
 <script>{_ABBREV_EXPAND_JS}</script>
+
+<!-- ===== ASK HAULTRA AI FAB ===== -->
+<button id="ask-fab" onclick="openAsk()" title="Ask HAULTRA AI (Ctrl+K)" style="
+  position:fixed; bottom:24px; left:50%; transform:translateX(-50%);
+  padding:12px 28px; border-radius:30px;
+  background:linear-gradient(135deg,#00ccff,#0077bb);
+  border:none; cursor:pointer;
+  box-shadow:0 4px 20px rgba(0,204,255,0.4);
+  z-index:9998; color:#fff; font-size:15px; font-weight:700;
+  letter-spacing:.5px; white-space:nowrap;
+  transition:box-shadow .2s, bottom .2s;
+" onmouseover="this.style.boxShadow='0 6px 28px rgba(0,204,255,0.7)';this.style.bottom='28px'"
+   onmouseout="this.style.boxShadow='0 4px 20px rgba(0,204,255,0.4)';this.style.bottom='24px'">
+  🚛 Ask HAULTRA AI
+</button>
+
+<div id="ask-overlay" onclick="closeAsk()" style="
+  display:none; position:fixed; inset:0;
+  background:rgba(0,0,0,0.7); z-index:9999;"></div>
+
+<div id="ask-modal" style="
+  display:none; position:fixed; left:50%; top:50%;
+  transform:translate(-50%,-50%);
+  width:min(680px,92vw); max-height:80vh;
+  background:#02060f; border:1px solid rgba(0,200,255,0.22);
+  border-radius:16px; padding:28px 30px 24px;
+  box-shadow:0 20px 60px rgba(0,0,0,0.8);
+  z-index:10000; flex-direction:column; gap:16px;">
+
+  <div style="display:flex;align-items:center;justify-content:space-between;">
+    <span style="color:#00ccff;font-size:17px;font-weight:800;letter-spacing:.5px;">🚛 Ask HAULTRA AI</span>
+    <button onclick="closeAsk()" style="background:none;border:none;color:#3d5a74;cursor:pointer;font-size:22px;line-height:1;padding:2px 6px;" title="Close (Esc)">&times;</button>
+  </div>
+
+  <div style="display:flex;gap:10px;">
+    <input id="ask-input" type="text"
+      placeholder="Ask about routes, drivers, loads, billing, dispatch…"
+      onkeydown="if(event.key==='Enter')submitAsk()"
+      style="flex:1;background:#040b18;border:1px solid rgba(0,180,255,0.18);border-radius:10px;
+             color:#e8f2ff;font-size:14px;padding:11px 16px;outline:none;" />
+    <button onclick="submitAsk()" id="ask-send-btn" style="
+      background:linear-gradient(135deg,#00ccff,#0077bb);border:none;
+      border-radius:10px;color:#fff;font-size:14px;font-weight:700;
+      cursor:pointer;padding:11px 22px;white-space:nowrap;">Send</button>
+  </div>
+
+  <div id="ask-answer" style="
+    display:none;background:#040b18;border:1px solid rgba(0,180,255,0.12);
+    border-radius:10px;padding:16px;color:#c0d8f0;font-size:14px;
+    line-height:1.7;max-height:45vh;overflow-y:auto;white-space:pre-wrap;"></div>
+
+  <div id="ask-spinner" style="display:none;text-align:center;color:#3d5a74;font-size:13px;">
+    ⏳ Thinking…
+  </div>
+</div>
+
+<script>
+(function(){{
+  function openAsk(){{
+    document.getElementById('ask-overlay').style.display='block';
+    var m=document.getElementById('ask-modal');
+    m.style.display='flex';
+    document.getElementById('ask-input').value='';
+    document.getElementById('ask-answer').style.display='none';
+    document.getElementById('ask-spinner').style.display='none';
+    document.getElementById('ask-send-btn').disabled=false;
+    setTimeout(function(){{document.getElementById('ask-input').focus();}},60);
+  }}
+  function closeAsk(){{
+    document.getElementById('ask-overlay').style.display='none';
+    document.getElementById('ask-modal').style.display='none';
+  }}
+  function submitAsk(){{
+    var q=(document.getElementById('ask-input').value||'').trim();
+    if(!q)return;
+    document.getElementById('ask-answer').style.display='none';
+    document.getElementById('ask-spinner').style.display='block';
+    document.getElementById('ask-send-btn').disabled=true;
+    var csrf=document.querySelector('meta[name="csrf-token"]');
+    var headers={{'Content-Type':'application/json'}};
+    if(csrf)headers['X-CSRFToken']=csrf.getAttribute('content');
+    fetch('/api/ask',{{method:'POST',headers:headers,body:JSON.stringify({{question:q}})}})
+    .then(function(r){{return r.json();}})
+    .then(function(d){{
+      document.getElementById('ask-spinner').style.display='none';
+      document.getElementById('ask-send-btn').disabled=false;
+      var box=document.getElementById('ask-answer');
+      box.textContent=d.answer||d.error||'No response.';
+      box.style.display='block';
+    }})
+    .catch(function(err){{
+      document.getElementById('ask-spinner').style.display='none';
+      document.getElementById('ask-send-btn').disabled=false;
+      var box=document.getElementById('ask-answer');
+      box.textContent='Error: '+err.message;
+      box.style.display='block';
+    }});
+  }}
+  window.openAsk=openAsk;
+  window.closeAsk=closeAsk;
+  window.submitAsk=submitAsk;
+  document.addEventListener('keydown',function(e){{
+    if((e.ctrlKey||e.metaKey)&&e.key==='k'){{e.preventDefault();openAsk();}}
+    if(e.key==='Escape'){{closeAsk();}}
+  }});
+}})();
+</script>
 
     </body>
     </html>
@@ -10230,6 +10337,70 @@ def ai_dispatch():
     """
 
     return render_template_string(shell_page("AI Dispatch", body))
+
+
+# =========================================================
+# ASK HAULTRA AI — LLM chat endpoint
+# =========================================================
+@app.route("/api/ask", methods=["POST"])
+@login_required
+def api_ask():
+    import os as _os
+    try:
+        from openai import OpenAI as _OAI
+    except ImportError:
+        return jsonify({"error": "AI package not installed. Add openai to requirements.txt."}), 500
+
+    data = request.get_json(force=True, silent=True) or {}
+    question = (data.get("question") or "").strip()
+    if not question:
+        return jsonify({"answer": "No question provided."}), 400
+
+    system_prompt = (
+        "You are HAULTRA AI — the intelligent dispatch and operations assistant for HAULTRA AI DISPATCH SYSTEMS, "
+        "a roll-off trucking and waste hauling business management platform.\n\n"
+        "You have deep expertise in:\n"
+        "- Roll-off container dispatch and routing\n"
+        "- Driver management, hours-of-service (HOS) rules, clock-in/out\n"
+        "- Dump locations, landfill fees, and waste disposal logistics\n"
+        "- Load scoring and profitability analysis (payout, miles, estimated profit)\n"
+        "- Customer orders, billing, and invoicing for hauling jobs\n"
+        "- Route optimization and stop sequencing\n"
+        "- DOT compliance, FMCSA regulations, and trucking safety\n"
+        "- Fuel costs, deadhead miles, and margin calculations\n"
+        "- Fleet maintenance scheduling and container tracking\n\n"
+        "HOW TO RESPOND:\n"
+        "- Be direct, specific, and actionable. Operators are busy — no fluff.\n"
+        "- For dispatch questions, give concrete guidance (stop sequences, timing, driver assignments).\n"
+        "- For billing/pricing questions, give specific numbers and formulas when possible.\n"
+        "- For compliance questions (HOS, DOT, FMCSA), cite the actual rule.\n"
+        "- For profit/load scoring, walk through the math.\n"
+        "- If you don't know something specific to this company's data, say so clearly and give general best-practice guidance.\n"
+        "- Keep responses concise but complete. Use line breaks for readability."
+    )
+
+    api_key = _os.environ.get("NEBIUS_API_KEY")
+    if not api_key:
+        return jsonify({"error": "NEBIUS_API_KEY not configured on server."}), 500
+
+    try:
+        client = _OAI(
+            base_url="https://api.tokenfactory.nebius.com/v1/",
+            api_key=api_key
+        )
+        resp = client.chat.completions.create(
+            model="meta-llama/Llama-3.3-70B-Instruct",
+            max_tokens=700,
+            temperature=0.3,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": question}
+            ]
+        )
+        answer = resp.choices[0].message.content.strip()
+        return jsonify({"answer": answer})
+    except Exception as ex:
+        return jsonify({"error": f"AI error: {str(ex)}"}), 500
 
 
 # =========================================================
