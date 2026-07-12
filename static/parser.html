@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#121212">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>HAULTRA — AI Route Parser</title>
+<link rel="manifest" href="/static/manifest.json">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg-0: #121212;
+    --bg-1: #171717;
+    --bg-2: #1A1A1A;
+    --text: #F5F5F0;
+    --text-dim: #A6A69E;
+    --text-faint: #78786F;
+    --orange: #FF6B1A;
+    --orange-dim: rgba(255, 107, 26, 0.14);
+    --orange-border: rgba(255, 107, 26, 0.55);
+    --teal: #00E5CC;
+    --teal-dim: rgba(0, 229, 204, 0.10);
+    --teal-border: rgba(0, 229, 204, 0.45);
+    --red: #FF5252;
+    --red-dim: rgba(255, 82, 82, 0.14);
+    --green: #3DDC84;
+    --slate: #8CA0B3;
+    --slate-dim: rgba(140, 160, 179, 0.16);
+    --slate-border: rgba(140, 160, 179, 0.45);
+    --radius: 14px;
+    --radius-sm: 9px;
+    --font-head: 'Bebas Neue', 'Anton', sans-serif;
+    --font-body: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --font-mono: 'JetBrains Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  }
+
+  html { -webkit-text-size-adjust: 100%; }
+  html, body { background: var(--bg-0); color: var(--text); min-height: 100vh; }
+  body {
+    font-family: var(--font-body);
+    padding-bottom: 92px;
+  }
+
+  a { color: var(--teal); }
+
+  .topbar {
+    position: sticky; top: 0; z-index: 90;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 18px;
+    background: var(--bg-1);
+    border-bottom: 1px solid rgba(255,255,255,0.07);
+  }
+  .back-link {
+    color: var(--text-dim); text-decoration: none; font-size: 0.85rem; font-weight: 600;
+    min-height: 48px; display: flex; align-items: center;
+  }
+  .back-link:hover { color: var(--text); }
+  .page-title {
+    font-family: var(--font-head);
+    font-size: 1.6rem;
+    letter-spacing: 1.5px;
+    color: var(--text);
+  }
+  .page-title .accent { color: var(--teal); }
+
+  .error-banner {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    margin: 14px 18px 0;
+    padding: 12px 16px;
+    background: var(--red-dim);
+    border: 1px solid var(--red);
+    color: #FFD9D9;
+    border-radius: var(--radius-sm);
+    font-size: 0.9rem;
+    font-weight: 500;
+  }
+  .error-banner[hidden] { display: none; }
+  .error-banner button {
+    background: none; border: none; color: #FFD9D9; font-size: 1.1rem;
+    cursor: pointer; min-width: 32px; min-height: 32px; line-height: 1;
+  }
+
+  .toast {
+    position: fixed; left: 50%; bottom: 108px; transform: translateX(-50%);
+    background: var(--bg-2); border: 1px solid var(--green); color: var(--green);
+    padding: 12px 20px; border-radius: var(--radius-sm); font-weight: 600; font-size: 0.9rem;
+    z-index: 200; box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    opacity: 0; pointer-events: none; transition: opacity 0.25s ease;
+  }
+  .toast.show { opacity: 1; }
+
+  .layout {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 18px;
+    padding: 18px;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+  @media (min-width: 900px) {
+    .layout { grid-template-columns: 1fr 1fr; align-items: start; }
+  }
+
+  .col {
+    background: var(--bg-1);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: var(--radius);
+    padding: 16px;
+  }
+  @media (min-width: 900px) {
+    .col { position: sticky; top: 76px; }
+    .col-output { max-height: calc(100vh - 96px); overflow-y: auto; }
+  }
+
+  .col-header {
+    font-family: var(--font-head);
+    font-size: 1.05rem;
+    letter-spacing: 1.5px;
+    color: var(--text-dim);
+    margin-bottom: 12px;
+  }
+  .col-header-row {
+    display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;
+    margin-bottom: 12px;
+  }
+  .stop-count {
+    font-family: var(--font-body);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+    background: rgba(255,255,255,0.05);
+    border-radius: 20px;
+    padding: 3px 10px;
+    margin-left: 8px;
+    vertical-align: middle;
+  }
+
+  .raw-textarea {
+    width: 100%;
+    min-height: 260px;
+    resize: vertical;
+    background: var(--bg-0);
+    border: 1px solid rgba(255,255,255,0.10);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 0.88rem;
+    line-height: 1.55;
+    padding: 14px;
+    outline: none;
+  }
+  .raw-textarea:focus { border-color: var(--teal-border); }
+
+  .btn {
+    font-family: var(--font-body);
+    font-weight: 700;
+    font-size: 0.92rem;
+    border-radius: var(--radius-sm);
+    min-height: 48px;
+    padding: 0 18px;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: opacity 0.15s, transform 0.08s, background 0.15s;
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  }
+  .btn:active { transform: scale(0.98); }
+  .btn:disabled { cursor: not-allowed; opacity: 0.55; }
+
+  .btn-teal-outline {
+    background: var(--teal-dim);
+    border-color: var(--teal-border);
+    color: var(--teal);
+    width: 100%;
+    margin-top: 12px;
+  }
+  .btn-teal-outline:hover:not(:disabled) { background: rgba(0,229,204,0.18); }
+
+  .btn-secondary {
+    background: transparent;
+    border-color: rgba(255,255,255,0.15);
+    color: var(--text-dim);
+  }
+  .btn-secondary:hover { color: var(--text); border-color: rgba(255,255,255,0.3); }
+  .btn-secondary.active {
+    color: var(--teal);
+    border-color: var(--teal-border);
+    background: var(--teal-dim);
+  }
+
+  .btn-orange-outline {
+    background: transparent;
+    border-color: var(--orange-border);
+    color: var(--orange);
+  }
+  .btn-orange-solid {
+    background: var(--orange);
+    border-color: var(--orange);
+    color: #1A1000;
+  }
+  .btn-orange-solid:hover:not(:disabled) { background: #ff7a2e; }
+
+  .flag-pill {
+    background: var(--orange-dim);
+    border: 1px solid var(--orange-border);
+    color: var(--orange);
+    font-size: 0.78rem;
+    font-weight: 700;
+    border-radius: 20px;
+    padding: 6px 12px;
+    cursor: pointer;
+    min-height: 32px;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .flag-pill[hidden] { display: none; }
+  .flag-pill:hover { background: rgba(255,107,26,0.24); }
+
+  .empty-state {
+    color: var(--text-faint);
+    font-size: 0.9rem;
+    padding: 28px 12px;
+    text-align: center;
+    line-height: 1.6;
+  }
+
+  .stop-cards { display: flex; flex-direction: column; gap: 12px; }
+
+  .stop-card {
+    background: var(--bg-0);
+    border: 2px solid var(--teal-border);
+    border-radius: var(--radius);
+    padding: 14px;
+    scroll-margin-top: 90px;
+  }
+  .stop-card.flagged {
+    border-color: var(--orange);
+    box-shadow: inset 0 0 0 1px rgba(255,107,26,0.18);
+  }
+
+  .stop-card-top {
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 10px;
+    margin-bottom: 10px;
+  }
+  .ai-tag {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 0.68rem; font-weight: 800; letter-spacing: 0.8px;
+    color: var(--teal); text-transform: uppercase;
+  }
+  .review-tag {
+    font-size: 0.68rem; font-weight: 800; letter-spacing: 0.6px;
+    color: var(--orange); text-transform: uppercase;
+    background: var(--orange-dim); border-radius: 4px; padding: 2px 6px;
+  }
+
+  .stop-card-body { display: flex; gap: 12px; align-items: flex-start; }
+
+  .action-badge {
+    min-width: 48px; min-height: 48px;
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--font-head);
+    font-size: 1.25rem;
+    letter-spacing: 0.5px;
+    border-radius: 10px;
+    flex-shrink: 0;
+  }
+  .action-badge.pickup {
+    background: var(--orange-dim); color: var(--orange); border: 1px solid var(--orange-border);
+  }
+  .action-badge.dropswap {
+    background: var(--slate-dim); color: var(--slate); border: 1px solid var(--slate-border);
+  }
+
+  .stop-main { flex: 1; min-width: 0; }
+  .stop-address {
+    font-size: 1.18rem;
+    font-weight: 700;
+    line-height: 1.3;
+    word-break: break-word;
+  }
+  .stop-address input, .stop-container input, .stop-action select {
+    width: 100%;
+    background: var(--bg-1);
+    border: 1px solid rgba(255,255,255,0.15);
+    color: var(--text);
+    border-radius: 7px;
+    padding: 8px 10px;
+    font-family: var(--font-body);
+    font-size: 0.95rem;
+    min-height: 40px;
+  }
+  .stop-container {
+    font-size: 0.86rem;
+    color: var(--text-dim);
+    margin-top: 4px;
+  }
+  .stop-notes {
+    font-size: 0.82rem;
+    color: var(--text-faint);
+    margin-top: 6px;
+    font-style: italic;
+  }
+
+  .stop-raw {
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px dashed rgba(255,255,255,0.10);
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--text-faint);
+    word-break: break-word;
+  }
+  .stop-raw .lbl { color: var(--text-dim); font-weight: 600; }
+
+  .stop-card-actions {
+    margin-top: 12px;
+    display: flex; justify-content: flex-end;
+  }
+  .btn-mark-reviewed {
+    background: transparent;
+    border: 1px solid var(--orange-border);
+    color: var(--orange);
+    font-size: 0.8rem;
+    font-weight: 700;
+    border-radius: var(--radius-sm);
+    min-height: 40px;
+    padding: 0 14px;
+    cursor: pointer;
+  }
+  .btn-mark-reviewed:hover { background: var(--orange-dim); }
+
+  .bottom-bar {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 100;
+    display: flex; gap: 12px;
+    padding: 14px 18px;
+    background: var(--bg-2);
+    border-top: 1px solid rgba(255,255,255,0.08);
+  }
+  .bottom-bar .btn-secondary { flex: 0 0 auto; min-width: 120px; }
+  .bottom-bar #confirm-btn { flex: 1; }
+
+  @media (max-width: 480px) {
+    .page-title { font-size: 1.3rem; }
+    .stop-address { font-size: 1.05rem; }
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <a class="back-link" href="/">&larr; HAULTRA</a>
+  <div class="page-title"><span class="accent">✦</span> AI ROUTE PARSER</div>
+  <div style="width:70px;"></div>
+</div>
+
+<div id="error-banner" class="error-banner" role="alert" hidden>
+  <span id="error-banner-text"></span>
+  <button type="button" onclick="dismissError()" aria-label="Dismiss">&times;</button>
+</div>
+
+<main class="layout">
+  <section class="col col-input">
+    <div class="col-header">STEP 1 &middot; RAW DISPATCH TEXT</div>
+    <textarea id="raw-text" class="raw-textarea" placeholder="Paste dispatch text here... e.g.&#10;pull n return 4512 elm st 30yd&#10;drop empty 88 harbor rd 20&#10;swap 770 industrial pkwy 40yd"></textarea>
+    <button id="reparse-btn" class="btn btn-teal-outline" onclick="reparse()">✦ Re-parse with AI</button>
+  </section>
+
+  <section class="col col-output">
+    <div class="col-header-row">
+      <div class="col-header">STEP 2 &middot; AI-PARSED ROUTE<span id="stop-count-badge" class="stop-count">0 stops</span></div>
+      <button id="flag-pill" class="flag-pill" hidden onclick="scrollToFirstFlagged()">
+        &#9888; <span id="flag-count">0</span> need a look
+      </button>
+    </div>
+    <div id="stop-cards" class="stop-cards">
+      <div class="empty-state">Paste dispatch text on the left and click &ldquo;Re-parse with AI&rdquo; to build your route.</div>
+    </div>
+  </section>
+</main>
+
+<div class="bottom-bar">
+  <button id="edit-btn" class="btn btn-secondary" onclick="toggleEditMode()">Edit stops</button>
+  <button id="confirm-btn" class="btn btn-orange-outline" disabled onclick="confirmDispatch()">⚡ Confirm &amp; Dispatch 0 Stops</button>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  var ACTION_META = {
+    PR: { full: 'Pull & Return', group: 'pickup' },
+    P:  { full: 'Pickup',        group: 'pickup' },
+    D:  { full: 'Drop',          group: 'dropswap' },
+    S:  { full: 'Swap',          group: 'dropswap' },
+    R:  { full: 'Relocate',      group: 'dropswap' },
+  };
+  var ACTION_CODES = Object.keys(ACTION_META);
+
+  var currentStops = [];
+  var editMode = false;
+  var toastTimer = null;
+
+  function el(id) { return document.getElementById(id); }
+
+  function showError(msg) {
+    el('error-banner-text').textContent = msg;
+    el('error-banner').hidden = false;
+  }
+  window.dismissError = function () { el('error-banner').hidden = true; };
+
+  function showToast(msg) {
+    var t = el('toast');
+    t.textContent = msg;
+    t.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { t.classList.remove('show'); }, 3200);
+  }
+
+  function normalizeStop(raw, idx) {
+    var action = (raw && raw.action ? String(raw.action) : '').trim().toUpperCase();
+    if (ACTION_CODES.indexOf(action) === -1) action = action || 'P';
+    var confidence = (raw && raw.confidence === 'low') ? 'low' : 'high';
+    return {
+      id: 'stop-' + idx,
+      action: action,
+      address: (raw && raw.address) ? String(raw.address) : '',
+      container_size: (raw && raw.container_size) ? String(raw.container_size) : '',
+      raw: (raw && raw.raw) ? String(raw.raw) : '',
+      confidence: confidence,
+      notes: (raw && raw.notes) ? String(raw.notes) : '',
+      reviewed: false,
+    };
+  }
+
+  function reparse() {
+    var text = el('raw-text').value.trim();
+    var btn = el('reparse-btn');
+    var original = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Parsing...';
+    dismissError();
+
+    fetch('/api/parse', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: text }),
+    })
+      .then(function (r) {
+        return r.json().catch(function () { return null; }).then(function (data) {
+          return { ok: r.ok, data: data };
+        });
+      })
+      .then(function (res) {
+        if (!res.ok || !res.data || !Array.isArray(res.data.stops)) {
+          throw new Error((res.data && res.data.error) || 'Parser returned an unexpected response — try again.');
+        }
+        renderStopCards(res.data.stops);
+      })
+      .catch(function (err) {
+        showError(err.message || 'Network error — try again.');
+      })
+      .finally(function () {
+        btn.disabled = false;
+        btn.textContent = original;
+      });
+  }
+  window.reparse = reparse;
+
+  function renderStopCards(stops) {
+    currentStops = stops.map(normalizeStop);
+    renderAllCards();
+    updateCounts();
+  }
+  window.renderStopCards = renderStopCards;
+
+  function renderAllCards() {
+    var container = el('stop-cards');
+    container.innerHTML = '';
+    if (!currentStops.length) {
+      container.innerHTML = '<div class="empty-state">No stops detected. Check the dispatch text and re-parse.</div>';
+      return;
+    }
+    currentStops.forEach(function (stop) {
+      container.appendChild(buildCard(stop));
+    });
+  }
+
+  function buildCard(stop) {
+    var flagged = stop.confidence === 'low' && !stop.reviewed;
+    var card = document.createElement('div');
+    card.className = 'stop-card' + (flagged ? ' flagged' : '');
+    card.id = stop.id;
+
+    var meta = ACTION_META[stop.action] || ACTION_META.P;
+
+    var top = document.createElement('div');
+    top.className = 'stop-card-top';
+    var aiTag = document.createElement('span');
+    aiTag.className = 'ai-tag';
+    aiTag.textContent = '✦ AI PARSED';
+    top.appendChild(aiTag);
+    if (flagged) {
+      var reviewTag = document.createElement('span');
+      reviewTag.className = 'review-tag';
+      reviewTag.textContent = 'NEEDS REVIEW';
+      top.appendChild(reviewTag);
+    }
+    card.appendChild(top);
+
+    var body = document.createElement('div');
+    body.className = 'stop-card-body';
+
+    var badge = document.createElement('div');
+    badge.className = 'action-badge ' + meta.group;
+    badge.title = meta.full;
+    badge.textContent = stop.action;
+    body.appendChild(badge);
+
+    var main = document.createElement('div');
+    main.className = 'stop-main';
+
+    if (editMode) {
+      var actionSel = document.createElement('div');
+      actionSel.className = 'stop-action';
+      var sel = document.createElement('select');
+      ACTION_CODES.forEach(function (code) {
+        var opt = document.createElement('option');
+        opt.value = code;
+        opt.textContent = code + ' — ' + ACTION_META[code].full;
+        if (code === stop.action) opt.selected = true;
+        sel.appendChild(opt);
+      });
+      sel.addEventListener('change', function () {
+        stop.action = sel.value;
+        renderAllCards();
+      });
+      actionSel.appendChild(sel);
+      main.appendChild(actionSel);
+
+      var addrWrap = document.createElement('div');
+      addrWrap.className = 'stop-address';
+      addrWrap.style.marginTop = '8px';
+      var addrInput = document.createElement('input');
+      addrInput.type = 'text';
+      addrInput.value = stop.address;
+      addrInput.placeholder = 'Address';
+      addrInput.addEventListener('input', function () { stop.address = addrInput.value; });
+      addrWrap.appendChild(addrInput);
+      main.appendChild(addrWrap);
+
+      var contWrap = document.createElement('div');
+      contWrap.className = 'stop-container';
+      var contInput = document.createElement('input');
+      contInput.type = 'text';
+      contInput.value = stop.container_size;
+      contInput.placeholder = 'Container size (e.g. 30yd)';
+      contInput.addEventListener('input', function () { stop.container_size = contInput.value; });
+      contWrap.appendChild(contInput);
+      main.appendChild(contWrap);
+    } else {
+      var addr = document.createElement('div');
+      addr.className = 'stop-address';
+      addr.textContent = stop.address || '(no address detected)';
+      main.appendChild(addr);
+
+      if (stop.container_size) {
+        var cont = document.createElement('div');
+        cont.className = 'stop-container';
+        cont.textContent = stop.container_size;
+        main.appendChild(cont);
+      }
+    }
+
+    if (stop.notes) {
+      var notes = document.createElement('div');
+      notes.className = 'stop-notes';
+      notes.textContent = stop.notes;
+      main.appendChild(notes);
+    }
+
+    body.appendChild(main);
+    card.appendChild(body);
+
+    if (stop.raw) {
+      var rawEl = document.createElement('div');
+      rawEl.className = 'stop-raw';
+      var lbl = document.createElement('span');
+      lbl.className = 'lbl';
+      lbl.textContent = 'raw: ';
+      rawEl.appendChild(lbl);
+      rawEl.appendChild(document.createTextNode(stop.raw));
+      card.appendChild(rawEl);
+    }
+
+    if (flagged) {
+      var actions = document.createElement('div');
+      actions.className = 'stop-card-actions';
+      var markBtn = document.createElement('button');
+      markBtn.type = 'button';
+      markBtn.className = 'btn-mark-reviewed';
+      markBtn.textContent = 'Mark reviewed';
+      markBtn.addEventListener('click', function () { markReviewed(stop.id); });
+      actions.appendChild(markBtn);
+      card.appendChild(actions);
+    }
+
+    return card;
+  }
+
+  function markReviewed(id) {
+    var stop = currentStops.find(function (s) { return s.id === id; });
+    if (!stop) return;
+    stop.reviewed = true;
+    renderAllCards();
+    updateCounts();
+  }
+  window.markReviewed = markReviewed;
+
+  function updateCounts() {
+    var count = currentStops.length;
+    var flaggedUnreviewed = currentStops.filter(function (s) {
+      return s.confidence === 'low' && !s.reviewed;
+    }).length;
+
+    el('stop-count-badge').textContent = count + (count === 1 ? ' stop' : ' stops');
+
+    var pill = el('flag-pill');
+    if (flaggedUnreviewed > 0) {
+      el('flag-count').textContent = flaggedUnreviewed;
+      pill.hidden = false;
+    } else {
+      pill.hidden = true;
+    }
+
+    var confirmBtn = el('confirm-btn');
+    if (count === 0) {
+      confirmBtn.disabled = true;
+      confirmBtn.className = 'btn btn-orange-outline';
+      confirmBtn.textContent = '⚡ Confirm & Dispatch 0 Stops';
+    } else if (flaggedUnreviewed > 0) {
+      confirmBtn.disabled = true;
+      confirmBtn.className = 'btn btn-orange-outline';
+      confirmBtn.textContent = '⚠ Review ' + flaggedUnreviewed + ' Flagged Stop' + (flaggedUnreviewed === 1 ? '' : 's');
+    } else {
+      confirmBtn.disabled = false;
+      confirmBtn.className = 'btn btn-orange-solid';
+      confirmBtn.textContent = '⚡ Confirm & Dispatch ' + count + ' Stop' + (count === 1 ? '' : 's');
+    }
+  }
+
+  function scrollToFirstFlagged() {
+    var card = document.querySelector('.stop-card.flagged');
+    if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+  window.scrollToFirstFlagged = scrollToFirstFlagged;
+
+  function toggleEditMode() {
+    editMode = !editMode;
+    el('edit-btn').classList.toggle('active', editMode);
+    el('edit-btn').textContent = editMode ? 'Done editing' : 'Edit stops';
+    renderAllCards();
+  }
+  window.toggleEditMode = toggleEditMode;
+
+  function confirmDispatch() {
+    if (el('confirm-btn').disabled) return;
+    showToast('✓ ' + currentStops.length + ' stop' + (currentStops.length === 1 ? '' : 's') + ' dispatched');
+  }
+  window.confirmDispatch = confirmDispatch;
+})();
+</script>
+</body>
+</html>
