@@ -1,6 +1,6 @@
 from flask import (
     Flask, request, redirect, url_for, session, flash,
-    render_template_string, send_file, abort, jsonify
+    render_template_string, send_file, send_from_directory, abort, jsonify
 )
 import sqlite3
 import os
@@ -239,12 +239,30 @@ def parse_route_text(text, conn, company_id):
     results      = []
     use_for_next = False  # carries swap-trigger past non-PR stops until consumed
 
-    for raw in text.splitlines():
-        raw = raw.strip()
-        if not raw:
+    input_lines = [l.strip() for l in text.splitlines() if l.strip()]
+    print(f"[PARSER] Input lines: {len(input_lines)}", flush=True)
+
+    for raw in input_lines:
+        raw_lo = raw.lower()
+
+        # ── Annotation lines: attach to previous stop as notes, set swap trigger ──
+        if _ANNOTATION_LINE_RE.match(raw) or _PENDING_EMPTY_RE.search(raw_lo):
+            if results:
+                prev_notes = results[-1].get("notes") or ""
+                results[-1]["notes"] = (prev_notes + ("  " if prev_notes else "") + raw).strip()
+                results[-1]["pending_empty_can_for_next_pr"] = True
+            use_for_next = True
+            print(f"[PARSER] Annotation line → attached to previous stop: {raw!r}", flush=True)
             continue
-        parsed = _parse_one_line(raw, conn, company_id)
+
+        try:
+            parsed = _parse_one_line(raw, conn, company_id)
+        except Exception as exc:
+            print(f"[PARSER] ERROR parsing {raw!r}: {exc}", flush=True)
+            continue
+
         if not parsed:
+            print(f"[PARSER] SKIP (unparseable): {raw!r}", flush=True)
             continue
 
         action_lc = (parsed.get("action") or "").lower()
@@ -259,7 +277,7 @@ def parse_route_text(text, conn, company_id):
             parsed["swap_with_previous_empty"] = True
             use_for_next = False
 
-        # Detect swap trigger phrase on this stop
+        # Detect swap trigger phrase in this stop's notes
         if _PENDING_EMPTY_RE.search(notes_lc):
             parsed["pending_empty_can_for_next_pr"] = True
             use_for_next = True
@@ -270,7 +288,15 @@ def parse_route_text(text, conn, company_id):
             parsed["return_destination"] = rt.group(1).strip().rstrip(".")
 
         results.append(parsed)
+        print(
+            f"[PARSER] Stop {len(results)}: action={parsed.get('action')!r}"
+            f"  addr={parsed.get('address')!r}"
+            f"  customer={parsed.get('customer_name')!r}"
+            f"  conf={parsed.get('confidence')}",
+            flush=True,
+        )
 
+    print(f"[PARSER] Total parsed stops: {len(results)}", flush=True)
     return results
 
 
@@ -818,8 +844,9 @@ def _next_can_state(action_lower, can_state):
         return "no_can"   # left the can at the site; truck is empty
 
     if is_pull:
-        # Truck returns same dumped-empty can to customer — truck leaves empty
-        return "no_can"
+        # After dump the driver keeps the emptied can on the truck.
+        # That empty can is available for a swap on the very next PR stop.
+        return "empty_can"
 
     if is_pr:
         if can_state == "empty_can":
@@ -1521,6 +1548,7 @@ def init_db():
     safe_add_column(conn, "stops", "can_state_before TEXT")
     safe_add_column(conn, "stops", "placement_note TEXT")
     safe_add_column(conn, "stops", "relocate_to_address TEXT")
+    safe_add_column(conn, "stops", "relocate_to_city TEXT")
     safe_add_column(conn, "stops", "return_destination TEXT")
     safe_add_column(conn, "stops", "pr_mode TEXT")
 
@@ -2821,9 +2849,15 @@ def _parse_inline_shorthand(lines):
 
 
 # ─── Relocate from/to parser ──────────────────────────────────────────────────
-# Matches: "relocate [can] <from_address> to <to_address> [size] [dump site]"
+# Matches: "relocate [can] <from> to <to>"
+#          "move one [of the Xs] [from] <from> to <to>"
+#          "move the can/container <from> to <to>"
 _RELOCATE_TO_RE = re.compile(
-    r"^(?:relocate|reloc|move\s+can)\s+(.+?)\s+to\s+(.+)$",
+    r"^(?:relocate|reloc"
+    r"|move\s+one"
+    r"|move\s+the\s+(?:can|container)"
+    r"|move\s+can"
+    r")\s+(.+?)\s+to\s+(.+)$",
     re.IGNORECASE,
 )
 
@@ -2844,8 +2878,12 @@ def _parse_relocate_line(raw, order_num=1):
     Returns None if the pattern does not match.
     """
     work = raw.strip()
-    # Strip leading "can" after relocate keyword so the address starts at house #
-    work = re.sub(r"^(relocate|reloc|move\s+can)\s+can\s+", r"\1 ", work, flags=re.I)
+    # Strip a redundant "can" token that sometimes appears between the keyword
+    # and the address, e.g. "relocate can 100 main st" → "relocate 100 main st"
+    work = re.sub(
+        r"^(relocate|reloc|move\s+one|move\s+the\s+(?:can|container)|move\s+can)\s+can\s+",
+        r"\1 ", work, flags=re.I
+    )
     m = _RELOCATE_TO_RE.match(work)
     if not m:
         return None
@@ -3086,11 +3124,25 @@ def _is_relocate_format(lines):
 # Patterns that signal "use this empty can for the NEXT PR stop"
 _PENDING_EMPTY_RE = re.compile(
     r"\b(?:use\s+it\s+to\b"
+    r"|use\s+it\s+for\s+next\b"
     r"|use\s+this\s+(?:empty|can)\b"
+    r"|use\s+this\s+can\s+to\b"
     r"|use\s+the\s+can\s+to\b"
     r"|use\s+for\s+next\b"
     r"|before\s+you\s+return\b"
     r"|take\s+empty\b)\b",
+    re.I,
+)
+# Matches whole annotation lines that should NOT become stops
+# e.g. "Use pulled can from previous stop", "use it for the swap"
+_ANNOTATION_LINE_RE = re.compile(
+    r"^\s*(?:use\s+(?:pulled\s+)?can\b"
+    r"|use\s+(?:it|this|the)\s+(?:pulled\s+)?can\b"
+    r"|use\s+(?:it|this)\s+(?:to|for)\b"
+    r"|use\s+for\s+next\b"
+    r"|before\s+you\s+return\b"
+    r"|take\s+(?:the\s+)?empty\b"
+    r"|leave\s+(?:the\s+)?(?:can|empty)\b)",
     re.I,
 )
 # Pattern for "return to <destination>" in notes
@@ -3352,6 +3404,7 @@ def shell_page(title, body, extra_head=""):
     {driver_hours}
     {co_settings}
     {subscription}
+    {live_dispatch}
 """.format(
     boss_panel=nav_link(url_for("boss_dashboard"), "📊 Boss Panel", path),
     orders=nav_link(url_for("orders_page"), "🧾 Orders", path),
@@ -3361,6 +3414,7 @@ def shell_page(title, body, extra_head=""):
     driver_hours=nav_link(url_for("driver_hours_page"), "⏱ Driver Hours", path),
     co_settings=nav_link(url_for("company_settings"), "⚙ Company Settings", path),
     subscription=nav_link(url_for("company_subscription"), "💳 Subscription", path),
+    live_dispatch=nav_link('/dispatch', '🚛 Live Dispatch', path),
 )
 
         superadmin_link = nav_link(url_for("superadmin_panel"), "🔧 Superadmin", path) \
@@ -8202,7 +8256,18 @@ _PASTE_ROUTE_JS = """
       if (suggCard) suggCard.style.display = 'none';
       return;
     }
-    preview.innerHTML = _stops.map(function(s, i) { return _removed[i] ? '' : cardHTML(s, i); }).join('');
+    var _cards = [];
+    _stops.forEach(function(s, i) {
+      if (_removed[i]) { _cards.push(''); return; }
+      try { _cards.push(cardHTML(s, i)); }
+      catch(e) {
+        console.error('pr card render error stop ' + i, e);
+        _cards.push('<div class="pr-stop l" id="pr-card-' + i + '" style="padding:12px;">'
+          + '<p style="color:#ff7090;margin:0;">Stop ' + (i+1) + ' render error: ' + String(e) + '</p>'
+          + '</div>');
+      }
+    });
+    preview.innerHTML = _cards.join('');
     renderSuggestions();
     if (footer) footer.style.display = 'flex';
     if (mobileBar) mobileBar.classList.add('pr-show');
@@ -8395,6 +8460,7 @@ _PASTE_ROUTE_JS = """
       if (_removed[i]) return;
       var chk = $('pr-chk-' + i);
       if (chk && !chk.checked) return;
+      var isRel = (s.action || '').toUpperCase() === 'RELOCATE';
       var stop = {
         customer_name:       _v('pr-cust-'   + i),
         address:             _v('pr-addr-'   + i),
@@ -8406,9 +8472,16 @@ _PASTE_ROUTE_JS = """
         dump_location:       _v('pr-dump-'   + i),
         placement_note:      _v('pr-place-'  + i),
         relocate_to_address: _v('pr-toaddr-' + i),
+        // preserve parser-detected flags through to the backend
+        pr_mode:             s.pr_mode             || '',
+        swap_with_prev_pull: s.swap_with_prev_pull || 0,
+        swap_with_previous_empty: s.swap_with_previous_empty || false,
+        return_destination:  s.return_destination  || '',
+        relocate_to_city:    s.to_city             || '',
       };
-      if (s.confidence < 45)                     hasLow = true;
-      if (!stop.address || !stop.customer_name)  hasMissReq = true;
+      if (s.confidence < 45)                           hasLow = true;
+      var addrOk = stop.address || (isRel && _v('pr-toaddr-' + i));
+      if (!addrOk || (!stop.customer_name && !isRel))  hasMissReq = true;
       toAdd.push(stop);
     });
     if (!toAdd.length) { alert('No stops selected.'); return; }
@@ -13023,29 +13096,40 @@ def add_parsed_stops(route_id):
         placement_note     = expand_abbrev(stop.get("placement_note")     or "")
         relocate_to_addr   = expand_abbrev(stop.get("relocate_to_address") or
                                            stop.get("to_address")           or "")
+        relocate_to_city   = expand_abbrev(stop.get("relocate_to_city")    or
+                                           stop.get("to_city")              or "")
         return_destination = expand_abbrev(stop.get("return_destination")  or "")
         pr_mode            = (stop.get("pr_mode") or "").strip()
         swap_flag          = 1 if stop.get("swap_with_previous_empty") or stop.get("swap_with_prev_pull") else 0
-        conn.execute("""
-            INSERT INTO stops (
-                route_id, stop_order, customer_name, address, city, state, zip_code,
-                action, container_size, dump_location,
-                placement_note, relocate_to_address, return_destination, pr_mode,
-                swap_with_prev_pull, status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
-        """, (route_id, last, customer_name, address, city, state, zip_code,
-              action, container_size, dump_location,
-              placement_note, relocate_to_addr, return_destination, pr_mode,
-              swap_flag, now_ts()))
-        added += 1
-        upsert_saved_address(conn, cid(),
-            customer_name, address, city, state, zip_code,
-            action, container_size, dump_location)
+        try:
+            conn.execute("""
+                INSERT INTO stops (
+                    route_id, stop_order, customer_name, address, city, state, zip_code,
+                    action, container_size, dump_location,
+                    placement_note, relocate_to_address, relocate_to_city,
+                    return_destination, pr_mode,
+                    swap_with_prev_pull, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+            """, (route_id, last, customer_name, address, city, state, zip_code,
+                  action, container_size, dump_location,
+                  placement_note, relocate_to_addr, relocate_to_city,
+                  return_destination, pr_mode,
+                  swap_flag, now_ts()))
+            added += 1
+            upsert_saved_address(conn, cid(),
+                customer_name, address, city, state, zip_code,
+                action, container_size, dump_location)
+        except Exception as exc:
+            app.logger.warning("add_parsed_stops: insert failed for stop %d: %s", last, exc)
+            last -= 1  # reclaim the order slot so next stop doesn't skip a number
 
     if added:
         conn.commit()
-        compute_can_flow(conn, route_id)
-        conn.commit()
+        try:
+            compute_can_flow(conn, route_id)
+            conn.commit()
+        except Exception as exc:
+            app.logger.warning("add_parsed_stops: compute_can_flow error: %s", exc)
 
     conn.close()
     return jsonify({"added": added})
@@ -13113,6 +13197,25 @@ def debug_db():
 # =========================================================
 # STARTUP — initialize DB before gunicorn serves any request
 # =========================================================
+
+# =========================================================
+# DISPATCH ROUTES — Firebase live dispatch feature
+# =========================================================
+@app.route('/dispatch')
+def dispatch_view():
+    return send_from_directory('static', 'dispatch.html')
+
+@app.route('/route')
+def route_view():
+    return send_from_directory('static', 'route.html')
+
+@app.route('/service-worker.js')
+def service_worker_file():
+    response = send_from_directory('static', 'service-worker.js')
+    response.headers['Service-Worker-Allowed'] = '/'
+    return response
+
+
 init_db()
 print("Startup complete. DATABASE_PATH =", DATABASE, flush=True)
 
