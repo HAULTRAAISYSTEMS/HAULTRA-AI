@@ -626,7 +626,7 @@ def get_csrf_token():
 
 
 # Endpoints that legitimately receive POST from external servers (no session/CSRF)
-_CSRF_EXEMPT_ENDPOINTS = {"stripe_webhook", "api_ask"}
+_CSRF_EXEMPT_ENDPOINTS = {"stripe_webhook", "api_ask", "api_parse_dispatch"}
 
 @app.before_request
 def csrf_protect():
@@ -3405,6 +3405,7 @@ def shell_page(title, body, extra_head=""):
     {co_settings}
     {subscription}
     {live_dispatch}
+    {ai_parser}
 """.format(
     boss_panel=nav_link(url_for("boss_dashboard"), "📊 Boss Panel", path),
     orders=nav_link(url_for("orders_page"), "🧾 Orders", path),
@@ -3415,6 +3416,7 @@ def shell_page(title, body, extra_head=""):
     co_settings=nav_link(url_for("company_settings"), "⚙ Company Settings", path),
     subscription=nav_link(url_for("company_subscription"), "💳 Subscription", path),
     live_dispatch=nav_link('/dispatch', '🚛 Live Dispatch', path),
+    ai_parser=nav_link('/parser', '✦ AI Parser', path),
 )
 
         superadmin_link = nav_link(url_for("superadmin_panel"), "🔧 Superadmin", path) \
@@ -10477,6 +10479,82 @@ def api_ask():
 
 
 # =========================================================
+# AI ROUTE PARSER — Anthropic-backed dispatch text → stops
+# =========================================================
+_PARSE_SYSTEM_PROMPT = """You parse raw roll-off dispatch text into structured stops for a trucking dispatch system.
+
+Action codes:
+  PR = pull & return (pull a full container, return it empty)
+  P  = pickup
+  D  = drop (deliver an empty container)
+  S  = swap (drop an empty, pull a full — one stop)
+  R  = relocate (move a container on-site or between addresses)
+
+Rules:
+- Treat each instruction / line as exactly one stop.
+- For every stop extract: action (one of PR, P, D, S, R), address, container_size
+  (e.g. "30yd", or null if not stated), raw (the original line, verbatim), confidence
+  ("low" or "high"), and notes (any extra detail worth surfacing, or an empty string).
+- Set confidence to "low" whenever the action, address, or destination is ambiguous,
+  vague, or only partially stated (e.g. an unclear relocation, a missing address, or a
+  vague action word). Otherwise set confidence to "high".
+- Respond with ONLY valid JSON — no markdown code fences, no commentary — in exactly
+  this shape:
+  {"stops":[{"action":"","address":"","container_size":null,"raw":"","confidence":"","notes":""}]}
+"""
+
+
+@app.route("/api/parse", methods=["POST"])
+@login_required
+def api_parse_dispatch():
+    import os as _os
+
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "No dispatch text provided"}), 400
+
+    try:
+        import anthropic
+    except ImportError:
+        return jsonify({"error": "AI package not installed. Add anthropic to requirements.txt."}), 500
+
+    api_key = _os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return jsonify({"error": "ANTHROPIC_API_KEY not configured on server."}), 500
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
+            system=_PARSE_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": text}],
+        )
+        raw_reply = "".join(
+            block.text for block in resp.content if getattr(block, "type", None) == "text"
+        ).strip()
+    except Exception as ex:
+        return jsonify({"error": str(ex)}), 500
+
+    cleaned = raw_reply.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return jsonify({"error": "Parser returned invalid format — try re-parsing"}), 502
+
+    stops = parsed.get("stops") if isinstance(parsed, dict) else None
+    if not isinstance(stops, list):
+        return jsonify({"error": "Parser returned invalid format — try re-parsing"}), 502
+
+    return jsonify({"stops": stops})
+
+
+# =========================================================
 # COMPANY REGISTRATION (public — creates a new tenant)
 # =========================================================
 @app.route("/register-company", methods=["GET", "POST"])
@@ -13208,6 +13286,11 @@ def dispatch_view():
 @app.route('/route')
 def route_view():
     return send_from_directory('static', 'route.html')
+
+@app.route('/parser')
+@login_required
+def parser_view():
+    return send_from_directory('static', 'parser.html')
 
 @app.route('/service-worker.js')
 def service_worker_file():
