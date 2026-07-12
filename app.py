@@ -3471,6 +3471,9 @@ def shell_page(title, body, extra_head=""):
     <meta name="csrf-token" content="{csrf_token}">
 
     <link rel="apple-touch-icon" href="/static/logo.png">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="/static/css/haultra-theme.css">
 
     {extra_head}
      <style>
@@ -3483,22 +3486,34 @@ def shell_page(title, body, extra_head=""):
 
 /* ── Design Tokens ─────────────────────────────────────────*/
 :root {{
-  --bg:          #02040a;
-  --bg-card:     rgba(6,11,22,0.92);
-  --bg-sidebar:  #040710;
-  --border:      rgba(0,160,255,0.10);
-  --border-glow: rgba(0,200,255,0.28);
-  --cyan:        #00ccff;
-  --cyan-dim:    rgba(0,200,255,0.12);
-  --gold:        #ff9d00;
-  --gold-dim:    rgba(255,157,0,0.12);
-  --green:       #00e87d;
-  --red:         #ff3b5c;
-  --text:        #e8f2ff;
-  --text-muted:  #3d5a74;
-  --text-soft:   #7a9ab8;
+  --bg:          #121212;
+  --bg-card:     rgba(23,23,23,0.92);
+  --bg-sidebar:  #141414;
+  --border:      rgba(255,107,26,0.12);
+  --border-glow: rgba(255,107,26,0.30);
+  /* NOTE: --cyan is now the PRIMARY (safety-orange) accent token, kept under its
+     original name to avoid touching the hundreds of var(--cyan) references below.
+     Electric teal (--teal) is reserved exclusively for AI-touched elements. */
+  --cyan:        #FF6B1A;
+  --cyan-dim:    rgba(255,107,26,0.14);
+  --teal:        #00E5CC;
+  --teal-dim:    rgba(0,229,204,0.12);
+  --teal-border: rgba(0,229,204,0.45);
+  --gold:        #FF6B1A;
+  --gold-dim:    rgba(255,107,26,0.14);
+  --slate:       #8CA0B3;
+  --slate-dim:   rgba(140,160,179,0.16);
+  --slate-border: rgba(140,160,179,0.45);
+  --green:       #3DDC84;
+  --red:         #FF5252;
+  --text:        #F5F5F0;
+  --text-muted:  #78786F;
+  --text-soft:   #A6A69E;
   --radius:      12px;
   --radius-lg:   16px;
+  --font-head:   'Bebas Neue', 'Anton', sans-serif;
+  --font-body:   'Inter', -apple-system, 'Segoe UI', Arial, sans-serif;
+  --font-mono:   'JetBrains Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
 }}
 
 /* ── Base ───────────────────────────────────────────────────*/
@@ -3509,21 +3524,20 @@ html, body {{
 }}
 
 body {{
-    font-family: 'Inter', 'SF Pro Display', -apple-system, 'Segoe UI', Arial, sans-serif;
+    font-family: var(--font-body);
     font-size: 14px;
     line-height: 1.5;
     color: var(--text);
     background: var(--bg);
-    /* cinematic deep-space backdrop */
+    /* subtle warm backdrop glow, flat charcoal otherwise (matches /parser) */
     background-image:
-        radial-gradient(ellipse 100% 60% at 20% -5%,  rgba(0,140,255,0.055) 0%, transparent 65%),
-        radial-gradient(ellipse  60% 40% at 85% 100%, rgba(255,120,0,0.030) 0%, transparent 65%),
-        radial-gradient(ellipse  40% 30% at 50%  50%, rgba(0,0,20,0.8) 0%, transparent 100%);
+        radial-gradient(ellipse 100% 60% at 20% -5%,  rgba(255,107,26,0.045) 0%, transparent 65%),
+        radial-gradient(ellipse  40% 30% at 50%  50%, rgba(0,0,0,0.6) 0%, transparent 100%);
     background-attachment: fixed;
 }}
 
 a {{ color: var(--cyan); text-decoration: none; transition: color .15s; }}
-a:hover {{ color: #66dfff; }}
+a:hover {{ color: #FF9D5C; }}
 
 /* ── App Shell ──────────────────────────────────────────────*/
 .app-shell {{ display: flex; min-height: 100vh; width: 100%; }}
@@ -3543,13 +3557,13 @@ a:hover {{ color: #66dfff; }}
     height: 100vh;
     overflow-y: auto;
     /* inner glow column */
-    box-shadow: inset -1px 0 0 rgba(0,180,255,0.05), 1px 0 20px rgba(0,0,0,0.4);
+    box-shadow: inset -1px 0 0 rgba(255,107,26,0.05), 1px 0 20px rgba(0,0,0,0.4);
 }}
 
 /* ── Logo ───────────────────────────────────────────────────*/
 .logo-card {{
     padding: 22px 20px 16px;
-    border-bottom: 1px solid rgba(0,160,255,0.07);
+    border-bottom: 1px solid rgba(255,107,26,0.07);
 }}
 
 .logo-wordmark {{
@@ -3564,7 +3578,7 @@ a:hover {{ color: #66dfff; }}
     font-weight: 900;
     letter-spacing: 1px;
     color: var(--gold);
-    background: linear-gradient(135deg, #ff9d00, #ffcc44);
+    background: linear-gradient(135deg, #FF6B1A, #FFA35C);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
@@ -3573,23 +3587,25 @@ a:hover {{ color: #66dfff; }}
 }}
 
 .logo-h {{
-    font-size: 20px;
-    font-weight: 900;
+    font-family: var(--font-head);
+    font-size: 24px;
+    font-weight: 400;
     letter-spacing: 3px;
-    background: linear-gradient(130deg, #ffffff 0%, #7dd3fc 60%, #00ccff 100%);
+    background: linear-gradient(130deg, #ffffff 0%, #F5F5F0 55%, #FF6B1A 100%);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
     text-shadow: none;
-    filter: drop-shadow(0 0 12px rgba(0,200,255,0.35));
+    filter: drop-shadow(0 0 12px rgba(255,107,26,0.35));
 }}
 
 .logo-rest {{
-    font-size: 20px;
-    font-weight: 900;
+    font-family: var(--font-head);
+    font-size: 24px;
+    font-weight: 400;
     letter-spacing: 3px;
-    color: #c8dff4;
-    background: linear-gradient(130deg, #ffffff 0%, #7dd3fc 60%, #00ccff 100%);
+    color: #F5F5F0;
+    background: linear-gradient(130deg, #ffffff 0%, #F5F5F0 55%, #FF6B1A 100%);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
@@ -3599,7 +3615,7 @@ a:hover {{ color: #66dfff; }}
     font-size: 8.5px;
     font-weight: 700;
     letter-spacing: 3.5px;
-    color: #1e3a52;
+    color: #55554C;
     margin-top: 5px;
     text-transform: uppercase;
 }}
@@ -3613,7 +3629,7 @@ a:hover {{ color: #66dfff; }}
     font-size: 12px;
     color: var(--text-soft);
     font-weight: 600;
-    border-bottom: 1px solid rgba(0,150,255,0.06);
+    border-bottom: 1px solid rgba(255,107,26,0.06);
 }}
 
 .sidebar-user-dot {{
@@ -3632,7 +3648,7 @@ a:hover {{ color: #66dfff; }}
     padding: 2px 8px;
     border-radius: 20px;
     background: var(--cyan-dim);
-    border: 1px solid rgba(0,200,255,0.16);
+    border: 1px solid rgba(255,107,26,0.16);
     color: var(--cyan);
     text-transform: uppercase;
 }}
@@ -3653,7 +3669,7 @@ a:hover {{ color: #66dfff; }}
     border-radius: 9px;
     background: transparent;
     border: 1px solid transparent;
-    color: #4a6880;
+    color: #8C8C82;
     font-weight: 600;
     font-size: 13px;
     letter-spacing: .15px;
@@ -3665,15 +3681,15 @@ a:hover {{ color: #66dfff; }}
 }}
 
 .nav-item:hover {{
-    background: rgba(0,180,255,0.06);
-    border-color: rgba(0,200,255,0.12);
-    color: #9ac8e8;
+    background: rgba(255,107,26,0.06);
+    border-color: rgba(255,107,26,0.12);
+    color: #E0E0D8;
     text-decoration: none;
 }}
 
 .nav-item.active {{
-    background: linear-gradient(90deg, rgba(0,180,255,0.13) 0%, rgba(0,180,255,0.04) 100%);
-    border-color: rgba(0,200,255,0.25);
+    background: linear-gradient(90deg, rgba(255,107,26,0.13) 0%, rgba(255,107,26,0.04) 100%);
+    border-color: rgba(255,107,26,0.25);
     color: var(--cyan);
     font-weight: 700;
 }}
@@ -3690,16 +3706,16 @@ a:hover {{ color: #66dfff; }}
 }}
 
 .nav-logout {{
-    color: #2e3f50 !important;
+    color: #6B6B62 !important;
     margin-top: 6px;
-    border-top: 1px solid rgba(0,150,255,0.05);
+    border-top: 1px solid rgba(255,107,26,0.05);
     padding-top: 14px !important;
 }}
 
 .nav-logout:hover {{
     background: rgba(255,50,50,0.06) !important;
     border-color: rgba(255,60,60,0.12) !important;
-    color: #ff6b6b !important;
+    color: #FF6B6B !important;
 }}
 
 /* ══════════════════════════════════════════════════════════
@@ -3718,11 +3734,11 @@ a:hover {{ color: #66dfff; }}
    ══════════════════════════════════════════════════════════*/
 .hero {{
     position: relative;
-    border: 1px solid rgba(0,180,255,0.14);
+    border: 1px solid rgba(255,107,26,0.14);
     border-radius: var(--radius-lg);
     padding: 28px 30px;
     margin-bottom: 22px;
-    background: linear-gradient(145deg, rgba(0,14,32,0.97) 0%, rgba(2,6,14,0.99) 100%);
+    background: linear-gradient(145deg, rgba(23,23,23,0.97) 0%, rgba(18,18,18,0.99) 100%);
     box-shadow: 0 4px 40px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.035);
     overflow: hidden;
 }}
@@ -3735,10 +3751,10 @@ a:hover {{ color: #66dfff; }}
     height: 1.5px;
     background: linear-gradient(90deg,
         transparent 0%,
-        rgba(0,200,255,0.7) 25%,
-        rgba(0,200,255,0.9) 45%,
-        rgba(255,157,0,0.9) 65%,
-        rgba(255,157,0,0.5) 80%,
+        rgba(255,107,26,0.7) 25%,
+        rgba(255,107,26,0.9) 45%,
+        rgba(255,107,26,0.9) 65%,
+        rgba(255,107,26,0.5) 80%,
         transparent 100%);
 }}
 
@@ -3748,17 +3764,18 @@ a:hover {{ color: #66dfff; }}
     position: absolute;
     top: -40px; right: -40px;
     width: 200px; height: 200px;
-    background: radial-gradient(circle, rgba(0,180,255,0.06) 0%, transparent 70%);
+    background: radial-gradient(circle, rgba(255,107,26,0.06) 0%, transparent 70%);
     pointer-events: none;
 }}
 
 .hero h1 {{
-    font-size: 21px;
-    font-weight: 800;
-    color: #e8f4ff;
-    letter-spacing: -.3px;
+    font-family: var(--font-head);
+    font-size: 30px;
+    font-weight: 400;
+    color: #F5F5F0;
+    letter-spacing: .5px;
     margin-bottom: 5px;
-    line-height: 1.2;
+    line-height: 1.15;
 }}
 
 .hero p {{
@@ -3772,7 +3789,7 @@ a:hover {{ color: #66dfff; }}
    ══════════════════════════════════════════════════════════*/
 .card {{
     background: var(--bg-card);
-    border: 1px solid rgba(0,150,255,0.10);
+    border: 1px solid rgba(255,107,26,0.10);
     border-radius: var(--radius-lg);
     padding: 22px;
     margin-bottom: 16px;
@@ -3783,7 +3800,7 @@ a:hover {{ color: #66dfff; }}
     font-size: 14px;
     font-weight: 700;
     letter-spacing: .2px;
-    color: #7a9ab8;
+    color: #A6A69E;
     text-transform: uppercase;
     margin-bottom: 16px;
 }}
@@ -3798,8 +3815,8 @@ a:hover {{ color: #66dfff; }}
 
 .stat {{
     position: relative;
-    background: rgba(0,10,24,0.70);
-    border: 1px solid rgba(0,150,255,0.12);
+    background: rgba(20,20,20,0.70);
+    border: 1px solid rgba(255,107,26,0.12);
     border-radius: var(--radius);
     padding: 18px 20px 16px;
     overflow: hidden;
@@ -3807,8 +3824,8 @@ a:hover {{ color: #66dfff; }}
 }}
 
 .stat:hover {{
-    border-color: rgba(0,200,255,0.22);
-    box-shadow: 0 0 20px rgba(0,180,255,0.05);
+    border-color: rgba(255,107,26,0.22);
+    box-shadow: 0 0 20px rgba(255,107,26,0.05);
 }}
 
 /* bottom cyan underline */
@@ -3830,12 +3847,13 @@ a:hover {{ color: #66dfff; }}
 }}
 
 .stat .num {{
-    font-size: 32px;
-    font-weight: 800;
-    color: #e8f4ff;
-    line-height: 1.1;
+    font-family: var(--font-head);
+    font-size: 42px;
+    font-weight: 400;
+    color: #F5F5F0;
+    line-height: 1;
     margin-top: 6px;
-    letter-spacing: -1px;
+    letter-spacing: .5px;
 }}
 
 /* ══════════════════════════════════════════════════════════
@@ -3853,10 +3871,10 @@ button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact
     letter-spacing: .15px;
     text-decoration: none;
     transition: filter .15s, transform .1s, box-shadow .15s;
-    /* default = electric cyan */
-    color: #020d18;
-    background: linear-gradient(135deg, #00d8ff 0%, #0098e8 100%);
-    box-shadow: 0 0 18px rgba(0,180,255,0.18);
+    /* default = safety orange (primary/commit) */
+    color: #1A1000;
+    background: linear-gradient(135deg, #FF8A42 0%, #FF6B1A 100%);
+    box-shadow: 0 0 18px rgba(255,107,26,0.22);
 }}
 
 .btn:hover,
@@ -3864,46 +3882,46 @@ button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact
     filter: brightness(1.1);
     transform: translateY(-1px);
     text-decoration: none;
-    color: #020d18;
-    box-shadow: 0 0 24px rgba(0,200,255,0.28);
+    color: #1A1000;
+    box-shadow: 0 0 24px rgba(255,107,26,0.34);
 }}
 
 /* secondary — dark glass */
 .btn.secondary {{
-    background: rgba(10,22,42,0.90);
-    border: 1px solid rgba(0,160,255,0.20);
-    color: #6ea8cc;
+    background: rgba(26,26,26,0.90);
+    border: 1px solid rgba(255,107,26,0.20);
+    color: #C9C9C0;
     box-shadow: none;
 }}
-.btn.secondary:hover {{ color: #a8d8f0; filter: none; border-color: rgba(0,200,255,0.35); }}
+.btn.secondary:hover {{ color: #F0F0E8; filter: none; border-color: rgba(255,107,26,0.35); }}
 
 /* gold — priority actions */
 .btn.gold, .btn.orange {{
-    background: linear-gradient(135deg, #ffb830 0%, #ff7d00 100%);
-    color: #120800;
-    box-shadow: 0 0 18px rgba(255,140,0,0.20);
+    background: linear-gradient(135deg, #FF8A42 0%, #FF6B1A 100%);
+    color: #1A1000;
+    box-shadow: 0 0 18px rgba(255,107,26,0.24);
 }}
 .btn.gold:hover, .btn.orange:hover {{
     filter: brightness(1.08);
-    box-shadow: 0 0 28px rgba(255,140,0,0.32);
-    color: #120800;
+    box-shadow: 0 0 28px rgba(255,107,26,0.38);
+    color: #1A1000;
 }}
 
 /* green */
 .btn.green {{
-    background: linear-gradient(135deg, #00e87d 0%, #00b85e 100%);
-    color: #011a0b;
-    box-shadow: 0 0 14px rgba(0,232,125,0.16);
+    background: linear-gradient(135deg, #3DDC84 0%, #22B368 100%);
+    color: #06170D;
+    box-shadow: 0 0 14px rgba(61,220,132,0.20);
 }}
-.btn.green:hover {{ filter: brightness(1.08); color: #011a0b; }}
+.btn.green:hover {{ filter: brightness(1.08); color: #06170D; }}
 
 /* red / danger */
 .btn.red {{
-    background: linear-gradient(135deg, #ff3b5c 0%, #cc1a34 100%);
-    color: #1a0009;
+    background: linear-gradient(135deg, #FF5252 0%, #CC3333 100%);
+    color: #1A0000;
     box-shadow: none;
 }}
-.btn.red:hover {{ filter: brightness(1.1); color: #1a0009; }}
+.btn.red:hover {{ filter: brightness(1.1); color: #1A0000; }}
 
 /* ── Forms ──────────────────────────────────────────────────*/
 form.inline {{ display: inline; }}
@@ -3914,7 +3932,7 @@ label {{
     font-size: 11px;
     letter-spacing: .5px;
     text-transform: uppercase;
-    color: #2e4a62;
+    color: #8C8C82;
     margin-top: 14px;
     margin-bottom: 6px;
 }}
@@ -3923,8 +3941,8 @@ input, textarea, select {{
     width: 100%;
     padding: 11px 14px;
     border-radius: 9px;
-    border: 1px solid rgba(0,150,255,0.14);
-    background: rgba(2,7,18,0.80);
+    border: 1px solid rgba(255,107,26,0.14);
+    background: rgba(18,18,18,0.80);
     color: var(--text);
     font-size: 13px;
     font-family: inherit;
@@ -3933,8 +3951,8 @@ input, textarea, select {{
 
 input:focus, textarea:focus, select:focus {{
     outline: none;
-    border-color: rgba(0,200,255,0.40);
-    box-shadow: 0 0 0 3px rgba(0,180,255,0.07);
+    border-color: rgba(255,107,26,0.40);
+    box-shadow: 0 0 0 3px rgba(255,107,26,0.07);
 }}
 
 textarea {{ min-height: 130px; resize: vertical; }}
@@ -3944,13 +3962,13 @@ table {{ width: 100%; border-collapse: collapse; }}
 
 th {{
     padding: 9px 12px;
-    border-bottom: 1px solid rgba(0,150,255,0.10);
+    border-bottom: 1px solid rgba(255,107,26,0.10);
     text-align: left;
     font-size: 10px;
     font-weight: 700;
     letter-spacing: 1px;
     text-transform: uppercase;
-    color: #1e3a52;
+    color: #55554C;
 }}
 
 td {{
@@ -3958,13 +3976,13 @@ td {{
     border-bottom: 1px solid rgba(255,255,255,0.033);
     vertical-align: middle;
     font-size: 13px;
-    color: #a8c4dc;
+    color: #D8D8D0;
 }}
 
-td a {{ color: #7dd3fc; font-weight: 600; }}
-td a:hover {{ color: #b8e8ff; }}
+td a {{ color: #FF9D5C; font-weight: 600; }}
+td a:hover {{ color: #FFB37A; }}
 
-tr:hover td {{ background: rgba(0,150,255,0.025); }}
+tr:hover td {{ background: rgba(255,107,26,0.025); }}
 .table-wrap {{ overflow-x: auto; }}
 
 /* ── Badges ─────────────────────────────────────────────────*/
@@ -3979,21 +3997,21 @@ tr:hover td {{ background: rgba(0,150,255,0.025); }}
 }}
 
 .badge.open {{
-    background: rgba(0,140,255,0.12);
-    border: 1px solid rgba(0,180,255,0.22);
-    color: #40b8ff;
+    background: rgba(140,160,179,0.16);
+    border: 1px solid rgba(140,160,179,0.45);
+    color: #ADC0D1;
 }}
 
 .badge.in_progress {{
-    background: rgba(255,140,0,0.10);
-    border: 1px solid rgba(255,160,0,0.22);
-    color: #ffa830;
+    background: rgba(255,107,26,0.14);
+    border: 1px solid rgba(255,107,26,0.45);
+    color: #FF9D5C;
 }}
 
 .badge.completed {{
-    background: rgba(0,232,125,0.10);
-    border: 1px solid rgba(0,232,125,0.22);
-    color: #00e87d;
+    background: rgba(61,220,132,0.12);
+    border: 1px solid rgba(61,220,132,0.32);
+    color: #3DDC84;
 }}
 
 /* ── Flash messages ─────────────────────────────────────────*/
@@ -4006,33 +4024,33 @@ tr:hover td {{ background: rgba(0,150,255,0.025); }}
 }}
 .flash.success {{
     background: rgba(0,80,36,0.38);
-    border: 1px solid rgba(0,232,125,0.20);
+    border: 1px solid rgba(61,220,132,0.28);
     color: #5cffa7;
 }}
 .flash.error {{
     background: rgba(100,10,20,0.45);
     border: 1px solid rgba(255,60,80,0.22);
-    color: #ff8a9a;
+    color: #FF9A9A;
 }}
 
 /* ── Stop cards (boss route view) ───────────────────────────*/
 .stop-card {{
-    background: rgba(4,10,22,0.82);
-    border: 1px solid rgba(0,150,255,0.12);
+    background: rgba(20,20,20,0.82);
+    border: 1px solid rgba(255,107,26,0.12);
     border-radius: var(--radius);
     padding: 16px;
     margin-bottom: 10px;
 }}
 
 .next-stop-glow {{
-    border-color: rgba(0,220,255,0.42);
-    box-shadow: 0 0 22px rgba(0,200,255,0.09);
+    border-color: rgba(255,107,26,0.42);
+    box-shadow: 0 0 22px rgba(255,107,26,0.09);
 }}
 
 .stop-handle {{
     cursor: grab;
-    background: rgba(0,70,140,0.28);
-    border: 1px solid rgba(0,160,255,0.16);
+    background: rgba(255,107,26,0.28);
+    border: 1px solid rgba(255,107,26,0.16);
     border-radius: 7px;
     padding: 4px 10px;
     display: inline-block;
@@ -4046,24 +4064,24 @@ tr:hover td {{ background: rgba(0,150,255,0.025); }}
 .photo-thumb {{
     max-width: 160px; max-height: 160px; width: 100%;
     object-fit: cover; border-radius: 8px;
-    border: 1px solid rgba(0,160,255,0.18); display: block;
+    border: 1px solid rgba(255,107,26,0.18); display: block;
 }}
 .photo-gallery {{ display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }}
 .photo-item {{
     display: flex; flex-direction: column; align-items: center;
     background: rgba(255,255,255,0.025);
-    border: 1px solid rgba(0,150,255,0.10);
+    border: 1px solid rgba(255,107,26,0.10);
     border-radius: 9px; padding: 8px; width: 160px;
 }}
-.photo-meta {{ font-size: 11px; color: #2e4a62; text-align: center; margin-top: 5px; line-height: 1.4; word-break: break-all; }}
+.photo-meta {{ font-size: 11px; color: #8C8C82; text-align: center; margin-top: 5px; line-height: 1.4; word-break: break-all; }}
 .photo-pdf-link {{
     display: flex; align-items: center; justify-content: center;
     width: 140px; height: 80px;
-    background: var(--cyan-dim); border: 1px solid rgba(0,200,255,0.18);
+    background: var(--cyan-dim); border: 1px solid rgba(255,107,26,0.18);
     border-radius: 8px; color: var(--cyan); text-decoration: none;
     font-size: 13px; font-weight: 600; gap: 6px;
 }}
-.photo-pdf-link:hover {{ background: rgba(0,200,255,0.18); }}
+.photo-pdf-link:hover {{ background: rgba(255,107,26,0.18); }}
 
 /* ── Progress mini bar ──────────────────────────────────────*/
 .mini-prog-track {{
@@ -4073,7 +4091,7 @@ tr:hover td {{ background: rgba(0,150,255,0.025); }}
 }}
 .mini-prog-fill {{
     height: 100%;
-    background: linear-gradient(90deg, #0098e8, #00ccff);
+    background: linear-gradient(90deg, #FF8A42, #FF6B1A);
     border-radius: 3px; transition: width .4s;
 }}
 
@@ -4081,32 +4099,32 @@ tr:hover td {{ background: rgba(0,150,255,0.025); }}
 .inline-reassign {{ display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; }}
 .compact-select {{
     font-size: 12px; padding: 4px 8px; border-radius: 6px;
-    background: rgba(2,7,18,0.82); border: 1px solid rgba(0,150,255,0.16);
-    color: #7aa8c8; max-width: 130px;
+    background: rgba(18,18,18,0.82); border: 1px solid rgba(255,107,26,0.16);
+    color: #B8B8AE; max-width: 130px;
 }}
 .btn-reassign {{
     font-size: 12px; padding: 4px 10px; border-radius: 6px;
-    background: rgba(0,90,180,0.22); border: 1px solid rgba(0,160,255,0.20);
-    color: #7aa8c8; cursor: pointer; white-space: nowrap;
+    background: rgba(255,107,26,0.22); border: 1px solid rgba(255,107,26,0.20);
+    color: #B8B8AE; cursor: pointer; white-space: nowrap;
     transition: background .13s;
 }}
-.btn-reassign:hover {{ background: rgba(0,120,220,0.38); }}
-tr.status-in-progress td {{ background: rgba(255,140,0,0.03); }}
+.btn-reassign:hover {{ background: rgba(255,107,26,0.38); }}
+tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 
 /* ── Footer ─────────────────────────────────────────────────*/
 .footer-note {{
-    text-align: center; color: #162636; font-size: 11px;
+    text-align: center; color: #4A4A42; font-size: 11px;
     margin-top: 40px; padding: 16px 0 6px;
-    border-top: 1px solid rgba(0,150,255,0.05); line-height: 2;
+    border-top: 1px solid rgba(255,107,26,0.05); line-height: 2;
 }}
-.footer-note a {{ color: #162636; margin: 0 6px; }}
+.footer-note a {{ color: #4A4A42; margin: 0 6px; }}
 .footer-note a:hover {{ color: var(--cyan); }}
 .footer-trust {{ display: flex; justify-content: center; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }}
 .footer-badge {{
     display: inline-flex; align-items: center; gap: 4px;
-    font-size: 10px; color: #1a3040;
+    font-size: 10px; color: #4A4A42;
     background: rgba(255,255,255,0.015);
-    border: 1px solid rgba(0,150,255,0.06);
+    border: 1px solid rgba(255,107,26,0.06);
     border-radius: 20px; padding: 3px 10px;
 }}
 
@@ -4119,7 +4137,7 @@ tr.status-in-progress td {{ background: rgba(255,140,0,0.03); }}
         width: 100%; min-width: unset;
         height: auto; position: static;
         border-right: none;
-        border-bottom: 1px solid rgba(0,160,255,0.08);
+        border-bottom: 1px solid rgba(255,107,26,0.08);
     }}
     .content {{ padding: 16px; }}
     .nav-stack {{
@@ -4322,7 +4340,7 @@ tr.status-in-progress td {{ background: rgba(255,140,0,0.03); }}
   );
   var _COLORS = {{
     warn:  'background:#1a0a00;border-bottom:1px solid rgba(255,157,0,.35);color:#fbbf24;',
-    ok:    'background:#001810;border-bottom:1px solid rgba(0,232,125,.30);color:#56f0b7;',
+    ok:    'background:#001810;border-bottom:1px solid rgba(0,232,125,.30);color:#3DDC84;',
     error: 'background:#200010;border-bottom:1px solid rgba(255,60,60,.40);color:#ff9a9a;'
   }};
 
@@ -4742,8 +4760,8 @@ tr.status-in-progress td {{ background: rgba(255,140,0,0.03); }}
     panel.style.cssText = (
       'display:none;position:fixed;bottom:60px;right:16px;z-index:99999;' +
       'width:340px;max-height:70vh;overflow-y:auto;' +
-      'background:#060e1e;border:1px solid rgba(0,160,255,.3);border-radius:14px;' +
-      'padding:16px 18px;font-size:12px;color:#b0c4de;font-family:monospace;' +
+      'background:#060e1e;border:1px solid rgba(255,107,26,.3);border-radius:14px;' +
+      'padding:16px 18px;font-size:12px;color:#B8B8AE;font-family:monospace;' +
       'box-shadow:0 8px 32px rgba(0,0,0,.6);'
     );
     document.body.appendChild(panel);
@@ -4762,10 +4780,10 @@ tr.status-in-progress td {{ background: rgba(255,140,0,0.03); }}
       var conflicts = q.filter(function(i) {{ return i.conflict; }});
       var retryable = q.filter(function(i) {{ return !i.conflict; }});
       var html = (
-        '<div style="font-size:14px;font-weight:700;color:#56f0b7;margin-bottom:10px;">' +
+        '<div style="font-size:14px;font-weight:700;color:#3DDC84;margin-bottom:10px;">' +
         '&#128203; HAULTRA Debug' +
         '<button onclick="document.getElementById(\'haul-debug-panel\').style.display=\'none\'" ' +
-        'style="float:right;background:none;border:none;color:#b0c4de;cursor:pointer;font-size:16px;">&#10005;</button>' +
+        'style="float:right;background:none;border:none;color:#B8B8AE;cursor:pointer;font-size:16px;">&#10005;</button>' +
         '</div>' +
         '<b>Online:</b> ' + navigator.onLine + '<br>' +
         '<b>Sync state:</b> ' + _syncState + '<br>' +
@@ -4827,19 +4845,19 @@ tr.status-in-progress td {{ background: rgba(255,140,0,0.03); }}
 
 <script>{_ABBREV_EXPAND_JS}</script>
 
-<!-- ===== ASK HAULTRA AI FAB ===== -->
+<!-- ===== ASK HAULTRA AI FAB (teal = AI-touched) ===== -->
 <button id="ask-fab" onclick="openAsk()" title="Ask HAULTRA AI (Ctrl+K)" style="
   position:fixed; bottom:24px; left:50%; transform:translateX(-50%);
-  padding:12px 28px; border-radius:30px;
-  background:linear-gradient(135deg,#00ccff,#0077bb);
-  border:none; cursor:pointer;
-  box-shadow:0 4px 20px rgba(0,204,255,0.4);
-  z-index:9998; color:#fff; font-size:15px; font-weight:700;
+  padding:13px 28px; border-radius:30px;
+  background:linear-gradient(135deg,#00E5CC,#00B8A3);
+  border:none; cursor:pointer; min-height:48px;
+  box-shadow:0 4px 20px rgba(0,229,204,0.35);
+  z-index:9998; color:#0A1512; font-size:15px; font-weight:700;
   letter-spacing:.5px; white-space:nowrap;
   transition:box-shadow .2s, bottom .2s;
-" onmouseover="this.style.boxShadow='0 6px 28px rgba(0,204,255,0.7)';this.style.bottom='28px'"
-   onmouseout="this.style.boxShadow='0 4px 20px rgba(0,204,255,0.4)';this.style.bottom='24px'">
-  🚛 Ask HAULTRA AI
+" onmouseover="this.style.boxShadow='0 6px 28px rgba(0,229,204,0.6)';this.style.bottom='28px'"
+   onmouseout="this.style.boxShadow='0 4px 20px rgba(0,229,204,0.35)';this.style.bottom='24px'">
+  ✦ Ask HAULTRA AI
 </button>
 
 <div id="ask-overlay" onclick="closeAsk()" style="
@@ -4850,34 +4868,34 @@ tr.status-in-progress td {{ background: rgba(255,140,0,0.03); }}
   display:none; position:fixed; left:50%; top:50%;
   transform:translate(-50%,-50%);
   width:min(680px,92vw); max-height:80vh;
-  background:#02060f; border:1px solid rgba(0,200,255,0.22);
+  background:#171717; border:1px solid rgba(0,229,204,0.28);
   border-radius:16px; padding:28px 30px 24px;
   box-shadow:0 20px 60px rgba(0,0,0,0.8);
   z-index:10000; flex-direction:column; gap:16px;">
 
   <div style="display:flex;align-items:center;justify-content:space-between;">
-    <span style="color:#00ccff;font-size:17px;font-weight:800;letter-spacing:.5px;">🚛 Ask HAULTRA AI</span>
-    <button onclick="closeAsk()" style="background:none;border:none;color:#3d5a74;cursor:pointer;font-size:22px;line-height:1;padding:2px 6px;" title="Close (Esc)">&times;</button>
+    <span style="color:#00E5CC;font-size:17px;font-weight:800;letter-spacing:.5px;">✦ Ask HAULTRA AI</span>
+    <button onclick="closeAsk()" style="background:none;border:none;color:#78786F;cursor:pointer;font-size:22px;line-height:1;padding:2px 6px;" title="Close (Esc)">&times;</button>
   </div>
 
   <div style="display:flex;gap:10px;">
     <input id="ask-input" type="text"
       placeholder="Ask about routes, drivers, loads, billing, dispatch…"
       onkeydown="if(event.key==='Enter')submitAsk()"
-      style="flex:1;background:#040b18;border:1px solid rgba(0,180,255,0.18);border-radius:10px;
-             color:#e8f2ff;font-size:14px;padding:11px 16px;outline:none;" />
+      style="flex:1;background:#121212;border:1px solid rgba(0,229,204,0.22);border-radius:10px;
+             color:#F5F5F0;font-size:14px;padding:11px 16px;outline:none;min-height:48px;" />
     <button onclick="submitAsk()" id="ask-send-btn" style="
-      background:linear-gradient(135deg,#00ccff,#0077bb);border:none;
-      border-radius:10px;color:#fff;font-size:14px;font-weight:700;
-      cursor:pointer;padding:11px 22px;white-space:nowrap;">Send</button>
+      background:linear-gradient(135deg,#00E5CC,#00B8A3);border:none;
+      border-radius:10px;color:#0A1512;font-size:14px;font-weight:700;
+      cursor:pointer;padding:11px 22px;white-space:nowrap;min-height:48px;">Send</button>
   </div>
 
   <div id="ask-answer" style="
-    display:none;background:#040b18;border:1px solid rgba(0,180,255,0.12);
-    border-radius:10px;padding:16px;color:#c0d8f0;font-size:14px;
+    display:none;background:#121212;border:1px solid rgba(0,229,204,0.16);
+    border-radius:10px;padding:16px;color:#D8D8D0;font-size:14px;
     line-height:1.7;max-height:45vh;overflow-y:auto;white-space:pre-wrap;"></div>
 
-  <div id="ask-spinner" style="display:none;text-align:center;color:#3d5a74;font-size:13px;">
+  <div id="ask-spinner" style="display:none;text-align:center;color:#78786F;font-size:13px;">
     ⏳ Thinking…
   </div>
 </div>
@@ -4987,29 +5005,37 @@ def login():
         return redirect(url_for("login"))
 
     body = f"""
-    <div style="max-width:520px;margin:70px auto;">
-        <div class="hero">
-            <h1>HAULTRA Login</h1>
-            <p>Operations + AI dispatch in one system.</p>
+    <div style="min-height:calc(100vh - 60px);display:flex;align-items:center;justify-content:center;padding:24px;">
+      <div style="width:100%;max-width:420px;">
+        <div style="text-align:center;margin-bottom:28px;">
+            <div style="font-family:var(--font-head);font-size:52px;letter-spacing:3px;line-height:1;
+                        background:linear-gradient(130deg, #ffffff 0%, #F5F5F0 55%, #FF6B1A 100%);
+                        -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;">
+                HAULTRA
+            </div>
+            <div style="font-size:11px;font-weight:700;letter-spacing:4px;color:#78786F;
+                        text-transform:uppercase;margin-top:6px;">
+                AI Dispatch Systems
+            </div>
         </div>
-        <div class="card">
-           
+        <div class="card" style="background:#171717;border:1px solid rgba(255,255,255,0.08);">
                 <form method="POST">
                 <label>Username</label>
-                <input name="username" required>
+                <input name="username" required autocomplete="username">
                 <label>Password</label>
-                <input type="password" name="password" required>
-                <div style="margin-top:10px;">
-                    <button type="submit">Login</button>
+                <input type="password" name="password" required autocomplete="current-password">
+                <div style="margin-top:16px;">
+                    <button type="submit" style="width:100%;min-height:48px;font-size:15px;">Login</button>
                 </div>
 
-                <div style="margin-top:14px;" class="small muted">
+                <div style="margin-top:16px;text-align:center;" class="small muted">
                 Need an account?
                 <a href="/signup">Create one here</a>
                 </div>
 
                </form>
         </div>
+      </div>
     </div>
     """
     return render_template_string(shell_page("Login", body))
@@ -5202,7 +5228,7 @@ def dashboard():
     <div class="hero">
         <div style="display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:12px;">
             <div>
-                <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#1e3a52;margin-bottom:7px;">
+                <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#55554C;margin-bottom:7px;">
                     HAULTRA AI &mdash; COMMAND CENTER
                 </div>
                 <h1 style="font-size:24px;letter-spacing:-.4px;">Dispatch Intelligence Dashboard</h1>
@@ -5221,15 +5247,15 @@ def dashboard():
         </div>
         <div class="stat">
             <div class="label">Open</div>
-            <div class="num" style="color:#40b8ff;">{open_routes}</div>
+            <div class="num">{open_routes}</div>
         </div>
         <div class="stat">
             <div class="label">In Progress</div>
-            <div class="num" style="color:#ffa830;">{progress_routes}</div>
+            <div class="num" style="color:#FF6B1A;">{progress_routes}</div>
         </div>
         <div class="stat">
             <div class="label">Completed</div>
-            <div class="num" style="color:#00e87d;">{completed_routes}</div>
+            <div class="num" style="color:#3DDC84;">{completed_routes}</div>
         </div>
         <div class="stat">
             <div class="label">Total Stops</div>
@@ -5239,7 +5265,7 @@ def dashboard():
 
     <div class="card">
         <div class="row between" style="margin-bottom:14px;">
-            <h2 style="margin:0;font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:#1e3a52;">
+            <h2 style="margin:0;font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:#55554C;">
                 Recent Routes
             </h2>
             {f'<a class="btn secondary" style="font-size:12px;padding:7px 14px;" href="{url_for("routes_page")}">All Routes →</a>' if user['role'] == 'boss' else ''}
@@ -5256,7 +5282,7 @@ def dashboard():
                     </tr>
                 </thead>
                 <tbody>
-                    {route_rows if route_rows else '<tr><td colspan="5" style="color:#1e3a52;padding:20px 12px;">No routes yet.</td></tr>'}
+                    {route_rows if route_rows else '<tr><td colspan="5" style="color:#55554C;padding:20px 12px;">No routes yet.</td></tr>'}
                 </tbody>
             </table>
         </div>
@@ -6033,7 +6059,7 @@ def boss_dashboard():
         progress_cell = f"""
             <div style="display:flex;align-items:center;gap:8px;">
                 <div class="mini-prog-track"><div class="mini-prog-fill" style="width:{pct}%"></div></div>
-                <span style="font-size:12px;color:#9dc8f0;">{done}/{total}</span>
+                <span style="font-size:12px;color:#D8D8D0;">{done}/{total}</span>
             </div>"""
         reassign_cell = ""
         if show_reassign:
@@ -6050,7 +6076,7 @@ def boss_dashboard():
             <td>
                 <a href="{url_for('view_route', route_id=r['id'])}">{e(r['route_name'])}</a>
                 <br><a href="{url_for('route_daily_log', route_id=r['id'])}"
-                       style="font-size:11px;color:#9dc8f0;">&#x1F4CB; Daily Log</a>
+                       style="font-size:11px;color:#D8D8D0;">&#x1F4CB; Daily Log</a>
             </td>
             <td style="white-space:nowrap;">{e(r['route_date'] or '')}</td>
             <td><span class="badge {e(r['status'])}">{status_label}</span></td>
@@ -6060,9 +6086,9 @@ def boss_dashboard():
         </tr>"""
 
     active_rows   = "".join(route_row(r) for r in active_routes) or \
-        '<tr><td colspan="6" style="text-align:center;color:#9dc8f0;">No active routes.</td></tr>'
+        '<tr><td colspan="6" style="text-align:center;color:#D8D8D0;">No active routes.</td></tr>'
     completed_rows= "".join(route_row(r, show_reassign=False) for r in recent_completed) or \
-        '<tr><td colspan="6" style="text-align:center;color:#9dc8f0;">None yet.</td></tr>'
+        '<tr><td colspan="6" style="text-align:center;color:#D8D8D0;">None yet.</td></tr>'
 
     route_thead = """<thead><tr>
         <th>Route</th><th>Date</th><th>Status</th>
@@ -6087,7 +6113,7 @@ def boss_dashboard():
             <td>
                 <div style="display:flex;align-items:center;gap:8px;">
                     <div class="mini-prog-track"><div class="mini-prog-fill" style="width:{pct}%"></div></div>
-                    <span style="font-size:12px;color:#9dc8f0;">{s_done}/{s_total}</span>
+                    <span style="font-size:12px;color:#D8D8D0;">{s_done}/{s_total}</span>
                 </div>
             </td>
         </tr>"""
@@ -6101,15 +6127,15 @@ def boss_dashboard():
     <div class="grid">
         <div class="stat"><div>Total Routes</div><div class="num">{total_routes}</div></div>
         <div class="stat"><div>Open</div><div class="num">{open_routes}</div></div>
-        <div class="stat" style="border-color:rgba(245,158,11,0.45);">
-            <div>In Progress</div><div class="num" style="color:#fbbf24;">{progress_routes}</div>
+        <div class="stat" style="border-color:rgba(255,107,26,0.45);">
+            <div>In Progress</div><div class="num" style="color:#FF6B1A;">{progress_routes}</div>
         </div>
-        <div class="stat" style="border-color:rgba(34,197,94,0.35);">
-            <div>Completed</div><div class="num" style="color:#4ade80;">{completed_routes}</div>
+        <div class="stat" style="border-color:rgba(61,220,132,0.35);">
+            <div>Completed</div><div class="num" style="color:#3DDC84;">{completed_routes}</div>
         </div>
         <div class="stat"><div>Total Stops</div><div class="num">{total_stops}</div></div>
-        <div class="stat" style="border-color:rgba(34,197,94,0.35);">
-            <div>Stops Done</div><div class="num" style="color:#4ade80;">{completed_stops}</div>
+        <div class="stat" style="border-color:rgba(61,220,132,0.35);">
+            <div>Stops Done</div><div class="num" style="color:#3DDC84;">{completed_stops}</div>
         </div>
         <div class="stat"><div>Drivers</div><div class="num">{drivers_count}</div></div>
         <div class="stat"><div>New Orders</div><div class="num">{new_orders}</div></div>
@@ -6322,7 +6348,7 @@ def text_to_route():
             conf_label = stop.get("confidence_label", "low")
             if conf_label == "high":
                 conf_badge = '<span class="p-badge p-badge-hi">&#10003; HIGH</span>'
-                card_border = "rgba(86,240,183,0.35)"
+                card_border = "rgba(61,220,132,0.35)"
             elif conf_label == "medium":
                 conf_badge = '<span class="p-badge p-badge-med">&#9888; MED</span>'
                 card_border = "rgba(240,192,86,0.35)"
@@ -6345,7 +6371,7 @@ def text_to_route():
     <div class="p-col-full" style="background:rgba(120,100,240,0.10);border-radius:6px;padding:8px 10px;">
       <span class="p-lbl">Relocate: FROM</span>
       <span style="font-size:13px;color:#c0b8f8;">{rel_from or "(see address)"}</span>
-      <span style="margin:0 8px;color:#7a9ab8;">&#8594;</span>
+      <span style="margin:0 8px;color:#A6A69E;">&#8594;</span>
       <span class="p-lbl" style="display:inline;">TO&nbsp;</span>
       <span style="font-size:13px;color:#c0b8f8;">{rel_to or "(not detected)"}</span>
     </div>"""
@@ -6420,7 +6446,7 @@ def text_to_route():
         body = f"""
 <style>
 .p-stop-card {{
-  background: var(--card-bg, #1a2235);
+  background: var(--card-bg, #171717);
   border: 1px solid rgba(255,255,255,0.07);
   border-radius: 10px;
   padding: 16px;
@@ -6439,7 +6465,7 @@ def text_to_route():
   .p-stop-grid {{ grid-template-columns: 1fr 1fr 1fr; }}
   .p-col-wide {{ grid-column: span 2; }}
 }}
-.p-lbl {{ font-size: 11px; color: #7a9ab8; display: block; margin-bottom: 3px; }}
+.p-lbl {{ font-size: 11px; color: #A6A69E; display: block; margin-bottom: 3px; }}
 .p-sel {{
   width: 100%;
   background: var(--input-bg, #0f1724);
@@ -6456,12 +6482,12 @@ def text_to_route():
   border-radius: 4px;
   vertical-align: middle;
 }}
-.p-badge-hi  {{ background: rgba(86,240,183,0.15); color: #56f0b7; }}
+.p-badge-hi  {{ background: rgba(61,220,132,0.15); color: #3DDC84; }}
 .p-badge-med {{ background: rgba(240,192,86,0.15);  color: #f0c056; }}
 .p-badge-low {{ background: rgba(240,112,86,0.18);  color: #f07056; }}
 .p-orig {{
   font-size: 11px;
-  color: #7a9ab8;
+  color: #A6A69E;
   font-style: italic;
   margin-bottom: 8px;
   white-space: nowrap;
@@ -6475,12 +6501,12 @@ def text_to_route():
 </div>
 <div class="card" style="margin-bottom:12px;padding:14px 18px;">
   <div style="display:flex;gap:20px;flex-wrap:wrap;align-items:flex-start;">
-    <div><span style="font-size:11px;color:#7a9ab8;">Route</span><br><strong>{e(route_name)}</strong></div>
-    <div><span style="font-size:11px;color:#7a9ab8;">Date</span><br><strong>{route_date}</strong></div>
-    <div><span style="font-size:11px;color:#7a9ab8;">Driver</span><br><strong>{e(assigned_name) or "Unassigned"}</strong></div>
-    <div><span style="font-size:11px;color:#7a9ab8;">Stops detected</span><br><strong>{len(parsed_stops)}</strong></div>
-    <div><span style="font-size:11px;color:#56f0b7;">&#10003; High</span>&nbsp;
-         <strong style="color:#56f0b7;">{_conf_counts["high"]}</strong>&ensp;
+    <div><span style="font-size:11px;color:#A6A69E;">Route</span><br><strong>{e(route_name)}</strong></div>
+    <div><span style="font-size:11px;color:#A6A69E;">Date</span><br><strong>{route_date}</strong></div>
+    <div><span style="font-size:11px;color:#A6A69E;">Driver</span><br><strong>{e(assigned_name) or "Unassigned"}</strong></div>
+    <div><span style="font-size:11px;color:#A6A69E;">Stops detected</span><br><strong>{len(parsed_stops)}</strong></div>
+    <div><span style="font-size:11px;color:#3DDC84;">&#10003; High</span>&nbsp;
+         <strong style="color:#3DDC84;">{_conf_counts["high"]}</strong>&ensp;
          <span style="font-size:11px;color:#f0c056;">&#9888; Med</span>&nbsp;
          <strong style="color:#f0c056;">{_conf_counts["medium"]}</strong>&ensp;
          <span style="font-size:11px;color:#f07056;">? Low</span>&nbsp;
@@ -6549,27 +6575,27 @@ def text_to_route():
   </form>
 </div>
 <div class="card">
-  <div style="font-size:12px;font-weight:600;color:#7a9ab8;margin-bottom:10px;">SUPPORTED FORMATS</div>
+  <div style="font-size:12px;font-weight:600;color:#A6A69E;margin-bottom:10px;">SUPPORTED FORMATS</div>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
     <div style="background:rgba(255,255,255,0.03);border-radius:8px;padding:12px;">
-      <div style="font-size:10px;color:#7a9ab8;font-weight:700;margin-bottom:5px;">ROLL-OFF (commas)</div>
-      <code style="font-size:12px;color:#56f0b7;display:block;">Pr 5660 lowery rd,vb, jaswal 30yd dump dom</code>
-      <code style="font-size:12px;color:#56f0b7;display:block;">Pull 280 benton,suff, power bolt 20yd</code>
+      <div style="font-size:10px;color:#A6A69E;font-weight:700;margin-bottom:5px;">ROLL-OFF (commas)</div>
+      <code style="font-size:12px;color:#3DDC84;display:block;">Pr 5660 lowery rd,vb, jaswal 30yd dump dom</code>
+      <code style="font-size:12px;color:#3DDC84;display:block;">Pull 280 benton,suff, power bolt 20yd</code>
     </div>
     <div style="background:rgba(255,255,255,0.03);border-radius:8px;padding:12px;">
-      <div style="font-size:10px;color:#7a9ab8;font-weight:700;margin-bottom:5px;">FREEFORM (no commas)</div>
-      <code style="font-size:12px;color:#56f0b7;display:block;">Pull 4915 Broad St vb rhr 30yd dump dom</code>
-      <code style="font-size:12px;color:#56f0b7;display:block;">R 7801 Shore Dr norf smith 20yd</code>
+      <div style="font-size:10px;color:#A6A69E;font-weight:700;margin-bottom:5px;">FREEFORM (no commas)</div>
+      <code style="font-size:12px;color:#3DDC84;display:block;">Pull 4915 Broad St vb rhr 30yd dump dom</code>
+      <code style="font-size:12px;color:#3DDC84;display:block;">R 7801 Shore Dr norf smith 20yd</code>
     </div>
     <div style="background:rgba(255,255,255,0.03);border-radius:8px;padding:12px;">
-      <div style="font-size:10px;color:#7a9ab8;font-weight:700;margin-bottom:5px;">PIPE / STRUCTURED</div>
-      <code style="font-size:12px;color:#56f0b7;display:block;">Smith | 123 Main St Norfolk | PR | 30yd</code>
-      <code style="font-size:12px;color:#56f0b7;display:block;">Jones | 4100 Holland Rd VB | Delivery | 20yd</code>
+      <div style="font-size:10px;color:#A6A69E;font-weight:700;margin-bottom:5px;">PIPE / STRUCTURED</div>
+      <code style="font-size:12px;color:#3DDC84;display:block;">Smith | 123 Main St Norfolk | PR | 30yd</code>
+      <code style="font-size:12px;color:#3DDC84;display:block;">Jones | 4100 Holland Rd VB | Delivery | 20yd</code>
     </div>
     <div style="background:rgba(255,255,255,0.03);border-radius:8px;padding:12px;">
-      <div style="font-size:10px;color:#7a9ab8;font-weight:700;margin-bottom:5px;">WORK ORDER (typed)</div>
-      <code style="font-size:12px;color:#56f0b7;display:block;">PR 1233 Westover Ave, Norfolk, VA, ringen 30yd</code>
-      <code style="font-size:12px;color:#56f0b7;display:block;">D 2431 Southern Pines, Chesapeake, Roof Joe 20yd</code>
+      <div style="font-size:10px;color:#A6A69E;font-weight:700;margin-bottom:5px;">WORK ORDER (typed)</div>
+      <code style="font-size:12px;color:#3DDC84;display:block;">PR 1233 Westover Ave, Norfolk, VA, ringen 30yd</code>
+      <code style="font-size:12px;color:#3DDC84;display:block;">D 2431 Southern Pines, Chesapeake, Roof Joe 20yd</code>
     </div>
   </div>
 </div>"""
@@ -6977,11 +7003,11 @@ def driver_route_detail(route_id):
         photo_html = build_photo_gallery_html(photos_by_stop.get(s["id"], []))
 
         action_color = {
-            "Drop": "#3fd2ff", "Pickup": "#56f0b7", "Swap": "#ffd27c",
-            "Pickup and Return": "#a78bfa",
-            "Dump": "#ff8a8a", "Remove": "#ff8a8a", "Service": "#b0c4ff",
-            "Final": "#c084fc", "Relocate": "#f9a8d4",
-        }.get(s["action"] or "", "#b0c4ff")
+            "Drop": "#8CA0B3", "Pickup": "#FF9D5C", "Swap": "#8CA0B3",
+            "Pickup and Return": "#FF9D5C",
+            "Dump": "#ff8a8a", "Remove": "#ff8a8a", "Service": "#8CA0B3",
+            "Final": "#c084fc", "Relocate": "#8CA0B3",
+        }.get(s["action"] or "", "#8CA0B3")
 
         toggle_label = "Reopen Stop" if is_done else "Complete Stop"
         toggle_class = "btn-driver btn-driver-reopen" if is_done else "btn-driver btn-driver-complete"
@@ -7123,7 +7149,7 @@ def driver_route_detail(route_id):
             )
         elif _is_pr:
             _swap_badge = (
-                '<span style="font-size:10px;background:rgba(150,200,255,0.18);color:#93c5fd;'
+                '<span style="font-size:10px;background:rgba(255,107,26,0.18);color:#FF9D5C;'
                 'padding:2px 8px;border-radius:6px;font-weight:700;letter-spacing:.4px;">'
                 '&#x21A9;&#xFE0F; RETURN</span> '
             )
@@ -7156,7 +7182,7 @@ def driver_route_detail(route_id):
         {f'<span class="action-pill" style="background:rgba(255,200,80,0.22);color:#fde68a;font-weight:900;letter-spacing:.5px;">{e(dict(s).get("wo_type") or "")}</span>' if dict(s).get("wo_type") else ''}
         {_swap_badge}
         <span class="action-pill" style="background:{action_color};color:#06101f;">{e(s['action'] or 'Service')}</span>
-        {f'<span class="action-pill" style="background:rgba(150,200,255,0.18);color:#cde;">{e(s["container_size"])} yd</span>' if s['container_size'] else ''}
+        {f'<span class="action-pill" style="background:rgba(255,107,26,0.18);color:#cde;">{e(s["container_size"])} yd</span>' if s['container_size'] else ''}
         <span class="badge" id="badge-{stop_key}" style="font-size:11px;">{e(s['status'])}</span>
         <span class="dist-badge" id="dist-{stop_key}"></span>
       </div>
@@ -7166,7 +7192,7 @@ def driver_route_detail(route_id):
 
   <div class="dsc-body" id="body-{stop_key}" style="{detail_style}">
     {"" if not s['ticket_number'] else f'<div class="dsc-field"><span class="dsc-label">Ticket</span>{e(s["ticket_number"])}</div>'}
-    {"" if not _s.get('phone') else f'<div class="dsc-field"><span class="dsc-label">Phone</span><a href="tel:{e(_s["phone"])}" style="color:#56f0b7;">{e(_s["phone"])}</a></div>'}
+    {"" if not _s.get('phone') else f'<div class="dsc-field"><span class="dsc-label">Phone</span><a href="tel:{e(_s["phone"])}" style="color:#3DDC84;">{e(_s["phone"])}</a></div>'}
     {"" if not _s.get('dump_location') else f'<div class="dsc-field"><span class="dsc-label">Dump Location</span>{e(_s["dump_location"])}</div>'}
     {"" if not s['notes'] else f'<div class="dsc-field"><span class="dsc-label">Notes</span><span style="white-space:pre-wrap;">{e(s["notes"] or "")}</span></div>'}
     <div class="dsc-field" id="done-at-row-{stop_key}" style="{'display:none;' if not s['completed_at'] else ''}">
@@ -7239,8 +7265,8 @@ def driver_route_detail(route_id):
 
 /* Stop cards */
 .driver-stop-card {
-    background: rgba(4,8,18,0.88);
-    border: 1px solid rgba(0,150,255,0.13);
+    background: rgba(20,20,20,0.88);
+    border: 1px solid rgba(255,107,26,0.13);
     border-radius: 14px;
     margin-bottom: 12px;
     overflow: hidden;
@@ -7248,13 +7274,13 @@ def driver_route_detail(route_id):
 }
 
 .dsc-active {
-    border-color: rgba(0,220,255,0.55) !important;
-    box-shadow: 0 0 28px rgba(0,200,255,0.10), 0 0 0 1px rgba(0,200,255,0.08);
+    border-color: rgba(255,107,26,0.55) !important;
+    box-shadow: 0 0 28px rgba(255,107,26,0.10), 0 0 0 1px rgba(255,107,26,0.08);
 }
 
 .dsc-done {
     opacity: 0.48;
-    border-color: rgba(40,50,68,0.45) !important;
+    border-color: rgba(45,45,42,0.45) !important;
 }
 
 /* Header row (tap to expand) */
@@ -7272,13 +7298,13 @@ def driver_route_detail(route_id):
 .dsc-num {
     font-size: 18px;
     font-weight: 900;
-    color: #00ccff;
+    color: #FF6B1A;
     min-width: 32px;
     padding-top: 2px;
     letter-spacing: -1px;
-    text-shadow: 0 0 12px rgba(0,200,255,0.40);
+    text-shadow: 0 0 12px rgba(255,107,26,0.40);
 }
-.dsc-done .dsc-num { color: #2e4050; text-shadow: none; }
+.dsc-done .dsc-num { color: #55554C; text-shadow: none; }
 
 /* Summary text */
 .dsc-summary { flex: 1; min-width: 0; }
@@ -7286,7 +7312,7 @@ def driver_route_detail(route_id):
 .dsc-customer {
     font-size: 16px;
     font-weight: 800;
-    color: #ddeeff;
+    color: #F5F5F0;
     line-height: 1.25;
     white-space: nowrap;
     overflow: hidden;
@@ -7295,7 +7321,7 @@ def driver_route_detail(route_id):
 
 .dsc-addr {
     font-size: 12px;
-    color: #3d5a74;
+    color: #78786F;
     margin-top: 3px;
     white-space: nowrap;
     overflow: hidden;
@@ -7322,12 +7348,12 @@ def driver_route_detail(route_id):
 
 .dist-badge {
     font-size: 11px;
-    color: #2e5070;
+    color: #8C8C82;
     font-weight: 700;
 }
 
 .dsc-chevron {
-    color: #1e3a50;
+    color: #55554C;
     font-size: 13px;
     padding-top: 4px;
     min-width: 16px;
@@ -7337,7 +7363,7 @@ def driver_route_detail(route_id):
 /* Body (expandable) */
 .dsc-body {
     padding: 0 16px 16px;
-    border-top: 1px solid rgba(0,150,255,0.08);
+    border-top: 1px solid rgba(255,107,26,0.08);
 }
 
 .dsc-field {
@@ -7345,8 +7371,8 @@ def driver_route_detail(route_id):
     gap: 10px;
     font-size: 13px;
     padding: 6px 0;
-    border-bottom: 1px solid rgba(0,150,255,0.05);
-    color: #8ab8d8;
+    border-bottom: 1px solid rgba(255,107,26,0.05);
+    color: #D8D8D0;
 }
 .dsc-field:last-of-type { border-bottom: none; }
 
@@ -7355,7 +7381,7 @@ def driver_route_detail(route_id):
     font-weight: 700;
     letter-spacing: .4px;
     text-transform: uppercase;
-    color: #1e3a52;
+    color: #55554C;
     min-width: 56px;
     flex-shrink: 0;
     padding-top: 1px;
@@ -7389,36 +7415,36 @@ def driver_route_detail(route_id):
 .btn-driver:active { transform: scale(0.98); }
 
 .btn-driver-nav {
-    background: linear-gradient(135deg, #00d8ff 0%, #0090d8 100%);
-    color: #020d18;
-    box-shadow: 0 2px 14px rgba(0,180,255,0.18);
+    background: linear-gradient(135deg, #FF8A42 0%, #FF6B1A 100%);
+    color: #1A1000;
+    box-shadow: 0 2px 14px rgba(255,107,26,0.18);
 }
 .btn-driver-complete {
-    background: linear-gradient(135deg, #00e87d 0%, #00b058 100%);
-    color: #011208;
-    box-shadow: 0 2px 14px rgba(0,200,100,0.15);
+    background: linear-gradient(135deg, #3DDC84 0%, #22B368 100%);
+    color: #06170D;
+    box-shadow: 0 2px 14px rgba(61,220,132,0.20);
 }
 .btn-driver-reopen {
-    background: rgba(30,55,90,0.85);
-    border: 1px solid rgba(0,150,255,0.22);
-    color: #7aa8cc;
+    background: rgba(38,38,35,0.85);
+    border: 1px solid rgba(255,107,26,0.22);
+    color: #B8B8AE;
     box-shadow: none;
 }
 .btn-driver-dump {
-    background: linear-gradient(135deg, #ffb830 0%, #ff7500 100%);
-    color: #100400;
-    box-shadow: 0 2px 14px rgba(255,140,0,0.16);
+    background: linear-gradient(135deg, #FF8A42 0%, #FF6B1A 100%);
+    color: #1A1000;
+    box-shadow: 0 2px 14px rgba(255,107,26,0.16);
 }
 .btn-driver-apple {
-    background: rgba(24,30,44,0.85);
-    border: 1px solid rgba(150,160,180,0.18);
-    color: #8090a8;
+    background: rgba(26,26,26,0.85);
+    border: 1px solid rgba(140,160,179,0.18);
+    color: #8C8C82;
 }
 
 /* Upload details */
 .upload-details { margin-top: 12px; }
 .upload-details summary {
-    color: #2e5070;
+    color: #8C8C82;
     font-size: 13px;
     cursor: pointer;
     padding: 6px 0;
@@ -7435,7 +7461,7 @@ def driver_route_detail(route_id):
 .progress-bar-fill {
     height: 100%;
     border-radius: 999px;
-    background: linear-gradient(90deg, #0090e8, #00ccff);
+    background: linear-gradient(90deg, #FF8A42, #FF6B1A);
     transition: width 0.4s ease;
 }
 
@@ -7445,8 +7471,8 @@ def driver_route_detail(route_id):
     bottom: 0; left: 0; right: 0;
     z-index: 999;
     padding: 10px 16px 14px;
-    background: rgba(2,6,16,0.97);
-    border-top: 1px solid rgba(0,200,255,0.15);
+    background: rgba(18,18,18,0.97);
+    border-top: 1px solid rgba(255,107,26,0.15);
     backdrop-filter: blur(16px);
     -webkit-backdrop-filter: blur(16px);
 }
@@ -7456,18 +7482,18 @@ def driver_route_detail(route_id):
     font-size: 16px;
     font-weight: 900;
     border-radius: 11px;
-    background: linear-gradient(135deg, #00d8ff 0%, #0090d8 100%);
-    color: #020d18;
+    background: linear-gradient(135deg, #FF8A42 0%, #FF6B1A 100%);
+    color: #1A1000;
     border: none;
     cursor: pointer;
     touch-action: manipulation;
-    box-shadow: 0 0 22px rgba(0,180,255,0.22);
+    box-shadow: 0 0 22px rgba(255,107,26,0.22);
     transition: filter .15s;
 }
 #sticky-next-bar button:hover { filter: brightness(1.1); }
 #sticky-next-bar button:disabled {
-    background: rgba(30,50,70,0.60);
-    color: #2e4a62;
+    background: rgba(35,35,32,0.60);
+    color: #8C8C82;
     box-shadow: none;
     cursor: default;
 }
@@ -7884,7 +7910,7 @@ _AUTOCOMPLETE_JS = """
     var box = document.createElement('div');
     box.style.cssText = [
       'position:absolute','left:0','right:0','top:100%','z-index:9999',
-      'background:#0a1826','border:1px solid #1e3a52','border-top:none',
+      'background:#0a1826','border:1px solid #55554C','border-top:none',
       'border-radius:0 0 10px 10px','max-height:260px','overflow-y:auto',
       'display:none','box-shadow:0 8px 32px rgba(0,0,0,.7)'
     ].join(';');
@@ -7909,9 +7935,9 @@ _AUTOCOMPLETE_JS = """
               ].join(';');
               var line2 = [d.address, d.city, d.state].filter(Boolean).join(', ');
               item.innerHTML =
-                '<div style="color:#61f7df;font-weight:600;">' + _esc(d.customer_name) + '</div>' +
-                (line2 ? '<div style="color:#6a8aa8;font-size:11px;margin-top:2px;">' + _esc(line2) + '</div>' : '');
-              item.addEventListener('mouseenter', function() { this.style.background = 'rgba(97,247,223,.08)'; });
+                '<div style="color:#FF9D5C;font-weight:600;">' + _esc(d.customer_name) + '</div>' +
+                (line2 ? '<div style="color:#8C8C82;font-size:11px;margin-top:2px;">' + _esc(line2) + '</div>' : '');
+              item.addEventListener('mouseenter', function() { this.style.background = 'rgba(255,107,26,.08)'; });
               item.addEventListener('mouseleave', function() { this.style.background = ''; });
               item.addEventListener('mousedown', function(ev) {
                 ev.preventDefault();
@@ -8132,31 +8158,31 @@ _PASTE_ROUTE_CSS = """<style>
 /* ── Paste Route Panel ───────────────────────────────────────────── */
 .pr-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start}
 @media(max-width:820px){.pr-grid{grid-template-columns:1fr}}
-.pr-card{background:rgba(4,20,45,.55);border:1px solid rgba(0,160,255,.12);border-radius:14px;padding:20px 22px;margin-bottom:18px}
-.pr-card h3{margin:0 0 4px;font-size:15px;color:#c8dff0;font-weight:800;letter-spacing:.3px}
-.pr-card .pr-sub{font-size:12px;color:#4a6a88;margin:0 0 14px}
+.pr-card{background:rgba(23,23,23,.75);border:1px solid rgba(255,107,26,.14);border-radius:14px;padding:20px 22px;margin-bottom:18px}
+.pr-card h3{margin:0 0 4px;font-size:15px;color:#F5F5F0;font-weight:800;letter-spacing:.3px}
+.pr-card .pr-sub{font-size:12px;color:#8C8C82;margin:0 0 14px}
 .pr-stop{border-radius:10px;padding:15px;margin-bottom:12px;position:relative;transition:opacity .2s,height .2s,padding .2s,margin .2s}
 .pr-stop.h{background:rgba(0,232,125,.04);border:1px solid rgba(0,232,125,.18)}
 .pr-stop.m{background:rgba(255,157,0,.05);border:1px solid rgba(255,157,0,.20)}
 .pr-stop.l{background:rgba(255,59,92,.05);border:1px solid rgba(255,59,92,.20)}
 .pr-badge{display:inline-flex;align-items:center;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;letter-spacing:.3px;margin-right:4px}
-.pr-b-pr{background:rgba(97,247,223,.12);color:#61f7df}
+.pr-b-pr{background:rgba(255,107,26,.14);color:#FF9D5C}
 .pr-b-p{background:rgba(251,191,36,.12);color:#fbbf24}
-.pr-b-d{background:rgba(96,165,250,.12);color:#60a5fa}
-.pr-b-swap{background:rgba(167,139,250,.12);color:#a78bfa}
-.pr-b-move{background:rgba(244,114,182,.12);color:#f472b6}
-.pr-b-relocate{background:rgba(251,146,60,.12);color:#fb923c}
+.pr-b-d{background:rgba(140,160,179,.16);color:#8CA0B3}
+.pr-b-swap{background:rgba(140,160,179,.16);color:#8CA0B3}
+.pr-b-move{background:rgba(140,160,179,.16);color:#8CA0B3}
+.pr-b-relocate{background:rgba(140,160,179,.16);color:#8CA0B3}
 .pr-b-other{background:rgba(120,120,150,.12);color:#9aa5b8}
-.pr-ch{background:rgba(0,232,125,.10);color:#00e87d}
+.pr-ch{background:rgba(61,220,132,.14);color:#3DDC84}
 .pr-cm{background:rgba(251,191,36,.10);color:#fbbf24}
 .pr-cl{background:rgba(255,59,92,.10);color:#ff7090}
-.pr-saved{background:rgba(97,247,223,.08);color:#61f7df;border:1px solid rgba(97,247,223,.2)}
-.pr-lbl{display:block;font-size:10px;color:#4a6a88;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px}
-.pr-inp{width:100%;background:rgba(0,0,0,.35);border:1px solid rgba(0,160,255,.13);border-radius:7px;color:#c8dff0;padding:7px 10px;font-size:13px;box-sizing:border-box;font-family:inherit}
-.pr-inp:focus{outline:none;border-color:rgba(0,200,255,.38)}
+.pr-saved{background:rgba(140,160,179,.12);color:#8CA0B3;border:1px solid rgba(140,160,179,.28)}
+.pr-lbl{display:block;font-size:10px;color:#8C8C82;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px}
+.pr-inp{width:100%;background:rgba(0,0,0,.35);border:1px solid rgba(255,107,26,.14);border-radius:7px;color:#F5F5F0;padding:7px 10px;font-size:13px;box-sizing:border-box;font-family:inherit}
+.pr-inp:focus{outline:none;border-color:rgba(255,107,26,.40)}
 .pr-miss .pr-inp{border-color:rgba(251,191,36,.4)!important;background:rgba(251,191,36,.03)!important}
 .pr-miss .pr-lbl{color:#fbbf24}
-.pr-orig{font-size:11px;color:#3d5564;font-style:italic;font-family:monospace;background:rgba(0,0,0,.18);border-radius:5px;padding:5px 9px;margin-bottom:12px}
+.pr-orig{font-size:11px;color:#78786F;font-style:italic;font-family:monospace;background:rgba(0,0,0,.18);border-radius:5px;padding:5px 9px;margin-bottom:12px}
 .pr-warn-strip{margin-top:10px;padding:6px 12px;border-radius:6px;font-size:12px;background:rgba(251,191,36,.07);border:1px solid rgba(251,191,36,.2);color:#fbbf24}
 .pr-card-acts{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
 .pr-btn-sm{font-size:12px;padding:5px 12px;border-radius:6px;border:none;cursor:pointer;font-weight:600;font-family:inherit}
@@ -8164,15 +8190,15 @@ _PASTE_ROUTE_CSS = """<style>
 .pr-btn-remove:hover{background:rgba(255,59,92,.22)}
 .pr-sugg{padding:9px 13px;border-radius:8px;margin-bottom:8px;font-size:13px;line-height:1.4;display:flex;align-items:flex-start;gap:8px}
 .pr-sw{background:rgba(251,191,36,.07);border:1px solid rgba(251,191,36,.18);color:#fbbf24}
-.pr-si{background:rgba(97,247,223,.05);border:1px solid rgba(97,247,223,.15);color:#61f7df}
+.pr-si{background:rgba(140,160,179,.08);border:1px solid rgba(140,160,179,.22);color:#8CA0B3}
 .pr-se{background:rgba(255,59,92,.07);border:1px solid rgba(255,59,92,.18);color:#ff7090}
-.pr-footer-bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:14px 0 2px;border-top:1px solid rgba(0,160,255,.1);margin-top:10px}
-.pr-footer-count{font-size:13px;color:#4a6a88;flex:1}
-.pr-tip-item{font-size:12px;color:#6a8aa8;padding:7px 0;border-bottom:1px solid rgba(0,100,160,.1)}
+.pr-footer-bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:14px 0 2px;border-top:1px solid rgba(255,107,26,.12);margin-top:10px}
+.pr-footer-count{font-size:13px;color:#8C8C82;flex:1}
+.pr-tip-item{font-size:12px;color:#A6A69E;padding:7px 0;border-bottom:1px solid rgba(255,107,26,.10)}
 .pr-tip-item:last-child{border-bottom:none}
-.pr-tip-item strong{color:#8fd3ff}
-.pr-tip-code{font-family:monospace;background:rgba(0,0,0,.3);border-radius:4px;padding:2px 6px;color:#8fd3ff;font-size:11px}
-#pr-mobile-bar{display:none;position:fixed;bottom:0;left:0;right:0;z-index:1200;background:rgba(4,10,28,.97);border-top:1px solid rgba(0,160,255,.2);padding:12px 16px;gap:10px}
+.pr-tip-item strong{color:#FF9D5C}
+.pr-tip-code{font-family:monospace;background:rgba(0,0,0,.3);border-radius:4px;padding:2px 6px;color:#FF9D5C;font-size:11px}
+#pr-mobile-bar{display:none;position:fixed;bottom:0;left:0;right:0;z-index:1200;background:rgba(20,20,20,.97);border-top:1px solid rgba(255,107,26,.24);padding:12px 16px;gap:10px}
 @media(max-width:820px){ #pr-mobile-bar.pr-show{display:flex} }
 </style>"""
 
@@ -8214,7 +8240,7 @@ _PASTE_ROUTE_JS = """
     var text = ta.value.trim();
     if (!text) { ta.focus(); return; }
     parseBtn.disabled = true; parseBtn.textContent = 'Parsing\u2026';
-    preview.innerHTML = '<p style="color:#5a7a9a;padding:24px 0;font-size:13px;text-align:center;">Analyzing route lines\u2026</p>';
+    preview.innerHTML = '<p style="color:#78786F;padding:24px 0;font-size:13px;text-align:center;">Analyzing route lines\u2026</p>';
     if (footer) footer.style.display = 'none';
     if (mobileBar) mobileBar.classList.remove('pr-show');
     if (suggCard) suggCard.style.display = 'none';
@@ -8252,7 +8278,7 @@ _PASTE_ROUTE_JS = """
   function renderAll() {
     var vis = _stops.filter(function(_, i) { return !_removed[i]; });
     if (!vis.length) {
-      preview.innerHTML = '<p style="color:#5a7a9a;padding:16px 0;font-size:13px;">No stops detected. Try one stop per line.</p>';
+      preview.innerHTML = '<p style="color:#78786F;padding:16px 0;font-size:13px;">No stops detected. Try one stop per line.</p>';
       if (footer) footer.style.display = 'none';
       if (mobileBar) mobileBar.classList.remove('pr-show');
       if (suggCard) suggCard.style.display = 'none';
@@ -8364,7 +8390,7 @@ _PASTE_ROUTE_JS = """
     // Extra info strip (RELOCATE from/to, return destination, placement note)
     var extraInfo = '';
     if (isRelocate && (s.from_address || s.to_address)) {
-      extraInfo += '<div style="font-size:11px;color:#7aaac8;margin-bottom:6px;">'
+      extraInfo += '<div style="font-size:11px;color:#B8B8AE;margin-bottom:6px;">'
         + '&#8680; From: <b>' + _esc(s.from_address || s.address) + (s.from_city ? ' (' + _esc(s.from_city) + ')' : '') + '</b>'
         + ' &nbsp;&#8594;&nbsp; To: <b>' + _esc(s.to_address) + (s.to_city ? ' (' + _esc(s.to_city) + ')' : '') + '</b>'
         + '</div>';
@@ -8373,7 +8399,7 @@ _PASTE_ROUTE_JS = """
       extraInfo += '<div style="font-size:11px;color:#fbbf24;margin-bottom:6px;">&#128204; Placement: ' + _esc(s.placement_note) + '</div>';
     }
     if (s.return_destination) {
-      extraInfo += '<div style="font-size:11px;color:#56f0b7;margin-bottom:6px;">&#8617; Return to: <b>' + _esc(s.return_destination) + '</b></div>';
+      extraInfo += '<div style="font-size:11px;color:#3DDC84;margin-bottom:6px;">&#8617; Return to: <b>' + _esc(s.return_destination) + '</b></div>';
     }
     if (s.swap_with_previous_empty) {
       extraInfo += '<div style="font-size:11px;color:#ff9d00;margin-bottom:6px;">&#9654; SWAP — uses empty can from previous stop</div>';
@@ -8396,8 +8422,8 @@ _PASTE_ROUTE_JS = """
       '<div class="pr-stop ' + confCls(s) + '" id="pr-card-' + i + '">'
       + '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">'
         + '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">'
-          + '<label style="display:flex;align-items:center;gap:7px;cursor:pointer;font-size:12px;color:#7aaac8;font-weight:700;">'
-            + '<input type="checkbox" id="pr-chk-' + i + '" checked style="width:15px;height:15px;accent-color:#00ccff;"> Stop ' + (i + 1)
+          + '<label style="display:flex;align-items:center;gap:7px;cursor:pointer;font-size:12px;color:#B8B8AE;font-weight:700;">'
+            + '<input type="checkbox" id="pr-chk-' + i + '" checked style="width:15px;height:15px;accent-color:#FF9D5C;"> Stop ' + (i + 1)
           + '</label>'
           + actionBadge(s.action, s.pr_mode)
         + '</div>'
@@ -8644,7 +8670,7 @@ def view_route(route_id):
 
     if session.get("role") == "boss":
         route_action_buttons += f"""
-    <button class="btn" type="button" onclick="_haulsTogglePaste()" style="background:linear-gradient(135deg,#004e8c,#003060);border:1px solid rgba(0,160,255,.3);">&#x1F4CB; Paste Route</button>
+    <button class="btn" type="button" onclick="_haulsTogglePaste()" style="background:linear-gradient(135deg,#FF8A42,#FF6B1A);border:1px solid rgba(255,107,26,.3);">&#x1F4CB; Paste Route</button>
     <a class="btn secondary" href="{url_for('route_daily_log', route_id=route_id)}">&#x1F4CB; Daily Log</a>
     <form class="inline" method="POST" action="{url_for('optimize_route', route_id=route_id)}"
           id="optimize-form"
@@ -8704,7 +8730,7 @@ def view_route(route_id):
             if _csb == "empty_can":
                 _can_pill = (
                     ' <span title="Truck arrives with empty can" style="font-size:11px;'
-                    'background:rgba(97,247,223,0.15);color:#61f7df;padding:2px 8px;'
+                    'background:rgba(255,107,26,0.15);color:#FF9D5C;padding:2px 8px;'
                     'border-radius:6px;font-weight:700;vertical-align:middle;">'
                     '&#x1F7E2; Empty Can</span>'
                 )
@@ -8735,14 +8761,14 @@ def view_route(route_id):
             if _is_swap_sc:
                 _swap_badge = (
                     ' <span title="PR Mode: Swap — driver carries empty can from prior Pull" '
-                    'style="font-size:11px;background:rgba(97,247,223,0.15);color:#61f7df;'
+                    'style="font-size:11px;background:rgba(255,107,26,0.15);color:#FF9D5C;'
                     'padding:2px 8px;border-radius:6px;font-weight:700;vertical-align:middle;">'
                     '&#x1F504; PR Mode: Swap</span>'
                 )
             else:
                 _swap_badge = (
                     ' <span title="PR Mode: Return Same Can — driver boxes out, dumps, returns empty can to site" '
-                    'style="font-size:11px;background:rgba(150,200,255,0.18);color:#93c5fd;'
+                    'style="font-size:11px;background:rgba(255,107,26,0.18);color:#FF9D5C;'
                     'padding:2px 8px;border-radius:6px;font-weight:700;vertical-align:middle;">'
                     '&#x21A9;&#xFE0F; PR Mode: Return Same Can</span>'
                 )
@@ -8828,12 +8854,12 @@ def view_route(route_id):
         <div id="paste-route-panel" style="display:none;margin-bottom:24px;">
 
             <!-- Panel header -->
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;padding-bottom:16px;border-bottom:1px solid rgba(0,160,255,.1);">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;padding-bottom:16px;border-bottom:1px solid rgba(255,107,26,.1);">
                 <div>
                     <h2 style="margin:0 0 4px;font-size:20px;color:#e5eefc;">&#x1F4CB; Paste Route</h2>
                     <p style="margin:0;font-size:13px;color:#4a6a88;">Paste messy route text &mdash; HAULTRA structures it into stops.</p>
                 </div>
-                <button id="pr-close-btn" type="button" style="background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:8px;color:#7a9ab8;padding:7px 14px;cursor:pointer;font-size:13px;font-family:inherit;">&#x2715; Close</button>
+                <button id="pr-close-btn" type="button" style="background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:8px;color:#A6A69E;padding:7px 14px;cursor:pointer;font-size:13px;font-family:inherit;">&#x2715; Close</button>
             </div>
 
             <!-- 2-column grid -->
@@ -8845,18 +8871,18 @@ def view_route(route_id):
                     <div class="pr-card">
                         <h3>Paste Route Text</h3>
                         <p class="pr-sub">Paste one stop per line. HAULTRA will structure the route.</p>
-                        <div style="margin-bottom:14px;padding:10px 14px;background:rgba(0,0,0,.2);border-radius:8px;border-left:3px solid rgba(0,160,255,.3);">
-                            <div style="font-size:10px;color:#3d5a74;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:7px;">Examples</div>
+                        <div style="margin-bottom:14px;padding:10px 14px;background:rgba(0,0,0,.2);border-radius:8px;border-left:3px solid rgba(255,107,26,.3);">
+                            <div style="font-size:10px;color:#78786F;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin-bottom:7px;">Examples</div>
                             <div class="pr-tip-code" style="display:block;margin-bottom:4px;">PR 515 central dr talent 30 dom</div>
                             <div class="pr-tip-code" style="display:block;margin-bottom:4px;">P 224 golden maple bartlett 20 wat</div>
                             <div class="pr-tip-code" style="display:block;margin-bottom:4px;">D 900 tidewater quick demo 20</div>
-                            <div style="font-size:10px;color:#3d5a74;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin:10px 0 5px;">Swap Example</div>
+                            <div style="font-size:10px;color:#78786F;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin:10px 0 5px;">Swap Example</div>
                             <div class="pr-tip-code" style="display:block;margin-bottom:2px;">PR 101 N Dogwood Rd, VB, Bishard 30yd dump dominion and before you return it use it to</div>
                             <div class="pr-tip-code" style="display:block;margin-bottom:4px;">PR 114 Sawyers Creek, Camden, Heartland 30yd dump dominion and return to Dogwood</div>
-                            <div style="font-size:10px;color:#3d5a74;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin:10px 0 5px;">Relocate Example</div>
+                            <div style="font-size:10px;color:#78786F;font-weight:700;text-transform:uppercase;letter-spacing:.5px;margin:10px 0 5px;">Relocate Example</div>
                             <div class="pr-tip-code" style="display:block;">Relocate one of the 20s from 224 Golden Maple Dr Chesapeake to 416 Maple Shore Dr Chesapeake place it on the street</div>
                         </div>
-                        <textarea id="pr-textarea" rows="8" placeholder="Paste route here &mdash; one stop per line&hellip;" style="width:100%;background:rgba(0,0,0,.4);border:1px solid rgba(0,160,255,.15);border-radius:9px;color:#c8dff0;padding:12px 14px;font-size:13px;line-height:1.7;resize:vertical;box-sizing:border-box;font-family:monospace;"></textarea>
+                        <textarea id="pr-textarea" rows="8" placeholder="Paste route here &mdash; one stop per line&hellip;" style="width:100%;background:rgba(0,0,0,.4);border:1px solid rgba(255,107,26,.15);border-radius:9px;color:#F5F5F0;padding:12px 14px;font-size:13px;line-height:1.7;resize:vertical;box-sizing:border-box;font-family:monospace;"></textarea>
                         <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap;">
                             <button id="pr-parse-btn" class="btn" type="button" style="padding:9px 22px;">Parse Route</button>
                             <button id="pr-clear-btn" class="btn secondary" type="button" style="padding:9px 16px;">Clear</button>
@@ -8905,7 +8931,7 @@ def view_route(route_id):
                     <!-- C: Parsed Stops Preview -->
                     <div class="pr-card">
                         <h3>Parsed Stops Preview</h3>
-                        <p class="pr-sub" id="pr-preview-sub">Click <strong style="color:#7aaac8;">Parse Route</strong> to analyze your pasted text.</p>
+                        <p class="pr-sub" id="pr-preview-sub">Click <strong style="color:#B8B8AE;">Parse Route</strong> to analyze your pasted text.</p>
                         <div id="pr-preview"></div>
                         <div class="pr-footer-bar" id="pr-footer-bar" style="display:none;">
                             <span class="pr-footer-count" id="pr-stop-count"></span>
@@ -8961,7 +8987,7 @@ def view_route(route_id):
                 </div>
                 <label>Notes</label>
                 <textarea name="notes"></textarea>
-                <p style="margin:10px 0 4px;color:#6a8aa8;font-size:11px;">
+                <p style="margin:10px 0 4px;color:#8C8C82;font-size:11px;">
                     Swap logic for PR stops is auto-derived from route order after Smart Optimize.
                 </p>
                 <div style="margin-top:6px;"><button type="submit">Add Stop</button></div>
@@ -8999,16 +9025,16 @@ def view_route(route_id):
             color:#e5eefc; font-family:inherit;">
         <div style="font-size:42px; margin-bottom:16px;">&#9883;</div>
         <div style="font-size:20px; font-weight:900; margin-bottom:8px;">Optimizing Route&hellip;</div>
-        <div id="optimize-msg" style="font-size:14px; color:#8fd3ff; margin-bottom:24px;">
+        <div id="optimize-msg" style="font-size:14px; color:#FF9D5C; margin-bottom:24px;">
             Geocoding stops &mdash; this takes about 1 second per stop
         </div>
         <div style="width:240px; background:rgba(255,255,255,0.1); border-radius:999px; height:8px; overflow:hidden;">
             <div id="optimize-progress-bar"
                  style="height:100%; width:0%; border-radius:999px;
-                        background:linear-gradient(90deg,#61f7df,#3fd2ff);
+                        background:linear-gradient(90deg,#FF9D5C,#FF9D5C);
                         transition:width 1.1s linear;"></div>
         </div>
-        <div id="optimize-step" style="font-size:12px; color:#6a8aa8; margin-top:10px;"></div>
+        <div id="optimize-step" style="font-size:12px; color:#8C8C82; margin-top:10px;"></div>
     </div>
 
     <script>
@@ -9270,9 +9296,9 @@ def edit_stop(stop_id):
         if _is_swap_edit:
             _swap_info_block = """
             <div style="margin-top:16px;padding:14px 16px;
-                        background:rgba(97,247,223,0.08);
-                        border:1px solid rgba(97,247,223,0.28);border-radius:10px;">
-                <p style="margin:0 0 4px;color:#61f7df;font-size:13px;font-weight:700;">
+                        background:rgba(255,107,26,0.08);
+                        border:1px solid rgba(255,107,26,0.28);border-radius:10px;">
+                <p style="margin:0 0 4px;color:#FF9D5C;font-size:13px;font-weight:700;">
                     &#x1F504; PR Mode: Swap
                 </p>
                 <p style="margin:0;color:#7ab8a8;font-size:12px;">
@@ -9283,12 +9309,12 @@ def edit_stop(stop_id):
         else:
             _swap_info_block = """
             <div style="margin-top:16px;padding:14px 16px;
-                        background:rgba(150,200,255,0.07);
-                        border:1px solid rgba(150,200,255,0.28);border-radius:10px;">
-                <p style="margin:0 0 4px;color:#93c5fd;font-size:13px;font-weight:700;">
+                        background:rgba(255,107,26,0.07);
+                        border:1px solid rgba(255,107,26,0.28);border-radius:10px;">
+                <p style="margin:0 0 4px;color:#FF9D5C;font-size:13px;font-weight:700;">
                     &#x21A9;&#xFE0F; PR Mode: Return Same Can
                 </p>
-                <p style="margin:0;color:#7a9ab8;font-size:12px;">
+                <p style="margin:0;color:#A6A69E;font-size:12px;">
                     Driver boxes out the full can, dumps it, then returns the emptied can to the same site.
                     Workflow: Arrive &#x2192; Box Out &#x2192; Go To Dump &#x2192; Return &amp; Box In &#x2192; Complete.
                 </p>
@@ -9313,47 +9339,47 @@ def edit_stop(stop_id):
         <form method="POST">
             <div class="grid" style="grid-template-columns:1fr 1fr;gap:12px 16px;">
                 <div style="grid-column:1/-1;">
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Customer Name</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Customer Name</label>
                     <input name="customer_name" value="{e(_stop['customer_name'])}" data-hac="1" autocomplete="off">
                 </div>
                 <div style="grid-column:1/-1;">
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Address</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Address</label>
                     <input name="address" value="{e(_stop['address'])}" data-hac="1" autocomplete="off">
                 </div>
                 <div>
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">City</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">City</label>
                     <input name="city" value="{e(_stop['city'])}">
                 </div>
                 <div>
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">State</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">State</label>
                     <input name="state" value="{e(_stop['state'])}">
                 </div>
                 <div>
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">ZIP</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">ZIP</label>
                     <input name="zip_code" value="{e(_stop['zip_code'])}">
                 </div>
                 <div>
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Action</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Action</label>
                     <input name="action" value="{e(_stop['action'])}">
                 </div>
                 <div>
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Container Size</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Container Size</label>
                     <input name="container_size" value="{e(_stop['container_size'])}">
                 </div>
                 <div>
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Ticket Number</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Ticket Number</label>
                     <input name="ticket_number" value="{e(_stop['ticket_number'])}">
                 </div>
                 <div>
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Reference Number</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Reference Number</label>
                     <input name="reference_number" value="{e(_stop['reference_number'])}">
                 </div>
                 <div>
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Dump Location</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Dump Location</label>
                     {_dump_field}
                 </div>
                 <div style="grid-column:1/-1;">
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Notes</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Notes</label>
                     <textarea name="notes" rows="3">{e(_stop['notes'])}</textarea>
                 </div>
             </div>
@@ -9919,7 +9945,7 @@ def route_daily_log(route_id):
             <td class="col-center">{e(s['can_number'] or '')}</td>
             <td class="col-num">{_w(s['scale_in_weight'])}</td>
             <td class="col-num">{_w(s['scale_out_weight'])}</td>
-            <td class="col-num" style="font-weight:700;color:#61f7df;">{_w(s['net_tons'])}</td>
+            <td class="col-num" style="font-weight:700;color:#FF9D5C;">{_w(s['net_tons'])}</td>
             <td class="col-center">{e(s['dump_ticket_number'] or '')}</td>
             <td class="col-center">
                 <span class="badge {e(s['status'])}" style="font-size:10px;">{e(s['status'])}</span>
@@ -9930,18 +9956,18 @@ def route_daily_log(route_id):
     <style>
     .log-tbl {{ width:100%;border-collapse:collapse;font-size:12px;min-width:900px; }}
     .log-tbl th {{
-        background:rgba(97,247,223,0.10);color:#61f7df;font-size:10px;font-weight:700;
-        padding:8px 5px;border-bottom:1px solid rgba(97,247,223,0.18);
+        background:rgba(255,107,26,0.10);color:#FF9D5C;font-size:10px;font-weight:700;
+        padding:8px 5px;border-bottom:1px solid rgba(255,107,26,0.22);
         text-align:center;white-space:nowrap;letter-spacing:.4px;
     }}
-    .log-tbl td {{ padding:7px 5px;border-bottom:1px solid rgba(80,100,140,0.15);font-size:12px; }}
-    .log-tbl tr.row-done td {{ color:#4ade80;opacity:.85; }}
-    .log-tbl tr:hover td {{ background:rgba(97,247,223,0.04); }}
-    .col-num   {{ text-align:right;font-family:monospace; }}
-    .col-time  {{ text-align:center;font-family:monospace;color:#9dc8f0; }}
+    .log-tbl td {{ padding:7px 5px;border-bottom:1px solid rgba(255,255,255,0.06);font-size:12px; }}
+    .log-tbl tr.row-done td {{ color:#3DDC84;opacity:.85; }}
+    .log-tbl tr:hover td {{ background:rgba(255,107,26,0.04); }}
+    .col-num   {{ text-align:right;font-family:var(--font-mono, monospace); }}
+    .col-time  {{ text-align:center;font-family:var(--font-mono, monospace);color:#D8D8D0; }}
     .col-center{{ text-align:center; }}
-    .col-addr  {{ font-size:11px; }}
-    .log-totals-row td {{ border-top:2px solid rgba(97,247,223,0.35);
+    .col-addr  {{ font-size:11px;font-family:var(--font-mono, monospace); }}
+    .log-totals-row td {{ border-top:2px solid rgba(255,107,26,0.40);
                           font-weight:700;color:#fbbf24;font-size:13px; }}
     @media print {{
         .sidebar,.btn,.hero p {{display:none!important;}}
@@ -10724,13 +10750,13 @@ def company_settings():
 
     plan_labels = {
         "trial": ("Trial", "#fbbf24"),
-        "starter": ("Starter", "#3fd2ff"),
-        "pro": ("Pro", "#56f0b7"),
+        "starter": ("Starter", "#FF9D5C"),
+        "pro": ("Pro", "#3DDC84"),
         "enterprise": ("Enterprise", "#c084fc"),
     }
     _co = dict(company) if company else {}
     plan      = _co.get("subscription_plan") or "trial"
-    plan_name, plan_color = plan_labels.get(plan, ("Unknown", "#9dc8f0"))
+    plan_name, plan_color = plan_labels.get(plan, ("Unknown", "#D8D8D0"))
     max_d     = _co.get("max_drivers") or 0
     co_name   = _co.get("name") or ""
     co_slug   = _co.get("slug") or ""
@@ -10776,7 +10802,7 @@ def company_settings():
 
     <div class="card">
         <h2>&#127968; Yard / Base Location</h2>
-        <p style="color:#7aaac8;font-size:13px;margin-bottom:12px;">
+        <p style="color:#B8B8AE;font-size:13px;margin-bottom:12px;">
             Used as the starting point when optimizing routes. Stops with notes containing
             <em>end of day</em>, <em>return to yard</em>, or <em>take to yard</em> are automatically
             pinned to the end of the optimized route.
@@ -10786,19 +10812,19 @@ def company_settings():
             <input type="hidden" name="_action" value="yard">
             <div class="grid" style="grid-template-columns:1fr 1fr;gap:12px 16px;">
                 <div style="grid-column:1/-1;">
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Yard / Base Address</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Yard / Base Address</label>
                     <input name="yard_address" value="{e(yard_addr)}" placeholder="e.g. 100 Industrial Blvd">
                 </div>
                 <div>
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">City</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">City</label>
                     <input name="yard_city" value="{e(yard_city)}" placeholder="e.g. Suffolk">
                 </div>
                 <div>
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">State</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">State</label>
                     <input name="yard_state" value="{e(yard_state)}" placeholder="VA" style="max-width:100px;">
                 </div>
                 <div>
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">ZIP</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">ZIP</label>
                     <input name="yard_zip" value="{e(yard_zip)}" placeholder="23434" style="max-width:140px;">
                 </div>
             </div>
@@ -10810,7 +10836,7 @@ def company_settings():
 
     <div class="card" id="work-hours">
         <h2>&#9201; Work Hours &amp; Pay Cycle</h2>
-        <p style="color:#7aaac8;font-size:13px;margin-bottom:16px;">
+        <p style="color:#B8B8AE;font-size:13px;margin-bottom:16px;">
             Configure your company&rsquo;s pay schedule and how driver day hours are measured.
             These settings apply to all drivers in your company.
         </p>
@@ -10819,7 +10845,7 @@ def company_settings():
             <div class="grid" style="grid-template-columns:1fr 1fr;gap:12px 16px;">
 
                 <div style="grid-column:1/-1;">
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Timezone</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Timezone</label>
                     <select name="timezone">
                         {"".join(f'<option value="{tz}" {"selected" if tz == wh_tz else ""}>{tz}</option>' for tz in [
                             "America/New_York","America/Chicago","America/Denver",
@@ -10830,42 +10856,42 @@ def company_settings():
                 </div>
 
                 <div>
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Workweek Starts On</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Workweek Starts On</label>
                     <select name="workweek_start_day">
                         {"".join(f'<option value="{d}" {"selected" if d == wh_wstart else ""}>{d.title()}</option>' for d in ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"])}
                     </select>
                 </div>
 
                 <div>
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Week Resets On</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Week Resets On</label>
                     <select name="workweek_reset_day">
                         {"".join(f'<option value="{d}" {"selected" if d == wh_wreset else ""}>{d.title()}</option>' for d in ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"])}
                     </select>
                 </div>
 
                 <div>
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Pay Period Type</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Pay Period Type</label>
                     <select name="pay_period_type">
                         {"".join(f'<option value="{pt}" {"selected" if pt == wh_ptype else ""}>{pt.title()}</option>' for pt in ["weekly","biweekly"])}
                     </select>
                 </div>
 
                 <div>
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Pay Period Ends On</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Pay Period Ends On</label>
                     <select name="pay_period_end_day">
                         {"".join(f'<option value="{d}" {"selected" if d == wh_pend else ""}>{d.title()}</option>' for d in ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"])}
                     </select>
                 </div>
 
                 <div>
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Payday</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Payday</label>
                     <select name="payday">
                         {"".join(f'<option value="{d}" {"selected" if d == wh_payday else ""}>{d.title()}</option>' for d in ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"])}
                     </select>
                 </div>
 
                 <div>
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Driver Day Start</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Driver Day Start</label>
                     <select name="driver_day_start_rule">
                         <option value="first_action" {"selected" if wh_dstart == "first_action" else ""}>First route action (automatic)</option>
                         <option value="manual"       {"selected" if wh_dstart == "manual"       else ""}>Manual clock-in</option>
@@ -10873,7 +10899,7 @@ def company_settings():
                 </div>
 
                 <div>
-                    <label style="display:block;font-size:12px;color:#7aaac8;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Driver Day End</label>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Driver Day End</label>
                     <select name="driver_day_end_rule">
                         <option value="last_action" {"selected" if wh_dend == "last_action" else ""}>Last route action (automatic)</option>
                         <option value="manual"      {"selected" if wh_dend == "manual"      else ""}>Manual clock-out</option>
@@ -10951,8 +10977,8 @@ def company_subscription():
 
     plans = [
         ("trial",      "Free",       "$0",    "14 days • up to 5 drivers",                  "#fbbf24"),
-        ("starter",    "Starter",    "$49/mo","Up to 10 drivers",                            "#3fd2ff"),
-        ("pro",        "Pro",        "$99/mo","Up to 30 drivers • priority support",         "#56f0b7"),
+        ("starter",    "Starter",    "$49/mo","Up to 10 drivers",                            "#FF9D5C"),
+        ("pro",        "Pro",        "$99/mo","Up to 30 drivers • priority support",         "#3DDC84"),
         ("enterprise", "Enterprise", "Custom","Unlimited drivers • dedicated support",       "#c084fc"),
     ]
 
@@ -10984,7 +11010,7 @@ def company_subscription():
     show_upgrade = plan in ("trial", "starter", "pro")
     upgrade_btn = (
         '<button onclick="haultraCheckout(\'starter\',this)" '
-        'class="btn" style="background:linear-gradient(135deg,#3fd2ff,#56f0b7);'
+        'class="btn" style="background:linear-gradient(135deg,#FF9D5C,#3DDC84);'
         'color:#0a1628;font-weight:700;border:none;padding:10px 22px;'
         'border-radius:8px;cursor:pointer;">'
         '&#11014;&#65039; Upgrade Plan</button>'
@@ -11021,10 +11047,10 @@ def company_subscription():
     conn2.close()
 
     pct = int(driver_count / max_d * 100) if max_d else 0
-    bar_color = "#f87171" if pct >= 90 else "#3fd2ff"
+    bar_color = "#f87171" if pct >= 90 else "#FF9D5C"
     seat_bar = f"""
     <div style="margin-top:6px;">
-        <div style="font-size:13px;color:#9dc8f0;margin-bottom:4px;">{driver_count} / {max_d} driver seats used</div>
+        <div style="font-size:13px;color:#D8D8D0;margin-bottom:4px;">{driver_count} / {max_d} driver seats used</div>
         <div class="mini-prog-track" style="width:100%;height:10px;">
             <div class="mini-prog-fill" style="width:{pct}%;background:{bar_color};"></div>
         </div>
@@ -11044,10 +11070,10 @@ def company_subscription():
 
     status_color = "#4ade80" if status == "active" else "#f87171"
     plan_color_map = {
-        "trial": "#fbbf24", "starter": "#3fd2ff",
-        "pro": "#56f0b7", "enterprise": "#c084fc",
+        "trial": "#fbbf24", "starter": "#FF9D5C",
+        "pro": "#3DDC84", "enterprise": "#c084fc",
     }
-    pc = plan_color_map.get(plan, "#9dc8f0")
+    pc = plan_color_map.get(plan, "#D8D8D0")
 
     body = f"""
     <div class="hero">
@@ -11621,13 +11647,13 @@ def privacy_policy():
     body = f"""
     <div class="hero">
         <h1>Privacy Policy</h1>
-        <p class="muted small">Effective date: <strong style="color:#e0f0ff;">{today}</strong>
+        <p class="muted small">Effective date: <strong style="color:#F5F5F0;">{today}</strong>
         &nbsp;&middot;&nbsp; HAULTRA AI SYSTEMS &nbsp;&middot;&nbsp; Virginia, USA</p>
     </div>
 
     <div class="card" style="max-width:820px;line-height:1.8;">
 
-        <div style="background:rgba(63,210,255,0.07);border:1px solid rgba(63,210,255,0.18);
+        <div style="background:rgba(255,107,26,0.08);border:1px solid rgba(255,107,26,0.20);
                     border-radius:10px;padding:14px 18px;margin-bottom:24px;font-size:14px;">
             This policy describes how <strong>HAULTRA AI SYSTEMS</strong>, headquartered in
             <strong>Virginia, USA</strong>, collects, uses, and protects your information when
@@ -11640,7 +11666,7 @@ def privacy_policy():
         in the Commonwealth of Virginia, United States. We provide dispatch and route management
         software built for the hauling and roll-off trucking industry. Our registered mailing
         address for privacy matters is:</p>
-        <p style="margin-left:18px;color:#9dc8f0;">
+        <p style="margin-left:18px;color:#D8D8D0;">
             HAULTRA AI SYSTEMS<br>
             Virginia, USA<br>
             <a href="mailto:info@haultraai.com">info@haultraai.com</a>
@@ -11759,8 +11785,8 @@ def privacy_policy():
             Security concerns: <a href="mailto:info@haultraai.com">info@haultraai.com</a>
         </p>
 
-        <div style="margin-top:28px;padding-top:16px;border-top:1px solid rgba(100,160,220,0.15);
-                    font-size:12px;color:#6a9bc0;">
+        <div style="margin-top:28px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.10);
+                    font-size:12px;color:#8C8C82;">
             &copy; {datetime.now().year} HAULTRA AI SYSTEMS &mdash; Virginia, USA.
             All rights reserved.
         </div>
@@ -11779,13 +11805,13 @@ def terms_of_service():
     body = f"""
     <div class="hero">
         <h1>Terms of Service</h1>
-        <p class="muted small">Effective date: <strong style="color:#e0f0ff;">{today}</strong>
+        <p class="muted small">Effective date: <strong style="color:#F5F5F0;">{today}</strong>
         &nbsp;&middot;&nbsp; HAULTRA AI SYSTEMS &nbsp;&middot;&nbsp; Virginia, USA</p>
     </div>
 
     <div class="card" style="max-width:820px;line-height:1.8;">
 
-        <div style="background:rgba(63,210,255,0.07);border:1px solid rgba(63,210,255,0.18);
+        <div style="background:rgba(255,107,26,0.08);border:1px solid rgba(255,107,26,0.20);
                     border-radius:10px;padding:14px 18px;margin-bottom:24px;font-size:14px;">
             Welcome to <strong>HAULTRA Systems</strong> ("HAULTRA", "we", "our", "us"). By
             accessing or using our platform, you agree to these Terms of Service. If you do
@@ -11884,8 +11910,8 @@ def terms_of_service():
         <a href="mailto:info@haultraai.com">info@haultraai.com</a><br>
         HAULTRA AI SYSTEMS &mdash; Virginia, USA</p>
 
-        <div style="margin-top:28px;padding-top:16px;border-top:1px solid rgba(100,160,220,0.15);
-                    font-size:12px;color:#6a9bc0;">
+        <div style="margin-top:28px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.10);
+                    font-size:12px;color:#8C8C82;">
             &copy; {year} HAULTRA AI SYSTEMS &mdash; Virginia, USA. All rights reserved.
         </div>
     </div>
@@ -11931,7 +11957,7 @@ def dump_locations_page():
             <td>{active_badge}</td>
             <td style="text-align:right;white-space:nowrap;">
                 <a href="{url_for('edit_dump_location', loc_id=_dlid)}"
-                   style="color:#3fd2ff;font-size:12px;margin-right:10px;">Edit</a>
+                   style="color:#FF9D5C;font-size:12px;margin-right:10px;">Edit</a>
                 <form method="POST" action="{url_for('toggle_dump_location', loc_id=_dlid)}" style="display:inline;">
                     <button type="submit" style="{toggle_style}">{toggle_label}</button>
                 </form>
@@ -12136,7 +12162,7 @@ def containers_page():
     conn.close()
 
     STATUS_COLOR = {
-        "yard":     "#56f0b7",
+        "yard":     "#3DDC84",
         "deployed": "#fbbf24",
         "lost":     "#f87171",
         "retired":  "#6b7280",
@@ -12146,7 +12172,7 @@ def containers_page():
     for c in containers:
         _cd   = dict(c)
         _cid  = _cd["id"]
-        _sc   = STATUS_COLOR.get(_cd["status"], "#9dc8f0")
+        _sc   = STATUS_COLOR.get(_cd["status"], "#D8D8D0")
         _badge = (
             f'<span style="font-size:11px;padding:2px 8px;border-radius:5px;'
             f'background:rgba(0,0,0,0.3);color:{_sc};border:1px solid {_sc}33;">'
@@ -12163,7 +12189,7 @@ def containers_page():
             <td class="muted small">{e(_cd["notes"] or "")}</td>
             <td style="text-align:right;white-space:nowrap;">
                 <a href="{url_for('edit_container', c_id=_cid)}"
-                   style="color:#3fd2ff;font-size:12px;margin-right:10px;">Edit</a>
+                   style="color:#FF9D5C;font-size:12px;margin-right:10px;">Edit</a>
                 <form method="POST" action="{url_for('delete_container', c_id=_cid)}"
                       style="display:inline;"
                       onsubmit="return confirm('Delete this container?');">
@@ -12483,7 +12509,7 @@ def driver_hours_page():
 
     # ── clock activity rows (combined auto + manual) ─────────────────────────
     _auto_badge   = ('<span style="display:inline-block;padding:1px 8px;border-radius:4px;'
-                     'background:rgba(0,180,255,0.10);color:#3fd2ff;font-size:11px;">Auto</span>')
+                     'background:rgba(255,107,26,0.10);color:#FF9D5C;font-size:11px;">Auto</span>')
     _manual_badge = ('<span style="display:inline-block;padding:1px 8px;border-radius:4px;'
                      'background:rgba(255,157,0,0.12);color:#fbbf24;font-size:11px;">Manual</span>')
     _csrf_tok = get_csrf_token()
@@ -12560,19 +12586,19 @@ def driver_hours_page():
                 <tfoot>
                     <tr style="border-top:1px solid rgba(255,255,255,0.10);">
                         <td colspan="3" style="font-weight:700;">Pay Period Total</td>
-                        <td style="text-align:right;font-weight:900;color:#56f0b7;">%.2f h</td>
+                        <td style="text-align:right;font-weight:900;color:#3DDC84;">%.2f h</td>
                     </tr>
                 </tfoot>
             </table>
         </div>
         <div class="small muted" style="margin-top:10px;">
             Start: %s &bull; End: %s &bull;
-            <a href="%s#work-hours" style="color:#3fd2ff;">Configure in Company Settings</a>
+            <a href="%s#work-hours" style="color:#FF9D5C;">Configure in Company Settings</a>
         </div>
     </div>
 
     <div class="card">
-        <div style="font-size:13px;font-weight:700;color:#3fd2ff;margin-bottom:14px;">
+        <div style="font-size:13px;font-weight:700;color:#FF9D5C;margin-bottom:14px;">
             Clock Activity &mdash; %s
         </div>
         <div class="table-wrap">
@@ -12808,19 +12834,19 @@ def driver_clock():
 
     # Status badge
     if has_ci and not has_co:
-        badge_bg = "rgba(0,232,125,0.14)"; badge_color = "#56f0b7"
+        badge_bg = "rgba(0,232,125,0.14)"; badge_color = "#3DDC84"
         badge_text = "&#9899;&nbsp;Clocked In"
     elif has_co:
-        badge_bg = "rgba(0,180,255,0.10)"; badge_color = "#3fd2ff"
+        badge_bg = "rgba(255,107,26,0.10)"; badge_color = "#FF9D5C"
         badge_text = "&#10003;&nbsp;Day Complete"
     else:
-        badge_bg = "rgba(100,120,150,0.08)"; badge_color = "#7a9ab8"
+        badge_bg = "rgba(100,120,150,0.08)"; badge_color = "#A6A69E"
         badge_text = "Not Clocked In"
 
     ci_display = _fmt(_ci) or "&mdash;"
     co_display = _fmt(_co) or "&mdash;"
-    ci_color   = "#56f0b7" if has_ci else "#3d5a74"
-    co_color   = "#fbbf24" if has_co else "#3d5a74"
+    ci_color   = "#3DDC84" if has_ci else "#78786F"
+    co_color   = "#fbbf24" if has_co else "#78786F"
 
     # ── style constants ──────────────────────────────────────────────────────
     S_GREEN  = ('width:100%;padding:18px;font-size:17px;font-weight:800;'
@@ -12840,12 +12866,12 @@ def driver_clock():
                 'border-radius:10px;border:1px solid rgba(255,157,0,0.22);'
                 'cursor:pointer;background:rgba(255,157,0,0.08);color:#ff9d00;')
     S_UPD    = ('padding:10px 16px;border-radius:8px;font-weight:600;font-size:13px;'
-                'background:rgba(0,200,255,0.10);color:#3fd2ff;'
-                'border:1px solid rgba(0,200,255,0.20);cursor:pointer;white-space:nowrap;')
+                'background:rgba(255,107,26,0.10);color:#FF9D5C;'
+                'border:1px solid rgba(255,107,26,0.20);cursor:pointer;white-space:nowrap;')
     S_TIME   = ('flex:1;padding:10px 12px;background:rgba(255,255,255,0.05);'
-                'border:1px solid rgba(0,160,255,0.20);border-radius:8px;'
+                'border:1px solid rgba(255,107,26,0.20);border-radius:8px;'
                 'color:#e8f2ff;font-size:15px;font-weight:600;')
-    DIVIDER  = '<div style="height:1px;background:rgba(0,160,255,0.10);margin:12px 0;"></div>'
+    DIVIDER  = '<div style="height:1px;background:rgba(255,107,26,0.10);margin:12px 0;"></div>'
     LBL      = ('<div style="font-size:11px;color:var(--text-soft);'
                 'text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;">')
 
@@ -12957,9 +12983,9 @@ def driver_clock():
         '<div style="display:inline-block;padding:8px 22px;border-radius:100px;margin-bottom:18px;'
         'background:' + badge_bg + ';color:' + badge_color + ';font-weight:700;font-size:15px;">'
         + badge_text + '</div>'
-        '<div style="display:flex;border:1px solid rgba(0,160,255,0.12);'
+        '<div style="display:flex;border:1px solid rgba(255,107,26,0.12);'
         'border-radius:10px;overflow:hidden;">'
-        '<div style="flex:1;padding:14px 18px;border-right:1px solid rgba(0,160,255,0.12);">'
+        '<div style="flex:1;padding:14px 18px;border-right:1px solid rgba(255,107,26,0.12);">'
         '<div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;'
         'color:var(--text-soft);margin-bottom:6px;">Clock In</div>'
         '<div style="font-size:24px;font-weight:800;color:' + ci_color + ';">'
