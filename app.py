@@ -1105,6 +1105,67 @@ def update_container_flow(conn, stop_id):
         app.logger.error("Container flow tracking failed for stop %s: %s", stop_id, e)
 
 
+def compute_containers_out(conn, company_id):
+    """
+    Read-only view of containers currently on-site at customer addresses.
+
+    ENABLE_CONTAINER_TRACKING is off, so customer_containers is never written.
+    Rather than fabricate numbers, this replays completed stops chronologically
+    (same action semantics as update_container_flow / compute_can_flow: a
+    Delivery or PR/swap stop leaves a container behind, a Pull closes it out)
+    to derive what's actually out right now from real stop history.
+
+    Returns a list of dicts: address, city, state, size, since (timestamp str),
+    customer_name, route_id — one per address currently holding a container.
+    """
+    rows = conn.execute(
+        """SELECT s.id, s.address, s.city, s.state, s.action, s.container_size,
+                  s.completed_at, s.customer_name, s.route_id, r.route_date
+           FROM stops s
+           JOIN routes r ON s.route_id = r.id
+           WHERE r.company_id = ? AND s.status = 'completed'
+             AND s.address IS NOT NULL AND TRIM(s.address) != ''
+           ORDER BY COALESCE(s.completed_at, r.route_date), s.id""",
+        (company_id,)
+    ).fetchall()
+
+    on_site = {}
+    for s in rows:
+        addr_key = (s["address"] or "").strip().lower() + "|" + (s["city"] or "").strip().lower()
+        action_lower = (s["action"] or "").lower()
+        is_pr       = "pickup and return" in action_lower or ("swap" in action_lower and "pull" not in action_lower)
+        is_delivery = "delivery" in action_lower or "drop" in action_lower
+        is_pull     = "pull" in action_lower and "return" not in action_lower
+
+        if is_delivery or is_pr:
+            on_site[addr_key] = {
+                "address": s["address"], "city": s["city"], "state": s["state"],
+                "size": s["container_size"], "since": s["completed_at"] or s["route_date"],
+                "customer_name": s["customer_name"], "route_id": s["route_id"],
+            }
+        elif is_pull:
+            on_site.pop(addr_key, None)
+
+    return list(on_site.values())
+
+
+def is_pull_job(action):
+    """True for any action that pulls a full container (plain Pull, or PR/swap)."""
+    action_lower = (action or "").lower()
+    is_pr   = "pickup and return" in action_lower or ("swap" in action_lower and "pull" not in action_lower)
+    is_pull = "pull" in action_lower and "return" not in action_lower
+    return is_pr or is_pull
+
+
+def size_bucket(size_str):
+    """Normalize a free-text container size to one of the standard buckets, else None."""
+    s = (size_str or "")
+    for bucket in ("10", "20", "30", "40"):
+        if bucket in s:
+            return f"{bucket}yd"
+    return None
+
+
 # =============================================================
 # PHASE 5B — DRIVER HOURS / PAY CYCLE HELPERS
 # =============================================================
@@ -1709,6 +1770,19 @@ def get_current_user():
 def cid():
     """Return the current session's company_id (None if not logged in)."""
     return session.get("company_id")
+
+
+def driver_active_route_id(conn, user_id):
+    """Best current route for a driver: today's assigned route if open,
+    else the earliest other open/in_progress route. Returns None if none."""
+    row = conn.execute(
+        """SELECT id FROM routes
+           WHERE assigned_to=? AND status IN ('open','in_progress')
+           ORDER BY (route_date = ?) DESC, route_date ASC, id ASC
+           LIMIT 1""",
+        (user_id, today_str())
+    ).fetchone()
+    return row["id"] if row else None
 
 
 def get_company_route(conn, route_id):
@@ -3387,71 +3461,81 @@ def shell_page(title, body, extra_head=""):
 
     sidebar = ""
     if user:
-        # resolve company name for sidebar display
-        _co_name = ""
-        if user["company_id"]:
-            _co_name = session.get("company_name", "")
-            _co_plan = session.get("company_plan", "").title()
+        _co_name = session.get("company_name", "") if user["company_id"] else ""
 
-        boss_only = ""
+        # ── Primary top-nav items (role-aware) ──────────────────────────
         if user["role"] == "boss":
-            boss_only = """
-    {boss_panel}
-    {orders}
-    {users}
-    {dump_locs}
-    {containers}
-    {driver_hours}
-    {co_settings}
-    {subscription}
-    {live_dispatch}
-    {ai_parser}
-""".format(
-    boss_panel=nav_link(url_for("boss_dashboard"), "📊 Boss Panel", path),
-    orders=nav_link(url_for("orders_page"), "🧾 Orders", path),
-    users=nav_link(url_for("manage_users"), "👥 Users", path),
-    dump_locs=nav_link(url_for("dump_locations_page"), "🗑 Dump Locations", path),
-    containers=nav_link(url_for("containers_page"), "📦 Containers", path),
-    driver_hours=nav_link(url_for("driver_hours_page"), "⏱ Driver Hours", path),
-    co_settings=nav_link(url_for("company_settings"), "⚙ Company Settings", path),
-    subscription=nav_link(url_for("company_subscription"), "💳 Subscription", path),
-    live_dispatch=nav_link('/dispatch', '🚛 Live Dispatch', path),
-    ai_parser=nav_link('/parser', '✦ AI Parser', path),
-)
+            primary_items = (
+                nav_link('/parser', '✦ Parser', path)
+                + nav_link(url_for("routes_page"), 'Route Board', path)
+                + nav_link(url_for("bin_tracker"), 'Bin Tracker', path)
+                + nav_link(url_for("dashboard"), 'Owner', path)
+            )
+        else:
+            _cab_conn = get_db()
+            _active_route_id = driver_active_route_id(_cab_conn, user["id"])
+            _cab_conn.close()
+            cab_href = (url_for('driver_route_detail', route_id=_active_route_id)
+                        if _active_route_id else url_for('driver_dashboard'))
+            primary_items = (
+                nav_link('/parser', '✦ Parser', path)
+                + nav_link(cab_href, 'Cab View', path)
+                + nav_link(url_for("dashboard"), 'Owner', path)
+            )
+
+        # ── Overflow "More" items (role-aware) — every remaining page ───
+        if user["role"] == "boss":
+            more_items = (
+                nav_link(url_for("boss_dashboard"), "📊 Boss Panel", path)
+                + nav_link(url_for("drivers_page"), "◉ Drivers", path)
+                + nav_link(url_for("orders_page"), "🧾 Orders", path)
+                + nav_link(url_for("manage_users"), "👥 Users", path)
+                + nav_link(url_for("dump_locations_page"), "🗑 Dump Locations", path)
+                + nav_link(url_for("containers_page"), "📦 Containers", path)
+                + nav_link(url_for("driver_hours_page"), "⏱ Driver Hours", path)
+                + nav_link(url_for("company_settings"), "⚙ Company Settings", path)
+                + nav_link(url_for("company_subscription"), "💳 Subscription", path)
+                + nav_link('/dispatch', '🚛 Live Dispatch', path)
+            )
+        else:
+            more_items = (
+                nav_link(url_for("driver_dashboard"), "◈ My Routes", path)
+                + nav_link(url_for("driver_clock"), "⏱ Clock In/Out", path)
+            )
 
         superadmin_link = nav_link(url_for("superadmin_panel"), "🔧 Superadmin", path) \
             if session.get("is_superadmin") else ""
 
-        co_badge = (f'<div class="muted small" style="margin-bottom:4px;">'
-                    f'{e(_co_name)}</div>') if _co_name else ""
+        co_pill = (f'<span class="company-pill">{e(_co_name)}</span>') if _co_name else ""
 
         sidebar = f"""
-        <aside class="sidebar">
-            <div class="logo-card">
-                <div class="logo-wordmark">
+        <nav class="topnav">
+            <div class="topnav-inner">
+                <a href="/" class="topnav-brand">
                     <span class="logo-h">H</span><span class="logo-rest">AULTRA</span>
+                    <span class="topnav-brand-sub">AI</span>
+                </a>
+                <div class="topnav-links">
+                    {primary_items}
                 </div>
-                <div class="logo-sub">AI DISPATCH SYSTEMS</div>
+                <div class="topnav-right">
+                    <details class="topnav-more">
+                        <summary class="nav-item">More &#9662;</summary>
+                        <div class="topnav-more-menu">
+                            <div class="topnav-more-user">
+                                {e(user['username'])} &middot; {e(user['role'])}
+                            </div>
+                            {more_items}
+                            {superadmin_link}
+                            <form method="POST" action="{url_for('logout')}" style="margin:0;padding:0;">
+                                <button type="submit" class="nav-item nav-logout">⏻ Logout</button>
+                            </form>
+                        </div>
+                    </details>
+                    {co_pill}
+                </div>
             </div>
-            {co_badge}
-            <div class="sidebar-user">
-                <span class="sidebar-user-dot"></span>
-                {e(user['username'] if user else '')}
-                <span class="sidebar-role-badge">{e(user['role'] if user else '')}</span>
-            </div>
-            <nav class="nav-stack">
-                {nav_link(url_for('dashboard'), '⬡ Dashboard', path)}
-                {nav_link(url_for('driver_dashboard'), '◈ My Routes', path) if user['role'] == 'driver' else ''}
-                {nav_link(url_for('driver_clock'), '⏱ Clock In/Out', path) if user['role'] == 'driver' else ''}
-                {nav_link(url_for('routes_page'), '◈ Routes', path) if user['role'] == 'boss' else ''}
-                {nav_link(url_for('drivers_page'), '◉ Drivers', path) if user['role'] == 'boss' else ''}
-                {boss_only}
-                {superadmin_link}
-                <form method="POST" action="{url_for('logout')}" style="margin:0;padding:0;margin-top:8px;">
-                    <button type="submit" class="nav-item nav-logout">⏻ Logout</button>
-                </form>
-            </nav>
-        </aside>
+        </nav>
         """
 
     from flask import get_flashed_messages
@@ -3540,38 +3624,39 @@ a {{ color: var(--cyan); text-decoration: none; transition: color .15s; }}
 a:hover {{ color: #FF9D5C; }}
 
 /* ── App Shell ──────────────────────────────────────────────*/
-.app-shell {{ display: flex; min-height: 100vh; width: 100%; }}
+.app-shell {{ display: flex; flex-direction: column; min-height: 100vh; width: 100%; }}
 
 /* ══════════════════════════════════════════════════════════
-   SIDEBAR
+   TOP NAV
    ══════════════════════════════════════════════════════════*/
-.sidebar {{
-    width: 234px;
-    min-width: 234px;
+.topnav {{
     background: var(--bg-sidebar);
-    border-right: 1px solid var(--border);
-    display: flex;
-    flex-direction: column;
+    border-bottom: 1px solid var(--border);
     position: sticky;
     top: 0;
-    height: 100vh;
-    overflow-y: auto;
-    /* inner glow column */
-    box-shadow: inset -1px 0 0 rgba(255,107,26,0.05), 1px 0 20px rgba(0,0,0,0.4);
+    z-index: 200;
+    box-shadow: 0 1px 0 rgba(255,107,26,0.05), 0 2px 20px rgba(0,0,0,0.4);
 }}
 
-/* ── Logo ───────────────────────────────────────────────────*/
-.logo-card {{
-    padding: 22px 20px 16px;
-    border-bottom: 1px solid rgba(255,107,26,0.07);
+.topnav-inner {{
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 10px 20px;
 }}
 
-.logo-wordmark {{
+/* ── Brand ──────────────────────────────────────────────────*/
+.topnav-brand {{
     display: flex;
     align-items: baseline;
-    gap: 1px;
+    gap: 6px;
     line-height: 1;
+    flex-shrink: 0;
 }}
+
+.logo-wordmark {{ display: flex; align-items: baseline; gap: 1px; line-height: 1; }}
 
 .logo-icon {{
     font-size: 11px;
@@ -3586,86 +3671,49 @@ a:hover {{ color: #FF9D5C; }}
     opacity: 0.85;
 }}
 
-.logo-h {{
+.logo-h, .logo-rest {{
     font-family: var(--font-head);
-    font-size: 24px;
+    font-size: 19px;
     font-weight: 400;
-    letter-spacing: 3px;
+    letter-spacing: 2px;
     background: linear-gradient(130deg, #ffffff 0%, #F5F5F0 55%, #FF6B1A 100%);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
     text-shadow: none;
-    filter: drop-shadow(0 0 12px rgba(255,107,26,0.35));
 }}
+.logo-h {{ filter: drop-shadow(0 0 10px rgba(255,107,26,0.35)); }}
 
-.logo-rest {{
-    font-family: var(--font-head);
-    font-size: 24px;
-    font-weight: 400;
-    letter-spacing: 3px;
-    color: #F5F5F0;
-    background: linear-gradient(130deg, #ffffff 0%, #F5F5F0 55%, #FF6B1A 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-}}
-
-.logo-sub {{
+.logo-sub, .topnav-brand-sub {{
     font-size: 8.5px;
     font-weight: 700;
-    letter-spacing: 3.5px;
+    letter-spacing: 2.5px;
     color: #55554C;
-    margin-top: 5px;
     text-transform: uppercase;
+    align-self: center;
+    margin-left: 2px;
 }}
 
-/* ── Sidebar user pill ──────────────────────────────────────*/
-.sidebar-user {{
+/* ── Primary links ────────────────────────────────────────── */
+.topnav-links {{
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 10px 20px 12px;
-    font-size: 12px;
-    color: var(--text-soft);
-    font-weight: 600;
-    border-bottom: 1px solid rgba(255,107,26,0.06);
-}}
-
-.sidebar-user-dot {{
-    width: 6px; height: 6px;
-    border-radius: 50%;
-    background: var(--green);
-    box-shadow: 0 0 8px var(--green);
-    flex-shrink: 0;
-}}
-
-.sidebar-role-badge {{
-    margin-left: auto;
-    font-size: 9.5px;
-    font-weight: 700;
-    letter-spacing: .6px;
-    padding: 2px 8px;
-    border-radius: 20px;
-    background: var(--cyan-dim);
-    border: 1px solid rgba(255,107,26,0.16);
-    color: var(--cyan);
-    text-transform: uppercase;
-}}
-
-/* ── Nav stack ──────────────────────────────────────────────*/
-.nav-stack {{
-    display: flex;
-    flex-direction: column;
     gap: 2px;
-    padding: 12px 10px;
     flex: 1;
+    min-width: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
 }}
+.topnav-links .nav-item {{ flex-shrink: 0; }}
+.topnav-brand, .topnav-right {{ flex-shrink: 0; }}
+.topnav-links::-webkit-scrollbar {{ display: none; }}
 
 .nav-item {{
-    display: block;
-    width: 100%;
-    padding: 10px 13px;
+    display: inline-flex;
+    align-items: center;
+    white-space: nowrap;
+    padding: 10px 14px;
+    min-height: 48px;
     border-radius: 9px;
     background: transparent;
     border: 1px solid transparent;
@@ -3688,40 +3736,92 @@ a:hover {{ color: #FF9D5C; }}
 }}
 
 .nav-item.active {{
-    background: linear-gradient(90deg, rgba(255,107,26,0.13) 0%, rgba(255,107,26,0.04) 100%);
+    background: linear-gradient(180deg, rgba(255,107,26,0.13) 0%, rgba(255,107,26,0.04) 100%);
     border-color: rgba(255,107,26,0.25);
     color: var(--cyan);
     font-weight: 700;
 }}
 
-/* left accent bar on active */
+/* bottom accent bar on active (top-nav orientation) */
 .nav-item.active::before {{
     content: '';
     position: absolute;
-    left: 0; top: 20%; bottom: 20%;
-    width: 2px;
+    left: 16%; right: 16%; bottom: 2px;
+    height: 2px;
     border-radius: 2px;
     background: var(--cyan);
     box-shadow: 0 0 8px var(--cyan);
 }}
 
 .nav-logout {{
-    color: #6B6B62 !important;
-    margin-top: 6px;
-    border-top: 1px solid rgba(255,107,26,0.05);
-    padding-top: 14px !important;
+    color: #FF9A9A !important;
+    margin-top: 4px;
+}}
+.nav-logout:hover {{
+    background: rgba(255,50,50,0.10) !important;
+    border-color: rgba(255,60,60,0.20) !important;
+    color: #FF6B6B !important;
 }}
 
-.nav-logout:hover {{
-    background: rgba(255,50,50,0.06) !important;
-    border-color: rgba(255,60,60,0.12) !important;
-    color: #FF6B6B !important;
+/* ── Right side: More dropdown + company pill ────────────────*/
+.topnav-right {{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+}}
+
+.topnav-more {{ position: relative; }}
+.topnav-more > summary {{
+    list-style: none;
+    user-select: none;
+}}
+.topnav-more > summary::-webkit-details-marker {{ display: none; }}
+
+.topnav-more-menu {{
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    min-width: 220px;
+    background: var(--bg-card);
+    border: 1px solid rgba(255,107,26,0.18);
+    border-radius: var(--radius);
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.55);
+    z-index: 250;
+}}
+.topnav-more-menu .nav-item {{ width: 100%; display: flex; }}
+
+.topnav-more-user {{
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .4px;
+    color: #55554C;
+    text-transform: uppercase;
+    padding: 6px 10px 8px;
+    border-bottom: 1px solid rgba(255,107,26,0.08);
+    margin-bottom: 4px;
+}}
+
+.company-pill {{
+    font-size: 11.5px;
+    font-weight: 700;
+    letter-spacing: .3px;
+    color: var(--text-soft);
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,107,26,0.14);
+    border-radius: 20px;
+    padding: 7px 14px;
+    white-space: nowrap;
 }}
 
 /* ══════════════════════════════════════════════════════════
    MAIN CONTENT
    ══════════════════════════════════════════════════════════*/
-.content {{ flex: 1; padding: 28px 32px; min-width: 0; }}
+.content {{ flex: 1; width: 100%; max-width: 1400px; margin: 0 auto; padding: 28px 32px; min-width: 0; box-sizing: border-box; }}
 
 /* ── Utilities ──────────────────────────────────────────────*/
 .muted  {{ color: var(--text-muted); }}
@@ -4129,29 +4229,238 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 }}
 
 /* ══════════════════════════════════════════════════════════
+   OWNER DASHBOARD — diesel-gauge stat cards, bar chart, inventory
+   ══════════════════════════════════════════════════════════*/
+.owner-header-row {{
+    display: flex; align-items: flex-start; justify-content: space-between;
+    flex-wrap: wrap; gap: 12px;
+}}
+
+.gauge-stat {{
+    position: relative;
+    background: rgba(20,20,20,0.70);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-top: 3px solid var(--cyan);
+    border-radius: var(--radius);
+    padding: 18px 20px 16px;
+}}
+.gauge-stat .label {{
+    font-size: 10px; font-weight: 700; letter-spacing: 1px;
+    text-transform: uppercase; color: var(--text-muted);
+}}
+.gauge-stat .num {{
+    font-family: var(--font-head); font-size: 40px; font-weight: 400;
+    color: #F5F5F0; line-height: 1; margin-top: 8px; letter-spacing: .5px;
+}}
+.gauge-stat .num.red   {{ color: var(--red); }}
+.gauge-stat .num.dim   {{ color: #55554C; }}
+.gauge-stat .sub {{ font-size: 11px; color: var(--text-muted); margin-top: 6px; }}
+
+.bar-chart-row {{
+    display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
+}}
+.bar-chart-row:last-child {{ margin-bottom: 0; }}
+.bar-chart-label {{
+    width: 100px; flex-shrink: 0; font-size: 12px; font-weight: 600;
+    color: #D8D8D0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}}
+.bar-chart-track {{
+    flex: 1; height: 20px; background: rgba(255,255,255,0.04);
+    border-radius: 5px; overflow: hidden; position: relative;
+}}
+.bar-chart-fill {{
+    height: 100%; background: linear-gradient(90deg, #FF8A42, #FF6B1A);
+    border-radius: 5px; min-width: 3px; transition: width .4s;
+}}
+.bar-chart-value {{
+    width: 30px; flex-shrink: 0; text-align: right;
+    font-size: 12.5px; font-weight: 700; color: #F5F5F0;
+}}
+
+.inv-row {{ margin-bottom: 14px; }}
+.inv-row:last-child {{ margin-bottom: 0; }}
+.inv-row-top {{
+    display: flex; justify-content: space-between; align-items: baseline;
+    margin-bottom: 5px; font-size: 12.5px;
+}}
+.inv-row-size {{ font-weight: 700; color: #F5F5F0; }}
+.inv-row-count {{ color: var(--text-muted); font-size: 11.5px; }}
+.inv-track {{
+    height: 8px; background: rgba(255,255,255,0.05);
+    border-radius: 4px; overflow: hidden;
+}}
+.inv-fill {{
+    height: 100%; border-radius: 4px;
+    background: linear-gradient(90deg, #FF8A42, #FF6B1A);
+    transition: width .4s;
+}}
+
+/* ══════════════════════════════════════════════════════════
+   BIN TRACKER
+   ══════════════════════════════════════════════════════════*/
+.bin-tracker-grid {{
+    display: grid; grid-template-columns: 1.1fr 1fr; gap: 18px;
+    align-items: start;
+}}
+@media (max-width: 900px) {{ .bin-tracker-grid {{ grid-template-columns: 1fr; }} }}
+
+.bin-map-col {{ position: sticky; top: 76px; }}
+@media (max-width: 900px) {{ .bin-map-col {{ position: static; }} }}
+
+.bin-map-stub {{
+    background: rgba(18,18,18,0.9);
+    border: 1px dashed rgba(255,107,26,0.22);
+    border-radius: var(--radius-lg);
+    min-height: 360px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center; padding: 30px;
+}}
+.bin-map-stub-icon {{ font-size: 40px; opacity: .5; margin-bottom: 10px; }}
+.bin-map-stub-title {{ font-family: var(--font-head); font-size: 22px; letter-spacing: .5px; color: #D8D8D0; }}
+.bin-map-stub-sub {{ font-size: 12.5px; color: var(--text-muted); margin-top: 8px; max-width: 320px; line-height: 1.6; }}
+
+.bin-list-header {{
+    display: flex; justify-content: space-between; align-items: flex-start;
+    margin-bottom: 14px; flex-wrap: wrap; gap: 8px;
+}}
+.bin-list-title {{ font-family: var(--font-head); font-size: 22px; letter-spacing: 1px; color: #F5F5F0; }}
+.bin-list-sub {{ font-size: 10.5px; font-weight: 700; letter-spacing: 1.5px; color: var(--text-muted); text-transform: uppercase; }}
+.bin-list-stats {{ font-size: 13px; color: var(--text-muted); text-align: right; }}
+.bin-count {{ font-family: var(--font-head); font-size: 22px; color: var(--cyan); margin-right: 4px; }}
+.bin-overdue-count {{ display: block; color: var(--red); font-size: 11.5px; font-weight: 700; margin-top: 2px; }}
+
+.bin-list {{ display: flex; flex-direction: column; gap: 10px; max-height: 74vh; overflow-y: auto; }}
+.bin-card {{
+    background: rgba(20,20,20,0.75);
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+}}
+.bin-card.overdue {{ border-color: rgba(255,82,82,0.45); background: rgba(255,82,82,0.05); }}
+.bin-card-top {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }}
+.bin-days {{ font-weight: 700; font-size: 13px; letter-spacing: .2px; color: #D8D8D0; }}
+.bin-days.overdue {{ color: var(--red); }}
+.bin-size {{ font-size: 11px; font-weight: 700; color: var(--text-muted); background: rgba(255,255,255,0.05); padding: 2px 8px; border-radius: 20px; }}
+.bin-addr {{ font-family: var(--font-mono); font-size: 13px; color: #F5F5F0; }}
+.bin-customer {{ font-size: 12px; color: var(--text-muted); margin-top: 2px; }}
+.bin-overdue-tag {{ font-size: 11px; font-weight: 700; color: var(--red); margin-top: 8px; letter-spacing: .3px; }}
+
+/* ══════════════════════════════════════════════════════════
+   CAB VIEW — single-stop mobile-first driver flow
+   ══════════════════════════════════════════════════════════*/
+.cab-wrap {{ max-width: 560px; margin: 0 auto; }}
+.cab-header {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }}
+.cab-title {{ font-family: var(--font-head); font-size: 26px; letter-spacing: 1px; color: #F5F5F0; }}
+.cab-online-badge {{
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11px; font-weight: 700; letter-spacing: .5px; text-transform: uppercase;
+    background: rgba(61,220,132,0.12); border: 1px solid rgba(61,220,132,0.35);
+    color: var(--green); border-radius: 20px; padding: 5px 12px;
+}}
+.cab-online-dot {{ width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 6px var(--green); }}
+
+.cab-progress-label {{ font-size: 12px; font-weight: 700; letter-spacing: 1px; color: var(--text-muted); text-transform: uppercase; margin-bottom: 6px; }}
+.cab-progress-track {{ height: 8px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; margin-bottom: 22px; }}
+.cab-progress-fill {{ height: 100%; background: linear-gradient(90deg, #FF8A42, #FF6B1A); border-radius: 4px; transition: width .4s; }}
+
+.cab-card {{
+    background: rgba(20,20,20,0.85);
+    border: 1px solid rgba(255,107,26,0.16);
+    border-radius: var(--radius-lg);
+    padding: 24px 22px;
+    margin-bottom: 18px;
+}}
+.cab-action-row {{ display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }}
+.cab-action-badge {{
+    min-width: 56px; min-height: 56px; display: flex; align-items: center; justify-content: center;
+    font-family: var(--font-head); font-size: 22px; border-radius: 12px; flex-shrink: 0;
+}}
+.cab-action-badge.pickup {{ background: var(--cyan-dim); color: var(--cyan); border: 1px solid rgba(255,107,26,0.5); }}
+.cab-action-badge.dropswap {{ background: rgba(140,160,179,0.16); color: #8CA0B3; border: 1px solid rgba(140,160,179,0.45); }}
+.cab-action-name {{ font-size: 15px; font-weight: 700; color: #D8D8D0; letter-spacing: .3px; }}
+
+.cab-address {{
+    font-family: var(--font-mono); font-size: 26px; font-weight: 700;
+    color: #F5F5F0; line-height: 1.3; word-break: break-word; margin-bottom: 10px;
+}}
+.cab-meta-line {{ font-size: 14px; color: var(--text-muted); margin-bottom: 4px; }}
+.cab-meta-line strong {{ color: #D8D8D0; }}
+
+.cab-nav-btn {{
+    display: flex; align-items: center; justify-content: center; gap: 10px;
+    width: 100%; min-height: 56px; margin-top: 18px;
+    background: linear-gradient(135deg, #FF8A42 0%, #FF6B1A 100%);
+    color: #1A1000; font-weight: 800; font-size: 16px; letter-spacing: .3px;
+    border-radius: 12px; text-decoration: none;
+    box-shadow: 0 4px 20px rgba(255,107,26,0.25);
+}}
+.cab-nav-btn:hover {{ color: #1A1000; filter: brightness(1.06); }}
+
+.cab-photo-status {{ font-size: 12.5px; color: var(--text-muted); text-align: center; margin-top: 14px; }}
+.cab-photo-status.ready {{ color: var(--green); }}
+
+.cab-complete-btn {{
+    width: 100%; min-height: 56px; margin-top: 10px;
+    background: linear-gradient(135deg, #3DDC84 0%, #22B368 100%);
+    color: #06170D; font-weight: 800; font-size: 16px; border: none; border-radius: 12px;
+    cursor: pointer;
+}}
+.cab-complete-btn:disabled {{ background: rgba(255,255,255,0.06); color: #55554C; cursor: not-allowed; box-shadow: none; }}
+
+.cab-all-done {{
+    text-align: center; padding: 60px 20px;
+}}
+.cab-all-done-icon {{ font-size: 48px; margin-bottom: 14px; }}
+.cab-all-done h2 {{ font-family: var(--font-head); font-size: 30px; letter-spacing: .5px; color: #F5F5F0; }}
+
+/* Driver workflow buttons (Cab View: Arrived / Box In-Out / Go To Dump) */
+.btn-driver {{
+    display: block; width: 100%; min-height: 52px; padding: 14px 16px;
+    border-radius: 12px; font-size: 15px; font-weight: 800; text-align: center;
+    border: none; cursor: pointer; text-decoration: none; line-height: 1.2;
+    box-sizing: border-box;
+}}
+.btn-driver-nav, .btn-driver-complete, .btn-driver-dump {{
+    background: linear-gradient(135deg, #FF8A42 0%, #FF6B1A 100%);
+    color: #1A1000;
+}}
+.btn-driver-apple {{
+    background: rgba(26,26,26,0.85);
+    border: 1px solid rgba(140,160,179,0.18);
+    color: #8C8C82;
+}}
+.btn-driver-reopen {{
+    background: rgba(38,38,35,0.85);
+    border: 1px solid rgba(255,107,26,0.22);
+    color: #B8B8AE;
+}}
+.upload-details {{ margin: 10px 0; }}
+.upload-details summary {{
+    color: #B8B8AE; font-size: 13px; font-weight: 600; cursor: pointer;
+    padding: 8px 0; list-style: none;
+}}
+.upload-details summary::-webkit-details-marker {{ display: none; }}
+.upload-details input[type="file"] {{
+    background: rgba(20,20,20,0.7); border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 9px; padding: 10px; color: #D8D8D0; font-size: 12.5px;
+}}
+
+/* ══════════════════════════════════════════════════════════
    RESPONSIVE
    ══════════════════════════════════════════════════════════*/
 @media (max-width: 900px) {{
-    .app-shell {{ flex-direction: column; }}
-    .sidebar {{
-        width: 100%; min-width: unset;
-        height: auto; position: static;
-        border-right: none;
-        border-bottom: 1px solid rgba(255,107,26,0.08);
-    }}
     .content {{ padding: 16px; }}
-    .nav-stack {{
-        flex-direction: row; flex-wrap: wrap;
-        gap: 4px; padding: 8px 10px;
-    }}
-    .nav-item {{
-        width: auto; padding: 8px 12px;
-        font-size: 12px;
-    }}
-    .nav-item.active::before {{ display: none; }}
-    .logo-card {{ padding: 14px 16px 10px; }}
-    .sidebar-user {{ padding: 6px 16px 10px; }}
+    .topnav-inner {{ padding: 8px 12px; gap: 10px; }}
+    .nav-item {{ padding: 10px 11px; font-size: 12.5px; }}
+    .company-pill {{ display: none; }}
     .grid {{ grid-template-columns: repeat(2, 1fr); }}
+}}
+
+@media (max-width: 560px) {{
+    .topnav-brand-sub {{ display: none; }}
+    .logo-h, .logo-rest {{ font-size: 16px; }}
+    .cab-address {{ font-size: 21px; }}
+    .cab-card {{ padding: 18px 16px; }}
 }}
 </style>
     </head>
@@ -5148,17 +5457,11 @@ def dashboard():
 
     conn = get_db()
     user = get_current_user()
-
     company_id = cid()
-    if user["role"] == "boss":
-        routes = conn.execute("""
-            SELECT r.*, u.username AS assigned_username
-            FROM routes r
-            LEFT JOIN users u ON r.assigned_to = u.id
-            WHERE r.company_id = ?
-            ORDER BY r.route_date DESC, r.id DESC LIMIT 8
-        """, (company_id,)).fetchall()
-    else:
+    today = today_str()
+
+    if user["role"] != "boss":
+        # ── Driver: simple personal view (Cab View covers the working driver UX) ──
         routes = conn.execute("""
             SELECT r.*, u.username AS assigned_username
             FROM routes r
@@ -5166,40 +5469,163 @@ def dashboard():
             WHERE r.assigned_to = ? AND r.company_id = ?
             ORDER BY r.route_date DESC, r.id DESC LIMIT 8
         """, (user["id"], company_id)).fetchall()
-
-    if user["role"] == "boss":
         _rc = conn.execute("""
-            SELECT COUNT(*) AS total,
-                   SUM(status='open') AS open,
-                   SUM(status='in_progress') AS progress,
-                   SUM(status='completed') AS completed
-            FROM routes WHERE company_id=?
-        """, (company_id,)).fetchone()
-        route_total, open_routes, progress_routes, completed_routes = (
-            _rc["total"], _rc["open"] or 0, _rc["progress"] or 0, _rc["completed"] or 0
-        )
-        stop_total  = conn.execute("SELECT COUNT(*) n FROM stops s JOIN routes r ON s.route_id=r.id WHERE r.company_id=?", (company_id,)).fetchone()["n"]
-        total_loads = conn.execute("SELECT COUNT(*) n FROM load_scores WHERE company_id=?", (company_id,)).fetchone()["n"]
-    else:
-        _rc = conn.execute("""
-            SELECT COUNT(*) AS total,
-                   SUM(status='open') AS open,
-                   SUM(status='in_progress') AS progress,
-                   SUM(status='completed') AS completed
+            SELECT COUNT(*) AS total, SUM(status='open') AS open,
+                   SUM(status='in_progress') AS progress, SUM(status='completed') AS completed
             FROM routes WHERE assigned_to=? AND company_id=?
         """, (user["id"], company_id)).fetchone()
         route_total, open_routes, progress_routes, completed_routes = (
             _rc["total"], _rc["open"] or 0, _rc["progress"] or 0, _rc["completed"] or 0
         )
-        stop_total  = conn.execute("SELECT COUNT(*) n FROM stops s JOIN routes r ON s.route_id=r.id WHERE r.assigned_to=? AND r.company_id=?", (user["id"], company_id)).fetchone()["n"]
-        total_loads = conn.execute("SELECT COUNT(*) n FROM load_scores WHERE created_by=? AND company_id=?", (user["id"], company_id)).fetchone()["n"]
+        stop_total = conn.execute(
+            "SELECT COUNT(*) n FROM stops s JOIN routes r ON s.route_id=r.id WHERE r.assigned_to=? AND r.company_id=?",
+            (user["id"], company_id)
+        ).fetchone()["n"]
+        conn.close()
 
-    top_load = conn.execute("SELECT * FROM load_scores WHERE company_id=? ORDER BY score DESC, estimated_profit DESC LIMIT 1", (company_id,)).fetchone()
+        route_rows = ""
+        for r in routes:
+            route_rows += f"""
+<tr>
+    <td>{e(r['route_date'])}</td>
+    <td><a href="{url_for('driver_route_detail', route_id=r['id'])}">{e(r['route_name'])}</a></td>
+    <td><span class="badge {e(r['status'])}">{e(r['status'])}</span></td>
+</tr>
+"""
+        body = f"""
+    <div class="hero">
+        <h1>My Day</h1>
+        <p>{e(today)} &mdash; your assigned routes and stops.</p>
+    </div>
+    <div class="grid" style="margin-bottom:20px;">
+        <div class="stat"><div class="label">Total Routes</div><div class="num">{route_total}</div></div>
+        <div class="stat"><div class="label">Open</div><div class="num">{open_routes}</div></div>
+        <div class="stat"><div class="label">In Progress</div><div class="num" style="color:#FF6B1A;">{progress_routes}</div></div>
+        <div class="stat"><div class="label">Completed</div><div class="num" style="color:#3DDC84;">{completed_routes}</div></div>
+        <div class="stat"><div class="label">Total Stops</div><div class="num">{stop_total}</div></div>
+    </div>
+    <div class="card">
+        <h2 style="margin:0 0 14px;font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:#55554C;">My Routes</h2>
+        <div class="table-wrap">
+            <table>
+                <thead><tr><th>Date</th><th>Route</th><th>Status</th></tr></thead>
+                <tbody>{route_rows if route_rows else '<tr><td colspan="3" style="color:#55554C;padding:20px 12px;">No routes yet.</td></tr>'}</tbody>
+            </table>
+        </div>
+    </div>
+    """
+        return render_template_string(shell_page("My Day", body))
+
+    # ══════════════════════════════════════════════════════════
+    # OWNER DASHBOARD (boss) — real data, "—" for anything we don't track
+    # ══════════════════════════════════════════════════════════
+
+    # Pulls today: completed pull/PR-type stops with completed_at falling on today
+    _today_pull_stops = conn.execute("""
+        SELECT s.action, r.assigned_to, u.username AS driver_username
+        FROM stops s
+        JOIN routes r ON s.route_id = r.id
+        LEFT JOIN users u ON r.assigned_to = u.id
+        WHERE r.company_id=? AND s.status='completed'
+          AND substr(COALESCE(s.completed_at, r.route_date), 1, 10) = ?
+    """, (company_id, today)).fetchall()
+    pulls_today_rows = [s for s in _today_pull_stops if is_pull_job(s["action"])]
+    pulls_today = len(pulls_today_rows)
+
+    driver_pull_counts = {}
+    for s in pulls_today_rows:
+        name = s["driver_username"] or "Unassigned"
+        driver_pull_counts[name] = driver_pull_counts.get(name, 0) + 1
+    driver_pull_list = sorted(driver_pull_counts.items(), key=lambda kv: kv[1], reverse=True)
+
+    # Containers out (live, derived from stop history — see compute_containers_out)
+    containers_out = compute_containers_out(conn, company_id)
+    out_count = len(containers_out)
+    for c in containers_out:
+        c["days_out"] = _days_out(c["since"])
+    overdue_count = sum(1 for c in containers_out if (c["days_out"] or 0) >= OVERDUE_RENTAL_DAYS)
+
+    # Fleet totals by size (real, boss-registered inventory — 0 if not registered yet)
+    fleet_rows = conn.execute(
+        "SELECT size, COUNT(*) n FROM containers WHERE company_id=? AND status != 'retired' GROUP BY size",
+        (company_id,)
+    ).fetchall()
+    fleet_by_bucket = {"10yd": 0, "20yd": 0, "30yd": 0, "40yd": 0}
+    for fr in fleet_rows:
+        b = size_bucket(fr["size"])
+        if b:
+            fleet_by_bucket[b] += fr["n"]
+    total_fleet = sum(fleet_by_bucket.values())
+
+    out_by_bucket = {"10yd": 0, "20yd": 0, "30yd": 0, "40yd": 0}
+    for c in containers_out:
+        b = size_bucket(c["size"])
+        if b:
+            out_by_bucket[b] += 1
+
+    routes = conn.execute("""
+        SELECT r.*, u.username AS assigned_username
+        FROM routes r
+        LEFT JOIN users u ON r.assigned_to = u.id
+        WHERE r.company_id = ?
+        ORDER BY r.route_date DESC, r.id DESC LIMIT 8
+    """, (company_id,)).fetchall()
     conn.close()
+
+    # ── Pulls by Driver bar chart ───────────────────────────────
+    if driver_pull_list:
+        max_pulls = max(n for _, n in driver_pull_list)
+        bar_rows = ""
+        for name, n in driver_pull_list:
+            pct = round((n / max_pulls) * 100) if max_pulls else 0
+            bar_rows += f"""
+            <div class="bar-chart-row">
+                <div class="bar-chart-label">{e(name)}</div>
+                <div class="bar-chart-track"><div class="bar-chart-fill" style="width:{pct}%;"></div></div>
+                <div class="bar-chart-value">{n}</div>
+            </div>"""
+    else:
+        bar_rows = '<div class="empty-state" style="padding:20px 0;">No pulls completed yet today.</div>'
+
+    # ── Container Inventory per-size bars ───────────────────────
+    if total_fleet == 0 and out_count == 0:
+        inv_html = '<div class="empty-state" style="padding:20px 0;">No containers registered yet &mdash; add your fleet in Containers to track inventory.</div>'
+    else:
+        inv_html = ""
+        for bucket in ("10yd", "20yd", "30yd", "40yd"):
+            y = fleet_by_bucket[bucket]
+            x = out_by_bucket[bucket]
+            if y == 0 and x == 0:
+                continue
+            if y == 0:
+                count_label = f"{x} out &middot; fleet not registered"
+                pct = 100
+            else:
+                count_label = f"{x} / {y} out"
+                pct = min(100, round((x / y) * 100))
+            inv_html += f"""
+            <div class="inv-row">
+                <div class="inv-row-top">
+                    <span class="inv-row-size">{bucket}</span>
+                    <span class="inv-row-count">{count_label}</span>
+                </div>
+                <div class="inv-track"><div class="inv-fill" style="width:{pct}%;"></div></div>
+            </div>"""
+        if not inv_html:
+            inv_html = '<div class="empty-state" style="padding:20px 0;">No containers registered yet &mdash; add your fleet in Containers to track inventory.</div>'
+
+    # ── Containers Out stat card body ───────────────────────────
+    if total_fleet > 0:
+        containers_out_num = f"{out_count}/{total_fleet}"
+        in_yard = max(0, total_fleet - out_count)
+        containers_out_sub = f"{in_yard} in yard"
+    else:
+        containers_out_num = str(out_count)
+        containers_out_sub = "fleet not registered in Containers"
 
     route_rows = ""
     for r in routes:
-       route_rows += f"""
+        route_rows += f"""
 <tr>
     <td>{e(r['route_date'])}</td>
     <td><a href="{url_for('view_route', route_id=r['id'])}">{e(r['route_name'])}</a></td>
@@ -5208,78 +5634,72 @@ def dashboard():
     <td>
         <div class="row">
             <a class="btn secondary" href="{url_for('view_route', route_id=r['id'])}">Open</a>
-            {f'''
             <form class="inline" method="POST"
                   action="{url_for('delete_route', route_id=r['id'])}"
                   onsubmit="return confirm('Delete this route?')">
                 <button class="btn red" type="submit">Delete</button>
             </form>
-            ''' if user['role'] == 'boss' else ''}
         </div>
     </td>
 </tr>
 """
 
-    top_load_html = "No loads scored yet"
-    if top_load:
-        top_load_html = f"{e(top_load['origin'])} → {e(top_load['destination'])} | Score {top_load['score']}"
-
     body = f"""
-    <div class="hero">
-        <div style="display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:12px;">
-            <div>
-                <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#55554C;margin-bottom:7px;">
-                    HAULTRA AI &mdash; COMMAND CENTER
-                </div>
-                <h1 style="font-size:24px;letter-spacing:-.4px;">Dispatch Intelligence Dashboard</h1>
-                <p style="margin-top:6px;">Run operations, track routes, manage drivers, complete stops, and score freight.</p>
+    <div class="hero owner-header-row">
+        <div>
+            <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#55554C;margin-bottom:7px;">
+                OWNER &middot; {e(today)}
             </div>
-            {f'''<a class="btn gold" href="{url_for('routes_page')}" style="align-self:flex-start;white-space:nowrap;">
-                View All Routes
-            </a>''' if user['role'] == 'boss' else ''}
+            <h1>Yard Overview</h1>
+            <p style="margin-top:6px;">Real-time pulls, containers, and driver activity for today.</p>
         </div>
+        <a class="btn gold" href="{url_for('export_day_csv')}" style="align-self:flex-start;white-space:nowrap;">
+            &#8615; Export Day
+        </a>
     </div>
 
     <div class="grid" style="margin-bottom:20px;">
-        <div class="stat">
-            <div class="label">Total Routes</div>
-            <div class="num">{route_total}</div>
+        <div class="gauge-stat">
+            <div class="label">Pulls Today</div>
+            <div class="num">{pulls_today}</div>
         </div>
-        <div class="stat">
-            <div class="label">Open</div>
-            <div class="num">{open_routes}</div>
+        <div class="gauge-stat">
+            <div class="label">Revenue</div>
+            <div class="num dim">&mdash;</div>
+            <div class="sub">not tracked yet</div>
         </div>
-        <div class="stat">
-            <div class="label">In Progress</div>
-            <div class="num" style="color:#FF6B1A;">{progress_routes}</div>
+        <div class="gauge-stat">
+            <div class="label">Containers Out</div>
+            <div class="num">{containers_out_num}</div>
+            <div class="sub">{containers_out_sub}</div>
         </div>
-        <div class="stat">
-            <div class="label">Completed</div>
-            <div class="num" style="color:#3DDC84;">{completed_routes}</div>
+        <div class="gauge-stat">
+            <div class="label">Overdue</div>
+            <div class="num {'red' if overdue_count else ''}">{overdue_count}</div>
+            <div class="sub">{OVERDUE_RENTAL_DAYS}+ days out</div>
         </div>
-        <div class="stat">
-            <div class="label">Total Stops</div>
-            <div class="num">{stop_total}</div>
+    </div>
+
+    <div class="row" style="align-items:stretch;gap:16px;flex-wrap:wrap;margin-bottom:16px;">
+        <div class="card" style="flex:1;min-width:300px;margin-bottom:0;">
+            <h2>Pulls by Driver</h2>
+            {bar_rows}
+        </div>
+        <div class="card" style="flex:1;min-width:300px;margin-bottom:0;">
+            <h2>Container Inventory</h2>
+            {inv_html}
         </div>
     </div>
 
     <div class="card">
         <div class="row between" style="margin-bottom:14px;">
-            <h2 style="margin:0;font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:#55554C;">
-                Recent Routes
-            </h2>
-            {f'<a class="btn secondary" style="font-size:12px;padding:7px 14px;" href="{url_for("routes_page")}">All Routes →</a>' if user['role'] == 'boss' else ''}
+            <h2 style="margin:0;">Recent Routes</h2>
+            <a class="btn secondary" style="font-size:12px;padding:7px 14px;" href="{url_for("routes_page")}">All Routes &rarr;</a>
         </div>
         <div class="table-wrap">
             <table>
                 <thead>
-                    <tr>
-                        <th>Date</th>
-                        <th>Route</th>
-                        <th>Assigned</th>
-                        <th>Status</th>
-                        <th></th>
-                    </tr>
+                    <tr><th>Date</th><th>Route</th><th>Assigned</th><th>Status</th><th></th></tr>
                 </thead>
                 <tbody>
                     {route_rows if route_rows else '<tr><td colspan="5" style="color:#55554C;padding:20px 12px;">No routes yet.</td></tr>'}
@@ -5288,8 +5708,7 @@ def dashboard():
         </div>
     </div>
     """
-    return render_template_string(shell_page("Dashboard", body))
-    
+    return render_template_string(shell_page("Owner", body))
 
 @app.route("/analytics")
 @login_required
@@ -6853,12 +7272,6 @@ def driver_route_detail(route_id):
     stop_ids = [s["id"] for s in stops]
     photos_by_stop = load_stop_photos(conn, stop_ids)
 
-    dump_loc = None
-    if route["dump_location_id"]:
-        dump_loc = conn.execute(
-            "SELECT * FROM dump_locations WHERE id=?", (route["dump_location_id"],)
-        ).fetchone()
-
     # Load all active dump locations keyed by lowercase name for per-stop nav lookup
     _dump_loc_rows = conn.execute(
         "SELECT name, address, city, state, zip_code FROM dump_locations WHERE active=1"
@@ -6869,704 +7282,295 @@ def driver_route_detail(route_id):
 
     completed_count = sum(1 for s in stops if s["status"] == "completed")
     total_count = len(stops)
+    pct = int(completed_count / total_count * 100) if total_count else 0
 
-    from urllib.parse import quote_plus
-
-    addresses = []
-    for s in stops:
-        full_address = " ".join(filter(None, [
-            s["address"] or "",
-            s["city"] or "",
-            s["state"] or "",
-            s["zip_code"] or "",
-        ])).strip()
-        if full_address:
-            addresses.append(full_address)
-
-    route_map_url = ""
-    if len(addresses) == 1:
-        route_map_url = "https://www.google.com/maps/search/?api=1&query=" + quote_plus(addresses[0])
-    elif len(addresses) >= 2:
-        origin = quote_plus(addresses[0])
-        destination = quote_plus(addresses[-1])
-        route_map_url = (
-            "https://www.google.com/maps/dir/?api=1"
-            f"&origin={origin}"
-            f"&destination={destination}"
-            "&travelmode=driving"
-        )
-        if len(addresses) > 2:
-            waypoints = "|".join(quote_plus(a) for a in addresses[1:-1])
-            route_map_url += f"&waypoints={waypoints}"
-
-    # Apple Maps full route: supports origin→destination with optional +to: waypoints
-    route_map_url_apple = ""
-    if len(addresses) == 1:
-        route_map_url_apple = "https://maps.apple.com/?q=" + quote_plus(addresses[0]) + "&dirflg=d"
-    elif len(addresses) >= 2:
-        # Apple Maps supports multi-stop via "daddr=A+to:B+to:C" (up to ~10 stops reliable)
-        daddr = "+to:".join(quote_plus(a) for a in addresses[1:])
-        route_map_url_apple = (
-            "https://maps.apple.com/?saddr=" + quote_plus(addresses[0]) +
-            "&daddr=" + daddr +
-            "&dirflg=d"
-        )
-
-    # Google Maps waypoints cap at 8 intermediate stops (10 total incl. origin+dest)
-    route_map_url_google = route_map_url
-    if len(addresses) > 10:
-        origin_g = quote_plus(addresses[0])
-        dest_g   = quote_plus(addresses[-1])
-        wpts     = "|".join(quote_plus(a) for a in addresses[1:9])
-        route_map_url_google = (
-            "https://www.google.com/maps/dir/?api=1"
-            f"&origin={origin_g}&destination={dest_g}"
-            f"&waypoints={wpts}&travelmode=driving"
-        )
-
-    nav_card_btns = ""
-    if route_map_url_google:
-        nav_card_btns += (
-            f'<a class="btn-driver btn-driver-nav" target="_blank" href="{route_map_url_google}">'
-            '&#128205; Google Maps</a>'
-        )
-    if route_map_url_apple:
-        nav_card_btns += (
-            f'<a class="btn-driver btn-driver-apple" target="_blank" href="{route_map_url_apple}">'
-            '&#63743; Apple Maps</a>'
-        )
-
-    nav_card_html = ""
-    if nav_card_btns:
-        stop_word = "stop" if len(addresses) == 1 else "stops"
-        nav_card_html = f"""
-<div class="card" style="margin-bottom:14px;">
-    <div style="font-weight:900;font-size:16px;margin-bottom:4px;">Start Full Route Navigation</div>
-    <div class="small muted" style="margin-bottom:14px;">Opens all {len(addresses)} {stop_word} in order &bull; driving mode</div>
-    <div class="dsc-action-row">{nav_card_btns}</div>
-</div>"""
-
-    # Dump location card
-    dump_card_html = ""
-    if dump_loc:
-        from urllib.parse import quote_plus as _qp
-        _dump_addr_parts = [
-            dump_loc["address"] or "",
-            dump_loc["city"] or "",
-            dump_loc["state"] or "",
-            dump_loc["zip_code"] or "",
-        ]
-        _dump_addr = " ".join(p for p in _dump_addr_parts if p).strip()
-        _dump_google = "https://www.google.com/maps/dir/?api=1&destination=" + _qp(_dump_addr) if _dump_addr else ""
-        _dump_apple  = "http://maps.apple.com/?daddr=" + _qp(_dump_addr) if _dump_addr else ""
-        _dump_notes  = f'<div class="small muted" style="margin-top:4px;">{e(dump_loc["notes"])}</div>' if dump_loc["notes"] else ""
-        _dump_nav = ""
-        if _dump_google:
-            _dump_nav += f'<a class="btn-driver btn-driver-nav" target="_blank" href="{_dump_google}">&#128205; Google Maps</a>'
-        if _dump_apple:
-            _dump_nav += f'<a class="btn-driver btn-driver-apple" target="_blank" href="{_dump_apple}">&#63743; Apple Maps</a>'
-        dump_card_html = f"""
-<div class="card" style="margin-bottom:14px;border-color:rgba(255,138,138,0.35);">
-    <div style="font-weight:900;font-size:16px;margin-bottom:2px;">&#128465; Dump Location</div>
-    <div style="font-size:18px;font-weight:800;color:#ff8a8a;margin-bottom:2px;">{e(dump_loc["name"])}</div>
-    <div class="small muted">{e(_dump_addr)}</div>
-    {_dump_notes}
-    {f'<div class="dsc-action-row" style="margin-top:12px;">{_dump_nav}</div>' if _dump_nav else ""}
-</div>"""
-
-    # Build stop data list for JS distance calculation
-    stop_address_data = []
-    next_open_stop_id = None
-    stop_cards = ""
-
-    for s in stops:
-        stop_key = s["id"]
-
-        if next_open_stop_id is None and s["status"] != "completed":
-            next_open_stop_id = stop_key
-
-        is_next = (stop_key == next_open_stop_id)
-        is_done = s["status"] == "completed"
-
-        full_address = " ".join(filter(None, [
-            s["address"] or "",
-            s["city"] or "",
-            s["state"] or "",
-            s["zip_code"] or "",
-        ])).strip()
-
-        _enc_addr  = quote_plus(full_address)
-        nav_google_web = "https://www.google.com/maps/dir/?api=1&destination=" + _enc_addr
-        nav_google_app = "comgooglemaps://?daddr=" + _enc_addr + "&directionsmode=driving"
-        nav_apple      = "https://maps.apple.com/?daddr=" + _enc_addr + "&dirflg=d"
-
-        photo_html = build_photo_gallery_html(photos_by_stop.get(s["id"], []))
-
-        action_color = {
-            "Drop": "#8CA0B3", "Pickup": "#FF9D5C", "Swap": "#8CA0B3",
-            "Pickup and Return": "#FF9D5C",
-            "Dump": "#ff8a8a", "Remove": "#ff8a8a", "Service": "#8CA0B3",
-            "Final": "#c084fc", "Relocate": "#8CA0B3",
-        }.get(s["action"] or "", "#8CA0B3")
-
-        toggle_label = "Reopen Stop" if is_done else "Complete Stop"
-        toggle_class = "btn-driver btn-driver-reopen" if is_done else "btn-driver btn-driver-complete"
-
-        # --- driver workflow state ---
-        _s = dict(s)
-        _driver_status = _s.get("driver_status") or "pending"
-        _csrf = get_csrf_token()
-
-        # ---- classify this stop's workflow type ----
-        _action_val   = (_s.get("action") or "").lower()
-        # True PR / Swap action: needs box-in step
-        _is_pr        = "pickup and return" in _action_val or (
-                            "swap" in _action_val and "pull" not in _action_val)
-        # Pure Pull: box-out → dump → complete (no box-in)
-        _is_pull      = "pull" in _action_val and "return" not in _action_val
-        # PR swap flag: driver is carrying empty can from prior Pull — skip dump entirely
-        _is_swap_pr   = _is_pr and bool(_s.get("swap_with_prev_pull"))
-
-        # Compact trail of completed workflow steps with times.
-        # Swap PR logical order: Arrived → Box Out → Box In → To Dump
-        # All other: Arrived → Box Out → To Dump → Box In
-        _trail_order = (
-            [("arrived_at","Arrived"),("box_out_at","Box Out"),("box_in_at","Box In"),("go_to_dump_at","To Dump")]
-            if _is_swap_pr else
-            [("arrived_at","Arrived"),("box_out_at","Box Out"),("go_to_dump_at","To Dump"),("box_in_at","Box In")]
-        )
-        _trail_parts = []
-        for _tc, _tl in _trail_order:
-            _tv = _s.get(_tc)
-            if _tv:
-                _trail_parts.append(
-                    f'<span style="color:#4ade80;font-size:11px;background:rgba(74,222,128,0.1);'
-                    f'padding:2px 7px;border-radius:6px;white-space:nowrap;">✓ {_tl} {_tv[-8:-3]}</span>'
-                )
-        _status_trail_html = (
-            '<div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:10px;">'
-            + "".join(_trail_parts) + '</div>'
-        ) if _trail_parts else ""
-
-        # Next workflow action button
-        _workflow_btn_html = ""
-        if not is_done:
-            if _is_swap_pr:
-                # Swap PR full workflow: box out old → box in empty → leave with loaded can → dump → complete
-                _wf_map = {
-                    "pending":     ("arrived",       "🚛 Arrived at Stop",               "btn-driver btn-driver-complete"),
-                    "arrived":     ("box_out",       "📦 Box Out — Remove Old Container", "btn-driver btn-driver-complete"),
-                    "box_out":     ("need_box_in",   "📦 Box In — Place Empty Can",       "btn-driver btn-driver-complete"),
-                    "need_box_in": ("box_in",        "✅ Confirm Box In",                 "btn-driver btn-driver-complete"),
-                    "box_in":      ("going_to_dump", "🗑️ Go To Dump",                    "btn-driver btn-driver-dump"),
-                }
-            elif _is_pr:
-                # Return Same Can: box-out → dump → return to same location → box-in empty
-                _wf_map = {
-                    "pending":     ("arrived",       "🚛 Arrived at Stop",                      "btn-driver btn-driver-complete"),
-                    "arrived":     ("box_out",       "📦 Box Out — Remove Container",            "btn-driver btn-driver-complete"),
-                    "box_out":     ("going_to_dump", "🗑️ Go To Dump",                           "btn-driver btn-driver-dump"),
-                    "need_box_in": ("box_in",        "🔄 Return & Box In — Place Empty Can",    "btn-driver btn-driver-complete"),
-                }
-            elif _is_pull:
-                # Pull: box-out → dump → complete (no box-in)
-                _wf_map = {
-                    "pending":     ("arrived",       "🚛 Arrived at Stop",           "btn-driver btn-driver-complete"),
-                    "arrived":     ("box_out",        "📦 Box Out — Remove Container","btn-driver btn-driver-complete"),
-                    "box_out":     ("going_to_dump",  "🗑️ Go To Dump",               "btn-driver btn-driver-dump"),
-                }
-            else:
-                # Delivery / Drop / Service: arrived → complete
-                _wf_map = {
-                    "pending":     ("arrived",       "🚛 Arrived at Stop",           "btn-driver btn-driver-complete"),
-                }
-
-            if _driver_status in _wf_map:
-                _nxt, _lbl, _cls = _wf_map[_driver_status]
-                _workflow_btn_html = (
-                    f'<form method="POST" action="{url_for("stop_driver_action", stop_id=s["id"])}"'
-                    f' style="margin-bottom:8px;">'
-                    f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
-                    f'<input type="hidden" name="action" value="{_nxt}">'
-                    f'<button class="{_cls}" type="submit" style="width:100%;">{_lbl}</button>'
-                    f'</form>'
-                )
-            elif _driver_status == "going_to_dump":
-                _dump_loc_text = _s.get("dump_location") or ""
-                _dump_label = f"🧾 Enter Dump Ticket{' — ' + _dump_loc_text if _dump_loc_text else ''}"
-                _dump_ticket_link = (
-                    f'<a class="btn-driver btn-driver-dump" '
-                    f'href="{url_for("dump_ticket", stop_id=s["id"])}" '
-                    f'style="display:block;text-align:center;text-decoration:none;'
-                    f'padding:12px 16px;border-radius:12px;font-weight:700;margin-bottom:8px;">'
-                    f'{_dump_label}</a>'
-                )
-                # Navigation buttons to drive to the dump site — resolved from DB
-                _dl_rec = _dump_loc_by_name.get(_dump_loc_text.strip().lower()) if _dump_loc_text else None
-                if _dl_rec:
-                    _dl_addr_parts = [
-                        _dl_rec.get("address") or "",
-                        _dl_rec.get("city") or "",
-                        _dl_rec.get("state") or "",
-                        _dl_rec.get("zip_code") or "",
-                    ]
-                    _dl_addr = " ".join(p for p in _dl_addr_parts if p).strip()
-                else:
-                    _dl_addr = ""
-                if _dl_addr:
-                    _dl_enc = urllib.parse.quote_plus(_dl_addr)
-                    _nav_html = (
-                        f'<div style="display:flex;gap:8px;margin-bottom:8px;">'
-                        f'<a class="btn-driver btn-driver-nav" target="_blank" '
-                        f'href="https://www.google.com/maps/dir/?api=1&destination={_dl_enc}&travelmode=driving" '
-                        f'style="flex:1;text-align:center;text-decoration:none;">&#128205; Google Maps</a>'
-                        f'<a class="btn-driver btn-driver-apple" target="_blank" '
-                        f'href="http://maps.apple.com/?daddr={_dl_enc}&dirflg=d" '
-                        f'style="flex:1;text-align:center;text-decoration:none;">&#63743; Apple Maps</a>'
-                        f'</div>'
-                    )
-                elif _dump_loc_text:
-                    _nav_html = (
-                        f'<div class="small muted" style="margin-bottom:8px;padding:8px;'
-                        f'background:rgba(255,255,255,0.06);border-radius:8px;">'
-                        f'&#9888;&#65039; Dump location &ldquo;{e(_dump_loc_text)}&rdquo; not found &mdash; '
-                        f'update address in Dump Locations.</div>'
-                    )
-                else:
-                    _nav_html = (
-                        f'<div class="small muted" style="margin-bottom:8px;padding:8px;'
-                        f'background:rgba(255,255,255,0.06);border-radius:8px;">'
-                        f'Dump location not set for this stop.</div>'
-                    )
-                _workflow_btn_html = _nav_html + _dump_ticket_link
-
-        # Badge on the stop card header showing PR mode
-        if _is_swap_pr:
-            _swap_badge = (
-                '<span style="font-size:10px;background:rgba(255,200,80,0.22);color:#fde68a;'
-                'padding:2px 8px;border-radius:6px;font-weight:700;letter-spacing:.4px;">'
-                '&#x1F504; SWAP</span> '
-            )
-        elif _is_pr:
-            _swap_badge = (
-                '<span style="font-size:10px;background:rgba(255,107,26,0.18);color:#FF9D5C;'
-                'padding:2px 8px;border-radius:6px;font-weight:700;letter-spacing:.4px;">'
-                '&#x21A9;&#xFE0F; RETURN</span> '
-            )
-        else:
-            _swap_badge = ""
-
-        card_class = "driver-stop-card"
-        if is_next:
-            card_class += " dsc-active"
-        elif is_done:
-            card_class += " dsc-done"
-
-        card_id = "next-stop-card" if is_next else f"stop-{stop_key}"
-
-        # detail block hidden for completed stops, visible for open
-        detail_style = "display:none;" if is_done else ""
-
-        if full_address:
-            stop_address_data.append({"id": stop_key, "address": full_address})
-
-        stop_cards += f"""
-<div class="{card_class}" id="{card_id}" data-stop-id="{stop_key}" data-driver-status="{_driver_status}">
-
-  <div class="dsc-header" onclick="toggleStopDetail({stop_key})">
-    <div class="dsc-num">#{s['stop_order']}</div>
-    <div class="dsc-summary">
-      <div class="dsc-customer">{e(s['customer_name'] or 'Stop ' + str(s['stop_order']))}</div>
-      <div class="dsc-addr">{e(full_address or 'No address')}</div>
-      <div class="dsc-meta-row">
-        {f'<span class="action-pill" style="background:rgba(255,200,80,0.22);color:#fde68a;font-weight:900;letter-spacing:.5px;">{e(dict(s).get("wo_type") or "")}</span>' if dict(s).get("wo_type") else ''}
-        {_swap_badge}
-        <span class="action-pill" style="background:{action_color};color:#06101f;">{e(s['action'] or 'Service')}</span>
-        {f'<span class="action-pill" style="background:rgba(255,107,26,0.18);color:#cde;">{e(s["container_size"])} yd</span>' if s['container_size'] else ''}
-        <span class="badge" id="badge-{stop_key}" style="font-size:11px;">{e(s['status'])}</span>
-        <span class="dist-badge" id="dist-{stop_key}"></span>
-      </div>
-    </div>
-    <div class="dsc-chevron" id="chev-{stop_key}">{'▲' if not is_done else '▼'}</div>
-  </div>
-
-  <div class="dsc-body" id="body-{stop_key}" style="{detail_style}">
-    {"" if not s['ticket_number'] else f'<div class="dsc-field"><span class="dsc-label">Ticket</span>{e(s["ticket_number"])}</div>'}
-    {"" if not _s.get('phone') else f'<div class="dsc-field"><span class="dsc-label">Phone</span><a href="tel:{e(_s["phone"])}" style="color:#3DDC84;">{e(_s["phone"])}</a></div>'}
-    {"" if not _s.get('dump_location') else f'<div class="dsc-field"><span class="dsc-label">Dump Location</span>{e(_s["dump_location"])}</div>'}
-    {"" if not s['notes'] else f'<div class="dsc-field"><span class="dsc-label">Notes</span><span style="white-space:pre-wrap;">{e(s["notes"] or "")}</span></div>'}
-    <div class="dsc-field" id="done-at-row-{stop_key}" style="{'display:none;' if not s['completed_at'] else ''}">
-      <span class="dsc-label">Done</span><span id="done-at-{stop_key}">{e(s['completed_at'] or '')}</span>
-    </div>
-    {photo_html}
-
-    <div class="dsc-action-row" style="margin-bottom:10px;">
-      <a class="btn-driver btn-driver-nav"
-         href="{nav_google_web}"
-         onclick="return openGoogleMapsStop(event, '{nav_google_app}', '{nav_google_web}')">
-        &#128205; Google Maps
-      </a>
-      <a class="btn-driver btn-driver-apple" href="{nav_apple}">
-        &#63743; Apple Maps
-      </a>
-    </div>
-
-    {_status_trail_html}
-    {_workflow_btn_html}
-    <form class="dsc-toggle-form" method="POST"
-          action="{url_for('toggle_stop_complete', stop_id=s['id'])}"
-          data-stop-id="{stop_key}">
-      <button id="toggle-btn-{stop_key}" class="{toggle_class}" type="submit" style="width:100%;">{toggle_label}</button>
-    </form>
-
-    <details class="upload-details">
-      <summary>&#128247; Upload Photo / Proof</summary>
-      <form method="POST" action="{url_for('upload_stop_photo', stop_id=s['id'])}" enctype="multipart/form-data" style="margin-top:10px;">
-        <input type="file" name="photos" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple required style="margin-bottom:8px;width:100%;">
-        <button class="btn secondary" type="submit" style="width:100%;">Upload</button>
-      </form>
-    </details>
-  </div>
-
-</div>
-"""
+    current_stop = None
+    current_stop_num = None
+    for i, s in enumerate(stops, start=1):
+        if s["status"] != "completed":
+            current_stop = s
+            current_stop_num = i
+            break
 
     route_action_buttons = ""
     if route["status"] == "open":
         route_action_buttons = f"""
         <form class="inline" method="POST" action="{url_for('mark_route_in_progress', route_id=route_id)}">
-            <button class="btn orange" style="font-size:16px;padding:14px 22px;">Start Route</button>
+            <button class="btn orange" style="min-height:44px;">Start Route</button>
         </form>"""
-    elif route["status"] == "in_progress":
+    elif route["status"] == "in_progress" and not current_stop:
         route_action_buttons = f"""
         <form class="inline" method="POST" action="{url_for('mark_route_completed', route_id=route_id)}">
-            <button class="btn green" style="font-size:16px;padding:14px 22px;">Finish Route</button>
+            <button class="btn green" style="min-height:44px;">Finish Route</button>
         </form>"""
 
-    pct = int(completed_count / total_count * 100) if total_count else 0
-    next_stop_num = ""
-    for s in stops:
-        if s["status"] != "completed":
-            next_stop_num = str(s["stop_order"])
-            break
+    # ══════════════════════════════════════════════════════════
+    # ALL STOPS DONE — celebration screen
+    # ══════════════════════════════════════════════════════════
+    if not current_stop:
+        body = f"""
+<div class="cab-wrap">
+    <div class="cab-header">
+        <div class="cab-title">MY ROUTE</div>
+        <span class="cab-online-badge" id="online-badge"><span class="cab-online-dot"></span>ONLINE</span>
+    </div>
+    <div class="cab-progress-label">{e(route['route_name'])} &middot; {e(route['route_date'])}</div>
+    <div class="cab-progress-track"><div class="cab-progress-fill" style="width:100%;"></div></div>
 
-    sticky_label = f"Next Stop #{next_stop_num}" if next_stop_num else "All Stops Done!"
-    sticky_disabled = "disabled" if not next_stop_num else ""
-
-    # Serialize stop addresses for JS distance engine
-    import json as _json
-    stop_addr_json = _json.dumps(stop_address_data)
-
-    extra_head = """
-<style>
-/* ════════════════════════════════════════════════════════
-   DRIVER ROUTE PAGE — ROCKKSTAAR COMMAND THEME
-   ════════════════════════════════════════════════════════ */
-
-/* Stop cards */
-.driver-stop-card {
-    background: rgba(20,20,20,0.88);
-    border: 1px solid rgba(255,107,26,0.13);
-    border-radius: 14px;
-    margin-bottom: 12px;
-    overflow: hidden;
-    transition: border-color .2s, box-shadow .2s;
-}
-
-.dsc-active {
-    border-color: rgba(255,107,26,0.55) !important;
-    box-shadow: 0 0 28px rgba(255,107,26,0.10), 0 0 0 1px rgba(255,107,26,0.08);
-}
-
-.dsc-done {
-    opacity: 0.48;
-    border-color: rgba(45,45,42,0.45) !important;
-}
-
-/* Header row (tap to expand) */
-.dsc-header {
-    display: flex;
-    align-items: flex-start;
-    gap: 12px;
-    padding: 15px 16px;
-    cursor: pointer;
-    user-select: none;
-    -webkit-tap-highlight-color: transparent;
-}
-
-/* Stop number */
-.dsc-num {
-    font-size: 18px;
-    font-weight: 900;
-    color: #FF6B1A;
-    min-width: 32px;
-    padding-top: 2px;
-    letter-spacing: -1px;
-    text-shadow: 0 0 12px rgba(255,107,26,0.40);
-}
-.dsc-done .dsc-num { color: #55554C; text-shadow: none; }
-
-/* Summary text */
-.dsc-summary { flex: 1; min-width: 0; }
-
-.dsc-customer {
-    font-size: 16px;
-    font-weight: 800;
-    color: #F5F5F0;
-    line-height: 1.25;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-.dsc-addr {
-    font-size: 12px;
-    color: #78786F;
-    margin-top: 3px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-.dsc-meta-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 5px;
-    margin-top: 7px;
-    align-items: center;
-}
-
-/* Action / type pills */
-.action-pill {
-    display: inline-block;
-    padding: 2px 9px;
-    border-radius: 999px;
-    font-size: 11px;
-    font-weight: 800;
-    letter-spacing: .3px;
-}
-
-.dist-badge {
-    font-size: 11px;
-    color: #8C8C82;
-    font-weight: 700;
-}
-
-.dsc-chevron {
-    color: #55554C;
-    font-size: 13px;
-    padding-top: 4px;
-    min-width: 16px;
-    text-align: right;
-}
-
-/* Body (expandable) */
-.dsc-body {
-    padding: 0 16px 16px;
-    border-top: 1px solid rgba(255,107,26,0.08);
-}
-
-.dsc-field {
-    display: flex;
-    gap: 10px;
-    font-size: 13px;
-    padding: 6px 0;
-    border-bottom: 1px solid rgba(255,107,26,0.05);
-    color: #D8D8D0;
-}
-.dsc-field:last-of-type { border-bottom: none; }
-
-.dsc-label {
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: .4px;
-    text-transform: uppercase;
-    color: #55554C;
-    min-width: 56px;
-    flex-shrink: 0;
-    padding-top: 1px;
-}
-
-/* Action button row */
-.dsc-action-row {
-    display: flex;
-    gap: 8px;
-    margin-top: 14px;
-}
-
-/* Driver buttons — large tap targets */
-.btn-driver {
-    flex: 1;
-    display: block;
-    padding: 15px 10px;
-    border-radius: 11px;
-    font-size: 15px;
-    font-weight: 800;
-    text-align: center;
-    border: none;
-    cursor: pointer;
-    text-decoration: none;
-    line-height: 1.1;
-    -webkit-tap-highlight-color: transparent;
-    touch-action: manipulation;
-    transition: filter .15s, transform .1s;
-}
-.btn-driver:hover { filter: brightness(1.08); transform: translateY(-1px); }
-.btn-driver:active { transform: scale(0.98); }
-
-.btn-driver-nav {
-    background: linear-gradient(135deg, #FF8A42 0%, #FF6B1A 100%);
-    color: #1A1000;
-    box-shadow: 0 2px 14px rgba(255,107,26,0.18);
-}
-.btn-driver-complete {
-    background: linear-gradient(135deg, #3DDC84 0%, #22B368 100%);
-    color: #06170D;
-    box-shadow: 0 2px 14px rgba(61,220,132,0.20);
-}
-.btn-driver-reopen {
-    background: rgba(38,38,35,0.85);
-    border: 1px solid rgba(255,107,26,0.22);
-    color: #B8B8AE;
-    box-shadow: none;
-}
-.btn-driver-dump {
-    background: linear-gradient(135deg, #FF8A42 0%, #FF6B1A 100%);
-    color: #1A1000;
-    box-shadow: 0 2px 14px rgba(255,107,26,0.16);
-}
-.btn-driver-apple {
-    background: rgba(26,26,26,0.85);
-    border: 1px solid rgba(140,160,179,0.18);
-    color: #8C8C82;
-}
-
-/* Upload details */
-.upload-details { margin-top: 12px; }
-.upload-details summary {
-    color: #8C8C82;
-    font-size: 13px;
-    cursor: pointer;
-    padding: 6px 0;
-}
-
-/* Route progress bar */
-.progress-bar-wrap {
-    background: rgba(255,255,255,0.05);
-    border-radius: 999px;
-    height: 6px;
-    margin: 12px 0 5px;
-    overflow: hidden;
-}
-.progress-bar-fill {
-    height: 100%;
-    border-radius: 999px;
-    background: linear-gradient(90deg, #FF8A42, #FF6B1A);
-    transition: width 0.4s ease;
-}
-
-/* Sticky next-stop bar */
-#sticky-next-bar {
-    position: fixed;
-    bottom: 0; left: 0; right: 0;
-    z-index: 999;
-    padding: 10px 16px 14px;
-    background: rgba(18,18,18,0.97);
-    border-top: 1px solid rgba(255,107,26,0.15);
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
-}
-#sticky-next-bar button {
-    width: 100%;
-    padding: 16px;
-    font-size: 16px;
-    font-weight: 900;
-    border-radius: 11px;
-    background: linear-gradient(135deg, #FF8A42 0%, #FF6B1A 100%);
-    color: #1A1000;
-    border: none;
-    cursor: pointer;
-    touch-action: manipulation;
-    box-shadow: 0 0 22px rgba(255,107,26,0.22);
-    transition: filter .15s;
-}
-#sticky-next-bar button:hover { filter: brightness(1.1); }
-#sticky-next-bar button:disabled {
-    background: rgba(35,35,32,0.60);
-    color: #8C8C82;
-    box-shadow: none;
-    cursor: default;
-}
-
-.stop-list-wrap { padding-bottom: 90px; }
-
-@media (min-width: 900px) {
-    #sticky-next-bar { left: 234px; }
-}
-</style>
+    <div class="cab-all-done">
+        <div class="cab-all-done-icon">&#9989;</div>
+        <h2>All Stops Done</h2>
+        <p style="color:var(--text-muted);margin-top:8px;">{total_count} of {total_count} stops completed.</p>
+        <div style="margin-top:22px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
+            {route_action_buttons}
+            <a class="btn secondary" href="{url_for('driver_dashboard')}">&#8592; Back to My Routes</a>
+        </div>
+    </div>
+</div>
+<script>
+(function() {{
+    var badge = document.getElementById('online-badge');
+    function upd() {{
+        if (!badge) return;
+        badge.innerHTML = navigator.onLine
+            ? '<span class="cab-online-dot"></span>ONLINE'
+            : '<span class="cab-online-dot" style="background:#FF5252;box-shadow:0 0 6px #FF5252;"></span>OFFLINE';
+        badge.style.color = navigator.onLine ? '' : '#FF5252';
+    }}
+    window.addEventListener('online', upd);
+    window.addEventListener('offline', upd);
+    upd();
+}})();
+</script>
 """
+        return render_template_string(shell_page("Cab View", body))
+
+    # ══════════════════════════════════════════════════════════
+    # CURRENT STOP — single-stop Cab View
+    # ══════════════════════════════════════════════════════════
+    s = current_stop
+    stop_id = s["id"]
+    _s = dict(s)
+    _csrf = get_csrf_token()
+
+    full_address = " ".join(filter(None, [
+        s["address"] or "", s["city"] or "", s["state"] or "", s["zip_code"] or "",
+    ])).strip()
+    _enc_addr = urllib.parse.quote_plus(full_address)
+    nav_google_web = "https://www.google.com/maps/dir/?api=1&destination=" + _enc_addr
+    nav_google_app = "comgooglemaps://?daddr=" + _enc_addr + "&directionsmode=driving"
+
+    action_lower = (s["action"] or "").lower()
+    is_pr    = "pickup and return" in action_lower or ("swap" in action_lower and "pull" not in action_lower)
+    is_pull  = "pull" in action_lower and "return" not in action_lower
+    is_swap_pr = is_pr and bool(_s.get("swap_with_prev_pull"))
+    badge_group = "pickup" if (is_pull or "pickup" in action_lower or is_pr) else "dropswap"
+    # Delivery/Drop/Service/Relocate read as dropswap; explicit pull-family reads as pickup
+    if "delivery" in action_lower or "drop" in action_lower or "relocate" in action_lower or "service" in action_lower:
+        badge_group = "dropswap"
+
+    driver_status = _s.get("driver_status") or "pending"
+
+    # ── Reuse the exact existing workflow state machine (arrived / box out /
+    #    go to dump / dump ticket / box in) — same _wf_map + same POST target
+    #    as before, just rendered inside the new single-stop card. ──────────
+    workflow_btn_html = ""
+    if is_swap_pr:
+        wf_map = {
+            "pending":     ("arrived",       "&#128666; Arrived at Stop",               "btn-driver btn-driver-complete"),
+            "arrived":     ("box_out",       "&#128230; Box Out &mdash; Remove Old Container", "btn-driver btn-driver-complete"),
+            "box_out":     ("need_box_in",   "&#128230; Box In &mdash; Place Empty Can",       "btn-driver btn-driver-complete"),
+            "need_box_in": ("box_in",        "&#9989; Confirm Box In",                 "btn-driver btn-driver-complete"),
+            "box_in":      ("going_to_dump", "&#128465;&#65039; Go To Dump",                    "btn-driver btn-driver-dump"),
+        }
+    elif is_pr:
+        wf_map = {
+            "pending":     ("arrived",       "&#128666; Arrived at Stop",                      "btn-driver btn-driver-complete"),
+            "arrived":     ("box_out",       "&#128230; Box Out &mdash; Remove Container",            "btn-driver btn-driver-complete"),
+            "box_out":     ("going_to_dump", "&#128465;&#65039; Go To Dump",                           "btn-driver btn-driver-dump"),
+            "need_box_in": ("box_in",        "&#128260; Return &amp; Box In &mdash; Place Empty Can",  "btn-driver btn-driver-complete"),
+        }
+    elif is_pull:
+        wf_map = {
+            "pending":     ("arrived",       "&#128666; Arrived at Stop",           "btn-driver btn-driver-complete"),
+            "arrived":     ("box_out",       "&#128230; Box Out &mdash; Remove Container", "btn-driver btn-driver-complete"),
+            "box_out":     ("going_to_dump", "&#128465;&#65039; Go To Dump",               "btn-driver btn-driver-dump"),
+        }
+    else:
+        wf_map = {"pending": ("arrived", "&#128666; Arrived at Stop", "btn-driver btn-driver-complete")}
+
+    if driver_status in wf_map:
+        nxt, lbl, cls = wf_map[driver_status]
+        workflow_btn_html = (
+            f'<form method="POST" action="{url_for("stop_driver_action", stop_id=stop_id)}" style="margin-bottom:10px;">'
+            f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
+            f'<input type="hidden" name="action" value="{nxt}">'
+            f'<button class="{cls}" type="submit" style="width:100%;min-height:52px;">{lbl}</button>'
+            f'</form>'
+        )
+    elif driver_status == "going_to_dump":
+        dump_loc_text = _s.get("dump_location") or ""
+        dump_label = f"&#129534; Enter Dump Ticket{' &mdash; ' + e(dump_loc_text) if dump_loc_text else ''}"
+        dump_ticket_link = (
+            f'<a class="btn-driver btn-driver-dump" href="{url_for("dump_ticket", stop_id=stop_id)}" '
+            f'style="display:block;text-align:center;text-decoration:none;padding:14px 16px;'
+            f'border-radius:12px;font-weight:700;margin-bottom:10px;min-height:52px;">{dump_label}</a>'
+        )
+        dl_rec = _dump_loc_by_name.get(dump_loc_text.strip().lower()) if dump_loc_text else None
+        dl_addr = ""
+        if dl_rec:
+            dl_addr = " ".join(p for p in [dl_rec.get("address") or "", dl_rec.get("city") or "",
+                                            dl_rec.get("state") or "", dl_rec.get("zip_code") or ""] if p).strip()
+        if dl_addr:
+            dl_enc = urllib.parse.quote_plus(dl_addr)
+            nav_html = (
+                f'<div style="display:flex;gap:8px;margin-bottom:10px;">'
+                f'<a class="btn-driver btn-driver-nav" target="_blank" style="flex:1;text-align:center;text-decoration:none;"'
+                f' href="https://www.google.com/maps/dir/?api=1&destination={dl_enc}&travelmode=driving">&#128205; Google Maps</a>'
+                f'<a class="btn-driver btn-driver-apple" target="_blank" style="flex:1;text-align:center;text-decoration:none;"'
+                f' href="http://maps.apple.com/?daddr={dl_enc}&dirflg=d">&#63743; Apple Maps</a>'
+                f'</div>'
+            )
+        elif dump_loc_text:
+            nav_html = (f'<div class="small muted" style="margin-bottom:10px;padding:8px;'
+                        f'background:rgba(255,255,255,0.06);border-radius:8px;">'
+                        f'&#9888;&#65039; Dump location &ldquo;{e(dump_loc_text)}&rdquo; not found &mdash; update in Dump Locations.</div>')
+        else:
+            nav_html = (f'<div class="small muted" style="margin-bottom:10px;padding:8px;'
+                        f'background:rgba(255,255,255,0.06);border-radius:8px;">Dump location not set for this stop.</div>')
+        workflow_btn_html = nav_html + dump_ticket_link
+
+    # ── Photo-proof gate: Complete Stop only unlocks once a photo exists ───
+    stop_photos = photos_by_stop.get(stop_id, [])
+    has_photo = len(stop_photos) > 0
+    photo_gallery = build_photo_gallery_html(stop_photos)
+
+    upload_widget = f"""
+    <details class="upload-details" {"open" if not has_photo else ""}>
+      <summary>&#128247; {"Add another photo" if has_photo else "Capture photo first"}</summary>
+      <form method="POST" action="{url_for('upload_stop_photo', stop_id=stop_id)}" enctype="multipart/form-data" style="margin-top:10px;">
+        <input type="file" name="photos" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple required capture="environment" style="margin-bottom:8px;width:100%;">
+        <button class="btn secondary" type="submit" style="width:100%;min-height:48px;">Upload</button>
+      </form>
+    </details>
+    {photo_gallery}
+    """
+
+    if has_photo:
+        complete_section = f"""
+        <form method="POST" action="{url_for('toggle_stop_complete', stop_id=stop_id)}" id="cab-complete-form">
+            <input type="hidden" name="_csrf_token" value="{_csrf}">
+            <button class="cab-complete-btn" type="submit">&#9989; Complete Stop</button>
+        </form>
+        """
+    else:
+        complete_section = """
+        <button class="cab-complete-btn" type="button" disabled>&#128247; Capture photo first</button>
+        <div class="cab-photo-status">Take at least one photo to unlock Complete Stop</div>
+        """
+
+    meta_bits = []
+    if s["container_size"]:
+        meta_bits.append(e(s["container_size"]))
+    if s["notes"]:
+        meta_bits.append(e(s["notes"]))
+    meta_line = " &middot; ".join(meta_bits) if meta_bits else ""
+    ticket_line = f'<div class="cab-meta-line"><strong>Ticket:</strong> {e(s["ticket_number"])}</div>' if s["ticket_number"] else ""
+    phone_line = f'<div class="cab-meta-line"><strong>Phone:</strong> <a href="tel:{e(_s["phone"])}" style="color:#3DDC84;">{e(_s["phone"])}</a></div>' if _s.get("phone") else ""
 
     body = f"""
-<div class="hero" style="padding-bottom:14px;">
-    <div class="row between" style="align-items:flex-start;flex-wrap:wrap;gap:10px;">
-        <div>
-            <h1 style="margin:0 0 4px;">{e(route['route_name'])}</h1>
-            <div class="small muted">{e(route['route_date'])} &bull; {e(route['assigned_username'] or 'Unassigned')}</div>
+<div class="cab-wrap">
+    <div class="cab-header">
+        <div class="cab-title">MY ROUTE</div>
+        <span class="cab-online-badge" id="online-badge"><span class="cab-online-dot"></span>ONLINE</span>
+    </div>
+
+    <div class="cab-progress-label">STOP {current_stop_num} OF {total_count}</div>
+    <div class="cab-progress-track"><div class="cab-progress-fill" style="width:{pct}%;"></div></div>
+
+    <div class="cab-card">
+        <div class="cab-action-row">
+            <div class="cab-action-badge {badge_group}">{e(s['action'] or 'STOP')}</div>
+            <div class="cab-action-name">{e(s['customer_name'] or ('Stop ' + str(current_stop_num)))}</div>
         </div>
-        <span class="badge {e(route['status'])}" style="font-size:14px;padding:8px 14px;">{e(route['status'].replace('_',' ').title())}</span>
+
+        <div class="cab-address">{e(full_address or 'No address on file')}</div>
+        {f'<div class="cab-meta-line">{meta_line}</div>' if meta_line else ''}
+        {ticket_line}
+        {phone_line}
+
+        <a class="cab-nav-btn" href="{nav_google_web}"
+           onclick="return openGoogleMapsStop(event, '{nav_google_app}', '{nav_google_web}')">
+            &#128205; Tap to Navigate
+        </a>
+
+        <div style="margin-top:20px;">
+            {workflow_btn_html}
+            {upload_widget}
+            {complete_section}
+        </div>
     </div>
-    <div class="progress-bar-wrap"><div id="progress-fill" class="progress-bar-fill" style="width:{pct}%;"></div></div>
-    <div id="progress-text" class="small muted">{completed_count} of {total_count} stops complete</div>
-    <div class="row" style="margin-top:14px;gap:10px;flex-wrap:wrap;">
+
+    <div style="display:flex;gap:10px;flex-wrap:wrap;">
         {route_action_buttons}
-        <a class="btn secondary" href="{url_for('driver_dashboard')}">&#8592; Back</a>
+        <a class="btn secondary" href="{url_for('driver_dashboard')}">&#8592; My Routes</a>
     </div>
-</div>
-
-{nav_card_html}
-
-{dump_card_html}
-
-<div class="stop-list-wrap" id="stop-list">
-    {stop_cards if stop_cards else '<div class="card">No stops on this route.</div>'}
-</div>
-
-<div id="sticky-next-bar">
-    <button id="sticky-next-btn" onclick="scrollToNext()" {sticky_disabled}>{e(sticky_label)}</button>
 </div>
 
 <script>
 (function() {{
-    var csrfToken = (document.querySelector('meta[name="csrf-token"]') || {{}}).getAttribute
-        ? document.querySelector('meta[name="csrf-token"]').getAttribute('content')
-        : '';
-
-    // ================================================================
-    // DOM helpers
-    // ================================================================
-    function $id(id) {{ return document.getElementById(id); }}
-
-    function openBody(stopId) {{
-        var b = $id('body-' + stopId), c = $id('chev-' + stopId);
-        if (b) b.style.display = 'block';
-        if (c) c.textContent = '\u25b2';
+    var badge = document.getElementById('online-badge');
+    function upd() {{
+        if (!badge) return;
+        badge.innerHTML = navigator.onLine
+            ? '<span class="cab-online-dot"></span>ONLINE'
+            : '<span class="cab-online-dot" style="background:#FF5252;box-shadow:0 0 6px #FF5252;"></span>OFFLINE';
+        badge.style.color = navigator.onLine ? '' : '#FF5252';
     }}
-    function closeBody(stopId) {{
-        var b = $id('body-' + stopId), c = $id('chev-' + stopId);
-        if (b) b.style.display = 'none';
-        if (c) c.textContent = '\u25bc';
+    window.addEventListener('online', upd);
+    window.addEventListener('offline', upd);
+    upd();
+
+    // Submit Complete Stop via AJAX (X-Requested-With) so the shared
+    // /stop/<id>/toggle endpoint takes its JSON branch instead of its
+    // default redirect to the boss route page — then just reload this
+    // page so Cab View naturally advances to the next stop.
+    var completeForm = document.getElementById('cab-complete-form');
+    if (completeForm) {{
+        completeForm.addEventListener('submit', function(ev) {{
+            ev.preventDefault();
+            var btn = completeForm.querySelector('button');
+            if (btn) {{ btn.disabled = true; btn.textContent = 'Saving…'; }}
+            var fd = new FormData(completeForm);
+            fetch(completeForm.action, {{
+                method: 'POST',
+                headers: {{ 'X-Requested-With': 'XMLHttpRequest' }},
+                body: fd,
+            }})
+            .then(function(r) {{ return r.json(); }})
+            .then(function(data) {{
+                if (data && data.success) {{
+                    window.location.reload();
+                }} else {{
+                    throw new Error('not ok');
+                }}
+            }})
+            .catch(function() {{
+                if (btn) {{
+                    btn.disabled = false;
+                    btn.textContent = '✅ Complete Stop';
+                }}
+                alert('Could not complete stop — check your connection and try again.');
+            }});
+        }});
     }}
 
-    // ================================================================
-    // Open Google Maps: try app scheme first, fall back to web URL
-    // ================================================================
-    window.openGoogleMapsStop = function(e, appUrl, webUrl) {{
-        e.preventDefault();
+    window.openGoogleMapsStop = function(ev, appUrl, webUrl) {{
+        ev.preventDefault();
         var isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
             (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
         var isAndroid = /Android/.test(navigator.userAgent);
         if (isIOS || isAndroid) {{
-            var start = Date.now();
             var fallback = setTimeout(function() {{ window.location = webUrl; }}, 600);
             window.location = appUrl;
             window.addEventListener('blur', function onBlur() {{
@@ -7578,322 +7582,10 @@ def driver_route_detail(route_id):
         }}
         return false;
     }};
-
-    // ================================================================
-    // Toggle stop detail (tap header)
-    // ================================================================
-    window.toggleStopDetail = function(stopId) {{
-        var b = $id('body-' + stopId);
-        if (!b) return;
-        if (b.style.display === 'none') openBody(stopId); else closeBody(stopId);
-    }};
-
-    // ================================================================
-    // Sticky "Next Stop" scroll
-    // ================================================================
-    window.scrollToNext = function() {{
-        var next = $id('next-stop-card');
-        if (next) next.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
-    }};
-
-    // Auto-scroll to next open stop on page load
-    window.addEventListener('load', function() {{
-        var next = $id('next-stop-card');
-        if (next) setTimeout(function() {{
-            next.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
-        }}, 350);
-    }});
-
-    // ================================================================
-    // Progress bar + text update
-    // ================================================================
-    function updateProgress(completed, total) {{
-        var pct   = total > 0 ? Math.round(completed / total * 100) : 0;
-        var fill  = $id('progress-fill');
-        var text  = $id('progress-text');
-        if (fill) fill.style.width = pct + '%';
-        if (text) text.textContent = completed + ' of ' + total + ' stops complete';
-    }}
-
-    // ================================================================
-    // Sticky button text update
-    // ================================================================
-    function updateStickyBtn() {{
-        var btn = $id('sticky-next-btn');
-        if (!btn) return;
-        var nextCard = document.querySelector('.driver-stop-card:not(.dsc-done)');
-        if (!nextCard) {{
-            btn.disabled = true;
-            btn.textContent = 'All Stops Done! \u2713';
-        }} else {{
-            var numEl = nextCard.querySelector('.dsc-num');
-            var num   = numEl ? numEl.textContent.replace('#','') : '';
-            btn.disabled = false;
-            btn.textContent = 'Next Stop #' + num;
-        }}
-    }}
-
-    // ================================================================
-    // Mark one card as completed in the DOM
-    // ================================================================
-    function markDone(stopId, completedAt) {{
-        var card = document.querySelector('[data-stop-id="' + stopId + '"]');
-        if (!card) return;
-        card.classList.remove('dsc-active');
-        card.classList.add('dsc-done');
-        if (card.id === 'next-stop-card') card.id = 'stop-' + stopId;
-
-        var badge = $id('badge-' + stopId);
-        if (badge) {{ badge.className = 'badge completed'; badge.textContent = 'completed'; }}
-
-        var btn = $id('toggle-btn-' + stopId);
-        if (btn) {{
-            btn.textContent = 'Reopen Stop';
-            btn.className   = 'btn-driver btn-driver-reopen';
-            btn.style.width = '100%';
-        }}
-
-        var row = $id('done-at-row-' + stopId);
-        var ts  = $id('done-at-' + stopId);
-        if (ts)  ts.textContent  = completedAt;
-        if (row) row.style.display = '';
-
-        closeBody(stopId);
-    }}
-
-    // ================================================================
-    // Mark one card as reopened in the DOM
-    // ================================================================
-    function markOpen(stopId) {{
-        var card = document.querySelector('[data-stop-id="' + stopId + '"]');
-        if (!card) return;
-        card.classList.remove('dsc-done');
-
-        var badge = $id('badge-' + stopId);
-        if (badge) {{ badge.className = 'badge open'; badge.textContent = 'open'; }}
-
-        var btn = $id('toggle-btn-' + stopId);
-        if (btn) {{
-            btn.textContent = 'Complete Stop';
-            btn.className   = 'btn-driver btn-driver-complete';
-            btn.style.width = '100%';
-        }}
-
-        var row = $id('done-at-row-' + stopId);
-        if (row) row.style.display = 'none';
-
-        openBody(stopId);
-    }}
-
-    // ================================================================
-    // Highlight the next open stop as active
-    // ================================================================
-    function highlightNext() {{
-        document.querySelectorAll('.driver-stop-card').forEach(function(c) {{
-            c.classList.remove('dsc-active');
-            if (c.id === 'next-stop-card') c.id = 'stop-' + c.dataset.stopId;
-        }});
-        var nextCard = document.querySelector('.driver-stop-card:not(.dsc-done)');
-        if (!nextCard) return null;
-        nextCard.classList.add('dsc-active');
-        nextCard.id = 'next-stop-card';
-        openBody(nextCard.dataset.stopId);
-        return nextCard;
-    }}
-
-    // ================================================================
-    // AJAX stop completion — intercept all .dsc-toggle-form submits
-    // ================================================================
-    document.getElementById('stop-list').addEventListener('submit', function(e) {{
-        var form = e.target;
-        if (!form.classList.contains('dsc-toggle-form')) return;
-        e.preventDefault();
-
-        var stopId      = form.dataset.stopId;
-        var btn         = $id('toggle-btn-' + stopId);
-        var isCompleting = btn && btn.classList.contains('btn-driver-complete');
-
-        /* ── helper: queue this toggle + apply optimistic UI ─────── */
-        function _queueOffline() {{
-            /* extract pathname from absolute action URL */
-            var togglePath;
-            try {{ togglePath = new URL(form.action).pathname; }}
-            catch(ex) {{ togglePath = '/stop/' + stopId + '/toggle'; }}
-
-            if (typeof window.__haultraOfflineQueue === 'function') {{
-                window.__haultraOfflineQueue({{
-                    url:       togglePath,
-                    body:      {{
-                        _csrf_token:     '',
-                        expected_status: isCompleting ? 'open' : 'completed'
-                    }},
-                    queued_at: new Date().toISOString(),
-                    label:     (isCompleting ? 'Complete' : 'Reopen') + ' Stop #' + stopId
-                }});
-            }}
-
-            /* optimistic DOM update */
-            if (isCompleting) {{
-                markDone(stopId, 'Pending Sync');
-            }} else {{
-                markOpen(stopId);
-            }}
-            /* count updated DOM state for progress bar */
-            var allCards  = document.querySelectorAll('.driver-stop-card');
-            var doneCards = document.querySelectorAll('.driver-stop-card.dsc-done');
-            updateProgress(doneCards.length, allCards.length);
-            highlightNext();
-            updateStickyBtn();
-
-            /* mark button as pending so driver knows it hasn't confirmed yet */
-            var pb = $id('toggle-btn-' + stopId);
-            if (pb) {{
-                pb.innerHTML  = '&#8635; Pending Sync';
-                pb.disabled   = true;
-                pb.style.opacity = '0.65';
-            }}
-        }}
-
-        /* ── Offline: queue immediately, no network attempt ─────── */
-        if (!navigator.onLine) {{
-            _queueOffline();
-            return;
-        }}
-
-        /* ── Online: AJAX attempt ───────────────────────────────── */
-        if (btn) {{ btn.disabled = true; btn.textContent = 'Saving\u2026'; }}
-
-        var fd = new FormData();
-        fd.append('_csrf_token', csrfToken);
-
-        fetch(form.action, {{
-            method:  'POST',
-            headers: {{ 'X-Requested-With': 'XMLHttpRequest' }},
-            body:    fd,
-        }})
-        .then(function(r) {{ return r.json(); }})
-        .then(function(data) {{
-            if (!data.success) throw new Error('not ok');
-
-            if (data.new_status === 'completed') {{
-                markDone(stopId, data.completed_at);
-            }} else {{
-                markOpen(stopId);
-            }}
-
-            updateProgress(data.progress.completed, data.progress.total);
-
-            var nextCard = highlightNext();
-            updateStickyBtn();
-
-            if (data.new_status === 'completed' && nextCard) {{
-                setTimeout(function() {{
-                    nextCard.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
-                }}, 280);
-            }}
-        }})
-        .catch(function() {{
-            if (!navigator.onLine) {{
-                /* connection dropped mid-request — queue + optimistic UI */
-                _queueOffline();
-            }} else {{
-                /* server error — re-enable button, show brief error highlight */
-                if (btn) {{
-                    btn.disabled = false;
-                    btn.textContent = isCompleting ? 'Complete Stop' : 'Reopen Stop';
-                    btn.style.boxShadow = '0 0 0 2px #ff6b6b';
-                    setTimeout(function() {{ btn.style.boxShadow = ''; }}, 3000);
-                }}
-            }}
-        }});
-    }});
-
-    // ================================================================
-    // Distance: Geolocation + Nominatim geocoding
-    // ================================================================
-    var stopAddresses = {stop_addr_json};
-
-    function haversine(lat1, lon1, lat2, lon2) {{
-        var R = 3958.8, dLat = (lat2-lat1)*Math.PI/180, dLon = (lon2-lon1)*Math.PI/180;
-        var a = Math.sin(dLat/2)*Math.sin(dLat/2) +
-                Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*
-                Math.sin(dLon/2)*Math.sin(dLon/2);
-        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-    }}
-
-    function geocode(address, cb) {{
-        fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' +
-              encodeURIComponent(address), {{ headers: {{ 'Accept-Language': 'en' }} }})
-            .then(function(r) {{ return r.json(); }})
-            .then(function(d) {{ if (d && d.length) cb(parseFloat(d[0].lat), parseFloat(d[0].lon)); }})
-            .catch(function() {{}});
-    }}
-
-    if (stopAddresses.length && navigator.geolocation) {{
-        navigator.geolocation.getCurrentPosition(function(pos) {{
-            var uLat = pos.coords.latitude, uLon = pos.coords.longitude;
-            var idx  = 0;
-            (function tick() {{
-                if (idx >= stopAddresses.length) return;
-                var item = stopAddresses[idx++];
-                geocode(item.address, function(lat, lon) {{
-                    var el = $id('dist-' + item.id);
-                    if (el) el.textContent = haversine(uLat, uLon, lat, lon).toFixed(1) + ' mi';
-                }});
-                setTimeout(tick, 1300);
-            }})();
-        }}, function() {{}}, {{ timeout: 8000 }});
-    }}
-
-    // ================================================================
-    // Photo upload offline guard
-    // Photo files cannot be serialised to localStorage, so we cannot
-    // queue them. Instead, block the submit and give a clear message.
-    // ================================================================
-    document.querySelectorAll('.upload-details form').forEach(function(upForm) {{
-        upForm.addEventListener('submit', function(evt) {{
-            if (navigator.onLine) return;    /* online: let it submit */
-            evt.preventDefault();
-            evt.stopImmediatePropagation();
-
-            var uploadBtn = upForm.querySelector('button[type=submit]');
-            var origLabel = uploadBtn ? uploadBtn.textContent : 'Upload';
-
-            /* Show an inline warning inside the form */
-            if (!upForm.querySelector('.photo-offline-warn')) {{
-                var warn = document.createElement('p');
-                warn.className = 'photo-offline-warn';
-                warn.style.cssText = (
-                    'color:#fbbf24;font-size:13px;margin:8px 0 0;' +
-                    'padding:8px 10px;background:rgba(255,180,0,.1);' +
-                    'border:1px solid rgba(255,180,0,.25);border-radius:8px;'
-                );
-                warn.textContent = (
-                    '\u26a0 You are offline. Photos cannot be saved to your device ' +
-                    'and cannot be queued for upload. Keep this tab open — the Upload ' +
-                    'button will re-enable when your connection returns.'
-                );
-                upForm.appendChild(warn);
-            }}
-
-            if (uploadBtn) {{
-                uploadBtn.disabled = true;
-                uploadBtn.textContent = '\u23f3 Waiting for connection\u2026';
-                /* re-enable and restore label when connection returns */
-                window.addEventListener('online', function _onlineOnce() {{
-                    uploadBtn.disabled = false;
-                    uploadBtn.textContent = origLabel;
-                    var w = upForm.querySelector('.photo-offline-warn');
-                    if (w) w.remove();
-                    window.removeEventListener('online', _onlineOnce);
-                }});
-            }}
-        }});
-    }});
 }})();
 </script>
 """
-    return render_template_string(shell_page("Driver Route", body, extra_head))
+    return render_template_string(shell_page("Cab View", body))
 
 
 # =========================================================
@@ -10344,6 +10036,38 @@ def upload_stop_photo(stop_id):
 # =========================================================
 # CSV EXPORT
 # =========================================================
+@app.route("/export/day")
+@boss_required
+def export_day_csv():
+    conn = get_db()
+    stops = conn.execute("""
+        SELECT s.*, r.route_name, u.username AS driver_username
+        FROM stops s
+        JOIN routes r ON s.route_id = r.id
+        LEFT JOIN users u ON r.assigned_to = u.id
+        WHERE r.company_id=? AND r.route_date=?
+        ORDER BY r.id, s.stop_order
+    """, (cid(), today_str())).fetchall()
+    conn.close()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Route", "Driver", "Stop", "Customer", "Address", "Action", "Container Size", "Status"])
+    for s in stops:
+        writer.writerow([
+            s["route_name"], s["driver_username"] or "Unassigned", s["stop_order"],
+            s["customer_name"], s["address"], s["action"], s["container_size"], s["status"]
+        ])
+    output.seek(0)
+
+    return send_file(
+        io.BytesIO(output.read().encode()),
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name=f"haultra-day-{today_str()}.csv"
+    )
+
+
 @app.route("/route/<int:route_id>/csv")
 @login_required
 def export_route_csv(route_id):
@@ -12137,6 +11861,117 @@ def delete_dump_location(loc_id):
     conn.close()
     flash(f"'{dl['name']}' deleted.", "success")
     return redirect(url_for("dump_locations_page"))
+
+
+# =========================================================
+# BIN TRACKER — containers currently out at customer sites
+# =========================================================
+OVERDUE_RENTAL_DAYS = 10  # UI flagging threshold; not yet a configurable company setting
+
+
+def _days_out(since_str):
+    if not since_str:
+        return None
+    try:
+        since_date = datetime.strptime(since_str[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+    today = datetime.now(_EASTERN).date() if _EASTERN else date.today()
+    return (today - since_date).days
+
+
+@app.route("/bin-tracker")
+@boss_required
+def bin_tracker():
+    conn = get_db()
+    out = compute_containers_out(conn, cid())
+
+    has_coords = conn.execute(
+        "SELECT COUNT(*) n FROM saved_addresses WHERE company_id=? AND lat IS NOT NULL AND lng IS NOT NULL",
+        (cid(),)
+    ).fetchone()["n"]
+    conn.close()
+
+    for c in out:
+        c["days_out"] = _days_out(c["since"])
+    out.sort(key=lambda c: c["days_out"] if c["days_out"] is not None else -1, reverse=True)
+
+    overdue_count = sum(1 for c in out if (c["days_out"] or 0) >= OVERDUE_RENTAL_DAYS)
+
+    rows_html = ""
+    if not out:
+        rows_html = '<div class="empty-state">No containers currently out. Delivery and pull history will populate this list as stops are completed.</div>'
+    else:
+        for c in out:
+            days = c["days_out"]
+            overdue = days is not None and days >= OVERDUE_RENTAL_DAYS
+            if days is None:
+                days_label = "&mdash;"
+            elif days == 0:
+                days_label = "Out today"
+            elif days == 1:
+                days_label = "1 day out"
+            else:
+                days_label = f"{days} days out"
+            card_cls = "bin-card overdue" if overdue else "bin-card"
+            addr_line = e(c["address"]) + (f', {e(c["city"])}' if c["city"] else "")
+            rows_html += f"""
+            <div class="{card_cls}">
+                <div class="bin-card-top">
+                    <span class="bin-days {'overdue' if overdue else ''}">{days_label}</span>
+                    {f'<span class="bin-size">{e(c["size"])}</span>' if c["size"] else ''}
+                </div>
+                <div class="bin-addr">{addr_line}</div>
+                {f'<div class="bin-customer">{e(c["customer_name"])}</div>' if c["customer_name"] else ''}
+                {f'<div class="bin-overdue-tag">&#9888; OVERDUE &mdash; past {OVERDUE_RENTAL_DAYS}-day window</div>' if overdue else ''}
+            </div>
+            """
+
+    map_panel = """
+    <div class="bin-map-stub">
+        <div class="bin-map-stub-icon">&#128506;</div>
+        <div class="bin-map-stub-title">Map coming soon</div>
+        <div class="bin-map-stub-sub">Container locations aren't geocoded yet &mdash;
+        addresses have no stored coordinates. The list on the right reflects
+        real, live container-out data.</div>
+    </div>
+    """ if not has_coords else """
+    <div class="bin-map-stub">
+        <div class="bin-map-stub-icon">&#128506;</div>
+        <div class="bin-map-stub-title">Map view coming soon</div>
+        <div class="bin-map-stub-sub">Saved addresses have coordinates, but the
+        map renderer isn't wired up yet.</div>
+    </div>
+    """
+
+    body = f"""
+    <div class="hero">
+        <h1>Bin Tracker</h1>
+        <p>Rental clocks for every container currently out at a customer site.</p>
+    </div>
+
+    <div class="bin-tracker-grid">
+        <div class="bin-map-col">
+            {map_panel}
+        </div>
+        <div class="bin-list-col">
+            <div class="bin-list-header">
+                <div>
+                    <div class="bin-list-title">RENTAL CLOCKS</div>
+                    <div class="bin-list-sub">CONTAINERS OUT</div>
+                </div>
+                <div class="bin-list-stats">
+                    <span class="bin-count">{len(out)}</span> out
+                    {f'<span class="bin-overdue-count">&#9888; {overdue_count} overdue</span>' if overdue_count else ''}
+                </div>
+            </div>
+            <div class="bin-list">
+                {rows_html}
+            </div>
+        </div>
+    </div>
+    """
+    return render_template_string(shell_page("Bin Tracker", body))
 
 
 # =========================================================
