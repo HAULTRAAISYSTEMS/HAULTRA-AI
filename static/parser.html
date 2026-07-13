@@ -6,6 +6,7 @@
 <meta name="theme-color" content="#121212">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="csrf-token" content="__CSRF_TOKEN__">
 <title>HAULTRA — AI Route Parser</title>
 <link rel="manifest" href="/static/manifest.json">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -44,7 +45,7 @@
   html, body { background: var(--bg-0); color: var(--text); min-height: 100vh; }
   body {
     font-family: var(--font-body);
-    padding-bottom: 92px;
+    padding-bottom: 152px;
   }
 
   a { color: var(--teal); }
@@ -336,13 +337,36 @@
 
   .bottom-bar {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 100;
-    display: flex; gap: 12px;
-    padding: 14px 18px;
+    display: flex; flex-direction: column; gap: 10px;
+    padding: 12px 18px 14px;
     background: var(--bg-2);
     border-top: 1px solid rgba(255,255,255,0.08);
   }
-  .bottom-bar .btn-secondary { flex: 0 0 auto; min-width: 120px; }
-  .bottom-bar #confirm-btn { flex: 1; }
+  .assign-row {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  }
+  .assign-row label {
+    font-size: 0.78rem; font-weight: 700; letter-spacing: 0.4px;
+    color: var(--text-dim); text-transform: uppercase; white-space: nowrap;
+  }
+  .driver-select {
+    flex: 1; min-width: 160px; min-height: 44px;
+    background: var(--bg-1);
+    border: 1px solid rgba(255,255,255,0.15);
+    color: var(--text);
+    border-radius: 7px;
+    padding: 8px 10px;
+    font-family: var(--font-body);
+    font-size: 0.92rem;
+  }
+  .no-drivers-msg {
+    font-size: 0.85rem; color: var(--text-dim);
+  }
+  .no-drivers-msg a { color: var(--teal); font-weight: 700; }
+
+  .dispatch-row { display: flex; gap: 12px; }
+  .dispatch-row .btn-secondary { flex: 0 0 auto; min-width: 120px; }
+  .dispatch-row #confirm-btn { flex: 1; }
 
   @media (max-width: 480px) {
     .page-title { font-size: 1.3rem; }
@@ -384,8 +408,11 @@
 </main>
 
 <div class="bottom-bar">
-  <button id="edit-btn" class="btn btn-secondary" onclick="toggleEditMode()">Edit stops</button>
-  <button id="confirm-btn" class="btn btn-orange-outline" disabled onclick="confirmDispatch()">⚡ Confirm &amp; Dispatch 0 Stops</button>
+  <div class="assign-row" id="assign-row"><!--ASSIGN_SLOT--></div>
+  <div class="dispatch-row">
+    <button id="edit-btn" class="btn btn-secondary" onclick="toggleEditMode()">Edit stops</button>
+    <button id="confirm-btn" class="btn btn-orange-outline" disabled onclick="confirmDispatch()">⚡ Confirm &amp; Dispatch 0 Stops</button>
+  </div>
 </div>
 
 <div id="toast" class="toast"></div>
@@ -406,6 +433,7 @@
   var currentStops = [];
   var editMode = false;
   var toastTimer = null;
+  var CSRF_TOKEN = (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
 
   function el(id) { return document.getElementById(id); }
 
@@ -640,6 +668,9 @@
     }
 
     var confirmBtn = el('confirm-btn');
+    var driverSelect = el('driver-select');
+    var noDriversAtAll = !driverSelect && !!el('assign-row') && el('assign-row').querySelector('.no-drivers-msg');
+
     if (count === 0) {
       confirmBtn.disabled = true;
       confirmBtn.className = 'btn btn-orange-outline';
@@ -648,6 +679,14 @@
       confirmBtn.disabled = true;
       confirmBtn.className = 'btn btn-orange-outline';
       confirmBtn.textContent = '⚠ Review ' + flaggedUnreviewed + ' Flagged Stop' + (flaggedUnreviewed === 1 ? '' : 's');
+    } else if (noDriversAtAll) {
+      confirmBtn.disabled = true;
+      confirmBtn.className = 'btn btn-orange-outline';
+      confirmBtn.textContent = '⚡ Add a Driver First';
+    } else if (driverSelect && !driverSelect.value) {
+      confirmBtn.disabled = true;
+      confirmBtn.className = 'btn btn-orange-outline';
+      confirmBtn.textContent = '⚡ Select a Driver to Dispatch';
     } else {
       confirmBtn.disabled = false;
       confirmBtn.className = 'btn btn-orange-solid';
@@ -670,10 +709,67 @@
   window.toggleEditMode = toggleEditMode;
 
   function confirmDispatch() {
-    if (el('confirm-btn').disabled) return;
-    showToast('✓ ' + currentStops.length + ' stop' + (currentStops.length === 1 ? '' : 's') + ' dispatched');
+    var btn = el('confirm-btn');
+    if (btn.disabled) return;
+
+    var driverSelect = el('driver-select');
+    var driverId = driverSelect ? driverSelect.value : '';
+    if (!driverId) return;
+    var driverName = driverSelect.options[driverSelect.selectedIndex].textContent;
+
+    dismissError();
+    var originalText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Dispatching...';
+
+    var payload = {
+      driver_id: driverId,
+      stops: currentStops.map(function (s) {
+        return {
+          action: s.action,
+          address: s.address,
+          container_size: s.container_size,
+          notes: s.notes,
+          confidence: s.confidence,
+          reviewed: s.reviewed,
+        };
+      }),
+    };
+
+    fetch('/api/dispatch', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': CSRF_TOKEN,
+      },
+      credentials: 'same-origin',
+      body: JSON.stringify(payload),
+    })
+      .then(function (r) {
+        return r.json().catch(function () { return null; }).then(function (data) {
+          return { ok: r.ok, data: data };
+        });
+      })
+      .then(function (res) {
+        if (!res.ok || !res.data || !res.data.success) {
+          throw new Error((res.data && res.data.error) || 'Dispatch failed — try again.');
+        }
+        showToast('✓ Route dispatched to ' + driverName + ' — ' + res.data.stop_count + ' stops');
+        btn.textContent = '✓ Dispatched — redirecting…';
+        setTimeout(function () { window.location.href = '/routes'; }, 1100);
+      })
+      .catch(function (err) {
+        showError(err.message || 'Dispatch failed — try again.');
+        btn.disabled = false;
+        btn.textContent = originalText;
+      });
   }
   window.confirmDispatch = confirmDispatch;
+
+  var driverSelectEl = el('driver-select');
+  if (driverSelectEl) {
+    driverSelectEl.addEventListener('change', updateCounts);
+  }
 })();
 </script>
 </body>
