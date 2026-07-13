@@ -4450,6 +4450,90 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 }}
 
 /* ══════════════════════════════════════════════════════════
+   ROUTE BOARD — driver lanes
+   ══════════════════════════════════════════════════════════*/
+.route-tabs {{ display: flex; gap: 8px; margin-bottom: 18px; }}
+.route-tab {{
+    background: rgba(26,26,26,0.85); border: 1px solid rgba(255,107,26,0.16);
+    color: #A6A69E; font-weight: 700; font-size: 12.5px; letter-spacing: .3px;
+    padding: 9px 18px; border-radius: 9px; text-decoration: none;
+}}
+.route-tab.active {{
+    background: linear-gradient(135deg, #FF8A42 0%, #FF6B1A 100%);
+    color: #1A1000; border-color: transparent;
+}}
+
+.board-legend {{ display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }}
+.board-legend-item {{ display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-muted); font-weight: 600; }}
+.board-legend-dot {{ width: 9px; height: 9px; border-radius: 3px; flex-shrink: 0; }}
+.board-legend-dot.pickup {{ background: var(--cyan); }}
+.board-legend-dot.dropswap {{ background: var(--slate); }}
+.board-legend-dot.urgent {{ background: var(--red); }}
+
+.board-empty {{
+    text-align: center; padding: 60px 24px; color: var(--text-muted);
+    background: rgba(20,20,20,0.6); border: 1px dashed rgba(255,107,26,0.2);
+    border-radius: var(--radius-lg);
+}}
+.board-empty p {{ margin-bottom: 18px; font-size: 14px; }}
+
+.lane {{
+    display: flex; gap: 18px; align-items: stretch;
+    background: rgba(20,20,20,0.68); border: 1px solid rgba(255,255,255,0.06);
+    border-radius: var(--radius); padding: 16px; margin-bottom: 14px;
+}}
+.lane-driver {{ width: 170px; flex-shrink: 0; }}
+.lane-name-row {{ display: flex; align-items: center; gap: 8px; }}
+.lane-status-dot {{ width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: #55554C; }}
+.lane-status-dot.active {{ background: var(--cyan); box-shadow: 0 0 6px var(--cyan); }}
+.lane-status-dot.done {{ background: var(--green); box-shadow: 0 0 6px var(--green); }}
+.lane-name {{
+    font-family: var(--font-head); font-size: 19px; letter-spacing: .5px;
+    text-transform: uppercase; color: #F5F5F0;
+}}
+.lane-sub {{ font-size: 11.5px; color: var(--text-muted); margin-top: 4px; line-height: 1.5; }}
+
+.lane-track {{
+    display: flex; gap: 10px; overflow-x: auto; flex: 1; min-width: 0;
+    padding-bottom: 4px; scroll-snap-type: x proximity;
+}}
+
+.stop-mini {{
+    flex-shrink: 0; scroll-snap-align: start;
+    width: 190px; min-height: 48px;
+    background: rgba(26,26,26,0.85); border: 1px solid rgba(255,255,255,0.08);
+    border-left: 3px solid #55554C; border-radius: var(--radius-sm);
+    padding: 10px 12px; text-decoration: none; display: block;
+    transition: border-color .15s, transform .1s;
+}}
+.stop-mini:hover {{ transform: translateY(-1px); border-color: rgba(255,107,26,0.4); }}
+.stop-mini.st-done    {{ border-left-color: var(--green); }}
+.stop-mini.st-enroute {{ border-left-color: var(--cyan); }}
+.stop-mini.st-pending {{ border-left-color: #55554C; }}
+
+.stop-mini-top {{ display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 6px; }}
+.stop-mini-badge {{
+    font-size: 10px; font-weight: 800; letter-spacing: .4px;
+    padding: 2px 6px; border-radius: 5px; flex-shrink: 0;
+}}
+.stop-mini-badge.pickup   {{ background: var(--cyan-dim); color: var(--cyan); border: 1px solid rgba(255,107,26,.4); }}
+.stop-mini-badge.dropswap {{ background: rgba(140,160,179,0.16); color: #8CA0B3; border: 1px solid rgba(140,160,179,0.4); }}
+.stop-mini-badge.neutral  {{ background: rgba(255,255,255,0.06); color: #A6A69E; border: 1px solid rgba(255,255,255,0.1); }}
+.stop-mini-urgent {{ font-size: 9px; font-weight: 800; color: var(--red); letter-spacing: .3px; white-space: nowrap; }}
+.stop-mini-addr {{ font-size: 12px; color: #D8D8D0; line-height: 1.35; margin-bottom: 6px; min-height: 32px; }}
+.stop-mini-addr.done {{ text-decoration: line-through; color: #6B6B62; }}
+.stop-mini-bottom {{ display: flex; align-items: center; justify-content: space-between; gap: 6px; }}
+.stop-mini-size {{ font-size: 10.5px; color: var(--text-muted); font-weight: 600; }}
+.stop-mini-pill {{
+    font-size: 9.5px; font-weight: 800; letter-spacing: .3px; text-transform: uppercase;
+    padding: 2px 7px; border-radius: 999px;
+}}
+.stop-mini-pill.done    {{ background: rgba(61,220,132,0.14); color: var(--green); }}
+.stop-mini-pill.enroute {{ background: rgba(255,107,26,0.16); color: #FF9D5C; }}
+.stop-mini-pill.pending {{ background: rgba(255,255,255,0.06); color: #A6A69E; }}
+.stop-mini-time {{ font-size: 10px; color: var(--text-muted); margin-top: 4px; }}
+
+/* ══════════════════════════════════════════════════════════
    RESPONSIVE
    ══════════════════════════════════════════════════════════*/
 @media (max-width: 900px) {{
@@ -4458,6 +4542,8 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     .nav-item {{ padding: 10px 11px; font-size: 12.5px; }}
     .company-pill {{ display: none; }}
     .grid {{ grid-template-columns: repeat(2, 1fr); }}
+    .lane {{ flex-direction: column; }}
+    .lane-driver {{ width: 100%; }}
 }}
 
 @media (max-width: 560px) {{
@@ -7074,116 +7160,336 @@ def text_to_route():
 # =========================================================
 # ROUTES / STOPS
 # =========================================================
+def _board_action_badge(action):
+    """Map a stop's raw action text to the mockup's P/PR/D/S/R card badge.
+
+    This is a display-only classification for the Route Board's badge color —
+    it intentionally does not reuse the can-flow "is_pr" logic (which treats
+    plain Swap as a PR variant), since the mockup calls for Swap to render as
+    its own slate 'S' badge distinct from the orange PR badge.
+    """
+    a = (action or "").strip().lower()
+    if "pickup and return" in a:
+        return "PR", "pickup"
+    if "pull" in a and "return" not in a:
+        return "P", "pickup"
+    if "swap" in a:
+        return "S", "dropswap"
+    if "delivery" in a or "drop" in a:
+        return "D", "dropswap"
+    if "relocate" in a or "move" in a:
+        return "R", "neutral"
+    label = (action or "?").strip()[:1].upper() or "?"
+    return label, "neutral"
+
+
+def _build_route_board_html(user):
+    """Render the #lane-container contents for the Route Board — one lane per
+    driver with stops today, built from real route/stop rows only. Shared by
+    the initial page render and the 30s polling partial so both stay in sync.
+    """
+    conn = get_db()
+    company_id = cid()
+    today = today_str()
+
+    params = [company_id, today]
+    sql = """
+        SELECT r.id AS route_id, r.route_name, r.assigned_to,
+               u.username AS driver_username,
+               s.id AS stop_id, s.stop_order, s.customer_name, s.address, s.city,
+               s.action, s.container_size, s.status AS stop_status, s.driver_status,
+               s.completed_at
+        FROM routes r
+        LEFT JOIN users u ON r.assigned_to = u.id
+        LEFT JOIN stops s ON s.route_id = r.id
+        WHERE r.company_id = ? AND r.route_date = ?
+    """
+    if user["role"] != "boss":
+        sql += " AND r.assigned_to = ?"
+        params.append(user["id"])
+    sql += " ORDER BY r.id, s.stop_order, s.id"
+
+    board_rows = conn.execute(sql, tuple(params)).fetchall()
+
+    # Real, derived "urgent" signal: a pending Pull/PR stop whose container has
+    # already been sitting overdue at that address (from compute_containers_out,
+    # the same replay used for the Owner Dashboard / Bin Tracker overdue counts).
+    containers_out = compute_containers_out(conn, company_id)
+    overdue_addr_keys = {
+        (c["address"] or "").strip().lower() + "|" + (c["city"] or "").strip().lower()
+        for c in containers_out
+        if (_days_out(c["since"]) or 0) >= OVERDUE_RENTAL_DAYS
+    }
+    conn.close()
+
+    lanes = {}
+    for row in board_rows:
+        driver_key = row["driver_username"] or "__unassigned__"
+        lane = lanes.setdefault(driver_key, {
+            "driver_username": row["driver_username"],
+            "route_names": [],
+            "route_ids_seen": set(),
+            "stops": [],
+        })
+        if row["route_id"] not in lane["route_ids_seen"]:
+            lane["route_ids_seen"].add(row["route_id"])
+            lane["route_names"].append(row["route_name"])
+        if row["stop_id"] is not None:
+            lane["stops"].append(row)
+
+    if not lanes:
+        return (
+            '<div class="board-empty"><p>No dispatches yet today.</p>'
+            f'<a class="btn gold" href="/parser" style="min-height:48px;display:inline-flex;align-items:center;">+ New Dispatch</a></div>'
+        )
+
+    sorted_keys = sorted(lanes.keys(), key=lambda k: (1, "") if k == "__unassigned__" else (0, k.lower()))
+
+    lanes_html = ""
+    for key in sorted_keys:
+        lane = lanes[key]
+        stops = lane["stops"]
+        display_name = lane["driver_username"] or "Unassigned"
+        total = len(stops)
+        done = sum(1 for s in stops if s["stop_status"] == "completed")
+
+        if total > 0 and done == total:
+            dot_cls = "done"
+        elif done > 0 or any((s["driver_status"] or "pending") != "pending" for s in stops):
+            dot_cls = "active"
+        else:
+            dot_cls = ""
+
+        route_label = lane["route_names"][0] if len(lane["route_names"]) == 1 else f"{len(lane['route_names'])} routes"
+        progress_label = f"{done}/{total} done" if total else "No stops"
+
+        cards_html = ""
+        for s in stops:
+            letter, group = _board_action_badge(s["action"])
+            stop_status = s["stop_status"]
+            driver_status = s["driver_status"] or "pending"
+
+            if stop_status == "completed":
+                pill_label, pill_cls, card_cls = "Done", "done", "st-done"
+            elif driver_status != "pending":
+                pill_label, pill_cls, card_cls = "En Route", "enroute", "st-enroute"
+            else:
+                pill_label, pill_cls, card_cls = "Pending", "pending", "st-pending"
+
+            addr_text = ", ".join(p for p in [s["address"] or "", s["city"] or ""] if p) or (s["customer_name"] or "Stop")
+            addr_cls = "stop-mini-addr done" if stop_status == "completed" else "stop-mini-addr"
+            size_label = size_bucket(s["container_size"]) or (s["container_size"] or "")
+
+            time_html = ""
+            if stop_status == "completed" and s["completed_at"]:
+                t = _fmt_12h(s["completed_at"])
+                if t:
+                    time_html = f'<div class="stop-mini-time">{e(t)}</div>'
+
+            addr_key = (s["address"] or "").strip().lower() + "|" + (s["city"] or "").strip().lower()
+            is_urgent = group == "pickup" and stop_status != "completed" and addr_key in overdue_addr_keys
+            urgent_html = '<span class="stop-mini-urgent">&#9888; OVERDUE</span>' if is_urgent else ""
+
+            link = (url_for("edit_stop", stop_id=s["stop_id"]) if user["role"] == "boss"
+                    else url_for("view_route", route_id=s["route_id"]))
+
+            cards_html += f"""
+            <a class="stop-mini {card_cls}" href="{link}">
+                <div class="stop-mini-top">
+                    <span class="stop-mini-badge {group}">{e(letter)}</span>
+                    {urgent_html}
+                </div>
+                <div class="{addr_cls}">{e(addr_text)}</div>
+                <div class="stop-mini-bottom">
+                    <span class="stop-mini-size">{e(size_label) if size_label else '&mdash;'}</span>
+                    <span class="stop-mini-pill {pill_cls}">{e(pill_label)}</span>
+                </div>
+                {time_html}
+            </a>"""
+
+        if not cards_html:
+            cards_html = '<div class="muted small" style="padding:10px;">No stops.</div>'
+
+        lanes_html += f"""
+        <div class="lane">
+            <div class="lane-driver">
+                <div class="lane-name-row">
+                    <span class="lane-status-dot {dot_cls}"></span>
+                    <span class="lane-name">{e(display_name)}</span>
+                </div>
+                <div class="lane-sub">{e(route_label)}<br>{e(progress_label)}</div>
+            </div>
+            <div class="lane-track">{cards_html}</div>
+        </div>"""
+
+    return lanes_html
+
+
+@app.route("/routes/board-partial")
+@login_required
+def route_board_partial():
+    return _build_route_board_html(get_current_user())
+
+
 @app.route("/routes")
 @login_required
 def routes_page():
     user = get_current_user()
-    conn = get_db()
     q = request.args.get("q", "").strip()
     status = request.args.get("status", "").strip()
+    active_tab = "history" if request.args.get("tab") == "history" else "board"
 
-    params = [cid()]
-    sql = """
-        SELECT r.*, u.username AS assigned_username, c.username AS created_username
-        FROM routes r
-        LEFT JOIN users u ON r.assigned_to = u.id
-        LEFT JOIN users c ON r.created_by = c.id
-        WHERE r.company_id = ?
+    today = today_str()
+    weekday = datetime.strptime(today, "%Y-%m-%d").strftime("%A").upper()
+
+    history_params = {"tab": "history"}
+    if q:
+        history_params["q"] = q
+    if status:
+        history_params["status"] = status
+    history_tab_href = url_for("routes_page") + "?" + urllib.parse.urlencode(history_params)
+
+    tabs_html = f"""
+    <div class="route-tabs">
+        <a class="route-tab {'active' if active_tab == 'board' else ''}" href="{url_for('routes_page')}"
+           style="min-height:48px;display:inline-flex;align-items:center;">Board</a>
+        <a class="route-tab {'active' if active_tab == 'history' else ''}" href="{history_tab_href}"
+           style="min-height:48px;display:inline-flex;align-items:center;">History</a>
+    </div>
     """
 
-    if user["role"] != "boss":
-        sql += " AND r.assigned_to = ?"
-        params.append(user["id"])
-
-    if q:
-        sql += " AND (r.route_name LIKE ? ESCAPE '\\' OR r.notes LIKE ? ESCAPE '\\' OR r.raw_text LIKE ? ESCAPE '\\')"
-        like_q = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-        params.extend([like_q, like_q, like_q])
-
-    if status in ("open", "in_progress", "completed"):
-        sql += " AND r.status = ?"
-        params.append(status)
-
-    sql += " ORDER BY r.route_date DESC, r.id DESC"
-
-    routes = conn.execute(sql, tuple(params)).fetchall()
-    conn.close()
-
-    rows = ""
-    for r in routes:
-        rows += f"""
-        <tr>
-            <td>{e(r['route_date'])}</td>
-            <td><a href="{url_for('view_route', route_id=r['id'])}">{e(r['route_name'])}</a></td>
-            <td>{e(r['assigned_username'] or 'Unassigned')}</td>
-            <td>{e(r['created_username'] or '')}</td>
-            <td><span class="badge {e(r['status'])}">{e(r['status'])}</span></td>
-            <td>
-                <div class="row">
-                  <td>
-    <div class="row">
-        <a class="btn secondary" href="{url_for('view_route', route_id=r['id'])}">Open</a>
-        <a class="btn green" href="{url_for('export_route_csv', route_id=r['id'])}">CSV</a>
-
-        {f'''
-        <form class="inline" method="POST"
-              action="{url_for('delete_route', route_id=r['id'])}"
-              onsubmit="return confirm('Delete this entire route?')">
-            <button class="btn red" type="submit">Delete</button>
-        </form>
-        ''' if user['role'] == 'boss' else ''}
-
+    header_html = f"""
+    <div class="hero owner-header-row">
+        <div>
+            <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#55554C;margin-bottom:7px;">
+                {e(weekday)} &middot; {e(today)}
+            </div>
+            <h1>Route Board</h1>
+        </div>
+        <div class="row" style="align-items:center;gap:18px;">
+            <div class="board-legend">
+                <span class="board-legend-item"><span class="board-legend-dot pickup"></span>Pickup</span>
+                <span class="board-legend-item"><span class="board-legend-dot dropswap"></span>Drop/Swap</span>
+                <span class="board-legend-item"><span class="board-legend-dot urgent"></span>Urgent</span>
+            </div>
+            <a class="btn gold" href="/parser" style="min-height:48px;display:inline-flex;align-items:center;white-space:nowrap;">+ New Dispatch</a>
+        </div>
     </div>
-</td>
+    """
+
+    if active_tab == "board":
+        board_inner = _build_route_board_html(user)
+        poll_script = f"""
+        <script>
+        (function() {{
+            var container = document.getElementById('lane-container');
+            if (!container) return;
+            setInterval(function() {{
+                fetch('{url_for("route_board_partial")}', {{credentials: 'same-origin'}})
+                    .then(function(r) {{ return r.ok ? r.text() : null; }})
+                    .then(function(html) {{ if (html !== null) container.innerHTML = html; }})
+                    .catch(function() {{}});
+            }}, 30000);
+        }})();
+        </script>
+        """
+        main_panel = f'<div id="lane-container">{board_inner}</div>{poll_script}'
+    else:
+        conn = get_db()
+        params = [cid()]
+        sql = """
+            SELECT r.*, u.username AS assigned_username, c.username AS created_username
+            FROM routes r
+            LEFT JOIN users u ON r.assigned_to = u.id
+            LEFT JOIN users c ON r.created_by = c.id
+            WHERE r.company_id = ?
+        """
+        if user["role"] != "boss":
+            sql += " AND r.assigned_to = ?"
+            params.append(user["id"])
+        if q:
+            sql += " AND (r.route_name LIKE ? ESCAPE '\\' OR r.notes LIKE ? ESCAPE '\\' OR r.raw_text LIKE ? ESCAPE '\\')"
+            like_q = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            params.extend([like_q, like_q, like_q])
+        if status in ("open", "in_progress", "completed"):
+            sql += " AND r.status = ?"
+            params.append(status)
+        sql += " ORDER BY r.route_date DESC, r.id DESC"
+        routes = conn.execute(sql, tuple(params)).fetchall()
+        conn.close()
+
+        rows = ""
+        for r in routes:
+            rows += f"""
+            <tr>
+                <td>{e(r['route_date'])}</td>
+                <td><a href="{url_for('view_route', route_id=r['id'])}">{e(r['route_name'])}</a></td>
+                <td>{e(r['assigned_username'] or 'Unassigned')}</td>
+                <td>{e(r['created_username'] or '')}</td>
+                <td><span class="badge {e(r['status'])}">{e(r['status'])}</span></td>
+                <td>
+                    <div class="row">
+                        <a class="btn secondary" href="{url_for('view_route', route_id=r['id'])}">Open</a>
+                        <a class="btn green" href="{url_for('export_route_csv', route_id=r['id'])}">CSV</a>
+                        {f'''
+                        <form class="inline" method="POST"
+                              action="{url_for('delete_route', route_id=r['id'])}"
+                              onsubmit="return confirm('Delete this entire route?')">
+                            <button class="btn red" type="submit">Delete</button>
+                        </form>
+                        ''' if user['role'] == 'boss' else ''}
+                    </div>
+                </td>
+            </tr>
+            """
+
+        main_panel = f"""
+        {f'''
+        <div class="row" style="margin-bottom:18px;gap:10px;">
+            <a class="btn gold" href="{url_for('new_route')}">+ Create Route</a>
+            <a class="btn secondary" href="{url_for('text_to_route')}">⌨ Paste Boss Text</a>
+        </div>
+        ''' if user['role'] == 'boss' else ''}
+        <div class="card">
+            <form method="GET" class="row">
+                <input type="hidden" name="tab" value="history">
+                <div style="flex:1;min-width:220px;">
+                    <label>Search</label>
+                    <input name="q" value="{e(q)}" placeholder="Route name, notes, or pasted route text">
                 </div>
-            </td>
-        </tr>
+                <div style="min-width:180px;">
+                    <label>Status</label>
+                    <select name="status">
+                        <option value="">All</option>
+                        <option value="open" {'selected' if status=='open' else ''}>Open</option>
+                        <option value="in_progress" {'selected' if status=='in_progress' else ''}>In Progress</option>
+                        <option value="completed" {'selected' if status=='completed' else ''}>Completed</option>
+                    </select>
+                </div>
+                <div style="align-self:flex-end;">
+                    <button type="submit">Filter</button>
+                </div>
+            </form>
+        </div>
+        <div class="card">
+            <div class="row between">
+                <h2 style="margin:0;">All Routes</h2>
+            </div>
+            <div class="table-wrap">
+                <table>
+                    <thead><tr><th>Date</th><th>Route</th><th>Assigned</th><th>Created By</th><th>Status</th><th>Actions</th></tr></thead>
+                    <tbody>{rows if rows else '<tr><td colspan="6">No routes found.</td></tr>'}</tbody>
+                </table>
+            </div>
+        </div>
         """
 
     body = f"""
-    <div class="hero">
-        <h1>Routes</h1>
-        <p>Search, filter, open, export, and manage route flow.</p>
-    </div>
-    {f'''
-    <div class="row" style="margin-bottom:18px;gap:10px;">
-        <a class="btn gold" href="{url_for('new_route')}">+ Create Route</a>
-        <a class="btn secondary" href="{url_for('text_to_route')}">⌨ Paste Boss Text</a>
-    </div>
-    ''' if user['role'] == 'boss' else ''}
-    <div class="card">
-        <form method="GET" class="row">
-            <div style="flex:1;min-width:220px;">
-                <label>Search</label>
-                <input name="q" value="{e(q)}" placeholder="Route name, notes, or pasted route text">
-            </div>
-            <div style="min-width:180px;">
-                <label>Status</label>
-                <select name="status">
-                    <option value="">All</option>
-                    <option value="open" {'selected' if status=='open' else ''}>Open</option>
-                    <option value="in_progress" {'selected' if status=='in_progress' else ''}>In Progress</option>
-                    <option value="completed" {'selected' if status=='completed' else ''}>Completed</option>
-                </select>
-            </div>
-            <div style="align-self:flex-end;">
-                <button type="submit">Filter</button>
-            </div>
-        </form>
-    </div>
-    <div class="card">
-        <div class="row between">
-            <h2 style="margin:0;">All Routes</h2>
-        </div>
-        <div class="table-wrap">
-            <table>
-                <thead><tr><th>Date</th><th>Route</th><th>Assigned</th><th>Created By</th><th>Status</th><th>Actions</th></tr></thead>
-                <tbody>{rows if rows else '<tr><td colspan="6">No routes found.</td></tr>'}</tbody>
-            </table>
-        </div>
-    </div>
+    {header_html}
+    {tabs_html}
+    {main_panel}
     """
-    return render_template_string(shell_page("Routes", body))
+    return render_template_string(shell_page("Route Board", body))
 
 
 @app.route("/route/new", methods=["GET", "POST"])
