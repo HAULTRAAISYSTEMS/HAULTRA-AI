@@ -648,7 +648,7 @@ def csrf_protect():
 _SUBSCRIPTION_EXEMPT = {
     "login", "logout", "company_register", "static",
     "subscription_blocked", "subscription_success", "billing",
-    "company_subscription", "stripe_webhook",
+    "company_subscription", "company_settings", "settings_page", "stripe_webhook",
     "privacy_policy", "terms_of_service",
 }
 
@@ -673,7 +673,7 @@ def subscription_enforce():
     if now_ts_float - cache_checked_at < _SUB_CACHE_TTL:
         cached_status = session.get("_sub_status")
         if cached_status in ("suspended", "cancelled"):
-            if request.endpoint in ("company_subscription", "company_settings"):
+            if request.endpoint in ("company_subscription", "company_settings", "settings_page"):
                 return
             return redirect(url_for("subscription_blocked"))
         return
@@ -716,7 +716,7 @@ def subscription_enforce():
     session["_sub_checked_at"] = now_ts_float
 
     if co["subscription_status"] in ("suspended", "cancelled"):
-        if request.endpoint in ("company_subscription", "company_settings"):
+        if request.endpoint in ("company_subscription", "company_settings", "settings_page"):
             return
         return redirect(url_for("subscription_blocked"))
 
@@ -1105,29 +1105,37 @@ def update_container_flow(conn, stop_id):
         app.logger.error("Container flow tracking failed for stop %s: %s", stop_id, e)
 
 
-def compute_containers_out(conn, company_id):
+def compute_containers_out(conn, company_id, asof_date=None):
     """
-    Read-only view of containers currently on-site at customer addresses.
+    Read-only view of containers on-site at customer addresses, as of a given
+    date (defaults to "right now" — i.e. no cutoff).
 
     ENABLE_CONTAINER_TRACKING is off, so customer_containers is never written.
     Rather than fabricate numbers, this replays completed stops chronologically
     (same action semantics as update_container_flow / compute_can_flow: a
     Delivery or PR/swap stop leaves a container behind, a Pull closes it out)
-    to derive what's actually out right now from real stop history.
+    to derive what's actually out from real stop history.
+
+    asof_date: optional "YYYY-MM-DD" string. When given, only stops completed
+    on or before that date are replayed — lets callers reconstruct a historical
+    snapshot (e.g. "how many were out 7 days ago") from the same real data,
+    instead of tracking separate historical rows nobody writes.
 
     Returns a list of dicts: address, city, state, size, since (timestamp str),
     customer_name, route_id — one per address currently holding a container.
     """
-    rows = conn.execute(
-        """SELECT s.id, s.address, s.city, s.state, s.action, s.container_size,
+    sql = """SELECT s.id, s.address, s.city, s.state, s.action, s.container_size,
                   s.completed_at, s.customer_name, s.route_id, r.route_date
            FROM stops s
            JOIN routes r ON s.route_id = r.id
            WHERE r.company_id = ? AND s.status = 'completed'
-             AND s.address IS NOT NULL AND TRIM(s.address) != ''
-           ORDER BY COALESCE(s.completed_at, r.route_date), s.id""",
-        (company_id,)
-    ).fetchall()
+             AND s.address IS NOT NULL AND TRIM(s.address) != ''"""
+    params = [company_id]
+    if asof_date:
+        sql += " AND substr(COALESCE(s.completed_at, r.route_date), 1, 10) <= ?"
+        params.append(asof_date)
+    sql += " ORDER BY COALESCE(s.completed_at, r.route_date), s.id"
+    rows = conn.execute(sql, tuple(params)).fetchall()
 
     on_site = {}
     for s in rows:
@@ -3483,19 +3491,15 @@ def shell_page(title, body, extra_head=""):
                 + nav_link(url_for("dashboard"), 'Owner', path)
             )
 
-        # ── Overflow "More" items (role-aware) — every remaining page ───
+        # ── Overflow "More" items (role-aware) ───────────────────────────
+        # Boss "More" is deliberately limited to these three — Driver Hours now
+        # lives per-row on Team, and Boss Panel / Orders / Live Dispatch keep
+        # working at their old URLs but no longer have a nav entry (see PR notes).
         if user["role"] == "boss":
             more_items = (
-                nav_link(url_for("boss_dashboard"), "📊 Boss Panel", path)
-                + nav_link(url_for("drivers_page"), "◉ Drivers", path)
-                + nav_link(url_for("orders_page"), "🧾 Orders", path)
-                + nav_link(url_for("manage_users"), "👥 Users", path)
-                + nav_link(url_for("dump_locations_page"), "🗑 Dump Locations", path)
-                + nav_link(url_for("containers_page"), "📦 Containers", path)
-                + nav_link(url_for("driver_hours_page"), "⏱ Driver Hours", path)
-                + nav_link(url_for("company_settings"), "⚙ Company Settings", path)
-                + nav_link(url_for("company_subscription"), "💳 Subscription", path)
-                + nav_link('/dispatch', '🚛 Live Dispatch', path)
+                nav_link(url_for("team_page"), "👥 Team", path)
+                + nav_link(url_for("yard_setup_page"), "🏗 Yard Setup", path)
+                + nav_link(url_for("settings_page"), "⚙ Settings", path)
             )
         else:
             more_items = (
@@ -5538,12 +5542,60 @@ def dashboard():
         driver_pull_counts[name] = driver_pull_counts.get(name, 0) + 1
     driver_pull_list = sorted(driver_pull_counts.items(), key=lambda kv: kv[1], reverse=True)
 
+    # ── Pulls Today vs 7-day average (only shown when there's real history to compare) ──
+    today_date    = datetime.strptime(today, "%Y-%m-%d").date()
+    window_start  = (today_date - timedelta(days=7)).isoformat()
+    window_end    = (today_date - timedelta(days=1)).isoformat()
+    _window_stops = conn.execute("""
+        SELECT s.action
+        FROM stops s
+        JOIN routes r ON s.route_id = r.id
+        WHERE r.company_id=? AND s.status='completed'
+          AND substr(COALESCE(s.completed_at, r.route_date), 1, 10) BETWEEN ? AND ?
+    """, (company_id, window_start, window_end)).fetchall()
+    _has_prior_history = conn.execute("""
+        SELECT COUNT(*) n FROM routes WHERE company_id=? AND route_date < ?
+    """, (company_id, today)).fetchone()["n"] > 0
+
+    pulls_trend_sub = ""
+    if _has_prior_history:
+        window_pulls = sum(1 for s in _window_stops if is_pull_job(s["action"]))
+        avg_per_day  = window_pulls / 7.0
+        if avg_per_day > 0:
+            pct_change = round((pulls_today - avg_per_day) / avg_per_day * 100)
+            sign = "+" if pct_change >= 0 else ""
+            pulls_trend_sub = f'<div class="sub">{sign}{pct_change}% vs 7-day avg ({avg_per_day:.1f}/day)</div>'
+        elif pulls_today > 0:
+            pulls_trend_sub = '<div class="sub">up from 0 in the past 7 days</div>'
+        else:
+            pulls_trend_sub = '<div class="sub">0 vs 7-day avg</div>'
+
     # Containers out (live, derived from stop history — see compute_containers_out)
     containers_out = compute_containers_out(conn, company_id)
     out_count = len(containers_out)
     for c in containers_out:
         c["days_out"] = _days_out(c["since"])
     overdue_count = sum(1 for c in containers_out if (c["days_out"] or 0) >= OVERDUE_RENTAL_DAYS)
+
+    # ── Overdue 7-day trend — reconstructed from real stop history, not stored snapshots ──
+    overdue_trend_sub = ""
+    _has_history_7d_ago = conn.execute("""
+        SELECT COUNT(*) n FROM stops s JOIN routes r ON s.route_id=r.id
+        WHERE r.company_id=? AND s.status='completed'
+          AND substr(COALESCE(s.completed_at, r.route_date), 1, 10) <= ?
+    """, (company_id, window_start)).fetchone()["n"] > 0
+    if _has_history_7d_ago:
+        containers_out_7d_ago = compute_containers_out(conn, company_id, asof_date=window_start)
+        overdue_7d_ago = sum(
+            1 for c in containers_out_7d_ago
+            if (_days_out(c["since"], asof_date=window_start) or 0) >= OVERDUE_RENTAL_DAYS
+        )
+        delta = overdue_count - overdue_7d_ago
+        if delta == 0:
+            overdue_trend_sub = '<div class="sub">flat vs 7 days ago</div>'
+        else:
+            sign = "+" if delta > 0 else ""
+            overdue_trend_sub = f'<div class="sub">{sign}{delta} vs 7 days ago</div>'
 
     # Fleet totals by size (real, boss-registered inventory — 0 if not registered yet)
     fleet_rows = conn.execute(
@@ -5662,6 +5714,7 @@ def dashboard():
         <div class="gauge-stat">
             <div class="label">Pulls Today</div>
             <div class="num">{pulls_today}</div>
+            {pulls_trend_sub}
         </div>
         <div class="gauge-stat">
             <div class="label">Revenue</div>
@@ -5677,6 +5730,7 @@ def dashboard():
             <div class="label">Overdue</div>
             <div class="num {'red' if overdue_count else ''}">{overdue_count}</div>
             <div class="sub">{OVERDUE_RENTAL_DAYS}+ days out</div>
+            {overdue_trend_sub}
         </div>
     </div>
 
@@ -5796,16 +5850,22 @@ def analytics_page():
 
 
 # =========================================================
-# USERS / DRIVERS
+# TEAM — merged Users + Drivers roster
 # =========================================================
-@app.route("/users")
+@app.route("/team")
 @boss_required
-def manage_users():
+def team_page():
     conn = get_db()
-    users = conn.execute(
-        "SELECT * FROM users WHERE company_id=? ORDER BY role, username",
-        (cid(),)
-    ).fetchall()
+    users = conn.execute("""
+        SELECT u.*, COUNT(DISTINCT r.id) AS routes_assigned,
+               SUM(CASE WHEN s.status='completed' THEN 1 ELSE 0 END) AS completed_stops
+        FROM users u
+        LEFT JOIN routes r ON r.assigned_to = u.id AND r.company_id = ?
+        LEFT JOIN stops s ON s.route_id = r.id
+        WHERE u.company_id=?
+        GROUP BY u.id
+        ORDER BY u.role, u.username
+    """, (cid(), cid())).fetchall()
     conn.close()
 
     current_uid = session["user_id"]
@@ -5814,32 +5874,42 @@ def manage_users():
     rows = ""
     for u in users:
         is_self      = u["id"] == current_uid
+        is_driver    = u["role"] == "driver"
         is_last_boss = u["role"] == "boss" and boss_count <= 1
 
-        _del_td_style = 'style="text-align:right;white-space:nowrap;width:80px;"'
+        _del_td_style = 'style="text-align:right;white-space:nowrap;width:170px;"'
         if is_self:
-            delete_cell = f'<td {_del_td_style}><span class="muted small">You</span></td>'
+            delete_cell = f'<span class="muted small">You</span>'
         elif is_last_boss:
-            delete_cell = f'<td {_del_td_style}><span class="muted small" title="Cannot delete the last boss">—</span></td>'
+            delete_cell = f'<span class="muted small" title="Cannot delete the last boss">&mdash;</span>'
         else:
             _del_uname  = e(u["username"])
             _del_action = url_for("delete_user", user_id=u["id"])
             delete_cell = (
-                f'<td {_del_td_style}>'
-                f'<form method="POST" action="{_del_action}" style="margin:0;" '
+                f'<form method="POST" action="{_del_action}" style="margin:0;display:inline;" '
                 f'onsubmit="return confirm(\'Delete {_del_uname}? This cannot be undone.\');">'
                 f'<button type="submit" '
                 f'style="background:transparent;color:#f87171;border:1px solid rgba(248,113,113,0.4);'
                 f'border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;line-height:1.4;">'
                 f'Delete</button>'
                 f'</form>'
-                f'</td>'
             )
+
+        hours_cell = (
+            f'<a href="{url_for("driver_hours_page")}?driver_id={u["id"]}" '
+            f'style="color:#FF9D5C;font-size:12px;margin-right:10px;">Hours</a>'
+            if is_driver else ""
+        )
 
         role_badge = (
             '<span class="badge completed">Boss</span>'
             if u["role"] == "boss"
             else '<span class="badge">Driver</span>'
+        )
+
+        stats_cell = (
+            f'{u["routes_assigned"] or 0} routes &middot; {u["completed_stops"] or 0} stops'
+            if is_driver else '<span class="muted small">&mdash;</span>'
         )
 
         rows += f"""
@@ -5848,31 +5918,37 @@ def manage_users():
             <td>{e(u['full_name'] or '')}</td>
             <td>{e(u['phone'] or '')}</td>
             <td>{role_badge}</td>
+            <td class="muted small">{stats_cell}</td>
             <td>{e(u['created_at'])}</td>
-            {delete_cell}
+            <td {_del_td_style}>{hours_cell}{delete_cell}</td>
         </tr>
         """
 
     body = f"""
     <div class="hero">
-        <h1>Users</h1>
-        <p>Create drivers and bosses that can work inside the same HAULTRA system.</p>
+        <h1>Team</h1>
+        <p>Everyone who can work inside this HAULTRA system &mdash; bosses and drivers, one roster.</p>
     </div>
 
     <div class="card">
         <div class="row between">
-            <h2 style="margin:0;">All Users</h2>
+            <h2 style="margin:0;">All Team Members</h2>
             <a class="btn" href="{url_for('register')}">Create User</a>
         </div>
         <div class="table-wrap">
             <table>
-                <thead><tr><th>Username</th><th>Full Name</th><th>Phone</th><th>Role</th><th>Created</th><th style="width:80px;"></th></tr></thead>
-                <tbody>{rows}</tbody>
+                <thead>
+                    <tr>
+                        <th>Username</th><th>Full Name</th><th>Phone</th><th>Role</th>
+                        <th>Driver Activity</th><th>Created</th><th style="width:170px;"></th>
+                    </tr>
+                </thead>
+                <tbody>{rows or '<tr><td colspan="7" class="muted">No team members found.</td></tr>'}</tbody>
             </table>
         </div>
     </div>
     """
-    return render_template_string(shell_page("Users", body))
+    return render_template_string(shell_page("Team", body))
 
 
 @app.route("/users/<int:user_id>/delete", methods=["POST"])
@@ -5887,13 +5963,13 @@ def delete_user(user_id):
     if not target:
         conn.close()
         flash("User not found.", "error")
-        return redirect(url_for("manage_users"))
+        return redirect(url_for("team_page"))
 
     # Cannot delete yourself
     if user_id == session["user_id"]:
         conn.close()
         flash("You cannot delete your own account.", "error")
-        return redirect(url_for("manage_users"))
+        return redirect(url_for("team_page"))
 
     # Cannot delete the last boss
     if target["role"] == "boss":
@@ -5903,7 +5979,7 @@ def delete_user(user_id):
         if boss_count <= 1:
             conn.close()
             flash("Cannot delete the last boss account.", "error")
-            return redirect(url_for("manage_users"))
+            return redirect(url_for("team_page"))
 
     # If deleting a driver: unassign their active routes (set assigned_to = NULL)
     if target["role"] == "driver":
@@ -5917,45 +5993,20 @@ def delete_user(user_id):
     conn.close()
 
     flash(f"User '{target['username']}' has been deleted.", "success")
-    return redirect(url_for("manage_users"))
+    return redirect(url_for("team_page"))
+
+
+# ── Legacy URLs — redirect to their new home on Team ────────────────────────
+@app.route("/users")
+@boss_required
+def manage_users():
+    return redirect(url_for("team_page"))
 
 
 @app.route("/drivers")
 @boss_required
 def drivers_page():
-    conn = get_db()
-    drivers = conn.execute("""
-        SELECT u.*, COUNT(DISTINCT r.id) AS routes_assigned,
-               SUM(CASE WHEN s.status='completed' THEN 1 ELSE 0 END) AS completed_stops
-        FROM users u
-        LEFT JOIN routes r ON r.assigned_to = u.id AND r.company_id = ?
-        LEFT JOIN stops s ON s.route_id = r.id
-        WHERE u.role='driver' AND u.company_id = ?
-        GROUP BY u.id
-        ORDER BY u.username
-    """, (cid(), cid())).fetchall()
-    conn.close()
-
-    cards = ""
-    for d in drivers:
-        cards += f"""
-        <div class="stat">
-            <div style="font-size:18px;font-weight:800;">{e(d['username'])}</div>
-            <div class="small muted">{e(d['full_name'] or '')}</div>
-            <div class="small muted">{e(d['phone'] or '')}</div>
-            <div style="margin-top:10px;">Routes Assigned: <b>{d['routes_assigned'] or 0}</b></div>
-            <div>Completed Stops: <b>{d['completed_stops'] or 0}</b></div>
-        </div>
-        """
-
-    body = f"""
-    <div class="hero">
-        <h1>Drivers</h1>
-        <p>See active drivers, route assignments, and stop completion totals.</p>
-    </div>
-    <div class="grid">{cards if cards else '<div class="stat">No drivers found.</div>'}</div>
-    """
-    return render_template_string(shell_page("Drivers", body))
+    return redirect(url_for("team_page"))
 
 @app.route("/signup")
 def signup():
@@ -6133,7 +6184,7 @@ def register():
             flash("Username already exists.", "error")
         finally:
             conn.close()
-        return redirect(url_for("manage_users"))
+        return redirect(url_for("team_page"))
 
     body = """
     <div class="hero">
@@ -10413,11 +10464,11 @@ def company_register():
 
 
 # =========================================================
-# COMPANY SETTINGS
+# SETTINGS — merged Company Settings + Subscription
 # =========================================================
-@app.route("/company/settings", methods=["GET", "POST"])
+@app.route("/settings", methods=["GET", "POST"])
 @boss_required
-def company_settings():
+def settings_page():
     conn = get_db()
     company = conn.execute("SELECT * FROM companies WHERE id=?", (cid(),)).fetchone()
 
@@ -10468,10 +10519,9 @@ def company_settings():
                 flash("Company name updated.", "success")
 
         conn.close()
-        return redirect(url_for("company_settings"))
+        return redirect(url_for("settings_page"))
 
-    conn.close()
-
+    # ── Profile / Yard / Work Hours (GET render) ────────────────────────────
     plan_labels = {
         "trial": ("Trial", "#fbbf24"),
         "starter": ("Starter", "#FF9D5C"),
@@ -10484,7 +10534,6 @@ def company_settings():
     max_d     = _co.get("max_drivers") or 0
     co_name   = _co.get("name") or ""
     co_slug   = _co.get("slug") or ""
-    trial_end = _co.get("trial_ends_at") or ""
     yard_addr  = _co.get("yard_address") or ""
     yard_city  = _co.get("yard_city")    or ""
     yard_state = _co.get("yard_state")   or ""
@@ -10505,13 +10554,8 @@ def company_settings():
         '<span style="color:#ff9d00;font-size:12px;">&#9888; Not set — route optimization will use stop-to-stop ordering</span>'
     )
 
-    body = f"""
-    <div class="hero">
-        <h1>Company Settings</h1>
-        <p>Manage your company profile and account details.</p>
-    </div>
-
-    <div class="card">
+    settings_body = f"""
+    <div class="card" id="profile">
         <h2>Profile</h2>
         <form method="POST">
             <input type="hidden" name="_action" value="profile">
@@ -10524,7 +10568,7 @@ def company_settings():
         <p class="muted small" style="margin-top:10px;">Slug: <code>{e(co_slug)}</code></p>
     </div>
 
-    <div class="card">
+    <div class="card" id="yard">
         <h2>&#127968; Yard / Base Location</h2>
         <p style="color:#B8B8AE;font-size:13px;margin-bottom:12px;">
             Used as the starting point when optimizing routes. Stops with notes containing
@@ -10636,48 +10680,18 @@ def company_settings():
             </div>
         </form>
     </div>
-
-    <div class="card">
-        <h2>Subscription</h2>
-        <div class="grid">
-            <div class="stat" style="border-color:{plan_color}40;">
-                <div>Current Plan</div>
-                <div class="num" style="color:{plan_color};font-size:22px;">{plan_name}</div>
-            </div>
-            <div class="stat">
-                <div>Max Drivers</div>
-                <div class="num">{max_d}</div>
-            </div>
-            {"" if not trial_end else f'<div class="stat"><div>Trial Ends</div><div class="num" style="font-size:16px;">{e(trial_end)}</div></div>'}
-        </div>
-        <a class="btn orange" href="{url_for('company_subscription')}" style="margin-top:12px;display:inline-block;">
-            Manage Subscription
-        </a>
-    </div>
     """
-    return render_template_string(shell_page("Company Settings", body))
 
-
-# =========================================================
-# SUBSCRIPTION MANAGEMENT (placeholder)
-# =========================================================
-@app.route("/company/subscription")
-@boss_required
-def company_subscription():
-    conn = get_db()
-    company = conn.execute("SELECT * FROM companies WHERE id=?", (cid(),)).fetchone()
+    # ── Subscription (GET render, folded in as its own section) ─────────────
     history = conn.execute(
         "SELECT * FROM subscriptions WHERE company_id=? ORDER BY started_at DESC",
         (cid(),)
     ).fetchall()
     conn.close()
 
-    plan   = company["subscription_plan"]   if company else "trial"
-    status = company["subscription_status"] if company else "active"
-    max_d  = company["max_drivers"]         if company else 5
-    trial_ends_at = company["trial_ends_at"] if company else None
+    sub_status = _co.get("subscription_status") or "active"
+    trial_ends_at = _co.get("trial_ends_at")
 
-    # compute trial countdown
     trial_banner = ""
     if plan == "trial" and trial_ends_at:
         try:
@@ -10690,7 +10704,7 @@ def company_subscription():
                     f'&#9888; Your free trial ends in <strong>{days_left} day{"s" if days_left != 1 else ""}</strong>. '
                     f'Contact <a href="mailto:info@haultraai.com">info@haultraai.com</a> to upgrade.</div>'
                 )
-            elif status == "active":
+            elif sub_status == "active":
                 trial_banner = (
                     '<div style="background:rgba(248,113,113,0.15);border:1px solid rgba(248,113,113,0.4);'
                     'border-radius:10px;padding:14px 18px;margin-bottom:18px;">'
@@ -10705,32 +10719,20 @@ def company_subscription():
         ("pro",        "Pro",        "$99/mo","Up to 30 drivers • priority support",         "#3DDC84"),
         ("enterprise", "Enterprise", "Custom","Unlimited drivers • dedicated support",       "#c084fc"),
     ]
+    plan_labels_full = {"trial": "Free Trial", "starter": "Starter", "pro": "Pro", "enterprise": "Enterprise"}
+    plan_label = plan_labels_full.get(plan, plan.title())
 
-    # plan display label map
-    plan_labels = {
-        "trial":      "Free Trial",
-        "starter":    "Starter",
-        "pro":        "Pro",
-        "enterprise": "Enterprise",
-    }
-    plan_label = plan_labels.get(plan, plan.title())
-
-    # expiration date display
     if plan == "trial" and trial_ends_at:
-        exp_display = trial_ends_at[:10]   # YYYY-MM-DD
+        exp_display = trial_ends_at[:10]
         try:
             ends_dt2 = datetime.strptime(trial_ends_at, "%Y-%m-%d %H:%M:%S")
             days_left2 = (ends_dt2 - datetime.now()).days
-            if days_left2 > 0:
-                exp_display = f"{trial_ends_at[:10]} ({days_left2}d left)"
-            else:
-                exp_display = f"{trial_ends_at[:10]} (expired)"
+            exp_display = f"{trial_ends_at[:10]} ({days_left2}d left)" if days_left2 > 0 else f"{trial_ends_at[:10]} (expired)"
         except ValueError:
             pass
     else:
-        exp_display = "—" if status == "active" else "Subscription ended"
+        exp_display = "—" if sub_status == "active" else "Subscription ended"
 
-    # upgrade CTA visibility: only show when not already on enterprise
     show_upgrade = plan in ("trial", "starter", "pro")
     upgrade_btn = (
         '<button onclick="haultraCheckout(\'starter\',this)" '
@@ -10763,26 +10765,25 @@ def company_subscription():
             {upgrade_card_btn}
         </div>"""
 
-    # current usage
-    conn2 = get_db()
-    driver_count = conn2.execute(
+    conn3 = get_db()
+    driver_count = conn3.execute(
         "SELECT COUNT(*) n FROM users WHERE role='driver' AND company_id=?", (cid(),)
     ).fetchone()["n"]
-    conn2.close()
+    conn3.close()
 
-    pct = int(driver_count / max_d * 100) if max_d else 0
-    bar_color = "#f87171" if pct >= 90 else "#FF9D5C"
+    seat_pct = int(driver_count / max_d * 100) if max_d else 0
+    bar_color = "#f87171" if seat_pct >= 90 else "#FF9D5C"
     seat_bar = f"""
     <div style="margin-top:6px;">
         <div style="font-size:13px;color:#D8D8D0;margin-bottom:4px;">{driver_count} / {max_d} driver seats used</div>
         <div class="mini-prog-track" style="width:100%;height:10px;">
-            <div class="mini-prog-fill" style="width:{pct}%;background:{bar_color};"></div>
+            <div class="mini-prog-fill" style="width:{seat_pct}%;background:{bar_color};"></div>
         </div>
     </div>"""
 
     hist_rows = ""
     for h in history:
-        plan_hl = plan_labels.get(h["plan"], h["plan"].title())
+        plan_hl = plan_labels_full.get(h["plan"], h["plan"].title())
         hist_rows += f"""
         <tr>
             <td>{e(plan_hl)}</td>
@@ -10792,24 +10793,19 @@ def company_subscription():
             <td>{e(h['notes'] or '')}</td>
         </tr>"""
 
-    status_color = "#4ade80" if status == "active" else "#f87171"
-    plan_color_map = {
-        "trial": "#fbbf24", "starter": "#FF9D5C",
-        "pro": "#3DDC84", "enterprise": "#c084fc",
-    }
+    status_color = "#4ade80" if sub_status == "active" else "#f87171"
+    plan_color_map = {"trial": "#fbbf24", "starter": "#FF9D5C", "pro": "#3DDC84", "enterprise": "#c084fc"}
     pc = plan_color_map.get(plan, "#D8D8D0")
 
-    body = f"""
-    <div class="hero">
-        <h1>Billing &amp; Subscription</h1>
-        <p>Your plan details, usage, and upgrade options.</p>
-    </div>
+    subscription_body = f"""
+    <div class="card" id="subscription" style="margin-top:8px;">
+        <h2 style="margin:0 0 4px;">Subscription &amp; Billing</h2>
+        <p style="color:#B8B8AE;font-size:13px;margin-bottom:16px;">Your plan details, usage, and upgrade options.</p>
 
-    {trial_banner}
+        {trial_banner}
 
-    <div class="card">
         <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:18px;">
-            <h2 style="margin:0;">Plan Overview</h2>
+            <h3 style="margin:0;font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:#B8B8AE;">Plan Overview</h3>
             {upgrade_btn}
         </div>
         <div class="grid">
@@ -10819,7 +10815,7 @@ def company_subscription():
             </div>
             <div class="stat">
                 <div class="muted small">Status</div>
-                <div class="num" style="color:{status_color};font-size:22px;">{status.title()}</div>
+                <div class="num" style="color:{status_color};font-size:22px;">{sub_status.title()}</div>
             </div>
             <div class="stat">
                 <div class="muted small">{"Trial Expiration" if plan == "trial" else "Renewal / Expiration"}</div>
@@ -10830,18 +10826,14 @@ def company_subscription():
                 {seat_bar}
             </div>
         </div>
-    </div>
 
-    <div class="card">
-        <h2>Available Plans</h2>
+        <h3 style="margin:22px 0 12px;font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:#B8B8AE;">Available Plans</h3>
         <div class="grid">{plan_cards}</div>
         <p class="muted small" style="margin-top:14px;">
             Secure checkout powered by Stripe. Cancel anytime.
         </p>
-    </div>
 
-    <div class="card">
-        <h2>Subscription History</h2>
+        <h3 style="margin:22px 0 12px;font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:#B8B8AE;">Subscription History</h3>
         <div class="table-wrap">
             <table>
                 <thead><tr><th>Plan</th><th>Status</th><th>Started</th><th>Ends</th><th>Notes</th></tr></thead>
@@ -10864,7 +10856,30 @@ def company_subscription():
     }};
     </script>
     """
-    return render_template_string(shell_page("Subscription", body))
+
+    body = f"""
+    <div class="hero">
+        <h1>Settings</h1>
+        <p>Company profile, yard location, work hours, and subscription — all in one place.</p>
+    </div>
+    {settings_body}
+    {subscription_body}
+    """
+    return render_template_string(shell_page("Settings", body))
+
+
+# ── Legacy URLs — redirect to their new home on Settings ────────────────────
+@app.route("/company/settings", methods=["GET", "POST"])
+@boss_required
+def company_settings():
+    return redirect(url_for("settings_page") + "#profile")
+
+
+@app.route("/company/subscription")
+@boss_required
+def company_subscription():
+    return redirect(url_for("settings_page") + "#subscription")
+
 
 
 # =========================================================
@@ -10994,12 +11009,12 @@ def create_checkout_session():
     plan = request.form.get("plan", "").lower()
     if plan not in STRIPE_PURCHASABLE_PLANS:
         flash("Invalid plan selected.", "error")
-        return redirect(url_for("company_subscription"))
+        return redirect(url_for("settings_page") + "#subscription")
 
     price_id = STRIPE_PRICE_IDS.get(plan)
     if not price_id:
         flash("Price ID not configured for this plan.", "error")
-        return redirect(url_for("company_subscription"))
+        return redirect(url_for("settings_page") + "#subscription")
 
     conn = get_db()
     company  = conn.execute("SELECT * FROM companies WHERE id=?", (cid(),)).fetchone()
@@ -11199,8 +11214,8 @@ def debug_stripe():
 @app.route("/billing")
 @boss_required
 def billing():
-    """Clean /billing URL — renders the same subscription management page."""
-    return company_subscription()
+    """Clean /billing URL — same subscription section, now on Settings."""
+    return redirect(url_for("settings_page") + "#subscription")
 
 
 # =========================================================
@@ -11234,7 +11249,7 @@ def subscription_blocked():
 
     sub_link = ""
     if session.get("role") == "boss":
-        sub_link = f'<a class="btn green" href="{url_for("company_subscription")}" style="margin-top:16px;display:inline-block;font-size:16px;padding:14px 28px;">View Plans &amp; Upgrade</a>'
+        sub_link = f'<a class="btn green" href="{url_for("settings_page")}#subscription" style="margin-top:16px;display:inline-block;font-size:16px;padding:14px 28px;">View Plans &amp; Upgrade</a>'
 
     body = f"""
     <div style="max-width:560px;margin:80px auto;text-align:center;">
@@ -11644,11 +11659,9 @@ def terms_of_service():
 
 
 # =========================================================
-# DUMP LOCATIONS
+# YARD SETUP — merged Dump Locations + Container Fleet
 # =========================================================
-@app.route("/dump-locations")
-@boss_required
-def dump_locations_page():
+def _dump_locations_section_html():
     conn = get_db()
     locs = conn.execute(
         "SELECT * FROM dump_locations ORDER BY active DESC, name ASC"
@@ -11694,16 +11707,13 @@ def dump_locations_page():
             </td>
         </tr>"""
 
-    body = f"""
-    <div class="hero">
-        <h1>Dump Locations</h1>
-        <p>Manage the disposal sites available for route assignment.</p>
-    </div>
-    <div class="card">
+    return f"""
+    <div class="card" id="dump-locations">
         <div class="row between" style="margin-bottom:16px;">
-            <h2 style="margin:0;">All Locations</h2>
+            <h2 style="margin:0;">&#128465; Dump Locations</h2>
             <a class="btn" href="{url_for('add_dump_location')}">+ Add Location</a>
         </div>
+        <p class="muted small" style="margin-bottom:14px;">Disposal sites available for route assignment.</p>
         <div class="table-wrap">
             <table>
                 <thead>
@@ -11716,7 +11726,6 @@ def dump_locations_page():
         </div>
     </div>
     """
-    return render_template_string(shell_page("Dump Locations", body))
 
 
 @app.route("/dump-locations/add", methods=["GET", "POST"])
@@ -11742,7 +11751,7 @@ def add_dump_location():
         conn.commit()
         conn.close()
         flash(f"Dump location '{name}' added.", "success")
-        return redirect(url_for("dump_locations_page"))
+        return redirect(url_for("yard_setup_page"))
 
     body = """
     <div class="hero"><h1>Add Dump Location</h1></div>
@@ -11761,7 +11770,7 @@ def add_dump_location():
             <textarea name="notes" placeholder="Any special instructions..."></textarea>
             <div style="margin-top:12px;display:flex;gap:10px;">
                 <button type="submit">Save Location</button>
-                <a class="btn secondary" href="/dump-locations">Cancel</a>
+                <a class="btn secondary" href="/yard-setup#dump-locations">Cancel</a>
             </div>
         </form>
     </div>
@@ -11777,7 +11786,7 @@ def edit_dump_location(loc_id):
     if not dl:
         conn.close()
         flash("Location not found.", "error")
-        return redirect(url_for("dump_locations_page"))
+        return redirect(url_for("yard_setup_page"))
 
     if request.method == "POST":
         name     = request.form.get("name", "").strip()
@@ -11799,7 +11808,7 @@ def edit_dump_location(loc_id):
         conn.commit()
         conn.close()
         flash("Location updated.", "success")
-        return redirect(url_for("dump_locations_page"))
+        return redirect(url_for("yard_setup_page"))
 
     conn.close()
     body = f"""
@@ -11819,7 +11828,7 @@ def edit_dump_location(loc_id):
             <textarea name="notes">{e(dl['notes'] or '')}</textarea>
             <div style="margin-top:12px;display:flex;gap:10px;">
                 <button type="submit">Save Changes</button>
-                <a class="btn secondary" href="{url_for('dump_locations_page')}">Cancel</a>
+                <a class="btn secondary" href="{url_for('yard_setup_page')}">Cancel</a>
             </div>
         </form>
     </div>
@@ -11835,14 +11844,14 @@ def toggle_dump_location(loc_id):
     if not dl:
         conn.close()
         flash("Location not found.", "error")
-        return redirect(url_for("dump_locations_page"))
+        return redirect(url_for("yard_setup_page"))
     new_active = 0 if dl["active"] else 1
     conn.execute("UPDATE dump_locations SET active=? WHERE id=?", (new_active, loc_id))
     conn.commit()
     conn.close()
     status_word = "activated" if new_active else "deactivated"
     flash(f"'{dl['name']}' {status_word}.", "success")
-    return redirect(url_for("dump_locations_page"))
+    return redirect(url_for("yard_setup_page"))
 
 
 @app.route("/dump-locations/<int:loc_id>/delete", methods=["POST"])
@@ -11853,14 +11862,14 @@ def delete_dump_location(loc_id):
     if not dl:
         conn.close()
         flash("Location not found.", "error")
-        return redirect(url_for("dump_locations_page"))
+        return redirect(url_for("yard_setup_page"))
     # Unlink from any routes that reference this location
     conn.execute("UPDATE routes SET dump_location_id=NULL WHERE dump_location_id=?", (loc_id,))
     conn.execute("DELETE FROM dump_locations WHERE id=?", (loc_id,))
     conn.commit()
     conn.close()
     flash(f"'{dl['name']}' deleted.", "success")
-    return redirect(url_for("dump_locations_page"))
+    return redirect(url_for("yard_setup_page"))
 
 
 # =========================================================
@@ -11869,15 +11878,21 @@ def delete_dump_location(loc_id):
 OVERDUE_RENTAL_DAYS = 10  # UI flagging threshold; not yet a configurable company setting
 
 
-def _days_out(since_str):
+def _days_out(since_str, asof_date=None):
     if not since_str:
         return None
     try:
         since_date = datetime.strptime(since_str[:10], "%Y-%m-%d").date()
     except Exception:
         return None
-    today = datetime.now(_EASTERN).date() if _EASTERN else date.today()
-    return (today - since_date).days
+    if asof_date:
+        try:
+            ref_date = datetime.strptime(asof_date[:10], "%Y-%m-%d").date()
+        except Exception:
+            return None
+    else:
+        ref_date = datetime.now(_EASTERN).date() if _EASTERN else date.today()
+    return (ref_date - since_date).days
 
 
 @app.route("/bin-tracker")
@@ -11975,11 +11990,9 @@ def bin_tracker():
 
 
 # =========================================================
-# PHASE 5A — CONTAINER FLEET INVENTORY  (/boss/containers)
+# PHASE 5A — CONTAINER FLEET INVENTORY  (part of /yard-setup)
 # =========================================================
-@app.route("/boss/containers")
-@boss_required
-def containers_page():
+def _containers_section_html():
     conn = get_db()
     containers = conn.execute(
         "SELECT * FROM containers WHERE company_id=? ORDER BY size ASC, label ASC",
@@ -12036,16 +12049,13 @@ def containers_page():
             </td>
         </tr>"""
 
-    body = f"""
-    <div class="hero">
-        <h1>Container Fleet</h1>
-        <p>Track your roll-off containers by size and status.</p>
-    </div>
-    <div class="card">
+    return f"""
+    <div class="card" id="containers">
         <div class="row between" style="margin-bottom:16px;">
-            <h2 style="margin:0;">All Containers</h2>
+            <h2 style="margin:0;">&#128230; Container Fleet</h2>
             <a class="btn" href="{url_for('add_container')}">+ Add Container</a>
         </div>
+        <p class="muted small" style="margin-bottom:14px;">Your roll-off containers by size and status.</p>
         <div class="table-wrap">
             <table>
                 <thead>
@@ -12058,7 +12068,33 @@ def containers_page():
         </div>
     </div>
     """
-    return render_template_string(shell_page("Container Fleet", body))
+
+
+@app.route("/yard-setup")
+@boss_required
+def yard_setup_page():
+    body = f"""
+    <div class="hero">
+        <h1>Yard Setup</h1>
+        <p>Dump locations and your container fleet, in one place.</p>
+    </div>
+    {_dump_locations_section_html()}
+    {_containers_section_html()}
+    """
+    return render_template_string(shell_page("Yard Setup", body))
+
+
+# ── Legacy URLs — redirect to their new home on Yard Setup ──────────────────
+@app.route("/dump-locations")
+@boss_required
+def dump_locations_page():
+    return redirect(url_for("yard_setup_page") + "#dump-locations")
+
+
+@app.route("/boss/containers")
+@boss_required
+def containers_page():
+    return redirect(url_for("yard_setup_page") + "#containers")
 
 
 @app.route("/boss/containers/add", methods=["GET", "POST"])
@@ -12081,7 +12117,7 @@ def add_container():
         conn.commit()
         conn.close()
         flash(f"{size} container added.", "success")
-        return redirect(url_for("containers_page"))
+        return redirect(url_for("yard_setup_page"))
 
     size_opts = "".join(
         f'<option value="{s}">{s}</option>'
@@ -12106,7 +12142,7 @@ def add_container():
             <textarea name="notes" placeholder="Any notes..."></textarea>
             <div style="margin-top:12px;display:flex;gap:10px;">
                 <button type="submit">Save</button>
-                <a class="btn secondary" href="{url_for('containers_page')}">Cancel</a>
+                <a class="btn secondary" href="{url_for('yard_setup_page')}">Cancel</a>
             </div>
         </form>
     </div>"""
@@ -12138,7 +12174,7 @@ def edit_container(c_id):
         conn.commit()
         conn.close()
         flash("Container updated.", "success")
-        return redirect(url_for("containers_page"))
+        return redirect(url_for("yard_setup_page"))
 
     _c = dict(c)
     conn.close()
@@ -12166,7 +12202,7 @@ def edit_container(c_id):
             <textarea name="notes">{e(_c['notes'] or '')}</textarea>
             <div style="margin-top:12px;display:flex;gap:10px;">
                 <button type="submit">Save Changes</button>
-                <a class="btn secondary" href="{url_for('containers_page')}">Cancel</a>
+                <a class="btn secondary" href="{url_for('yard_setup_page')}">Cancel</a>
             </div>
         </form>
     </div>"""
@@ -12185,7 +12221,7 @@ def delete_container(c_id):
     conn.commit()
     conn.close()
     flash(f"{c['size']} container deleted.", "success")
-    return redirect(url_for("containers_page"))
+    return redirect(url_for("yard_setup_page"))
 
 
 # =========================================================
@@ -12206,11 +12242,11 @@ def driver_hours_page():
 
     if not drivers:
         conn.close()
-        body = """
+        body = f"""
         <div class="hero"><h1>Driver Hours</h1></div>
         <div class="card">
             <p class="muted">No drivers found. Add drivers under
-            <a href="/boss/users">Users</a> to see hours here.</p>
+            <a href="{url_for('team_page')}">Team</a> to see hours here.</p>
         </div>
         """
         return render_template_string(shell_page("Driver Hours", body))
@@ -12380,7 +12416,7 @@ def driver_hours_page():
     ptype       = (co_settings.get("pay_period_type") or "weekly").title()
     payday_raw  = co_settings.get("payday") or ""
     payday_note = (" &bull; Payday: %s" % e(payday_raw.title())) if payday_raw else ""
-    settings_url = url_for("company_settings")
+    settings_url = url_for("settings_page") + "#work-hours"
     start_lbl = ("Manual clock"    if (co_settings.get("driver_day_start_rule") or "") == "manual"
                  else "First completed stop")
     end_lbl   = ("Manual clock"    if (co_settings.get("driver_day_end_rule")   or "") == "manual"
