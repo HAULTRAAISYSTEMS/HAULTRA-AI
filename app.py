@@ -626,7 +626,7 @@ def get_csrf_token():
 
 
 # Endpoints that legitimately receive POST from external servers (no session/CSRF)
-_CSRF_EXEMPT_ENDPOINTS = {"stripe_webhook", "api_ask", "api_parse_dispatch"}
+_CSRF_EXEMPT_ENDPOINTS = {"stripe_webhook", "api_parse_dispatch"}
 
 @app.before_request
 def csrf_protect():
@@ -5243,113 +5243,6 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 </script>
 
 <script>{_ABBREV_EXPAND_JS}</script>
-
-<!-- ===== ASK HAULTRA AI FAB (teal = AI-touched) ===== -->
-<button id="ask-fab" onclick="openAsk()" title="Ask HAULTRA AI (Ctrl+K)" style="
-  position:fixed; bottom:24px; left:50%; transform:translateX(-50%);
-  padding:13px 28px; border-radius:30px;
-  background:linear-gradient(135deg,#00E5CC,#00B8A3);
-  border:none; cursor:pointer; min-height:48px;
-  box-shadow:0 4px 20px rgba(0,229,204,0.35);
-  z-index:9998; color:#0A1512; font-size:15px; font-weight:700;
-  letter-spacing:.5px; white-space:nowrap;
-  transition:box-shadow .2s, bottom .2s;
-" onmouseover="this.style.boxShadow='0 6px 28px rgba(0,229,204,0.6)';this.style.bottom='28px'"
-   onmouseout="this.style.boxShadow='0 4px 20px rgba(0,229,204,0.35)';this.style.bottom='24px'">
-  ✦ Ask HAULTRA AI
-</button>
-
-<div id="ask-overlay" onclick="closeAsk()" style="
-  display:none; position:fixed; inset:0;
-  background:rgba(0,0,0,0.7); z-index:9999;"></div>
-
-<div id="ask-modal" style="
-  display:none; position:fixed; left:50%; top:50%;
-  transform:translate(-50%,-50%);
-  width:min(680px,92vw); max-height:80vh;
-  background:#171717; border:1px solid rgba(0,229,204,0.28);
-  border-radius:16px; padding:28px 30px 24px;
-  box-shadow:0 20px 60px rgba(0,0,0,0.8);
-  z-index:10000; flex-direction:column; gap:16px;">
-
-  <div style="display:flex;align-items:center;justify-content:space-between;">
-    <span style="color:#00E5CC;font-size:17px;font-weight:800;letter-spacing:.5px;">✦ Ask HAULTRA AI</span>
-    <button onclick="closeAsk()" style="background:none;border:none;color:#78786F;cursor:pointer;font-size:22px;line-height:1;padding:2px 6px;" title="Close (Esc)">&times;</button>
-  </div>
-
-  <div style="display:flex;gap:10px;">
-    <input id="ask-input" type="text"
-      placeholder="Ask about routes, drivers, loads, billing, dispatch…"
-      onkeydown="if(event.key==='Enter')submitAsk()"
-      style="flex:1;background:#121212;border:1px solid rgba(0,229,204,0.22);border-radius:10px;
-             color:#F5F5F0;font-size:14px;padding:11px 16px;outline:none;min-height:48px;" />
-    <button onclick="submitAsk()" id="ask-send-btn" style="
-      background:linear-gradient(135deg,#00E5CC,#00B8A3);border:none;
-      border-radius:10px;color:#0A1512;font-size:14px;font-weight:700;
-      cursor:pointer;padding:11px 22px;white-space:nowrap;min-height:48px;">Send</button>
-  </div>
-
-  <div id="ask-answer" style="
-    display:none;background:#121212;border:1px solid rgba(0,229,204,0.16);
-    border-radius:10px;padding:16px;color:#D8D8D0;font-size:14px;
-    line-height:1.7;max-height:45vh;overflow-y:auto;white-space:pre-wrap;"></div>
-
-  <div id="ask-spinner" style="display:none;text-align:center;color:#78786F;font-size:13px;">
-    ⏳ Thinking…
-  </div>
-</div>
-
-<script>
-(function(){{
-  function openAsk(){{
-    document.getElementById('ask-overlay').style.display='block';
-    var m=document.getElementById('ask-modal');
-    m.style.display='flex';
-    document.getElementById('ask-input').value='';
-    document.getElementById('ask-answer').style.display='none';
-    document.getElementById('ask-spinner').style.display='none';
-    document.getElementById('ask-send-btn').disabled=false;
-    setTimeout(function(){{document.getElementById('ask-input').focus();}},60);
-  }}
-  function closeAsk(){{
-    document.getElementById('ask-overlay').style.display='none';
-    document.getElementById('ask-modal').style.display='none';
-  }}
-  function submitAsk(){{
-    var q=(document.getElementById('ask-input').value||'').trim();
-    if(!q)return;
-    document.getElementById('ask-answer').style.display='none';
-    document.getElementById('ask-spinner').style.display='block';
-    document.getElementById('ask-send-btn').disabled=true;
-    var csrf=document.querySelector('meta[name="csrf-token"]');
-    var headers={{'Content-Type':'application/json'}};
-    if(csrf)headers['X-CSRFToken']=csrf.getAttribute('content');
-    fetch('/api/ask',{{method:'POST',headers:headers,body:JSON.stringify({{question:q}})}})
-    .then(function(r){{return r.json();}})
-    .then(function(d){{
-      document.getElementById('ask-spinner').style.display='none';
-      document.getElementById('ask-send-btn').disabled=false;
-      var box=document.getElementById('ask-answer');
-      box.textContent=d.answer||d.error||'No response.';
-      box.style.display='block';
-    }})
-    .catch(function(err){{
-      document.getElementById('ask-spinner').style.display='none';
-      document.getElementById('ask-send-btn').disabled=false;
-      var box=document.getElementById('ask-answer');
-      box.textContent='Error: '+err.message;
-      box.style.display='block';
-    }});
-  }}
-  window.openAsk=openAsk;
-  window.closeAsk=closeAsk;
-  window.submitAsk=submitAsk;
-  document.addEventListener('keydown',function(e){{
-    if((e.ctrlKey||e.metaKey)&&e.key==='k'){{e.preventDefault();openAsk();}}
-    if(e.key==='Escape'){{closeAsk();}}
-  }});
-}})();
-</script>
 
     </body>
     </html>
@@ -10521,68 +10414,6 @@ def ai_dispatch():
     return render_template_string(shell_page("AI Dispatch", body))
 
 
-# =========================================================
-# ASK HAULTRA AI — LLM chat endpoint
-# =========================================================
-@app.route("/api/ask", methods=["POST"])
-@login_required
-def api_ask():
-    import os as _os
-    try:
-        from openai import OpenAI as _OAI
-    except ImportError:
-        return jsonify({"error": "AI package not installed. Add openai to requirements.txt."}), 500
-
-    data = request.get_json(force=True, silent=True) or {}
-    question = (data.get("question") or "").strip()
-    if not question:
-        return jsonify({"answer": "No question provided."}), 400
-
-    system_prompt = (
-        "You are HAULTRA AI — the intelligent dispatch and operations assistant for HAULTRA AI DISPATCH SYSTEMS, "
-        "a roll-off trucking and waste hauling business management platform.\n\n"
-        "You have deep expertise in:\n"
-        "- Roll-off container dispatch and routing\n"
-        "- Driver management, hours-of-service (HOS) rules, clock-in/out\n"
-        "- Dump locations, landfill fees, and waste disposal logistics\n"
-        "- Load scoring and profitability analysis (payout, miles, estimated profit)\n"
-        "- Customer orders, billing, and invoicing for hauling jobs\n"
-        "- Route optimization and stop sequencing\n"
-        "- DOT compliance, FMCSA regulations, and trucking safety\n"
-        "- Fuel costs, deadhead miles, and margin calculations\n"
-        "- Fleet maintenance scheduling and container tracking\n\n"
-        "HOW TO RESPOND:\n"
-        "- Be direct, specific, and actionable. Operators are busy — no fluff.\n"
-        "- For dispatch questions, give concrete guidance (stop sequences, timing, driver assignments).\n"
-        "- For billing/pricing questions, give specific numbers and formulas when possible.\n"
-        "- For compliance questions (HOS, DOT, FMCSA), cite the actual rule.\n"
-        "- For profit/load scoring, walk through the math.\n"
-        "- If you don't know something specific to this company's data, say so clearly and give general best-practice guidance.\n"
-        "- Keep responses concise but complete. Use line breaks for readability."
-    )
-
-    api_key = _os.environ.get("NEBIUS_API_KEY")
-    if not api_key:
-        return jsonify({"error": "NEBIUS_API_KEY not configured on server."}), 500
-
-    try:
-        client = _OAI(
-            base_url="https://api.tokenfactory.nebius.com/v1/",
-            api_key=api_key
-        )
-        resp = client.chat.completions.create(
-            model="meta-llama/Llama-3.3-70B-Instruct",
-            max_tokens=700,
-            temperature=0.3,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": question}
-            ]
-        )
-        answer = resp.choices[0].message.content.strip()
-        return jsonify({"answer": answer})
-    except Exception as ex:
-        return jsonify({"error": f"AI error: {str(ex)}"}), 500
 
 
 # =========================================================
@@ -13417,6 +13248,95 @@ def add_parsed_stops(route_id):
 
 
 # =========================================================
+# AI PARSER — CONFIRM & DISPATCH (creates a route from parsed stops)
+# =========================================================
+# Maps the AI parser's short action codes to the same canonical action
+# labels used everywhere else (is_pull_job, compute_can_flow, Route Board
+# badges), so a dispatched route behaves identically to one created via
+# Create Route / Paste Boss Text.
+_PARSER_ACTION_MAP = {"PR": "Pickup and Return", "P": "Pull", "D": "Delivery", "S": "Swap", "R": "Relocate"}
+
+
+@app.route("/api/dispatch", methods=["POST"])
+@boss_required
+def api_dispatch():
+    data = request.get_json(silent=True) or {}
+    stops_in = data.get("stops")
+    driver_id_raw = data.get("driver_id")
+    route_date = (data.get("route_date") or today_str()).strip() or today_str()
+
+    if not isinstance(stops_in, list) or not stops_in:
+        return jsonify({"error": "No stops to dispatch."}), 400
+
+    if not driver_id_raw or not str(driver_id_raw).isdigit():
+        return jsonify({"error": "Select a driver before dispatching."}), 400
+    driver_id = int(driver_id_raw)
+
+    conn = get_db()
+    driver = conn.execute(
+        "SELECT id, username FROM users WHERE id=? AND company_id=? AND role='driver'",
+        (driver_id, cid())
+    ).fetchone()
+    if not driver:
+        conn.close()
+        return jsonify({"error": "Selected driver not found."}), 400
+
+    clean_stops = []
+    for i, s in enumerate(stops_in, start=1):
+        if not isinstance(s, dict):
+            conn.close()
+            return jsonify({"error": f"Stop {i} is malformed."}), 400
+        action_code = (s.get("action") or "").strip().upper()
+        address = expand_abbrev((s.get("address") or "").strip())
+        if action_code not in _PARSER_ACTION_MAP:
+            conn.close()
+            return jsonify({"error": f"Stop {i} has an unrecognized action."}), 400
+        if not address:
+            conn.close()
+            return jsonify({"error": f"Stop {i} is missing an address."}), 400
+        if s.get("confidence") == "low" and not s.get("reviewed"):
+            conn.close()
+            return jsonify({"error": f"Stop {i} is still flagged for review — mark it reviewed before dispatching."}), 400
+        clean_stops.append({
+            "address": address,
+            "action": _PARSER_ACTION_MAP[action_code],
+            "container_size": expand_abbrev((s.get("container_size") or "").strip()),
+            "notes": expand_abbrev((s.get("notes") or "").strip()),
+        })
+
+    route_name = f"{driver['username']} — {route_date}"
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO routes (route_date, route_name, raw_text, assigned_to, created_by,
+                             status, notes, company_id, created_at)
+        VALUES (?, ?, '', ?, ?, 'open', '', ?, ?)
+    """, (route_date, route_name, driver_id, session["user_id"], cid(), now_ts()))
+    route_id = cur.lastrowid
+
+    for idx, s in enumerate(clean_stops, start=1):
+        cur.execute("""
+            INSERT INTO stops (route_id, stop_order, address, action, container_size, notes,
+                                status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'open', ?)
+        """, (route_id, idx, s["address"], s["action"], s["container_size"], s["notes"], now_ts()))
+
+    conn.commit()
+    try:
+        compute_can_flow(conn, route_id)
+        conn.commit()
+    except Exception as exc:
+        app.logger.warning("api_dispatch: compute_can_flow error: %s", exc)
+    conn.close()
+
+    return jsonify({
+        "success": True,
+        "route_id": route_id,
+        "driver": driver["username"],
+        "stop_count": len(clean_stops),
+    })
+
+
+# =========================================================
 # ADDRESS AUTOCOMPLETE API
 # =========================================================
 @app.route("/api/address-suggestions")
@@ -13493,7 +13413,35 @@ def route_view():
 @app.route('/parser')
 @login_required
 def parser_view():
-    return send_from_directory('static', 'parser.html')
+    conn = get_db()
+    drivers = conn.execute(
+        "SELECT id, username, full_name FROM users WHERE role='driver' AND company_id=? ORDER BY username",
+        (cid(),)
+    ).fetchall()
+    conn.close()
+
+    if drivers:
+        options = "".join(
+            f'<option value="{d["id"]}">{e(d["full_name"] or d["username"])}</option>'
+            for d in drivers
+        )
+        assign_html = (
+            '<label for="driver-select">Assign to</label>'
+            '<select id="driver-select" class="driver-select">'
+            f'<option value="">Select a driver&hellip;</option>{options}</select>'
+        )
+    else:
+        assign_html = (
+            '<div class="no-drivers-msg">No drivers yet &mdash; '
+            f'<a href="{url_for("team_page")}">add one in Team</a>.</div>'
+        )
+
+    path = os.path.join(app.root_path, 'static', 'parser.html')
+    with open(path, encoding='utf-8') as f:
+        html = f.read()
+    html = html.replace('__CSRF_TOKEN__', get_csrf_token())
+    html = html.replace('<!--ASSIGN_SLOT-->', assign_html)
+    return html
 
 @app.route('/service-worker.js')
 def service_worker_file():
