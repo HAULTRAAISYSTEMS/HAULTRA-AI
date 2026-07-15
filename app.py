@@ -4370,6 +4370,17 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .cab-progress-track {{ height: 8px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; margin-bottom: 22px; }}
 .cab-progress-fill {{ height: 100%; background: linear-gradient(90deg, #FF8A42, #FF6B1A); border-radius: 4px; transition: width .4s; }}
 
+.route-updated-banner {{
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    background: var(--cyan-dim); border: 1px solid rgba(255,107,26,0.4);
+    border-radius: 10px; padding: 10px 14px; margin-bottom: 14px;
+    font-size: 13px; font-weight: 600; color: #FF9D5C;
+}}
+.route-updated-banner button {{
+    background: none; border: none; color: #FF9D5C; cursor: pointer;
+    font-size: 18px; line-height: 1; padding: 4px 6px; min-width: 32px; min-height: 32px;
+}}
+
 .cab-card {{
     background: rgba(20,20,20,0.85);
     border: 1px solid rgba(255,107,26,0.16);
@@ -4511,6 +4522,14 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     text-transform: uppercase; color: #F5F5F0;
 }}
 .lane-sub {{ font-size: 11.5px; color: var(--text-muted); margin-top: 4px; line-height: 1.5; }}
+.lane-add-stops {{
+    display: inline-flex; align-items: center; min-height: 30px;
+    margin-top: 10px; padding: 5px 12px; font-size: 11px; font-weight: 700;
+    color: var(--cyan); background: var(--cyan-dim);
+    border: 1px solid rgba(255,107,26,0.35); border-radius: 20px;
+    text-decoration: none; white-space: nowrap;
+}}
+.lane-add-stops:hover {{ background: rgba(255,107,26,0.24); color: #FFB37A; }}
 
 .lane-track {{
     display: flex; gap: 10px; overflow-x: auto; flex: 1; min-width: 0;
@@ -7176,6 +7195,14 @@ def _build_route_board_html(user):
         route_label = lane["route_names"][0] if len(lane["route_names"]) == 1 else f"{len(lane['route_names'])} routes"
         progress_label = f"{done}/{total} done" if total else "No stops"
 
+        add_stops_html = ""
+        if user["role"] == "boss" and len(lane["route_ids_seen"]) == 1:
+            _lane_route_id = next(iter(lane["route_ids_seen"]))
+            add_stops_html = (
+                f'<a class="lane-add-stops" href="{url_for("parser_view", route_id=_lane_route_id)}">'
+                f'+ Add Stops</a>'
+            )
+
         cards_html = ""
         for s in stops:
             letter, group = _board_action_badge(s["action"])
@@ -7233,6 +7260,7 @@ def _build_route_board_html(user):
                     <span class="lane-name">{e(display_name)}</span>
                 </div>
                 <div class="lane-sub">{e(route_label)}<br>{e(progress_label)}</div>
+                {add_stops_html}
             </div>
             <div class="lane-track">{cards_html}</div>
         </div>"""
@@ -7770,8 +7798,13 @@ def driver_route_detail(route_id):
         <span class="cab-online-badge" id="online-badge"><span class="cab-online-dot"></span>ONLINE</span>
     </div>
 
-    <div class="cab-progress-label">STOP {current_stop_num} OF {total_count}</div>
-    <div class="cab-progress-track"><div class="cab-progress-fill" style="width:{pct}%;"></div></div>
+    <div id="route-updated-banner" class="route-updated-banner" hidden>
+        <span id="route-updated-text"></span>
+        <button type="button" onclick="document.getElementById('route-updated-banner').hidden=true;" aria-label="Dismiss">&times;</button>
+    </div>
+
+    <div class="cab-progress-label" id="cab-progress-label">STOP {current_stop_num} OF {total_count}</div>
+    <div class="cab-progress-track"><div class="cab-progress-fill" id="cab-progress-fill" style="width:{pct}%;"></div></div>
 
     <div class="cab-card">
         <div class="cab-action-row">
@@ -7815,6 +7848,41 @@ def driver_route_detail(route_id):
     window.addEventListener('online', upd);
     window.addEventListener('offline', upd);
     upd();
+
+    // Poll for mid-route changes (a boss adding stops via Route Board) every
+    // ~30s. Never swaps the currently-displayed stop out from under the driver
+    // — only the progress counter/bar and a dismissible banner update live.
+    (function() {{
+        var baselineTotal = {total_count};
+        var lastKnownTotal = baselineTotal;
+        function poll() {{
+            fetch('{url_for("driver_route_status", route_id=route_id)}', {{credentials: 'same-origin'}})
+                .then(function(r) {{ return r.ok ? r.json() : null; }})
+                .then(function(data) {{
+                    if (!data || typeof data.total !== 'number') return;
+                    if (data.total > lastKnownTotal) {{
+                        var delta = data.total - lastKnownTotal;
+                        lastKnownTotal = data.total;
+                        var label = document.getElementById('cab-progress-label');
+                        if (label && data.current_stop_num) {{
+                            label.textContent = 'STOP ' + data.current_stop_num + ' OF ' + data.total;
+                        }}
+                        var fill = document.getElementById('cab-progress-fill');
+                        if (fill && data.total > 0) {{
+                            fill.style.width = Math.round((data.completed / data.total) * 100) + '%';
+                        }}
+                        var banner = document.getElementById('route-updated-banner');
+                        var text = document.getElementById('route-updated-text');
+                        if (banner && text) {{
+                            text.textContent = 'Route updated — ' + delta + ' stop' + (delta === 1 ? '' : 's') + ' added.';
+                            banner.hidden = false;
+                        }}
+                    }}
+                }})
+                .catch(function() {{ /* offline or transient — try again next cycle */ }});
+        }}
+        setInterval(poll, 30000);
+    }})();
 
     // Photo input opens the camera/file picker directly and uploads on
     // selection — no separate Upload press, multi-photo still supported
@@ -8635,6 +8703,41 @@ def upsert_saved_address(conn, company_id, customer_name, address,
             )
     except Exception as e:
         app.logger.warning("upsert_saved_address failed for %r: %s", addr, e)
+
+
+@app.route("/driver/route/<int:route_id>/status")
+@login_required
+def driver_route_status(route_id):
+    """Lightweight JSON polled by Cab View (~30s) so a boss adding stops mid-route
+    shows up as an updated stop count + banner without disrupting the driver's
+    current stop."""
+    conn = get_db()
+    route = conn.execute(
+        "SELECT id, assigned_to FROM routes WHERE id=? AND company_id=?",
+        (route_id, cid())
+    ).fetchone()
+    if not route:
+        conn.close()
+        return jsonify({"error": "Route not found."}), 404
+    if session.get("role") != "boss" and route["assigned_to"] != session["user_id"]:
+        conn.close()
+        return jsonify({"error": "Access denied."}), 403
+
+    stops = conn.execute(
+        "SELECT status FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
+        (route_id,)
+    ).fetchall()
+    conn.close()
+
+    total = len(stops)
+    completed = sum(1 for s in stops if s["status"] == "completed")
+    current_stop_num = None
+    for i, s in enumerate(stops, start=1):
+        if s["status"] != "completed":
+            current_stop_num = i
+            break
+
+    return jsonify({"total": total, "completed": completed, "current_stop_num": current_stop_num})
 
 
 @app.route("/route/<int:route_id>")
@@ -13389,6 +13492,35 @@ def add_parsed_stops(route_id):
 _PARSER_ACTION_MAP = {"PR": "Pickup and Return", "P": "Pull", "D": "Delivery", "S": "Swap", "R": "Relocate"}
 
 
+def _validate_parser_stops(stops_in):
+    """Shared validation for AI-parsed stops, used by both /api/dispatch (new route)
+    and /api/route/<id>/insert-stops (existing route). Returns (clean_stops, error).
+    Each clean stop carries insert_before through unchanged (raw client string, 'end'
+    by default) — callers that don't do positional inserts simply ignore it."""
+    if not isinstance(stops_in, list) or not stops_in:
+        return None, "No stops to dispatch."
+    clean_stops = []
+    for i, s in enumerate(stops_in, start=1):
+        if not isinstance(s, dict):
+            return None, f"Stop {i} is malformed."
+        action_code = (s.get("action") or "").strip().upper()
+        address = expand_abbrev((s.get("address") or "").strip())
+        if action_code not in _PARSER_ACTION_MAP:
+            return None, f"Stop {i} has an unrecognized action."
+        if not address:
+            return None, f"Stop {i} is missing an address."
+        if s.get("confidence") == "low" and not s.get("reviewed"):
+            return None, f"Stop {i} is still flagged for review — mark it reviewed before dispatching."
+        clean_stops.append({
+            "address": address,
+            "action": _PARSER_ACTION_MAP[action_code],
+            "container_size": expand_abbrev((s.get("container_size") or "").strip()),
+            "notes": expand_abbrev((s.get("notes") or "").strip()),
+            "insert_before": str(s.get("insert_before") or "end").strip(),
+        })
+    return clean_stops, None
+
+
 @app.route("/api/dispatch", methods=["POST"])
 @boss_required
 def api_dispatch():
@@ -13397,8 +13529,9 @@ def api_dispatch():
     driver_id_raw = data.get("driver_id")
     route_date = (data.get("route_date") or today_str()).strip() or today_str()
 
-    if not isinstance(stops_in, list) or not stops_in:
-        return jsonify({"error": "No stops to dispatch."}), 400
+    clean_stops, err = _validate_parser_stops(stops_in)
+    if err:
+        return jsonify({"error": err}), 400
 
     if not driver_id_raw or not str(driver_id_raw).isdigit():
         return jsonify({"error": "Select a driver before dispatching."}), 400
@@ -13412,29 +13545,6 @@ def api_dispatch():
     if not driver:
         conn.close()
         return jsonify({"error": "Selected driver not found."}), 400
-
-    clean_stops = []
-    for i, s in enumerate(stops_in, start=1):
-        if not isinstance(s, dict):
-            conn.close()
-            return jsonify({"error": f"Stop {i} is malformed."}), 400
-        action_code = (s.get("action") or "").strip().upper()
-        address = expand_abbrev((s.get("address") or "").strip())
-        if action_code not in _PARSER_ACTION_MAP:
-            conn.close()
-            return jsonify({"error": f"Stop {i} has an unrecognized action."}), 400
-        if not address:
-            conn.close()
-            return jsonify({"error": f"Stop {i} is missing an address."}), 400
-        if s.get("confidence") == "low" and not s.get("reviewed"):
-            conn.close()
-            return jsonify({"error": f"Stop {i} is still flagged for review — mark it reviewed before dispatching."}), 400
-        clean_stops.append({
-            "address": address,
-            "action": _PARSER_ACTION_MAP[action_code],
-            "container_size": expand_abbrev((s.get("container_size") or "").strip()),
-            "notes": expand_abbrev((s.get("notes") or "").strip()),
-        })
 
     route_name = f"{driver['username']} — {route_date}"
     cur = conn.cursor()
@@ -13464,6 +13574,88 @@ def api_dispatch():
         "success": True,
         "route_id": route_id,
         "driver": driver["username"],
+        "stop_count": len(clean_stops),
+    })
+
+
+@app.route("/api/route/<int:route_id>/insert-stops", methods=["POST"])
+@boss_required
+def api_insert_stops(route_id):
+    data = request.get_json(silent=True) or {}
+    stops_in = data.get("stops")
+
+    clean_stops, err = _validate_parser_stops(stops_in)
+    if err:
+        return jsonify({"error": err}), 400
+
+    conn = get_db()
+    route = conn.execute(
+        "SELECT id FROM routes WHERE id=? AND company_id=?", (route_id, cid())
+    ).fetchone()
+    if not route:
+        conn.close()
+        return jsonify({"error": "Route not found."}), 404
+
+    existing = conn.execute(
+        "SELECT id, status FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
+        (route_id,)
+    ).fetchall()
+
+    current_stop_id = None
+    for s in existing:
+        if s["status"] != "completed":
+            current_stop_id = s["id"]
+            break
+
+    # Locked prefix: completed stops + the driver's current in-progress stop, in
+    # their original order — never renumbered out of place, never a valid insertion
+    # target (enforced here server-side, not just by omitting them from the UI list).
+    locked_prefix = []
+    working = []
+    reached_current = False
+    for s in existing:
+        if s["status"] == "completed" or (not reached_current and s["id"] == current_stop_id):
+            locked_prefix.append(s["id"])
+            if s["id"] == current_stop_id:
+                reached_current = True
+        else:
+            working.append(s["id"])
+
+    cur = conn.cursor()
+    new_stops = []
+    for s in clean_stops:
+        cur.execute("""
+            INSERT INTO stops (route_id, stop_order, address, action, container_size, notes,
+                                status, created_at)
+            VALUES (?, 0, ?, ?, ?, ?, 'open', ?)
+        """, (route_id, s["address"], s["action"], s["container_size"], s["notes"], now_ts()))
+        new_stops.append((cur.lastrowid, s["insert_before"]))
+
+    # Merge new stops into the insertable (unlocked) sequence at their chosen position.
+    # Multiple stops targeting the same anchor stack in submission order, immediately
+    # before that anchor. Anything targeting "end" or a locked/unknown stop goes last.
+    for new_id, insert_before_raw in new_stops:
+        target_id = int(insert_before_raw) if insert_before_raw.isdigit() else None
+        if target_id is not None and target_id in working:
+            working.insert(working.index(target_id), new_id)
+        else:
+            working.append(new_id)
+
+    final_order = locked_prefix + working
+    for pos, sid in enumerate(final_order, start=1):
+        cur.execute("UPDATE stops SET stop_order=? WHERE id=?", (pos, sid))
+
+    conn.commit()
+    try:
+        compute_can_flow(conn, route_id)
+        conn.commit()
+    except Exception as exc:
+        app.logger.warning("api_insert_stops: compute_can_flow error: %s", exc)
+    conn.close()
+
+    return jsonify({
+        "success": True,
+        "route_id": route_id,
         "stop_count": len(clean_stops),
     })
 
@@ -13545,34 +13737,101 @@ def route_view():
 @app.route('/parser')
 @login_required
 def parser_view():
-    conn = get_db()
-    drivers = conn.execute(
-        "SELECT id, username, full_name FROM users WHERE role='driver' AND company_id=? ORDER BY username",
-        (cid(),)
-    ).fetchall()
-    conn.close()
+    route_id_arg = (request.args.get('route_id') or '').strip()
+    route_mode_js = "null"
+    route_seq_html = ""
 
-    if drivers:
-        options = "".join(
-            f'<option value="{d["id"]}">{e(d["full_name"] or d["username"])}</option>'
-            for d in drivers
-        )
-        assign_html = (
-            '<label for="driver-select">Assign to</label>'
-            '<select id="driver-select" class="driver-select">'
-            f'<option value="">Select a driver&hellip;</option>{options}</select>'
-        )
+    if route_id_arg.isdigit():
+        if session.get("role") != "boss":
+            abort(403)
+        conn = get_db()
+        route_row = conn.execute(
+            """SELECT r.id, r.route_name, u.username AS driver_username
+               FROM routes r LEFT JOIN users u ON r.assigned_to = u.id
+               WHERE r.id=? AND r.company_id=?""",
+            (int(route_id_arg), cid())
+        ).fetchone()
+        if not route_row:
+            conn.close()
+            abort(404)
+        existing_stops = conn.execute(
+            """SELECT id, address, city, action, status FROM stops
+               WHERE route_id=? ORDER BY stop_order ASC, id ASC""",
+            (route_row["id"],)
+        ).fetchall()
+        conn.close()
+
+        current_stop_id = None
+        for s in existing_stops:
+            if s["status"] != "completed":
+                current_stop_id = s["id"]
+                break
+
+        seq_rows_html = ""
+        insertable_options = ""
+        for s in existing_stops:
+            letter, group = _board_action_badge(s["action"])
+            addr_text = ", ".join(p for p in [s["address"] or "", s["city"] or ""] if p) or "Stop"
+            is_locked = (s["status"] == "completed") or (s["id"] == current_stop_id)
+            if s["status"] == "completed":
+                state_label, state_cls = "Done", "seq-done"
+            elif s["id"] == current_stop_id:
+                state_label, state_cls = "Current", "seq-current"
+            else:
+                state_label, state_cls = "Pending", "seq-pending"
+            seq_rows_html += (
+                f'<div class="seq-row {state_cls}">'
+                f'<span class="stop-mini-badge {group}">{e(letter)}</span>'
+                f'<span class="seq-addr">{e(addr_text)}</span>'
+                f'<span class="seq-state">{state_label}</span>'
+                f'</div>'
+            )
+            if not is_locked:
+                insertable_options += f'<option value="{s["id"]}">Before: {e(addr_text)}</option>'
+
+        route_seq_html = f"""
+        <div class="route-ctx-banner">
+            <div class="route-ctx-title">Adding stops to {e(route_row['driver_username'] or 'Unassigned')}&rsquo;s route</div>
+            <div class="route-ctx-sub">{e(route_row['route_name'])} &mdash; completed and in-progress stops are locked in place</div>
+            <div class="seq-list">{seq_rows_html or '<div class="muted small">No stops yet.</div>'}</div>
+        </div>
+        """
+        route_mode_js = json.dumps({
+            "route_id": route_row["id"],
+            "insert_options_html": insertable_options,
+        })
+        assign_html = f'<input type="hidden" id="insert-route-id" value="{route_row["id"]}">'
     else:
-        assign_html = (
-            '<div class="no-drivers-msg">No drivers yet &mdash; '
-            f'<a href="{url_for("team_page")}">add one in Team</a>.</div>'
-        )
+        conn = get_db()
+        drivers = conn.execute(
+            "SELECT id, username, full_name FROM users WHERE role='driver' AND company_id=? ORDER BY username",
+            (cid(),)
+        ).fetchall()
+        conn.close()
+
+        if drivers:
+            options = "".join(
+                f'<option value="{d["id"]}">{e(d["full_name"] or d["username"])}</option>'
+                for d in drivers
+            )
+            assign_html = (
+                '<label for="driver-select">Assign to</label>'
+                '<select id="driver-select" class="driver-select">'
+                f'<option value="">Select a driver&hellip;</option>{options}</select>'
+            )
+        else:
+            assign_html = (
+                '<div class="no-drivers-msg">No drivers yet &mdash; '
+                f'<a href="{url_for("team_page")}">add one in Team</a>.</div>'
+            )
 
     path = os.path.join(app.root_path, 'static', 'parser.html')
     with open(path, encoding='utf-8') as f:
         html = f.read()
     html = html.replace('__CSRF_TOKEN__', get_csrf_token())
     html = html.replace('<!--ASSIGN_SLOT-->', assign_html)
+    html = html.replace('<!--ROUTE_SEQ_SLOT-->', route_seq_html)
+    html = html.replace('__ROUTE_MODE_JSON__', route_mode_js)
     return html
 
 @app.route('/service-worker.js')
