@@ -143,6 +143,41 @@
     vertical-align: middle;
   }
 
+  .route-ctx-banner {
+    margin: 0 18px 14px;
+    padding: 14px 16px;
+    background: var(--orange-dim);
+    border: 1px solid var(--orange-border);
+    border-radius: var(--radius);
+  }
+  .route-ctx-title { font-weight: 700; color: var(--orange); font-size: 0.95rem; margin-bottom: 3px; }
+  .route-ctx-sub { font-size: 0.78rem; color: var(--text-dim); margin-bottom: 10px; }
+  .seq-list { display: flex; flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; }
+  .seq-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 10px; border-radius: 8px;
+    background: var(--bg-0); font-size: 0.82rem;
+  }
+  .seq-row.seq-done { opacity: 0.6; }
+  .seq-row.seq-current { border: 1px solid var(--orange-border); }
+  .seq-addr { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .seq-state {
+    font-size: 0.68rem; font-weight: 800; letter-spacing: 0.4px; text-transform: uppercase;
+    color: var(--text-dim); white-space: nowrap;
+  }
+  .seq-row.seq-current .seq-state { color: var(--orange); }
+  .seq-row.seq-done .seq-state { color: var(--green); }
+  .insert-before-select {
+    width: 100%; margin-top: 8px; min-height: 44px;
+    background: var(--bg-1); border: 1px solid rgba(255,255,255,0.15);
+    color: var(--text); border-radius: 7px; padding: 8px 10px;
+    font-family: var(--font-body); font-size: 0.88rem;
+  }
+  .insert-before-label {
+    display: block; font-size: 0.72rem; font-weight: 700; letter-spacing: 0.4px;
+    text-transform: uppercase; color: var(--text-dim); margin-top: 10px;
+  }
+
   .raw-textarea {
     width: 100%;
     min-height: 260px;
@@ -387,6 +422,8 @@
   <button type="button" onclick="dismissError()" aria-label="Dismiss">&times;</button>
 </div>
 
+<!--ROUTE_SEQ_SLOT-->
+
 <main class="layout">
   <section class="col col-input">
     <div class="col-header">STEP 1 &middot; RAW DISPATCH TEXT</div>
@@ -434,6 +471,7 @@
   var editMode = false;
   var toastTimer = null;
   var CSRF_TOKEN = (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
+  var ROUTE_MODE = __ROUTE_MODE_JSON__;
 
   function el(id) { return document.getElementById(id); }
 
@@ -464,6 +502,7 @@
       confidence: confidence,
       notes: (raw && raw.notes) ? String(raw.notes) : '',
       reviewed: false,
+      insert_before: 'end',
     };
   }
 
@@ -613,6 +652,26 @@
       main.appendChild(notes);
     }
 
+    if (ROUTE_MODE) {
+      var posLabel = document.createElement('label');
+      posLabel.className = 'insert-before-label';
+      posLabel.textContent = 'Insert Before';
+      main.appendChild(posLabel);
+
+      var posSel = document.createElement('select');
+      posSel.className = 'insert-before-select';
+      posSel.innerHTML = ROUTE_MODE.insert_options_html;
+      var endOpt = document.createElement('option');
+      endOpt.value = 'end';
+      endOpt.textContent = 'End of Route';
+      posSel.appendChild(endOpt);
+      posSel.value = stop.insert_before || 'end';
+      posSel.addEventListener('change', function () {
+        stop.insert_before = posSel.value;
+      });
+      main.appendChild(posSel);
+    }
+
     body.appendChild(main);
     card.appendChild(body);
 
@@ -670,11 +729,12 @@
     var confirmBtn = el('confirm-btn');
     var driverSelect = el('driver-select');
     var noDriversAtAll = !driverSelect && !!el('assign-row') && el('assign-row').querySelector('.no-drivers-msg');
+    var verb = ROUTE_MODE ? 'Insert' : 'Confirm & Dispatch';
 
     if (count === 0) {
       confirmBtn.disabled = true;
       confirmBtn.className = 'btn btn-orange-outline';
-      confirmBtn.textContent = '⚡ Confirm & Dispatch 0 Stops';
+      confirmBtn.textContent = '⚡ ' + verb + ' 0 Stops';
     } else if (flaggedUnreviewed > 0) {
       confirmBtn.disabled = true;
       confirmBtn.className = 'btn btn-orange-outline';
@@ -690,7 +750,7 @@
     } else {
       confirmBtn.disabled = false;
       confirmBtn.className = 'btn btn-orange-solid';
-      confirmBtn.textContent = '⚡ Confirm & Dispatch ' + count + ' Stop' + (count === 1 ? '' : 's');
+      confirmBtn.textContent = '⚡ ' + verb + ' ' + count + ' Stop' + (count === 1 ? '' : 's');
     }
   }
 
@@ -712,31 +772,51 @@
     var btn = el('confirm-btn');
     if (btn.disabled) return;
 
-    var driverSelect = el('driver-select');
-    var driverId = driverSelect ? driverSelect.value : '';
-    if (!driverId) return;
-    var driverName = driverSelect.options[driverSelect.selectedIndex].textContent;
+    var url, payload, verbing, successMsg;
+
+    if (ROUTE_MODE) {
+      url = '/api/route/' + ROUTE_MODE.route_id + '/insert-stops';
+      payload = {
+        stops: currentStops.map(function (s) {
+          return {
+            action: s.action,
+            address: s.address,
+            container_size: s.container_size,
+            notes: s.notes,
+            confidence: s.confidence,
+            reviewed: s.reviewed,
+            insert_before: s.insert_before || 'end',
+          };
+        }),
+      };
+      verbing = 'Inserting...';
+    } else {
+      var driverSelect = el('driver-select');
+      var driverId = driverSelect ? driverSelect.value : '';
+      if (!driverId) return;
+      url = '/api/dispatch';
+      payload = {
+        driver_id: driverId,
+        stops: currentStops.map(function (s) {
+          return {
+            action: s.action,
+            address: s.address,
+            container_size: s.container_size,
+            notes: s.notes,
+            confidence: s.confidence,
+            reviewed: s.reviewed,
+          };
+        }),
+      };
+      verbing = 'Dispatching...';
+    }
 
     dismissError();
     var originalText = btn.textContent;
     btn.disabled = true;
-    btn.textContent = 'Dispatching...';
+    btn.textContent = verbing;
 
-    var payload = {
-      driver_id: driverId,
-      stops: currentStops.map(function (s) {
-        return {
-          action: s.action,
-          address: s.address,
-          container_size: s.container_size,
-          notes: s.notes,
-          confidence: s.confidence,
-          reviewed: s.reviewed,
-        };
-      }),
-    };
-
-    fetch('/api/dispatch', {
+    fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -752,14 +832,18 @@
       })
       .then(function (res) {
         if (!res.ok || !res.data || !res.data.success) {
-          throw new Error((res.data && res.data.error) || 'Dispatch failed — try again.');
+          var verb = ROUTE_MODE ? 'Insert' : 'Dispatch';
+          throw new Error((res.data && res.data.error) || (verb + ' failed — try again.'));
         }
-        showToast('✓ Route dispatched to ' + driverName + ' — ' + res.data.stop_count + ' stops');
-        btn.textContent = '✓ Dispatched — redirecting…';
+        successMsg = ROUTE_MODE
+          ? ('✓ ' + res.data.stop_count + ' stop' + (res.data.stop_count === 1 ? '' : 's') + ' added to the route')
+          : ('✓ Route dispatched to ' + res.data.driver + ' — ' + res.data.stop_count + ' stops');
+        showToast(successMsg);
+        btn.textContent = '✓ Done — redirecting…';
         setTimeout(function () { window.location.href = '/routes'; }, 1100);
       })
       .catch(function (err) {
-        showError(err.message || 'Dispatch failed — try again.');
+        showError(err.message || 'Request failed — try again.');
         btn.disabled = false;
         btn.textContent = originalText;
       });
