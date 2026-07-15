@@ -1631,6 +1631,9 @@ def init_db():
     safe_add_column(conn, "companies", "driver_day_start_rule TEXT")
     safe_add_column(conn, "companies", "driver_day_end_rule TEXT")
 
+    # --- Photo proof mode: off | encouraged (default) | required ---
+    safe_add_column(conn, "companies", "photo_proof_mode TEXT NOT NULL DEFAULT 'encouraged'")
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS driver_clock_entries (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4417,6 +4420,22 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .cab-all-done-icon {{ font-size: 48px; margin-bottom: 14px; }}
 .cab-all-done h2 {{ font-family: var(--font-head); font-size: 30px; letter-spacing: .5px; color: #F5F5F0; }}
 
+/* Photo-proof "Encouraged" nudge (Cab View: complete with zero photos) */
+.no-photo-confirm-overlay {{
+    position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 400;
+}}
+.no-photo-confirm-modal {{
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%);
+    width: min(340px, 88vw);
+    background: #171717; border: 1px solid rgba(255,107,26,0.28);
+    border-radius: 16px; padding: 22px 22px 18px; z-index: 401;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.8); text-align: center;
+}}
+.no-photo-confirm-title {{ font-size: 17px; font-weight: 700; color: #F5F5F0; margin-bottom: 6px; }}
+.no-photo-confirm-body {{ font-size: 13.5px; color: var(--text-muted); margin-bottom: 18px; }}
+.no-photo-confirm-actions {{ display: flex; flex-direction: column; gap: 10px; }}
+.no-photo-confirm-actions .btn {{ width: 100%; min-height: 48px; }}
+
 /* Driver workflow buttons (Cab View: Arrived / Box In-Out / Go To Dump) */
 .btn-driver {{
     display: block; width: 100%; min-height: 52px; padding: 14px 16px;
@@ -7091,7 +7110,8 @@ def _build_route_board_html(user):
                u.username AS driver_username,
                s.id AS stop_id, s.stop_order, s.customer_name, s.address, s.city,
                s.action, s.container_size, s.status AS stop_status, s.driver_status,
-               s.completed_at
+               s.completed_at,
+               EXISTS(SELECT 1 FROM route_photos rp WHERE rp.stop_id = s.id) AS has_photo
         FROM routes r
         LEFT JOIN users u ON r.assigned_to = u.id
         LEFT JOIN stops s ON s.route_id = r.id
@@ -7182,6 +7202,7 @@ def _build_route_board_html(user):
             addr_key = (s["address"] or "").strip().lower() + "|" + (s["city"] or "").strip().lower()
             is_urgent = group == "pickup" and stop_status != "completed" and addr_key in overdue_addr_keys
             urgent_html = '<span class="stop-mini-urgent">&#9888; OVERDUE</span>' if is_urgent else ""
+            photo_html = '<span class="stop-mini-photo" title="Has photo">&#128247;</span>' if s["has_photo"] else ""
 
             link = (url_for("edit_stop", stop_id=s["stop_id"]) if user["role"] == "boss"
                     else url_for("view_route", route_id=s["route_id"]))
@@ -7191,6 +7212,7 @@ def _build_route_board_html(user):
                 <div class="stop-mini-top">
                     <span class="stop-mini-badge {group}">{e(letter)}</span>
                     {urgent_html}
+                    {photo_html}
                 </div>
                 <div class="{addr_cls}">{e(addr_text)}</div>
                 <div class="stop-mini-bottom">
@@ -7528,6 +7550,10 @@ def driver_route_detail(route_id):
     ).fetchall()
     _dump_loc_by_name = {r["name"].lower(): dict(r) for r in _dump_loc_rows}
 
+    photo_proof_mode = (conn.execute(
+        "SELECT photo_proof_mode FROM companies WHERE id=?", (session["company_id"],)
+    ).fetchone() or {"photo_proof_mode": "encouraged"})["photo_proof_mode"] or "encouraged"
+
     conn.close()
 
     completed_count = sum(1 for s in stops if s["status"] == "completed")
@@ -7690,34 +7716,43 @@ def driver_route_detail(route_id):
                         f'background:rgba(255,255,255,0.06);border-radius:8px;">Dump location not set for this stop.</div>')
         workflow_btn_html = nav_html + dump_ticket_link
 
-    # ── Photo-proof gate: Complete Stop only unlocks once a photo exists ───
+    # ── Photo proof: Off / Encouraged (nudge) / Required (hard gate) ───────
     stop_photos = photos_by_stop.get(stop_id, [])
     has_photo = len(stop_photos) > 0
     photo_gallery = build_photo_gallery_html(stop_photos)
 
     upload_widget = f"""
-    <details class="upload-details" {"open" if not has_photo else ""}>
-      <summary>&#128247; {"Add another photo" if has_photo else "Capture photo first"}</summary>
-      <form method="POST" action="{url_for('upload_stop_photo', stop_id=stop_id)}" enctype="multipart/form-data" style="margin-top:10px;">
-        <input type="file" name="photos" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple required capture="environment" style="margin-bottom:8px;width:100%;">
-        <button class="btn secondary" type="submit" style="width:100%;min-height:48px;">Upload</button>
-      </form>
-    </details>
+    <form method="POST" action="{url_for('upload_stop_photo', stop_id=stop_id)}"
+          enctype="multipart/form-data" id="cab-photo-form" style="margin-bottom:10px;">
+        <input type="file" name="photos" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple
+               capture="environment" id="cab-photo-input" style="display:none;">
+        <button type="button" class="btn secondary" style="width:100%;min-height:48px;"
+                onclick="document.getElementById('cab-photo-input').click();">
+            &#128247; {"Add Another Photo" if has_photo else "Add Photo"}
+        </button>
+    </form>
     {photo_gallery}
     """
 
-    if has_photo:
-        complete_section = f"""
-        <form method="POST" action="{url_for('toggle_stop_complete', stop_id=stop_id)}" id="cab-complete-form">
-            <input type="hidden" name="_csrf_token" value="{_csrf}">
-            <button class="cab-complete-btn" type="submit">&#9989; Complete Stop</button>
-        </form>
-        """
-    else:
-        complete_section = """
-        <button class="cab-complete-btn" type="button" disabled>&#128247; Capture photo first</button>
-        <div class="cab-photo-status">Take at least one photo to unlock Complete Stop</div>
-        """
+    required_locked = (photo_proof_mode == "required" and not has_photo)
+    complete_section = f"""
+    <form method="POST" action="{url_for('toggle_stop_complete', stop_id=stop_id)}" id="cab-complete-form"
+          data-has-photo="{'1' if has_photo else '0'}" data-photo-mode="{e(photo_proof_mode)}">
+        <input type="hidden" name="_csrf_token" value="{_csrf}">
+        <button class="cab-complete-btn" type="submit" {"disabled" if required_locked else ""}>&#9989; Complete Stop</button>
+    </form>
+    {'<div class="cab-photo-status">Take at least one photo to unlock Complete Stop</div>' if required_locked else ''}
+
+    <div id="no-photo-confirm-overlay" class="no-photo-confirm-overlay" hidden></div>
+    <div id="no-photo-confirm-modal" class="no-photo-confirm-modal" hidden>
+        <div class="no-photo-confirm-title">&#128247; No photo added</div>
+        <p class="no-photo-confirm-body">Complete anyway?</p>
+        <div class="no-photo-confirm-actions">
+            <button type="button" class="btn orange" id="no-photo-complete-anyway">Complete Without Photo</button>
+            <button type="button" class="btn secondary" id="no-photo-add-first">Add Photo First</button>
+        </div>
+    </div>
+    """
 
     meta_bits = []
     if s["container_size"]:
@@ -7781,14 +7816,31 @@ def driver_route_detail(route_id):
     window.addEventListener('offline', upd);
     upd();
 
+    // Photo input opens the camera/file picker directly and uploads on
+    // selection — no separate Upload press, multi-photo still supported
+    // via the `multiple` attribute on the hidden input.
+    var photoInput = document.getElementById('cab-photo-input');
+    var photoForm = document.getElementById('cab-photo-form');
+    if (photoInput && photoForm) {{
+        photoInput.addEventListener('change', function() {{
+            if (photoInput.files && photoInput.files.length) {{
+                photoForm.submit();
+            }}
+        }});
+    }}
+
     // Submit Complete Stop via AJAX (X-Requested-With) so the shared
     // /stop/<id>/toggle endpoint takes its JSON branch instead of its
     // default redirect to the boss route page — then just reload this
     // page so Cab View naturally advances to the next stop.
     var completeForm = document.getElementById('cab-complete-form');
     if (completeForm) {{
-        completeForm.addEventListener('submit', function(ev) {{
-            ev.preventDefault();
+        var hasPhoto  = completeForm.dataset.hasPhoto === '1';
+        var photoMode = completeForm.dataset.photoMode;
+        var overlay   = document.getElementById('no-photo-confirm-overlay');
+        var modal     = document.getElementById('no-photo-confirm-modal');
+
+        function submitComplete() {{
             var btn = completeForm.querySelector('button');
             if (btn) {{ btn.disabled = true; btn.textContent = 'Saving…'; }}
             var fd = new FormData(completeForm);
@@ -7812,6 +7864,39 @@ def driver_route_detail(route_id):
                 }}
                 alert('Could not complete stop — check your connection and try again.');
             }});
+        }}
+
+        function closeNoPhotoConfirm() {{
+            if (overlay) overlay.hidden = true;
+            if (modal) modal.hidden = true;
+        }}
+
+        var completeAnywayBtn = document.getElementById('no-photo-complete-anyway');
+        var addFirstBtn = document.getElementById('no-photo-add-first');
+        if (completeAnywayBtn) {{
+            completeAnywayBtn.addEventListener('click', function() {{
+                closeNoPhotoConfirm();
+                submitComplete();
+            }});
+        }}
+        if (addFirstBtn) {{
+            addFirstBtn.addEventListener('click', function() {{
+                closeNoPhotoConfirm();
+                if (photoInput) photoInput.click();
+            }});
+        }}
+
+        completeForm.addEventListener('submit', function(ev) {{
+            ev.preventDefault();
+            // Encouraged mode + zero photos: nudge once, one tap through either way.
+            // Off mode never prompts; Required mode's button is disabled server-side
+            // until a photo exists, so this branch only ever applies to Encouraged.
+            if (!hasPhoto && photoMode === 'encouraged') {{
+                if (overlay) overlay.hidden = false;
+                if (modal) modal.hidden = false;
+                return;
+            }}
+            submitComplete();
         }});
     }}
 
@@ -9214,6 +9299,9 @@ def edit_stop(stop_id):
         "SELECT customer_name, address, action FROM stops WHERE route_id=? AND id!=? ORDER BY stop_order",
         (ownership["route_id"], stop_id)
     ).fetchall()
+    _edit_photo_count = conn.execute(
+        "SELECT COUNT(*) n FROM route_photos WHERE stop_id=?", (stop_id,)
+    ).fetchone()["n"]
     conn.close()
     _sibling_json = json.dumps([
         {"customer_name": s["customer_name"] or "", "address": s["address"] or "", "action": s["action"] or ""}
@@ -9275,9 +9363,18 @@ def edit_stop(stop_id):
         + '</select>'
     ) if _edit_dump_locs else f'<input name="dump_location" placeholder="e.g. Dominion" value="{e(_cur_dump)}">'
 
+    _photo_indicator = (
+        f'<span style="font-size:12px;color:#A6A69E;font-weight:600;">&#128247; {_edit_photo_count} photo{"s" if _edit_photo_count != 1 else ""}</span>'
+        if _edit_photo_count else
+        '<span style="font-size:12px;color:#55554C;">No photos yet</span>'
+    )
+
     body = f"""
     <div class="card" style="max-width:680px;">
-        <h2 style="margin-bottom:18px;">Edit Stop</h2>
+        <div class="row between" style="margin-bottom:18px;">
+            <h2 style="margin:0;">Edit Stop</h2>
+            {_photo_indicator}
+        </div>
         <form method="POST">
             <div class="grid" style="grid-template-columns:1fr 1fr;gap:12px 16px;">
                 <div style="grid-column:1/-1;">
@@ -10648,6 +10745,13 @@ def settings_page():
             )
             conn.commit()
             flash("Work hours & pay cycle settings saved.", "success")
+        elif action == "photo_proof":
+            mode = request.form.get("photo_proof_mode", "encouraged").strip()
+            if mode not in ("off", "encouraged", "required"):
+                mode = "encouraged"
+            conn.execute("UPDATE companies SET photo_proof_mode=? WHERE id=?", (mode, cid()))
+            conn.commit()
+            flash("Photo proof setting saved.", "success")
         else:
             new_name = request.form.get("company_name", "").strip()
             if new_name:
@@ -10683,6 +10787,7 @@ def settings_page():
     wh_payday  = _co.get("payday")                or "friday"
     wh_dstart  = _co.get("driver_day_start_rule") or "first_action"
     wh_dend    = _co.get("driver_day_end_rule")   or "last_action"
+    photo_mode = _co.get("photo_proof_mode") or "encouraged"
 
     _yard_set = bool(yard_addr or yard_city)
     _yard_status = (
@@ -10814,6 +10919,33 @@ def settings_page():
             </div>
             <div style="margin-top:16px;">
                 <button type="submit" class="btn gold">Save Work Hours Settings</button>
+            </div>
+        </form>
+    </div>
+
+    <div class="card" id="photo-proof">
+        <h2>&#128247; Photo Proof</h2>
+        <p style="color:#B8B8AE;font-size:13px;margin-bottom:16px;">
+            Controls whether drivers must attach a photo before completing a stop in Cab View.
+        </p>
+        <form method="POST">
+            <input type="hidden" name="_action" value="photo_proof">
+            <div style="display:flex;flex-direction:column;gap:10px;">
+                <label style="display:flex;align-items:flex-start;gap:10px;min-height:48px;cursor:pointer;">
+                    <input type="radio" name="photo_proof_mode" value="off" {"checked" if photo_mode == "off" else ""} style="margin-top:4px;width:18px;height:18px;">
+                    <span><strong>Off</strong><br><span class="muted small">No photo prompt at all — Complete Stop always goes straight through.</span></span>
+                </label>
+                <label style="display:flex;align-items:flex-start;gap:10px;min-height:48px;cursor:pointer;">
+                    <input type="radio" name="photo_proof_mode" value="encouraged" {"checked" if photo_mode == "encouraged" else ""} style="margin-top:4px;width:18px;height:18px;">
+                    <span><strong>Encouraged</strong> <span class="muted small">(default)</span><br><span class="muted small">If a driver taps Complete Stop with no photo, a quick confirm nudges them to add one — one tap through either way.</span></span>
+                </label>
+                <label style="display:flex;align-items:flex-start;gap:10px;min-height:48px;cursor:pointer;">
+                    <input type="radio" name="photo_proof_mode" value="required" {"checked" if photo_mode == "required" else ""} style="margin-top:4px;width:18px;height:18px;">
+                    <span><strong>Required</strong><br><span class="muted small">Complete Stop stays locked until at least one photo is attached — for companies that bill with photo evidence.</span></span>
+                </label>
+            </div>
+            <div style="margin-top:16px;">
+                <button type="submit" class="btn gold">Save Photo Proof Setting</button>
             </div>
         </form>
     </div>
