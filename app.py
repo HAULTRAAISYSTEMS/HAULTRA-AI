@@ -1674,6 +1674,10 @@ def init_db():
     # --- Photo proof mode: off | encouraged (default) | required ---
     safe_add_column(conn, "companies", "photo_proof_mode TEXT NOT NULL DEFAULT 'encouraged'")
 
+    # --- Driver nav app preference: NULL (unset, current behavior) | google |
+    #     apple | waze | device_default ---
+    safe_add_column(conn, "users", "nav_preference TEXT")
+
     # --- Password reset tokens: single-use, 1-hour expiry, only the hash is stored ---
     cur.execute("""
     CREATE TABLE IF NOT EXISTS password_reset_tokens (
@@ -4020,7 +4024,7 @@ a:hover {{ color: #FF9D5C; }}
    BUTTONS
    ══════════════════════════════════════════════════════════*/
 .btn,
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select) {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn) {{
     display: inline-block;
     border: none;
     cursor: pointer;
@@ -4038,7 +4042,7 @@ button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact
 }}
 
 .btn:hover,
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):hover {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):hover {{
     filter: brightness(1.1);
     transform: translateY(-1px);
     text-decoration: none;
@@ -4417,6 +4421,13 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     background: rgba(61,220,132,0.12); border: 1px solid rgba(61,220,132,0.35);
     color: var(--green); border-radius: 20px; padding: 5px 12px;
 }}
+.cab-gear-btn {{
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 48px; min-height: 48px;
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 10px; color: #D8D8D0; font-size: 18px; cursor: pointer;
+}}
+.cab-gear-btn:hover {{ background: rgba(255,107,26,0.14); border-color: rgba(255,107,26,0.3); }}
 .cab-online-dot {{ width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 6px var(--green); }}
 
 .cab-progress-label {{ font-size: 12px; font-weight: 700; letter-spacing: 1px; color: var(--text-muted); text-transform: uppercase; margin-bottom: 6px; }}
@@ -4429,6 +4440,7 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     border-radius: 10px; padding: 10px 14px; margin-bottom: 14px;
     font-size: 13px; font-weight: 600; color: #FF9D5C;
 }}
+.route-updated-banner[hidden] {{ display: none; }}
 .route-updated-banner button {{
     background: none; border: none; color: #FF9D5C; cursor: pointer;
     font-size: 18px; line-height: 1; padding: 4px 6px; min-width: 32px; min-height: 32px;
@@ -4466,6 +4478,16 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     box-shadow: 0 4px 20px rgba(255,107,26,0.25);
 }}
 .cab-nav-btn:hover {{ color: #1A1000; filter: brightness(1.06); }}
+
+.cab-copy-btn {{
+    display: flex; align-items: center; justify-content: center; gap: 10px;
+    width: 100%; min-height: 52px; margin-top: 10px;
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.14);
+    color: #D8D8D0; font-weight: 700; font-size: 14px; letter-spacing: .2px;
+    border-radius: 12px; cursor: pointer;
+}}
+.cab-copy-btn:hover {{ background: rgba(255,255,255,0.1); }}
+.cab-copy-hint {{ font-size: 11.5px; color: var(--text-muted); text-align: center; margin-top: 8px; line-height: 1.5; }}
 
 .cab-photo-status {{ font-size: 12.5px; color: var(--text-muted); text-align: center; margin-top: 14px; }}
 .cab-photo-status.ready {{ color: var(--green); }}
@@ -6188,6 +6210,24 @@ def team_page():
             if is_driver else '<span class="muted small">&mdash;</span>'
         )
 
+        if is_driver:
+            _cur_pref = u["nav_preference"] or ""
+            _nav_opts = "".join(
+                f'<option value="{val}" {"selected" if _cur_pref == val else ""}>{label}</option>'
+                for val, label in [
+                    ("", "Default"), ("google", "Google Maps"), ("apple", "Apple Maps"),
+                    ("waze", "Waze"), ("device_default", "Device Default"),
+                ]
+            )
+            nav_cell = (
+                f'<form method="POST" action="{url_for("set_nav_preference", user_id=u["id"])}" style="margin:0;">'
+                f'<input type="hidden" name="next" value="{url_for("team_page")}">'
+                f'<select name="nav_preference" class="compact-select" onchange="this.form.submit()">{_nav_opts}</select>'
+                f'</form>'
+            )
+        else:
+            nav_cell = '<span class="muted small">&mdash;</span>'
+
         rows += f"""
         <tr>
             <td>{e(u['username'])}</td>
@@ -6195,6 +6235,7 @@ def team_page():
             <td>{e(u['phone'] or '')}</td>
             <td>{role_badge}</td>
             <td class="muted small">{stats_cell}</td>
+            <td>{nav_cell}</td>
             <td>{e(u['created_at'])}</td>
             <td {_del_td_style}>{hours_cell}{delete_cell}</td>
         </tr>
@@ -6216,10 +6257,10 @@ def team_page():
                 <thead>
                     <tr>
                         <th>Username</th><th>Full Name</th><th>Phone</th><th>Role</th>
-                        <th>Driver Activity</th><th>Created</th><th style="width:170px;"></th>
+                        <th>Driver Activity</th><th>Nav App</th><th>Created</th><th style="width:170px;"></th>
                     </tr>
                 </thead>
-                <tbody>{rows or '<tr><td colspan="7" class="muted">No team members found.</td></tr>'}</tbody>
+                <tbody>{rows or '<tr><td colspan="8" class="muted">No team members found.</td></tr>'}</tbody>
             </table>
         </div>
     </div>
@@ -6270,6 +6311,39 @@ def delete_user(user_id):
 
     flash(f"User '{target['username']}' has been deleted.", "success")
     return redirect(url_for("team_page"))
+
+
+_NAV_PREFERENCES = {"google", "apple", "waze", "device_default"}
+
+
+@app.route("/users/<int:user_id>/nav-preference", methods=["POST"])
+@login_required
+def set_nav_preference(user_id):
+    """Shared by both editing surfaces — a driver setting their own preference
+    from the Cab View gear panel, and a boss setting any driver's preference
+    from Team."""
+    if session.get("role") != "boss" and user_id != session["user_id"]:
+        flash("Access denied.", "error")
+        return redirect(url_for("dashboard"))
+
+    pref = (request.form.get("nav_preference") or "").strip()
+    if pref not in _NAV_PREFERENCES:
+        pref = None  # blank/unrecognized clears it back to "current behavior"
+
+    conn = get_db()
+    target = conn.execute(
+        "SELECT id FROM users WHERE id=? AND company_id=?", (user_id, cid())
+    ).fetchone()
+    if not target:
+        conn.close()
+        abort(404)
+    conn.execute("UPDATE users SET nav_preference=? WHERE id=?", (pref, user_id))
+    conn.commit()
+    conn.close()
+
+    flash("Navigation preference saved.", "success")
+    next_url = request.form.get("next") or url_for("team_page")
+    return redirect(next_url)
 
 
 # ── Legacy URLs — redirect to their new home on Team ────────────────────────
@@ -7814,7 +7888,7 @@ def new_route():
 def driver_route_detail(route_id):
     conn = get_db()
     route = conn.execute("""
-        SELECT r.*, u.username AS assigned_username
+        SELECT r.*, u.username AS assigned_username, u.nav_preference
         FROM routes r
         LEFT JOIN users u ON r.assigned_to = u.id
         WHERE r.id = ? AND r.assigned_to = ? AND r.company_id = ?
@@ -7885,13 +7959,48 @@ def driver_route_detail(route_id):
     # ══════════════════════════════════════════════════════════
     # ALL STOPS DONE — celebration screen
     # ══════════════════════════════════════════════════════════
+    _nav_pref = route["nav_preference"] or ""
+    _nav_pref_options = "".join(
+        f'<label style="display:flex;align-items:center;gap:10px;min-height:48px;cursor:pointer;">'
+        f'<input type="radio" name="nav_preference" value="{val}" {"checked" if _nav_pref == val else ""} '
+        f'style="width:18px;height:18px;">{label}</label>'
+        for val, label in [
+            ("", "Default (current behavior)"), ("google", "Google Maps"), ("apple", "Apple Maps"),
+            ("waze", "Waze"), ("device_default", "Device Default"),
+        ]
+    )
+    gear_button_html = (
+        '<button type="button" class="cab-gear-btn" '
+        "onclick=\"document.getElementById('nav-pref-overlay').hidden=false;"
+        "document.getElementById('nav-pref-modal').hidden=false;\" "
+        'aria-label="Navigation settings">&#9881;</button>'
+    )
+    nav_pref_modal_html = f"""
+    <div id="nav-pref-overlay" class="no-photo-confirm-overlay" hidden
+         onclick="document.getElementById('nav-pref-overlay').hidden=true;document.getElementById('nav-pref-modal').hidden=true;"></div>
+    <div id="nav-pref-modal" class="no-photo-confirm-modal" hidden style="text-align:left;">
+        <div class="no-photo-confirm-title" style="margin-bottom:14px;">&#9881; Navigation App</div>
+        <form method="POST" action="{url_for('set_nav_preference', user_id=session['user_id'])}">
+            <input type="hidden" name="next" value="{e(request.path)}">
+            <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:16px;">
+                {_nav_pref_options}
+            </div>
+            <button type="submit" class="btn orange" style="width:100%;min-height:48px;">Save</button>
+        </form>
+    </div>
+    """
+
     if not current_stop:
         body = f"""
 <div class="cab-wrap">
     <div class="cab-header">
         <div class="cab-title">MY ROUTE</div>
-        <span class="cab-online-badge" id="online-badge"><span class="cab-online-dot"></span>ONLINE</span>
+        <div style="display:flex;align-items:center;gap:10px;">
+            {gear_button_html}
+            <span class="cab-online-badge" id="online-badge"><span class="cab-online-dot"></span>ONLINE</span>
+        </div>
     </div>
+    {nav_pref_modal_html}
     <div class="cab-progress-label">{e(route['route_name'])} &middot; {e(route['route_date'])}</div>
     <div class="cab-progress-track"><div class="cab-progress-fill" style="width:100%;"></div></div>
 
@@ -7937,6 +8046,11 @@ def driver_route_detail(route_id):
     _enc_addr = urllib.parse.quote_plus(full_address)
     nav_google_web = "https://www.google.com/maps/dir/?api=1&destination=" + _enc_addr
     nav_google_app = "comgooglemaps://?daddr=" + _enc_addr + "&directionsmode=driving"
+    # HTML-escaped so the JSON-quoted JS string literal (which itself uses
+    # double quotes, and may contain an apostrophe from the address) can't
+    # collide with the double-quoted HTML attribute it's embedded in below.
+    _nav_pref_js = e(json.dumps(_nav_pref))
+    _full_addr_js = e(json.dumps(full_address))
 
     action_lower = (s["action"] or "").lower()
     is_pr    = "pickup and return" in action_lower or ("swap" in action_lower and "pull" not in action_lower)
@@ -8069,8 +8183,12 @@ def driver_route_detail(route_id):
 <div class="cab-wrap">
     <div class="cab-header">
         <div class="cab-title">MY ROUTE</div>
-        <span class="cab-online-badge" id="online-badge"><span class="cab-online-dot"></span>ONLINE</span>
+        <div style="display:flex;align-items:center;gap:10px;">
+            {gear_button_html}
+            <span class="cab-online-badge" id="online-badge"><span class="cab-online-dot"></span>ONLINE</span>
+        </div>
     </div>
+    {nav_pref_modal_html}
 
     <div id="route-updated-banner" class="route-updated-banner" hidden>
         <span id="route-updated-text"></span>
@@ -8092,9 +8210,15 @@ def driver_route_detail(route_id):
         {phone_line}
 
         <a class="cab-nav-btn" href="{nav_google_web}"
-           onclick="return openGoogleMapsStop(event, '{nav_google_app}', '{nav_google_web}')">
+           onclick="return openNavStop(event, {_nav_pref_js}, {_full_addr_js})">
             &#128205; Tap to Navigate
         </a>
+        <button type="button" class="cab-copy-btn" onclick="copyStopAddress(this, {_full_addr_js})">
+            &#128203; Copy Address
+        </button>
+        <div id="cab-copy-hint" class="cab-copy-hint" hidden>
+            Using a Garmin or in-dash GPS? Copy the address and enter it on your unit.
+        </div>
 
         <div style="margin-top:20px;">
             {workflow_btn_html}
@@ -8122,6 +8246,15 @@ def driver_route_detail(route_id):
     window.addEventListener('online', upd);
     window.addEventListener('offline', upd);
     upd();
+
+    // Show the Garmin/GPS-unit hint under Copy Address once, ever, per device.
+    try {{
+        if (!localStorage.getItem('haultra_copy_hint_seen')) {{
+            var copyHint = document.getElementById('cab-copy-hint');
+            if (copyHint) {{ copyHint.hidden = false; }}
+            localStorage.setItem('haultra_copy_hint_seen', '1');
+        }}
+    }} catch (e) {{ /* localStorage unavailable (e.g. private browsing) — skip the hint */ }}
 
     // Poll for mid-route changes (a boss adding stops via Route Board) every
     // ~30s. Never swaps the currently-displayed stop out from under the driver
@@ -8242,11 +8375,43 @@ def driver_route_detail(route_id):
         }});
     }}
 
-    window.openGoogleMapsStop = function(ev, appUrl, webUrl) {{
+    // Tap to Navigate — respects the driver's nav app preference (set via the
+    // gear panel / Team). pref === '' means no preference was ever set, which
+    // keeps the original Google-app-then-web-fallback behavior unchanged.
+    window.openNavStop = function(ev, pref, address) {{
         ev.preventDefault();
+        var enc = encodeURIComponent(address);
         var isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
             (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
         var isAndroid = /Android/.test(navigator.userAgent);
+
+        if (pref === 'google') {{
+            window.location = 'https://maps.google.com/?daddr=' + enc;
+            return false;
+        }}
+        if (pref === 'apple') {{
+            window.location = 'https://maps.apple.com/?daddr=' + enc;
+            return false;
+        }}
+        if (pref === 'waze') {{
+            window.location = 'https://waze.com/ul?q=' + enc + '&navigate=yes';
+            return false;
+        }}
+        if (pref === 'device_default') {{
+            if (isAndroid) {{
+                window.location = 'geo:0,0?q=' + enc;
+            }} else if (isIOS) {{
+                window.location = 'https://maps.apple.com/?daddr=' + enc;
+            }} else {{
+                window.location = 'https://maps.google.com/?daddr=' + enc;
+            }}
+            return false;
+        }}
+
+        // No preference set — original behavior: try the Google Maps app via
+        // its URL scheme, fall back to the web version if it didn't open.
+        var appUrl = 'comgooglemaps://?daddr=' + enc + '&directionsmode=driving';
+        var webUrl = 'https://www.google.com/maps/dir/?api=1&destination=' + enc;
         if (isIOS || isAndroid) {{
             var fallback = setTimeout(function() {{ window.location = webUrl; }}, 600);
             window.location = appUrl;
@@ -8258,6 +8423,37 @@ def driver_route_detail(route_id):
             window.open(webUrl, '_blank');
         }}
         return false;
+    }};
+
+    // Copy Address — for drivers using a dedicated GPS unit (Garmin etc.)
+    // that can't receive links.
+    window.copyStopAddress = function(btn, address) {{
+        var original = btn.textContent;
+        function flash() {{
+            btn.textContent = 'Copied ✓';
+            setTimeout(function() {{ btn.textContent = original; }}, 2000);
+        }}
+        if (navigator.clipboard && navigator.clipboard.writeText) {{
+            navigator.clipboard.writeText(address).then(flash, function() {{
+                alert('Could not copy — long-press the address above to copy it manually.');
+            }});
+        }} else {{
+            // Fallback for older/non-secure-context browsers without the Clipboard API.
+            var ta = document.createElement('textarea');
+            ta.value = address;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.focus();
+            ta.select();
+            try {{
+                document.execCommand('copy');
+                flash();
+            }} catch (err) {{
+                alert('Could not copy — long-press the address above to copy it manually.');
+            }}
+            document.body.removeChild(ta);
+        }}
     }};
 }})();
 </script>
