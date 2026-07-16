@@ -10,11 +10,13 @@ import csv
 import html
 import math
 import secrets
+import hashlib
 import warnings
 import time
 import json
 import urllib.request
 import urllib.parse
+import requests
 from datetime import datetime, date, timedelta
 from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -623,6 +625,44 @@ def get_csrf_token():
     if "_csrf_token" not in session:
         session["_csrf_token"] = secrets.token_hex(32)
     return session["_csrf_token"]
+
+
+def send_email(to_email, subject, html_body):
+    """
+    Send a transactional email via Resend. This is the ONLY place that talks to
+    the mail provider — swap providers by editing this function alone, every
+    caller just passes to/subject/html and gets a bool back.
+
+    Returns True on a confirmed send, False otherwise (including when
+    RESEND_API_KEY isn't configured, e.g. local dev) — callers must not use
+    the return value to change what they show the user, since doing so for
+    the password-reset flow would leak whether an account/email exists.
+    """
+    api_key = os.environ.get("RESEND_API_KEY")
+    from_addr = os.environ.get("RESEND_FROM_EMAIL", "HAULTRA AI <onboarding@resend.dev>")
+    if not api_key:
+        # Dev/misconfigured fallback: log what would have been sent (including
+        # the body, so a reset link is still recoverable from the server log
+        # while testing locally) instead of silently dropping it.
+        app.logger.warning(
+            "send_email: RESEND_API_KEY not configured — email not sent (to=%s, subject=%r)\n%s",
+            to_email, subject, html_body
+        )
+        return False
+    try:
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"from": from_addr, "to": [to_email], "subject": subject, "html": html_body},
+            timeout=10,
+        )
+        if resp.status_code >= 400:
+            app.logger.warning("send_email: Resend API error %s: %s", resp.status_code, resp.text[:300])
+            return False
+        return True
+    except Exception as exc:
+        app.logger.warning("send_email: failed to send to %s: %s", to_email, exc)
+        return False
 
 
 # Endpoints that legitimately receive POST from external servers (no session/CSRF)
@@ -1633,6 +1673,19 @@ def init_db():
 
     # --- Photo proof mode: off | encouraged (default) | required ---
     safe_add_column(conn, "companies", "photo_proof_mode TEXT NOT NULL DEFAULT 'encouraged'")
+
+    # --- Password reset tokens: single-use, 1-hour expiry, only the hash is stored ---
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id    INTEGER NOT NULL,
+        token_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used_at    TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    )
+    """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS driver_clock_entries (
@@ -5304,9 +5357,23 @@ def login():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "").strip()
-        conn = get_db()
-        user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
-        conn.close()
+
+        try:
+            conn = get_db()
+            # Case-insensitive, whitespace-trimmed match — the #1 silent login
+            # killer is a username that differs only by case from how it was
+            # typed at signup.
+            user = conn.execute(
+                "SELECT * FROM users WHERE username = ? COLLATE NOCASE", (username,)
+            ).fetchone()
+            conn.close()
+        except Exception as exc:
+            # A real server/DB error is NOT the same thing as wrong credentials —
+            # don't let it masquerade as "invalid login" or the real cause never
+            # gets diagnosed. Log it, show a distinct message, don't leak detail.
+            app.logger.error("login: unexpected error looking up user %r: %s", username, exc)
+            flash("Something went wrong on our end — please try again in a moment.", "error")
+            return redirect(url_for("login"))
 
         if user and check_password_hash(user["password_hash"], password):
             session.clear()
@@ -5331,7 +5398,9 @@ def login():
 
             return redirect(url_for("dashboard"))
 
-        flash("Invalid login.", "error")
+        # Wrong username or wrong password both land here, with the same
+        # message — never reveal which one was wrong.
+        flash("Username or password incorrect.", "error")
         return redirect(url_for("login"))
 
     body = f"""
@@ -5358,7 +5427,11 @@ def login():
                     <button type="submit" style="width:100%;min-height:48px;font-size:15px;">Login</button>
                 </div>
 
-                <div style="margin-top:16px;text-align:center;" class="small muted">
+                <div style="margin-top:14px;text-align:center;">
+                <a href="{url_for('forgot_password')}" class="small">Forgot password?</a>
+                </div>
+
+                <div style="margin-top:10px;text-align:center;" class="small muted">
                 Need an account?
                 <a href="/signup">Create one here</a>
                 </div>
@@ -5374,6 +5447,181 @@ def logout():
     session.clear()
     flash("Logged out.", "success")
     return redirect(url_for("login"))
+
+
+@app.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    init_db()
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        want_username = request.form.get("_action") == "username"
+
+        if email:
+            conn = get_db()
+            matches = conn.execute(
+                "SELECT id, username, full_name FROM users WHERE email = ? COLLATE NOCASE",
+                (email,)
+            ).fetchall()
+
+            if want_username:
+                if matches:
+                    names = ", ".join(sorted(m["username"] for m in matches))
+                    html_body = (
+                        f"<p>Hi,</p>"
+                        f"<p>The HAULTRA username(s) linked to this email address:</p>"
+                        f"<p style=\"font-size:18px;font-weight:700;\">{e(names)}</p>"
+                        f"<p>If you didn't request this, you can safely ignore this email.</p>"
+                    )
+                    send_email(email, "Your HAULTRA username", html_body)
+            else:
+                for u in matches:
+                    raw_token = secrets.token_urlsafe(32)
+                    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+                    expires_at = (datetime.now() + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+                    conn.execute(
+                        """INSERT INTO password_reset_tokens (user_id, token_hash, created_at, expires_at)
+                           VALUES (?, ?, ?, ?)""",
+                        (u["id"], token_hash, now_ts(), expires_at)
+                    )
+                    conn.commit()
+                    reset_link = url_for("reset_password", token=raw_token, _external=True)
+                    html_body = (
+                        f"<p>Hi {e(u['full_name'] or u['username'])},</p>"
+                        f"<p>Someone requested a password reset for your HAULTRA account "
+                        f"(username <strong>{e(u['username'])}</strong>). This link expires in "
+                        f"1 hour and can only be used once:</p>"
+                        f"<p><a href=\"{reset_link}\">{reset_link}</a></p>"
+                        f"<p>If you didn't request this, you can safely ignore this email — "
+                        f"your password will not change.</p>"
+                    )
+                    send_email(email, "Reset your HAULTRA password", html_body)
+            conn.close()
+
+        # Identical response whether or not the email matched an account, and
+        # whether the send succeeded — the only thing that would ever differ
+        # is server-side logging, never what the requester sees.
+        flash("If that email is on file, we've sent you a message.", "success")
+        return redirect(url_for("forgot_password"))
+
+    body = f"""
+    <div style="min-height:calc(100vh - 60px);display:flex;align-items:center;justify-content:center;padding:24px;">
+      <div style="width:100%;max-width:420px;">
+        <div style="text-align:center;margin-bottom:28px;">
+            <div style="font-family:var(--font-head);font-size:40px;letter-spacing:3px;line-height:1;
+                        background:linear-gradient(130deg, #ffffff 0%, #F5F5F0 55%, #FF6B1A 100%);
+                        -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;">
+                HAULTRA
+            </div>
+        </div>
+        <div class="card" style="background:#171717;border:1px solid rgba(255,255,255,0.08);">
+            <h2 style="margin-bottom:6px;">Account Recovery</h2>
+            <p class="muted small" style="margin-bottom:18px;">
+                Enter the email on your account. We'll send a password reset link, or your
+                username if you just need a reminder.
+            </p>
+            <form method="POST">
+                <label>Email</label>
+                <input type="email" name="email" required autocomplete="email">
+                <div style="margin-top:16px;display:flex;flex-direction:column;gap:10px;">
+                    <button type="submit" name="_action" value="reset" style="width:100%;min-height:48px;font-size:15px;">
+                        Send Reset Link
+                    </button>
+                    <button type="submit" name="_action" value="username" class="btn secondary" style="width:100%;min-height:48px;font-size:14px;">
+                        Email Me My Username
+                    </button>
+                </div>
+            </form>
+            <div style="margin-top:16px;text-align:center;" class="small muted">
+                <a href="{url_for('login')}">&larr; Back to login</a>
+            </div>
+        </div>
+      </div>
+    </div>
+    """
+    return render_template_string(shell_page("Account Recovery", body))
+
+
+@app.route("/reset-password/<token>", methods=["GET", "POST"])
+def reset_password(token):
+    init_db()
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+
+    conn = get_db()
+    row = conn.execute(
+        """SELECT prt.id AS token_id, prt.user_id, prt.expires_at, prt.used_at, u.username
+           FROM password_reset_tokens prt
+           JOIN users u ON u.id = prt.user_id
+           WHERE prt.token_hash = ?""",
+        (token_hash,)
+    ).fetchone()
+
+    valid = False
+    if row and not row["used_at"]:
+        try:
+            valid = datetime.now() <= datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            valid = False
+
+    if not valid:
+        conn.close()
+        flash("That reset link is invalid or has expired — request a new one below.", "error")
+        return redirect(url_for("forgot_password"))
+
+    if request.method == "POST":
+        password = request.form.get("password", "").strip()
+        confirm = request.form.get("confirm_password", "").strip()
+
+        if len(password) < 8:
+            conn.close()
+            flash("Password must be at least 8 characters.", "error")
+            return redirect(url_for("reset_password", token=token))
+        if password != confirm:
+            conn.close()
+            flash("Passwords don't match.", "error")
+            return redirect(url_for("reset_password", token=token))
+
+        conn.execute(
+            "UPDATE users SET password_hash=? WHERE id=?",
+            (generate_password_hash(password), row["user_id"])
+        )
+        conn.execute(
+            "UPDATE password_reset_tokens SET used_at=? WHERE id=?",
+            (now_ts(), row["token_id"])
+        )
+        conn.commit()
+        conn.close()
+        flash("Password updated — please log in.", "success")
+        return redirect(url_for("login"))
+
+    conn.close()
+    body = f"""
+    <div style="min-height:calc(100vh - 60px);display:flex;align-items:center;justify-content:center;padding:24px;">
+      <div style="width:100%;max-width:420px;">
+        <div style="text-align:center;margin-bottom:28px;">
+            <div style="font-family:var(--font-head);font-size:40px;letter-spacing:3px;line-height:1;
+                        background:linear-gradient(130deg, #ffffff 0%, #F5F5F0 55%, #FF6B1A 100%);
+                        -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;">
+                HAULTRA
+            </div>
+        </div>
+        <div class="card" style="background:#171717;border:1px solid rgba(255,255,255,0.08);">
+            <h2 style="margin-bottom:6px;">Set a New Password</h2>
+            <p class="muted small" style="margin-bottom:18px;">Resetting password for <strong>{e(row['username'])}</strong>.</p>
+            <form method="POST">
+                <label>New Password</label>
+                <input type="password" name="password" required minlength="8" autocomplete="new-password">
+                <label>Confirm Password</label>
+                <input type="password" name="confirm_password" required minlength="8" autocomplete="new-password">
+                <div style="margin-top:16px;">
+                    <button type="submit" style="width:100%;min-height:48px;font-size:15px;">Set New Password</button>
+                </div>
+            </form>
+        </div>
+      </div>
+    </div>
+    """
+    return render_template_string(shell_page("Reset Password", body))
+
 
 @app.route("/driver")
 @driver_required
@@ -6167,6 +6415,7 @@ def register():
         role      = request.form.get("role", "").strip()
         full_name = request.form.get("full_name", "").strip()
         phone     = request.form.get("phone", "").strip()
+        email     = request.form.get("email", "").strip()
 
         if not username or not password or role not in ("boss", "driver"):
             flash("Fill everything correctly.", "error")
@@ -6188,12 +6437,24 @@ def register():
                     flash(f"Driver limit reached ({co['max_drivers']}). Upgrade your plan to add more.", "error")
                     return redirect(url_for("register"))
 
+        # Case-insensitive duplicate check — the DB's UNIQUE constraint on
+        # username is case-sensitive, so "Bob" and "bob" wouldn't collide
+        # there, but login now matches case-insensitively and two accounts
+        # that only differ by case would make that lookup ambiguous.
+        existing = conn.execute(
+            "SELECT id FROM users WHERE username = ? COLLATE NOCASE", (username,)
+        ).fetchone()
+        if existing:
+            conn.close()
+            flash("Username already exists.", "error")
+            return redirect(url_for("register"))
+
         try:
             conn.execute(
-                """INSERT INTO users (username, password_hash, role, full_name, phone,
-                   company_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO users (username, password_hash, role, full_name, phone, email,
+                   company_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (username, generate_password_hash(password), role,
-                 full_name, phone, company_id, now_ts())
+                 full_name, phone, email or None, company_id, now_ts())
             )
             conn.commit()
             flash("User created.", "success")
@@ -6216,6 +6477,8 @@ def register():
             <input type="password" name="password" required>
             <label>Full Name</label>
             <input name="full_name">
+            <label>Email</label>
+            <input type="email" name="email" placeholder="for password reset / recovery">
             <label>Phone</label>
             <input name="phone">
             <label>Role</label>
@@ -10705,6 +10968,7 @@ def company_register():
         password     = request.form.get("password", "").strip()
         full_name    = request.form.get("full_name", "").strip()
         phone        = request.form.get("phone", "").strip()
+        email        = request.form.get("email", "").strip()
 
         if not company_name or not username or not password:
             flash("Company name, username, and password are required.", "error")
@@ -10719,6 +10983,13 @@ def company_register():
         while conn.execute("SELECT id FROM companies WHERE slug=?", (slug,)).fetchone():
             slug = f"{slug_base}-{n}"
             n += 1
+
+        # Case-insensitive duplicate check — see the matching comment in
+        # register() for why this matters now that login is case-insensitive.
+        if conn.execute("SELECT id FROM users WHERE username = ? COLLATE NOCASE", (username,)).fetchone():
+            conn.close()
+            flash("That username is already taken.", "error")
+            return redirect(url_for("company_register"))
 
         try:
             trial_ends = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d %H:%M:%S")
@@ -10736,10 +11007,10 @@ def company_register():
             company_id = _crow["id"]
 
             conn.execute(
-                """INSERT INTO users (username, password_hash, role, full_name, phone,
-                   company_id, created_at) VALUES (?,?,?,?,?,?,?)""",
+                """INSERT INTO users (username, password_hash, role, full_name, phone, email,
+                   company_id, created_at) VALUES (?,?,?,?,?,?,?,?)""",
                 (username, generate_password_hash(password), "boss",
-                 full_name, phone, company_id, now_ts())
+                 full_name, phone, email or None, company_id, now_ts())
             )
             conn.commit()
             _urow = conn.execute("SELECT id FROM users WHERE username=? AND company_id=?",
@@ -10783,6 +11054,8 @@ def company_register():
                 <input type="password" name="password" required>
                 <label>Full Name</label>
                 <input name="full_name">
+                <label>Email</label>
+                <input type="email" name="email" placeholder="for password reset / recovery">
                 <label>Phone</label>
                 <input name="phone">
                 <div style="margin-top:14px;">
@@ -10857,10 +11130,12 @@ def settings_page():
             flash("Photo proof setting saved.", "success")
         else:
             new_name = request.form.get("company_name", "").strip()
+            new_email = request.form.get("email", "").strip()
             if new_name:
                 conn.execute("UPDATE companies SET name=? WHERE id=?", (new_name, cid()))
-                conn.commit()
-                flash("Company name updated.", "success")
+            conn.execute("UPDATE users SET email=? WHERE id=?", (new_email or None, session["user_id"]))
+            conn.commit()
+            flash("Profile updated.", "success")
 
         conn.close()
         return redirect(url_for("settings_page"))
@@ -10872,6 +11147,9 @@ def settings_page():
         "pro": ("Pro", "#3DDC84"),
         "enterprise": ("Enterprise", "#c084fc"),
     }
+    _me = conn.execute("SELECT email FROM users WHERE id=?", (session["user_id"],)).fetchone()
+    my_email = (_me["email"] if _me else "") or ""
+
     _co = dict(company) if company else {}
     plan      = _co.get("subscription_plan") or "trial"
     plan_name, plan_color = plan_labels.get(plan, ("Unknown", "#D8D8D0"))
@@ -10906,6 +11184,8 @@ def settings_page():
             <input type="hidden" name="_action" value="profile">
             <label>Company Name</label>
             <input name="company_name" value="{e(co_name)}" required>
+            <label>Your Email</label>
+            <input type="email" name="email" value="{e(my_email)}" placeholder="for password reset / recovery">
             <div style="margin-top:10px;">
                 <button type="submit" class="btn">Save</button>
             </div>
