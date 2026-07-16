@@ -1678,6 +1678,23 @@ def init_db():
     #     apple | waze | device_default ---
     safe_add_column(conn, "users", "nav_preference TEXT")
 
+    # --- Per-route boss <-> driver messages: minimal thread, one row per
+    #     message. "Unread" is derived per-viewer as "not sent by me and
+    #     read_at IS NULL" rather than tracked per-recipient, since a route
+    #     thread only ever has two participants. ---
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS messages (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        route_id       INTEGER NOT NULL,
+        sender_user_id INTEGER NOT NULL,
+        body           TEXT NOT NULL,
+        created_at     TEXT NOT NULL,
+        read_at        TEXT,
+        FOREIGN KEY (route_id) REFERENCES routes(id),
+        FOREIGN KEY (sender_user_id) REFERENCES users(id)
+    )
+    """)
+
     # --- Password reset tokens: single-use, 1-hour expiry, only the hash is stored ---
     cur.execute("""
     CREATE TABLE IF NOT EXISTS password_reset_tokens (
@@ -4024,7 +4041,7 @@ a:hover {{ color: #FF9D5C; }}
    BUTTONS
    ══════════════════════════════════════════════════════════*/
 .btn,
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn) {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn) {{
     display: inline-block;
     border: none;
     cursor: pointer;
@@ -4042,7 +4059,7 @@ button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact
 }}
 
 .btn:hover,
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):hover {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):hover {{
     filter: brightness(1.1);
     transform: translateY(-1px);
     text-decoration: none;
@@ -4522,6 +4539,52 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .no-photo-confirm-actions {{ display: flex; flex-direction: column; gap: 10px; }}
 .no-photo-confirm-actions .btn {{ width: 100%; min-height: 48px; }}
 
+/* Message thread — shared by Cab View (Message Boss) and Route Board (per-lane) */
+.msg-modal {{
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%);
+    width: min(420px, 92vw); max-height: 82vh; display: flex; flex-direction: column;
+    background: #171717; border: 1px solid rgba(255,107,26,0.28);
+    border-radius: 16px; padding: 18px 18px 16px; z-index: 401;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.8);
+}}
+.msg-modal[hidden] {{ display: none; }}
+.msg-modal-header {{
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 12px; flex-shrink: 0;
+}}
+.msg-modal-header #msg-modal-title {{ font-size: 15px; font-weight: 700; color: #F5F5F0; }}
+.msg-modal-header button {{
+    background: none; border: none; color: #78786F; cursor: pointer;
+    font-size: 22px; line-height: 1; padding: 4px 8px; min-width: 40px; min-height: 40px;
+}}
+.msg-quick-taps {{ display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; flex-shrink: 0; }}
+.msg-quick-btn {{
+    min-height: 40px; padding: 8px 12px; font-size: 12px; font-weight: 600;
+    color: #FF9D5C; background: rgba(255,107,26,0.12);
+    border: 1px solid rgba(255,107,26,0.3); border-radius: 20px; cursor: pointer;
+}}
+.msg-quick-btn:hover {{ background: rgba(255,107,26,0.2); }}
+.msg-list {{
+    flex: 1; overflow-y: auto; min-height: 120px; max-height: 40vh;
+    display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px;
+    padding-right: 2px;
+}}
+.msg-empty {{ color: var(--text-muted); font-size: 13px; text-align: center; padding: 24px 0; }}
+.msg-bubble {{ max-width: 82%; padding: 8px 12px; border-radius: 12px; font-size: 13.5px; line-height: 1.4; }}
+.msg-bubble-meta {{ font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .3px; opacity: .65; margin-bottom: 2px; }}
+.msg-them {{ align-self: flex-start; background: rgba(255,255,255,0.07); color: #F0F0E8; border-bottom-left-radius: 3px; }}
+.msg-me {{
+    align-self: flex-end; background: linear-gradient(135deg, #FF8A42 0%, #FF6B1A 100%);
+    color: #1A1000; border-bottom-right-radius: 3px;
+}}
+.msg-compose {{ display: flex; gap: 8px; flex-shrink: 0; }}
+.msg-compose textarea {{
+    flex: 1; resize: none; min-height: 48px; max-height: 100px;
+    background: var(--bg-0); border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 10px; color: var(--text); font-family: inherit; font-size: 13px; padding: 10px 12px;
+}}
+.msg-compose .btn {{ min-height: 48px; align-self: flex-end; }}
+
 /* Driver workflow buttons (Cab View: Arrived / Box In-Out / Go To Dump) */
 .btn-driver {{
     display: block; width: 100%; min-height: 52px; padding: 14px 16px;
@@ -4597,14 +4660,29 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     text-transform: uppercase; color: #F5F5F0;
 }}
 .lane-sub {{ font-size: 11.5px; color: var(--text-muted); margin-top: 4px; line-height: 1.5; }}
+.lane-actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }}
 .lane-add-stops {{
     display: inline-flex; align-items: center; min-height: 30px;
-    margin-top: 10px; padding: 5px 12px; font-size: 11px; font-weight: 700;
+    padding: 5px 12px; font-size: 11px; font-weight: 700;
     color: var(--cyan); background: var(--cyan-dim);
     border: 1px solid rgba(255,107,26,0.35); border-radius: 20px;
     text-decoration: none; white-space: nowrap;
 }}
 .lane-add-stops:hover {{ background: rgba(255,107,26,0.24); color: #FFB37A; }}
+.lane-message-btn {{
+    display: inline-flex; align-items: center; gap: 5px; min-height: 30px;
+    padding: 5px 12px; font-size: 11px; font-weight: 700;
+    color: #C9C9C0; background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.14); border-radius: 20px;
+    cursor: pointer; white-space: nowrap;
+}}
+.lane-message-btn:hover {{ background: rgba(255,255,255,0.1); }}
+.lane-msg-badge {{
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 16px; height: 16px; padding: 0 4px;
+    background: var(--red); color: #1A0000; font-size: 10px; font-weight: 800;
+    border-radius: 9px;
+}}
 
 .lane-track {{
     display: flex; gap: 10px; overflow-x: auto; flex: 1; min-width: 0;
@@ -7462,6 +7540,129 @@ def _board_action_badge(action):
     return label, "neutral"
 
 
+_MESSAGE_QUICK_TAPS = [
+    "Blocked / can't access",
+    "Running late",
+    "Site wants to talk to you",
+    "Done early",
+]
+
+
+def _message_thread_modal_html(show_quick_taps=False):
+    """Shared thread modal, injected once per page (Cab View or Route Board).
+    JS opens it for a specific route_id via openMessageThread(routeId, title)."""
+    quick_taps_html = ""
+    if show_quick_taps:
+        buttons = "".join(
+            f'<button type="button" class="msg-quick-btn" data-msg="{e(t)}">{e(t)}</button>'
+            for t in _MESSAGE_QUICK_TAPS
+        )
+        quick_taps_html = f'<div class="msg-quick-taps">{buttons}</div>'
+
+    return f"""
+    <div id="msg-overlay" class="no-photo-confirm-overlay" hidden onclick="closeMessageThread()"></div>
+    <div id="msg-modal" class="msg-modal" hidden>
+        <div class="msg-modal-header">
+            <div id="msg-modal-title">Messages</div>
+            <button type="button" onclick="closeMessageThread()" aria-label="Close">&times;</button>
+        </div>
+        {quick_taps_html}
+        <div id="msg-list" class="msg-list"></div>
+        <div class="msg-compose">
+            <textarea id="msg-input" placeholder="Type a message..." rows="2"></textarea>
+            <button type="button" id="msg-send-btn" class="btn orange" onclick="sendMessageFreeText()">Send</button>
+        </div>
+    </div>
+    """
+
+
+def _message_thread_js():
+    """Shared open/send/render logic for the thread modal — identical on Cab
+    View and Route Board, just wired to different trigger buttons."""
+    return """
+(function() {
+    var CSRF = (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
+    var currentThreadRouteId = null;
+    var currentThreadTitle = '';
+
+    function el(id) { return document.getElementById(id); }
+
+    function escapeHtml(s) {
+        var d = document.createElement('div');
+        d.textContent = s == null ? '' : String(s);
+        return d.innerHTML;
+    }
+
+    function renderThread(messages) {
+        var list = el('msg-list');
+        if (!list) return;
+        if (!messages.length) {
+            list.innerHTML = '<div class="msg-empty">No messages yet.</div>';
+            return;
+        }
+        list.innerHTML = messages.map(function(m) {
+            var cls = 'msg-bubble ' + (m.is_me ? 'msg-me' : 'msg-them');
+            return '<div class="' + cls + '">' +
+                '<div class="msg-bubble-meta">' + escapeHtml(m.sender_username) + '</div>' +
+                '<div class="msg-bubble-body">' + escapeHtml(m.body) + '</div>' +
+                '</div>';
+        }).join('');
+        list.scrollTop = list.scrollHeight;
+    }
+
+    window.openMessageThread = function(routeId, title) {
+        currentThreadRouteId = routeId;
+        currentThreadTitle = title || 'Messages';
+        if (el('msg-modal-title')) el('msg-modal-title').textContent = 'Messages \\u2014 ' + currentThreadTitle;
+        if (el('msg-overlay')) el('msg-overlay').hidden = false;
+        if (el('msg-modal')) el('msg-modal').hidden = false;
+        fetch('/route/' + routeId + '/messages', { credentials: 'same-origin' })
+            .then(function(r) { return r.json(); })
+            .then(function(data) { renderThread(data.messages || []); })
+            .catch(function() {
+                if (el('msg-list')) el('msg-list').innerHTML = '<div class="msg-empty">Could not load messages.</div>';
+            });
+    };
+
+    window.closeMessageThread = function() {
+        if (el('msg-overlay')) el('msg-overlay').hidden = true;
+        if (el('msg-modal')) el('msg-modal').hidden = true;
+    };
+
+    function postMessage(body) {
+        if (!currentThreadRouteId || !body) return;
+        fetch('/route/' + currentThreadRouteId + '/messages', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF },
+            credentials: 'same-origin',
+            body: JSON.stringify({ body: body }),
+        })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (data && data.success) {
+                    window.openMessageThread(currentThreadRouteId, currentThreadTitle);
+                }
+            });
+    }
+
+    window.sendQuickMessage = function(text) { postMessage(text); };
+
+    window.sendMessageFreeText = function() {
+        var input = el('msg-input');
+        if (!input) return;
+        var text = (input.value || '').trim();
+        if (!text) return;
+        input.value = '';
+        postMessage(text);
+    };
+
+    document.querySelectorAll('.msg-quick-btn').forEach(function(b) {
+        b.addEventListener('click', function() { sendQuickMessage(b.dataset.msg); });
+    });
+})();
+"""
+
+
 def _build_route_board_html(user):
     """Render the #lane-container contents for the Route Board — one lane per
     driver with stops today, built from real route/stop rows only. Shared by
@@ -7499,6 +7700,16 @@ def _build_route_board_html(user):
         (c["address"] or "").strip().lower() + "|" + (c["city"] or "").strip().lower()
         for c in containers_out
         if (_days_out(c["since"]) or 0) >= OVERDUE_RENTAL_DAYS
+    }
+
+    unread_by_route = {
+        r["route_id"]: r["n"]
+        for r in conn.execute("""
+            SELECT m.route_id, COUNT(*) n
+            FROM messages m JOIN routes r ON r.id = m.route_id
+            WHERE r.company_id=? AND r.route_date=? AND m.sender_user_id != ? AND m.read_at IS NULL
+            GROUP BY m.route_id
+        """, (company_id, today, user["id"])).fetchall()
     }
     conn.close()
 
@@ -7544,11 +7755,19 @@ def _build_route_board_html(user):
         progress_label = f"{done}/{total} done" if total else "No stops"
 
         add_stops_html = ""
+        message_html = ""
         if user["role"] == "boss" and len(lane["route_ids_seen"]) == 1:
             _lane_route_id = next(iter(lane["route_ids_seen"]))
             add_stops_html = (
                 f'<a class="lane-add-stops" href="{url_for("parser_view", route_id=_lane_route_id)}">'
                 f'+ Add Stops</a>'
+            )
+            _lane_unread = unread_by_route.get(_lane_route_id, 0)
+            _lane_msg_badge = f'<span class="lane-msg-badge">{_lane_unread}</span>' if _lane_unread else ""
+            message_html = (
+                f'<button type="button" class="lane-message-btn" '
+                f'onclick="openMessageThread({_lane_route_id}, {e(json.dumps(display_name))})">'
+                f'&#128172; Message{_lane_msg_badge}</button>'
             )
 
         cards_html = ""
@@ -7608,7 +7827,10 @@ def _build_route_board_html(user):
                     <span class="lane-name">{e(display_name)}</span>
                 </div>
                 <div class="lane-sub">{e(route_label)}<br>{e(progress_label)}</div>
-                {add_stops_html}
+                <div class="lane-actions">
+                    {add_stops_html}
+                    {message_html}
+                </div>
             </div>
             <div class="lane-track">{cards_html}</div>
         </div>"""
@@ -7779,6 +8001,8 @@ def routes_page():
     {header_html}
     {tabs_html}
     {main_panel}
+    {_message_thread_modal_html(show_quick_taps=False)}
+    <script>{_message_thread_js()}</script>
     """
     return render_template_string(shell_page("Route Board", body))
 
@@ -7929,6 +8153,11 @@ def driver_route_detail(route_id):
     photo_proof_mode = (conn.execute(
         "SELECT photo_proof_mode FROM companies WHERE id=?", (session["company_id"],)
     ).fetchone() or {"photo_proof_mode": "encouraged"})["photo_proof_mode"] or "encouraged"
+
+    unread_messages = conn.execute(
+        "SELECT COUNT(*) n FROM messages WHERE route_id=? AND sender_user_id != ? AND read_at IS NULL",
+        (route_id, session["user_id"])
+    ).fetchone()["n"]
 
     conn.close()
 
@@ -8219,6 +8448,9 @@ def driver_route_detail(route_id):
         <div id="cab-copy-hint" class="cab-copy-hint" hidden>
             Using a Garmin or in-dash GPS? Copy the address and enter it on your unit.
         </div>
+        <button type="button" class="cab-copy-btn" id="msg-boss-btn" onclick="openMessageThread({route_id}, 'Boss')">
+            &#128172; Message Boss<span id="msg-boss-badge" class="lane-msg-badge" {"hidden" if not unread_messages else ""}>{unread_messages or ""}</span>
+        </button>
 
         <div style="margin-top:20px;">
             {workflow_btn_html}
@@ -8232,6 +8464,8 @@ def driver_route_detail(route_id):
         <a class="btn secondary" href="{url_for('driver_dashboard')}">&#8592; My Routes</a>
     </div>
 </div>
+
+{_message_thread_modal_html(show_quick_taps=True)}
 
 <script>
 (function() {{
@@ -8262,12 +8496,16 @@ def driver_route_detail(route_id):
     (function() {{
         var baselineTotal = {total_count};
         var lastKnownTotal = baselineTotal;
+        var lastKnownUnread = {unread_messages};
         function poll() {{
             fetch('{url_for("driver_route_status", route_id=route_id)}', {{credentials: 'same-origin'}})
                 .then(function(r) {{ return r.ok ? r.json() : null; }})
                 .then(function(data) {{
-                    if (!data || typeof data.total !== 'number') return;
-                    if (data.total > lastKnownTotal) {{
+                    if (!data) return;
+                    var banner = document.getElementById('route-updated-banner');
+                    var text = document.getElementById('route-updated-text');
+
+                    if (typeof data.total === 'number' && data.total > lastKnownTotal) {{
                         var delta = data.total - lastKnownTotal;
                         lastKnownTotal = data.total;
                         var label = document.getElementById('cab-progress-label');
@@ -8278,12 +8516,28 @@ def driver_route_detail(route_id):
                         if (fill && data.total > 0) {{
                             fill.style.width = Math.round((data.completed / data.total) * 100) + '%';
                         }}
-                        var banner = document.getElementById('route-updated-banner');
-                        var text = document.getElementById('route-updated-text');
                         if (banner && text) {{
                             text.textContent = 'Route updated — ' + delta + ' stop' + (delta === 1 ? '' : 's') + ' added.';
                             banner.hidden = false;
                         }}
+                    }}
+
+                    if (typeof data.unread_messages === 'number') {{
+                        var msgBadge = document.getElementById('msg-boss-badge');
+                        if (msgBadge) {{
+                            if (data.unread_messages > 0) {{
+                                msgBadge.textContent = data.unread_messages;
+                                msgBadge.hidden = false;
+                            }} else {{
+                                msgBadge.hidden = true;
+                            }}
+                        }}
+                        var threadOpen = document.getElementById('msg-modal') && !document.getElementById('msg-modal').hidden;
+                        if (data.unread_messages > lastKnownUnread && !threadOpen && banner && text) {{
+                            text.textContent = 'New message from boss';
+                            banner.hidden = false;
+                        }}
+                        lastKnownUnread = data.unread_messages;
                     }}
                 }})
                 .catch(function() {{ /* offline or transient — try again next cycle */ }});
@@ -8456,6 +8710,7 @@ def driver_route_detail(route_id):
         }}
     }};
 }})();
+{_message_thread_js()}
 </script>
 """
     return render_template_string(shell_page("Cab View", body))
@@ -9197,6 +9452,12 @@ def driver_route_status(route_id):
         "SELECT status FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
         (route_id,)
     ).fetchall()
+
+    unread_messages = conn.execute(
+        "SELECT COUNT(*) n FROM messages WHERE route_id=? AND sender_user_id != ? AND read_at IS NULL",
+        (route_id, session["user_id"])
+    ).fetchone()["n"]
+
     conn.close()
 
     total = len(stops)
@@ -9207,7 +9468,72 @@ def driver_route_status(route_id):
             current_stop_num = i
             break
 
-    return jsonify({"total": total, "completed": completed, "current_stop_num": current_stop_num})
+    return jsonify({
+        "total": total, "completed": completed, "current_stop_num": current_stop_num,
+        "unread_messages": unread_messages,
+    })
+
+
+@app.route("/route/<int:route_id>/messages", methods=["GET", "POST"])
+@login_required
+def route_messages(route_id):
+    """Minimal per-route boss<->driver thread. GET returns the full thread and
+    marks the other party's messages as read; POST appends a new message.
+    'Unread' is derived per-viewer (not sent by me, read_at IS NULL) rather
+    than tracked per-recipient — a route thread only ever has two sides."""
+    conn = get_db()
+    route = conn.execute(
+        "SELECT id, assigned_to FROM routes WHERE id=? AND company_id=?",
+        (route_id, cid())
+    ).fetchone()
+    if not route:
+        conn.close()
+        return jsonify({"error": "Route not found."}), 404
+    if session.get("role") != "boss" and route["assigned_to"] != session["user_id"]:
+        conn.close()
+        return jsonify({"error": "Access denied."}), 403
+
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        body = (data.get("body") or "").strip()[:500]
+        if not body:
+            conn.close()
+            return jsonify({"error": "Message can't be empty."}), 400
+
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO messages (route_id, sender_user_id, body, created_at) VALUES (?, ?, ?, ?)",
+            (route_id, session["user_id"], body, now_ts())
+        )
+        conn.commit()
+        msg_id = cur.lastrowid
+        conn.close()
+        return jsonify({"success": True, "id": msg_id})
+
+    # GET — mark the other party's messages read, then return the full thread.
+    conn.execute(
+        "UPDATE messages SET read_at=? WHERE route_id=? AND sender_user_id != ? AND read_at IS NULL",
+        (now_ts(), route_id, session["user_id"])
+    )
+    conn.commit()
+
+    rows = conn.execute("""
+        SELECT m.id, m.sender_user_id, u.username AS sender_username, u.role AS sender_role,
+               m.body, m.created_at
+        FROM messages m JOIN users u ON u.id = m.sender_user_id
+        WHERE m.route_id=?
+        ORDER BY m.id ASC
+    """, (route_id,)).fetchall()
+    conn.close()
+
+    return jsonify({"messages": [
+        {
+            "id": r["id"], "sender_username": r["sender_username"], "sender_role": r["sender_role"],
+            "body": r["body"], "created_at": r["created_at"],
+            "is_me": r["sender_user_id"] == session["user_id"],
+        }
+        for r in rows
+    ]})
 
 
 @app.route("/route/<int:route_id>")
