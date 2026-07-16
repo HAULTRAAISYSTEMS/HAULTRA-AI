@@ -5756,10 +5756,20 @@ def driver_dashboard():
         WHERE r.assigned_to = ?
         ORDER BY r.route_date DESC, r.id DESC
     """, (session["user_id"],)).fetchall()
+
+    # Table only shows this pay period — same reasoning as the Owner
+    # Dashboard's Recent Routes — but the offline prefetch below still
+    # walks the FULL unfiltered `routes` list so an older open/in_progress
+    # route is never silently dropped from offline caching.
+    _co_row = conn.execute("SELECT * FROM companies WHERE id=?", (session["company_id"],)).fetchone()
+    co_settings = {k: _co_row[k] for k in _co_row.keys()} if _co_row else {}
+    pay_period_start, pay_period_end = get_pay_period_bounds(co_settings)
     conn.close()
 
+    display_routes = [r for r in routes if pay_period_start <= r["route_date"] <= pay_period_end]
+
     rows = ""
-    for r in routes:
+    for r in display_routes:
         rows += f"""
         <tr>
             <td>{e(r['route_date'])}</td>
@@ -5770,7 +5780,9 @@ def driver_dashboard():
         </tr>
         """
 
-    # Build list of active route URLs to prefetch for offline use
+    # Build list of active route URLs to prefetch for offline use — walks
+    # the full route history, not just this pay period, so an active route
+    # is always cached regardless of its date.
     _prefetch_urls = json.dumps([
         url_for('driver_route_detail', route_id=r['id'])
         for r in routes
@@ -5784,7 +5796,8 @@ def driver_dashboard():
     </div>
 
     <div class="card">
-        <h2>My Assigned Routes</h2>
+        <h2 style="margin-bottom:4px;">This Pay Week</h2>
+        <p class="muted small" style="margin-bottom:14px;">{e(pay_period_start)} &ndash; {e(pay_period_end)}</p>
         <div class="table-wrap">
             <table>
                 <thead>
@@ -5797,7 +5810,7 @@ def driver_dashboard():
                     </tr>
                 </thead>
                 <tbody>
-                    {rows if rows else '<tr><td colspan="5">No assigned routes.</td></tr>'}
+                    {rows if rows else '<tr><td colspan="5">No routes assigned this pay week.</td></tr>'}
                 </tbody>
             </table>
         </div>
@@ -5991,13 +6004,20 @@ def dashboard():
         if b:
             out_by_bucket[b] += 1
 
+    # "Recent Routes" = this pay period only, not just "the last 8 ever" —
+    # otherwise old routes linger on the dashboard indefinitely once volume
+    # is low. Same pay-period math already used for Driver Hours.
+    _co_row = conn.execute("SELECT * FROM companies WHERE id=?", (company_id,)).fetchone()
+    co_settings = {k: _co_row[k] for k in _co_row.keys()} if _co_row else {}
+    pay_period_start, pay_period_end = get_pay_period_bounds(co_settings)
+
     routes = conn.execute("""
         SELECT r.*, u.username AS assigned_username
         FROM routes r
         LEFT JOIN users u ON r.assigned_to = u.id
-        WHERE r.company_id = ?
-        ORDER BY r.route_date DESC, r.id DESC LIMIT 8
-    """, (company_id,)).fetchall()
+        WHERE r.company_id = ? AND r.route_date BETWEEN ? AND ?
+        ORDER BY r.route_date DESC, r.id DESC
+    """, (company_id, pay_period_start, pay_period_end)).fetchall()
     conn.close()
 
     # ── Pulls by Driver bar chart ───────────────────────────────
@@ -6122,17 +6142,18 @@ def dashboard():
     </div>
 
     <div class="card">
-        <div class="row between" style="margin-bottom:14px;">
-            <h2 style="margin:0;">Recent Routes</h2>
+        <div class="row between" style="margin-bottom:4px;">
+            <h2 style="margin:0;">This Pay Week</h2>
             <a class="btn secondary" style="font-size:12px;padding:7px 14px;" href="{url_for("routes_page")}">All Routes &rarr;</a>
         </div>
+        <p class="muted small" style="margin-bottom:14px;">{e(pay_period_start)} &ndash; {e(pay_period_end)}</p>
         <div class="table-wrap">
             <table>
                 <thead>
                     <tr><th>Date</th><th>Route</th><th>Assigned</th><th>Status</th><th></th></tr>
                 </thead>
                 <tbody>
-                    {route_rows if route_rows else '<tr><td colspan="5" style="color:#55554C;padding:20px 12px;">No routes yet.</td></tr>'}
+                    {route_rows if route_rows else '<tr><td colspan="5" style="color:#55554C;padding:20px 12px;">No routes dispatched this pay week yet.</td></tr>'}
                 </tbody>
             </table>
         </div>
