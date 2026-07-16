@@ -8194,6 +8194,12 @@ def driver_route_detail(route_id):
             current_stop_num = i
             break
 
+    # The stop immediately before current_stop, if any — by definition it's
+    # completed (current_stop is the first non-completed stop in order), so
+    # a driver who made a mistake can reopen it instead of being stuck.
+    prev_stop = stops[current_stop_num - 2] if current_stop_num and current_stop_num > 1 else None
+    _csrf = get_csrf_token()
+
     route_action_buttons = ""
     if route["status"] == "open":
         route_action_buttons = f"""
@@ -8260,6 +8266,13 @@ def driver_route_detail(route_id):
         <p style="color:var(--text-muted);margin-top:8px;">{total_count} of {total_count} stops completed.</p>
         <div style="margin-top:22px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
             {route_action_buttons}
+            {f'''
+            <form method="POST" action="{url_for('toggle_stop_complete', stop_id=stops[-1]['id'])}"
+                  onsubmit="return confirm('Reopen the last stop? Its progress will reset and it will become your current stop again.');">
+                <input type="hidden" name="_csrf_token" value="{_csrf}">
+                <button type="submit" class="btn secondary" style="min-height:48px;">&#8592; Fix Last Stop</button>
+            </form>
+            ''' if total_count > 0 else ''}
             <a class="btn secondary" href="{url_for('driver_dashboard')}">&#8592; Back to My Routes</a>
         </div>
     </div>
@@ -8288,7 +8301,6 @@ def driver_route_detail(route_id):
     s = current_stop
     stop_id = s["id"]
     _s = dict(s)
-    _csrf = get_csrf_token()
 
     full_address = " ".join(filter(None, [
         s["address"] or "", s["city"] or "", s["state"] or "", s["zip_code"] or "",
@@ -8447,6 +8459,14 @@ def driver_route_detail(route_id):
 
     <div class="cab-progress-label" id="cab-progress-label">STOP {current_stop_num} OF {total_count}</div>
     <div class="cab-progress-track"><div class="cab-progress-fill" id="cab-progress-fill" style="width:{pct}%;"></div></div>
+
+    {f'''
+    <form method="POST" action="{url_for('toggle_stop_complete', stop_id=prev_stop['id'])}" style="margin-bottom:14px;"
+          onsubmit="return confirm('Reopen the previous stop? Its progress will reset and it will become your current stop again.');">
+        <input type="hidden" name="_csrf_token" value="{_csrf}">
+        <button type="submit" class="btn secondary" style="min-height:48px;">&#8592; Previous Stop</button>
+    </form>
+    ''' if prev_stop else ''}
 
     <div class="cab-card">
         <div class="cab-action-row">
@@ -10520,6 +10540,8 @@ def toggle_stop_complete(stop_id):
         })
 
     conn.close()
+    if session.get("role") != "boss":
+        return redirect(url_for("driver_route_detail", route_id=stop["route_id"]))
     return redirect(url_for("view_route", route_id=stop["route_id"]))
 
 
@@ -10562,7 +10584,12 @@ def stop_driver_action(stop_id):
             "stop_id": stop_id,
         }), 409
 
-    # State machine guard — prevent backwards/invalid transitions
+    # State machine guard — prevent backwards/invalid transitions.
+    # box_in -> going_to_dump covers PR "swap" mode's last step: the driver
+    # boxed in the can they just picked up, but it turned out to already be
+    # full, so they still need to dump it (see driver_route_detail's
+    # is_swap_pr wf_map, which already offers this exact button — this
+    # guard just has to allow the transition it triggers).
     _VALID_TRANSITIONS = {
         None:            {"arrived"},
         "pending":       {"arrived"},
@@ -10570,7 +10597,7 @@ def stop_driver_action(stop_id):
         "box_out":       {"going_to_dump", "need_box_in", "skip_to_box_in"},
         "going_to_dump": {"need_box_in", "skip_to_box_in"},
         "need_box_in":   {"box_in", "skip_to_box_in"},
-        "box_in":        set(),
+        "box_in":        {"going_to_dump"},
     }
     current_status = stop["driver_status"]
     allowed = _VALID_TRANSITIONS.get(current_status, set())
