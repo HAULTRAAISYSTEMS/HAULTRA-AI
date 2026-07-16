@@ -5422,7 +5422,18 @@ def login():
                 <label>Username</label>
                 <input name="username" required autocomplete="username">
                 <label>Password</label>
-                <input type="password" name="password" required autocomplete="current-password">
+                <div style="position:relative;">
+                    <input type="password" id="login-password" name="password" required
+                           autocomplete="current-password" style="padding-right:56px;">
+                    <button type="button" id="toggle-login-password"
+                            onclick="var p=document.getElementById('login-password');var showing=p.type==='text';p.type=showing?'password':'text';this.textContent=showing?'Show':'Hide';this.setAttribute('aria-label',showing?'Show password':'Hide password');"
+                            aria-label="Show password"
+                            style="position:absolute;right:0;top:0;bottom:0;min-width:48px;min-height:48px;
+                                   background:none;border:none;color:#78786F;font-size:12px;font-weight:700;
+                                   letter-spacing:.3px;text-transform:uppercase;cursor:pointer;padding:0 14px;">
+                        Show
+                    </button>
+                </div>
                 <div style="margin-top:16px;">
                     <button type="submit" style="width:100%;min-height:48px;font-size:15px;">Login</button>
                 </div>
