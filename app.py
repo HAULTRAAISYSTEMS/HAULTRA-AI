@@ -1250,13 +1250,17 @@ def compute_containers_out(conn, company_id, asof_date=None):
     instead of tracking separate historical rows nobody writes.
 
     Returns a list of dicts: address, city, state, size, since (timestamp str),
-    customer_name, route_id, stop_id, lat, lng — one per address currently
-    holding a container. lat/lng are the geocoded coordinates of the stop
-    that left the container there (None if never geocoded or geocoding
-    failed — callers should treat that as "no map location", not an error).
+    customer_name, route_id, stop_id, lat, lng, is_gps — one per address
+    currently holding a container. lat/lng prefer the driver's GPS stamp
+    from the moment that stop was completed (is_gps=True) over the
+    geocoded address estimate (is_gps=False) when both exist, since GPS is
+    where the truck actually stood. Both can be None if neither was ever
+    captured/geocoded — callers should treat that as "no map location",
+    not an error.
     """
     sql = """SELECT s.id, s.address, s.city, s.state, s.action, s.container_size,
-                  s.completed_at, s.customer_name, s.route_id, s.lat, s.lng, r.route_date
+                  s.completed_at, s.customer_name, s.route_id, s.lat, s.lng,
+                  s.gps_lat, s.gps_lng, r.route_date
            FROM stops s
            JOIN routes r ON s.route_id = r.id
            WHERE r.company_id = ? AND s.status = 'completed'
@@ -1277,11 +1281,15 @@ def compute_containers_out(conn, company_id, asof_date=None):
         is_pull     = "pull" in action_lower and "return" not in action_lower
 
         if is_delivery or is_pr:
+            has_gps = s["gps_lat"] is not None and s["gps_lng"] is not None
             on_site[addr_key] = {
                 "address": s["address"], "city": s["city"], "state": s["state"],
                 "size": s["container_size"], "since": s["completed_at"] or s["route_date"],
                 "customer_name": s["customer_name"], "route_id": s["route_id"],
-                "stop_id": s["id"], "lat": s["lat"], "lng": s["lng"],
+                "stop_id": s["id"],
+                "lat": s["gps_lat"] if has_gps else s["lat"],
+                "lng": s["gps_lng"] if has_gps else s["lng"],
+                "is_gps": has_gps,
             }
         elif is_pull:
             on_site.pop(addr_key, None)
@@ -1777,6 +1785,18 @@ def init_db():
     #     that keeps a repeat address from ever being re-geocoded. ---
     safe_add_column(conn, "stops", "lat REAL")
     safe_add_column(conn, "stops", "lng REAL")
+
+    # --- GPS stamp captured on the driver's device at the moment a stop was
+    #     completed — separate from lat/lng (the geocoded address estimate)
+    #     above. This is per-completion evidence and is never overwritten:
+    #     it stays on this stop row even after the container is relocated by
+    #     a later, different stop. compute_containers_out() prefers this over
+    #     the geocoded address for the "current" container position when
+    #     both exist, since GPS is where the truck actually stood. ---
+    safe_add_column(conn, "stops", "gps_lat REAL")
+    safe_add_column(conn, "stops", "gps_lng REAL")
+    safe_add_column(conn, "stops", "gps_accuracy REAL")
+    safe_add_column(conn, "stops", "gps_captured_at TEXT")
 
     # --- Per-route boss <-> driver messages: minimal thread, one row per
     #     message. "Unread" is derived per-viewer as "not sent by me and
@@ -7739,6 +7759,152 @@ def _message_thread_modal_html(show_quick_taps=False):
     """
 
 
+def _gps_settings_js():
+    """Gear-modal 'Enable Location' status + retry control — shared by both
+    Cab View screens since the gear button/modal appear on both."""
+    return """
+(function() {
+    var btn = document.getElementById('gps-enable-btn');
+    var status = document.getElementById('gps-status-line');
+    if (!btn || !status) return;
+
+    function refreshStatus() {
+        if (!navigator.geolocation) {
+            status.textContent = "Location isn't supported on this device.";
+            btn.style.display = 'none';
+            return;
+        }
+        if (navigator.permissions && navigator.permissions.query) {
+            navigator.permissions.query({ name: 'geolocation' }).then(function(result) {
+                if (result.state === 'granted') {
+                    status.textContent = 'Location is enabled.';
+                } else if (result.state === 'denied') {
+                    status.textContent = 'Location is turned off for HAULTRA. Enable it in your browser or device settings, then reopen this page.';
+                } else {
+                    status.textContent = "Location hasn't been set up yet — tap Enable Location.";
+                }
+            }).catch(function() { /* Permissions API present but query unsupported for this name — leave default copy */ });
+        }
+    }
+    refreshStatus();
+
+    btn.addEventListener('click', function() {
+        btn.disabled = true;
+        btn.textContent = 'Requesting…';
+        navigator.geolocation.getCurrentPosition(function() {
+            status.textContent = 'Location is enabled.';
+            btn.disabled = false;
+            btn.textContent = 'Enable Location';
+        }, function() {
+            status.textContent = 'Location is turned off for HAULTRA. Enable it in your browser or device settings, then reopen this page.';
+            btn.disabled = false;
+            btn.textContent = 'Enable Location';
+        }, { timeout: 8000 });
+    });
+})();
+"""
+
+
+def _gps_capture_js():
+    """GPS stamp capture on Complete Stop.
+
+    Checks for a Capacitor Geolocation plugin at runtime (this app has no
+    Capacitor wrapper today — nothing currently sets window.Capacitor — so
+    this always falls through to the standard browser Geolocation API in
+    production; the check is here so a future native wrapper picks it up
+    automatically with no code change).
+
+    window.captureGpsStamp(callback) always calls back within ~5.3s with
+    either {lat, lng, accuracy} or null. It never throws and never blocks
+    the caller beyond that timeout — permission denial, an unsupported
+    browser, or a dead-zone timeout all just resolve to null.
+    """
+    return """
+(function() {
+    var PROMPT_KEY = 'haultra_gps_preprompt_shown';
+
+    function getCapacitorGeolocation() {
+        try {
+            var cap = window.Capacitor;
+            if (cap && typeof cap.isNativePlatform === 'function' && cap.isNativePlatform() &&
+                cap.Plugins && cap.Plugins.Geolocation) {
+                return cap.Plugins.Geolocation;
+            }
+        } catch (e) {}
+        return null;
+    }
+
+    function requestBrowserPosition(onDone) {
+        navigator.geolocation.getCurrentPosition(function(pos) {
+            onDone({
+                lat: pos.coords.latitude,
+                lng: pos.coords.longitude,
+                accuracy: pos.coords.accuracy,
+            });
+        }, function() {
+            onDone(null);
+        }, { timeout: 5000, maximumAge: 0 });
+    }
+
+    function showPrePrompt(onChoice) {
+        var overlay = document.getElementById('gps-preprompt-overlay');
+        var modal = document.getElementById('gps-preprompt-modal');
+        var allowBtn = document.getElementById('gps-preprompt-allow');
+        var skipBtn = document.getElementById('gps-preprompt-skip');
+        if (!overlay || !modal || !allowBtn || !skipBtn) { onChoice(true); return; }
+
+        function close() { overlay.hidden = true; modal.hidden = true; }
+        overlay.hidden = false;
+        modal.hidden = false;
+        allowBtn.onclick = function() { close(); onChoice(true); };
+        skipBtn.onclick = function() { close(); onChoice(false); };
+    }
+
+    window.captureGpsStamp = function(callback) {
+        var finished = false;
+        function finish(result) {
+            if (finished) return;
+            finished = true;
+            callback(result);
+        }
+        var timer = setTimeout(function() { finish(null); }, 5300);
+
+        var nativeGeo = getCapacitorGeolocation();
+        if (nativeGeo) {
+            nativeGeo.getCurrentPosition({ timeout: 5000 }).then(function(pos) {
+                clearTimeout(timer);
+                finish({
+                    lat: pos.coords.latitude,
+                    lng: pos.coords.longitude,
+                    accuracy: pos.coords.accuracy,
+                });
+            }).catch(function() {
+                clearTimeout(timer);
+                finish(null);
+            });
+            return;
+        }
+
+        if (!navigator.geolocation) {
+            clearTimeout(timer);
+            finish(null);
+            return;
+        }
+
+        if (!localStorage.getItem(PROMPT_KEY)) {
+            localStorage.setItem(PROMPT_KEY, '1');
+            showPrePrompt(function(proceed) {
+                if (!proceed) { clearTimeout(timer); finish(null); return; }
+                requestBrowserPosition(function(result) { clearTimeout(timer); finish(result); });
+            });
+        } else {
+            requestBrowserPosition(function(result) { clearTimeout(timer); finish(result); });
+        }
+    };
+})();
+"""
+
+
 def _message_thread_js():
     """Shared open/send/render logic for the thread modal — identical on Cab
     View and Route Board, just wired to different trigger buttons."""
@@ -8385,6 +8551,14 @@ def driver_route_detail(route_id):
             </div>
             <button type="submit" class="btn orange" style="width:100%;min-height:48px;">Save</button>
         </form>
+
+        <div class="no-photo-confirm-title" style="font-size:15px;margin:22px 0 8px;">&#128205; Location</div>
+        <div id="gps-status-line" class="no-photo-confirm-body" style="margin-bottom:12px;">
+            Used to record where containers are placed when you complete a stop.
+        </div>
+        <button type="button" id="gps-enable-btn" class="btn secondary" style="width:100%;min-height:48px;">
+            Enable Location
+        </button>
     </div>
     """
 
@@ -8434,6 +8608,7 @@ def driver_route_detail(route_id):
     upd();
 }})();
 </script>
+<script>{_gps_settings_js()}</script>
 """
         return render_template_string(shell_page("Cab View", body))
 
@@ -8650,6 +8825,19 @@ def driver_route_detail(route_id):
 
 {_message_thread_modal_html(show_quick_taps=True)}
 
+<div id="gps-preprompt-overlay" class="no-photo-confirm-overlay" hidden></div>
+<div id="gps-preprompt-modal" class="no-photo-confirm-modal" hidden>
+    <div class="no-photo-confirm-title">&#128205; Location</div>
+    <p class="no-photo-confirm-body">HAULTRA uses your location at stop completion
+    to record where containers are placed.</p>
+    <div class="no-photo-confirm-actions">
+        <button type="button" class="btn orange" id="gps-preprompt-allow">Allow Location</button>
+        <button type="button" class="btn secondary" id="gps-preprompt-skip">Not Now</button>
+    </div>
+</div>
+
+<script>{_gps_settings_js()}</script>
+<script>{_gps_capture_js()}</script>
 <script>
 (function() {{
     var badge = document.getElementById('online-badge');
@@ -8752,10 +8940,14 @@ def driver_route_detail(route_id):
         var overlay   = document.getElementById('no-photo-confirm-overlay');
         var modal     = document.getElementById('no-photo-confirm-modal');
 
-        function submitComplete() {{
+        function doSubmit(gps) {{
             var btn = completeForm.querySelector('button');
-            if (btn) {{ btn.disabled = true; btn.textContent = 'Saving…'; }}
             var fd = new FormData(completeForm);
+            if (gps) {{
+                fd.append('gps_lat', gps.lat);
+                fd.append('gps_lng', gps.lng);
+                if (gps.accuracy != null) fd.append('gps_accuracy', gps.accuracy);
+            }}
             fetch(completeForm.action, {{
                 method: 'POST',
                 headers: {{ 'X-Requested-With': 'XMLHttpRequest' }},
@@ -8776,6 +8968,19 @@ def driver_route_detail(route_id):
                 }}
                 alert('Could not complete stop — check your connection and try again.');
             }});
+        }}
+
+        // GPS capture never blocks completion — permission denial, an
+        // unsupported browser, or a dead-zone timeout all resolve to null
+        // within ~5.3s (see _gps_capture_js) and the stop completes anyway.
+        function submitComplete() {{
+            var btn = completeForm.querySelector('button');
+            if (btn) {{ btn.disabled = true; btn.textContent = 'Saving…'; }}
+            if (typeof window.captureGpsStamp === 'function') {{
+                window.captureGpsStamp(function(gps) {{ doSubmit(gps); }});
+            }} else {{
+                doSubmit(null);
+            }}
         }}
 
         function closeNoPhotoConfirm() {{
@@ -10659,9 +10864,32 @@ def toggle_stop_complete(stop_id):
     completed_at = now_ts() if new_status == "completed" else None
     new_driver_status = "completed" if new_status == "completed" else "pending"
 
+    # Optional GPS stamp from the driver's device at the moment of
+    # completion — purely best-effort evidence, never required. Bad/missing
+    # values just mean no stamp gets stored; completion proceeds either way.
+    gps_lat = gps_lng = gps_accuracy = None
+    got_gps = False
+    if new_status == "completed":
+        try:
+            _lat = float(request.form.get("gps_lat", ""))
+            _lng = float(request.form.get("gps_lng", ""))
+            if -90 <= _lat <= 90 and -180 <= _lng <= 180:
+                gps_lat, gps_lng = _lat, _lng
+                try:
+                    gps_accuracy = float(request.form.get("gps_accuracy", ""))
+                except (TypeError, ValueError):
+                    gps_accuracy = None
+                got_gps = True
+        except (TypeError, ValueError):
+            pass
+
     conn.execute("""
-        UPDATE stops SET status=?, completed_at=?, driver_status=? WHERE id=?
-    """, (new_status, completed_at, new_driver_status, stop_id))
+        UPDATE stops SET status=?, completed_at=?, driver_status=?,
+               gps_lat=?, gps_lng=?, gps_accuracy=?, gps_captured_at=?
+        WHERE id=?
+    """, (new_status, completed_at, new_driver_status,
+          gps_lat, gps_lng, gps_accuracy, (now_ts() if got_gps else None),
+          stop_id))
     if new_status == "completed":
         update_container_flow(conn, stop_id)
     conn.commit()
@@ -10673,7 +10901,10 @@ def toggle_stop_complete(stop_id):
             or "pickup and return" in _action_lower
             or ("swap" in _action_lower and "pull" not in _action_lower)
         )
-        if _leaves_container:
+        # A GPS stamp already gives us the true position — skip the address
+        # geocode in that case rather than spend a Nominatim request on
+        # data we won't use for positioning.
+        if _leaves_container and not got_gps:
             geocode_stop_in_background(stop_id)
 
     if request.headers.get("X-Requested-With") == "XMLHttpRequest":
@@ -13358,6 +13589,7 @@ def bin_tracker():
                     f'{c["days_out"]} day{"s" if c["days_out"] != 1 else ""} out'
                 ),
                 "overdue": bool(c["days_out"] is not None and c["days_out"] >= OVERDUE_RENTAL_DAYS),
+                "is_gps": bool(c["is_gps"]),
             }
             for c in geocoded
         ]
@@ -13405,12 +13637,16 @@ def bin_tracker():
                 var overdueBadge = p.overdue
                     ? '<div style="color:#FF5252;font-weight:700;font-size:11px;margin-top:4px;">&#9888; OVERDUE</div>'
                     : '';
+                var sourceNote = p.is_gps
+                    ? '<div style="color:#3DDC84;font-size:11px;font-weight:700;margin-top:6px;">&#10003; GPS</div>'
+                    : '<div style="color:#78786F;font-size:11px;margin-top:6px;">address estimate</div>';
                 return '<div style="font-family:var(--font-body,inherit);min-width:170px;">' +
                     '<strong>' + escHtml(p.address) + (p.city ? ', ' + escHtml(p.city) : '') + '</strong>' +
                     (p.customer ? '<div style="margin-top:2px;">' + escHtml(p.customer) + '</div>' : '') +
                     (p.size ? '<div style="color:#A6A69E;font-size:12px;margin-top:2px;">' + escHtml(p.size) + '</div>' : '') +
                     '<div style="font-size:12px;margin-top:4px;">' + escHtml(p.days_label) + '</div>' +
                     overdueBadge +
+                    sourceNote +
                     '</div>';
             }}
 
