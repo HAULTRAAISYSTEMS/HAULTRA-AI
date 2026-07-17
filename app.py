@@ -13,6 +13,7 @@ import secrets
 import hashlib
 import warnings
 import time
+import threading
 import json
 import urllib.request
 import urllib.parse
@@ -785,22 +786,109 @@ def _haversine_mi(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
+# Nominatim usage policy: max 1 request/second, identify the app + a real
+# contact. This lock + timestamp throttles every call through
+# _geocode_server below to that limit, process-wide, regardless of which
+# caller (route optimization, the stop-completion hook, or the backfill
+# script) is making it.
+_NOMINATIM_USER_AGENT = "HAULTRA-AI dispatch, contact: timbobrown04@gmail.com"
+_geocode_rate_lock = threading.Lock()
+_geocode_last_call = [0.0]
+
+
 def _geocode_server(address):
-    """Geocode an address with Nominatim. Returns (lat, lng) or None."""
-    url = ("https://nominatim.openstreetmap.org/search?format=json&limit=1&q="
-           + urllib.parse.quote_plus(address))
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "HaultraAISystems/1.0 route-optimizer",
-        "Accept-Language": "en",
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            data = json.loads(resp.read().decode())
-            if data:
-                return float(data[0]["lat"]), float(data[0]["lon"])
-    except Exception:
-        pass
+    """Geocode an address with Nominatim. Returns (lat, lng) or None.
+
+    Self-throttles to <=1 request/second across the whole process, so
+    callers don't each need their own time.sleep(). Never raises — any
+    failure (network, timeout, no results) just returns None.
+    """
+    if not (address or "").strip():
+        return None
+
+    with _geocode_rate_lock:
+        wait = 1.05 - (time.time() - _geocode_last_call[0])
+        if wait > 0:
+            time.sleep(wait)
+        _geocode_last_call[0] = time.time()
+
+        url = ("https://nominatim.openstreetmap.org/search?format=json&limit=1&q="
+               + urllib.parse.quote_plus(address))
+        req = urllib.request.Request(url, headers={
+            "User-Agent": _NOMINATIM_USER_AGENT,
+            "Accept-Language": "en",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode())
+                if data:
+                    return float(data[0]["lat"]), float(data[0]["lon"])
+        except Exception as exc:
+            app.logger.warning("Nominatim geocode failed for %r: %s", address, exc)
     return None
+
+
+def geocode_address_cached(conn, company_id, address, city, state="", zip_code=""):
+    """Geocode a stop's address, reusing any coordinates already stored for
+    the same address+city within this company instead of re-requesting
+    Nominatim. Returns (lat, lng) or None — never raises, never blocks on a
+    lock beyond what _geocode_server already serializes.
+    """
+    address = (address or "").strip()
+    city = (city or "").strip()
+    if not address:
+        return None
+
+    cached = conn.execute("""
+        SELECT s.lat, s.lng FROM stops s JOIN routes r ON s.route_id = r.id
+        WHERE r.company_id = ? AND lower(trim(s.address)) = lower(?)
+          AND lower(trim(COALESCE(s.city, ''))) = lower(?)
+          AND s.lat IS NOT NULL AND s.lng IS NOT NULL
+        LIMIT 1
+    """, (company_id, address, city)).fetchone()
+    if cached:
+        return cached["lat"], cached["lng"]
+
+    full_address = ", ".join(p for p in [address, city, state, zip_code] if p)
+    return _geocode_server(full_address)
+
+
+def geocode_stop_in_background(stop_id):
+    """Kick off geocoding for a stop's address on a daemon thread so the
+    HTTP request that triggered it (a driver completing a stop) returns
+    immediately. A failed or slow geocode never blocks or fails stop
+    completion — it just leaves lat/lng null, same as if it were never
+    attempted. Opens its own DB connection since it outlives the request.
+    """
+    def _worker():
+        try:
+            conn = get_db()
+            stop = conn.execute(
+                "SELECT address, city, state, zip_code, route_id, lat, lng FROM stops WHERE id=?",
+                (stop_id,)
+            ).fetchone()
+            if not stop or stop["lat"] is not None or not (stop["address"] or "").strip():
+                conn.close()
+                return
+            route = conn.execute(
+                "SELECT company_id FROM routes WHERE id=?", (stop["route_id"],)
+            ).fetchone()
+            if not route:
+                conn.close()
+                return
+            coords = geocode_address_cached(
+                conn, route["company_id"], stop["address"], stop["city"],
+                stop["state"], stop["zip_code"]
+            )
+            if coords:
+                conn.execute("UPDATE stops SET lat=?, lng=? WHERE id=?",
+                             (coords[0], coords[1], stop_id))
+                conn.commit()
+            conn.close()
+        except Exception as exc:
+            app.logger.warning("background geocode failed for stop %s: %s", stop_id, exc)
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 # Actions that require a dump trip after the customer stop
@@ -1162,10 +1250,13 @@ def compute_containers_out(conn, company_id, asof_date=None):
     instead of tracking separate historical rows nobody writes.
 
     Returns a list of dicts: address, city, state, size, since (timestamp str),
-    customer_name, route_id — one per address currently holding a container.
+    customer_name, route_id, stop_id, lat, lng — one per address currently
+    holding a container. lat/lng are the geocoded coordinates of the stop
+    that left the container there (None if never geocoded or geocoding
+    failed — callers should treat that as "no map location", not an error).
     """
     sql = """SELECT s.id, s.address, s.city, s.state, s.action, s.container_size,
-                  s.completed_at, s.customer_name, s.route_id, r.route_date
+                  s.completed_at, s.customer_name, s.route_id, s.lat, s.lng, r.route_date
            FROM stops s
            JOIN routes r ON s.route_id = r.id
            WHERE r.company_id = ? AND s.status = 'completed'
@@ -1190,6 +1281,7 @@ def compute_containers_out(conn, company_id, asof_date=None):
                 "address": s["address"], "city": s["city"], "state": s["state"],
                 "size": s["container_size"], "since": s["completed_at"] or s["route_date"],
                 "customer_name": s["customer_name"], "route_id": s["route_id"],
+                "stop_id": s["id"], "lat": s["lat"], "lng": s["lng"],
             }
         elif is_pull:
             on_site.pop(addr_key, None)
@@ -1677,6 +1769,14 @@ def init_db():
     # --- Driver nav app preference: NULL (unset, current behavior) | google |
     #     apple | waze | device_default ---
     safe_add_column(conn, "users", "nav_preference TEXT")
+
+    # --- Geocoded coordinates for a stop's own address, used by the Bin
+    #     Tracker map. NULL until geocoded (or if geocoding failed/was never
+    #     attempted) — compute_containers_out() and the map degrade to
+    #     list-only for those. See geocode_address_cached() for the cache
+    #     that keeps a repeat address from ever being re-geocoded. ---
+    safe_add_column(conn, "stops", "lat REAL")
+    safe_add_column(conn, "stops", "lng REAL")
 
     # --- Per-route boss <-> driver messages: minimal thread, one row per
     #     message. "Unread" is derived per-viewer as "not sent by me and
@@ -4411,6 +4511,36 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .bin-map-stub-icon {{ font-size: 40px; opacity: .5; margin-bottom: 10px; }}
 .bin-map-stub-title {{ font-family: var(--font-head); font-size: 22px; letter-spacing: .5px; color: #D8D8D0; }}
 .bin-map-stub-sub {{ font-size: 12.5px; color: var(--text-muted); margin-top: 8px; max-width: 320px; line-height: 1.6; }}
+
+.bin-map {{
+    height: 460px;
+    border-radius: var(--radius-lg);
+    border: 1px solid rgba(255,107,26,0.18);
+    overflow: hidden;
+    background: #121212;
+}}
+@media (max-width: 900px) {{ .bin-map {{ height: 300px; }} }}
+.bin-map-note {{
+    margin-top: 10px; font-size: 12px; color: var(--text-muted);
+    background: rgba(255,107,26,0.06); border: 1px solid rgba(255,107,26,0.15);
+    border-radius: var(--radius-sm); padding: 10px 12px; line-height: 1.5;
+}}
+.bin-no-map {{ font-size: 11px; color: var(--text-muted); margin-top: 8px; }}
+
+/* Dark-theme the Leaflet chrome so it matches the app instead of Leaflet's
+   default white popups/controls */
+.leaflet-popup-content-wrapper, .leaflet-popup-tip {{
+    background: #1A1A1A; color: #F5F5F0;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+}}
+.leaflet-popup-content-wrapper {{ border: 1px solid rgba(255,107,26,0.22); border-radius: 10px; }}
+.leaflet-popup-content {{ margin: 12px 14px; font-size: 13px; line-height: 1.5; }}
+.leaflet-container a.leaflet-popup-close-button {{ color: #A6A69E; }}
+.leaflet-bar a, .leaflet-bar a:hover {{
+    background: #1A1A1A; color: #F5F5F0; border-bottom: 1px solid rgba(255,255,255,0.1);
+}}
+.leaflet-control-attribution {{ background: rgba(18,18,18,0.75) !important; color: #78786F !important; }}
+.leaflet-control-attribution a {{ color: #A6A69E !important; }}
 
 .bin-list-header {{
     display: flex; justify-content: space-between; align-items: flex-start;
@@ -10536,6 +10666,16 @@ def toggle_stop_complete(stop_id):
         update_container_flow(conn, stop_id)
     conn.commit()
 
+    if new_status == "completed":
+        _action_lower = (stop["action"] or "").lower()
+        _leaves_container = (
+            "delivery" in _action_lower or "drop" in _action_lower
+            or "pickup and return" in _action_lower
+            or ("swap" in _action_lower and "pull" not in _action_lower)
+        )
+        if _leaves_container:
+            geocode_stop_in_background(stop_id)
+
     if request.headers.get("X-Requested-With") == "XMLHttpRequest":
         prog      = conn.execute(
             "SELECT COUNT(*) AS total, SUM(status='completed') AS completed FROM stops WHERE route_id=?",
@@ -13145,11 +13285,6 @@ def _days_out(since_str, asof_date=None):
 def bin_tracker():
     conn = get_db()
     out = compute_containers_out(conn, cid())
-
-    has_coords = conn.execute(
-        "SELECT COUNT(*) n FROM saved_addresses WHERE company_id=? AND lat IS NOT NULL AND lng IS NOT NULL",
-        (cid(),)
-    ).fetchone()["n"]
     conn.close()
 
     for c in out:
@@ -13157,6 +13292,7 @@ def bin_tracker():
     out.sort(key=lambda c: c["days_out"] if c["days_out"] is not None else -1, reverse=True)
 
     overdue_count = sum(1 for c in out if (c["days_out"] or 0) >= OVERDUE_RENTAL_DAYS)
+    geocoded = [c for c in out if c["lat"] is not None and c["lng"] is not None]
 
     rows_html = ""
     if not out:
@@ -13175,8 +13311,14 @@ def bin_tracker():
                 days_label = f"{days} days out"
             card_cls = "bin-card overdue" if overdue else "bin-card"
             addr_line = e(c["address"]) + (f', {e(c["city"])}' if c["city"] else "")
+            has_coords = c["lat"] is not None and c["lng"] is not None
+            card_click = (
+                f' onclick="panToContainer({c["stop_id"]})" style="cursor:pointer;"'
+                if has_coords else ""
+            )
+            no_map_note = "" if has_coords else '<div class="bin-no-map">&#128205; No map location</div>'
             rows_html += f"""
-            <div class="{card_cls}">
+            <div class="{card_cls}" id="bin-card-{c['stop_id']}"{card_click}>
                 <div class="bin-card-top">
                     <span class="bin-days {'overdue' if overdue else ''}">{days_label}</span>
                     {f'<span class="bin-size">{e(c["size"])}</span>' if c["size"] else ''}
@@ -13184,25 +13326,128 @@ def bin_tracker():
                 <div class="bin-addr">{addr_line}</div>
                 {f'<div class="bin-customer">{e(c["customer_name"])}</div>' if c["customer_name"] else ''}
                 {f'<div class="bin-overdue-tag">&#9888; OVERDUE &mdash; past {OVERDUE_RENTAL_DAYS}-day window</div>' if overdue else ''}
+                {no_map_note}
             </div>
             """
 
-    map_panel = """
-    <div class="bin-map-stub">
-        <div class="bin-map-stub-icon">&#128506;</div>
-        <div class="bin-map-stub-title">Map coming soon</div>
-        <div class="bin-map-stub-sub">Container locations aren't geocoded yet &mdash;
-        addresses have no stored coordinates. The list on the right reflects
-        real, live container-out data.</div>
-    </div>
-    """ if not has_coords else """
-    <div class="bin-map-stub">
-        <div class="bin-map-stub-icon">&#128506;</div>
-        <div class="bin-map-stub-title">Map view coming soon</div>
-        <div class="bin-map-stub-sub">Saved addresses have coordinates, but the
-        map renderer isn't wired up yet.</div>
-    </div>
-    """
+    if not out:
+        map_panel = """
+        <div class="bin-map-stub">
+            <div class="bin-map-stub-icon">&#128506;</div>
+            <div class="bin-map-stub-title">Nothing out right now</div>
+            <div class="bin-map-stub-sub">The map will populate as soon as a
+            delivery, pickup &amp; return, or swap stop is completed.</div>
+        </div>
+        """
+        map_extra_html = ""
+        map_head = ""
+        map_script = ""
+    else:
+        map_points = [
+            {
+                "stop_id":  c["stop_id"],
+                "lat":      c["lat"],
+                "lng":      c["lng"],
+                "address":  c["address"] or "",
+                "city":     c["city"] or "",
+                "customer": c["customer_name"] or "",
+                "size":     c["size"] or "",
+                "days_label": (
+                    "—" if c["days_out"] is None else
+                    "Out today" if c["days_out"] == 0 else
+                    f'{c["days_out"]} day{"s" if c["days_out"] != 1 else ""} out'
+                ),
+                "overdue": bool(c["days_out"] is not None and c["days_out"] >= OVERDUE_RENTAL_DAYS),
+            }
+            for c in geocoded
+        ]
+        map_panel = '<div id="bin-map" class="bin-map"></div>'
+        map_extra_html = (
+            '<div class="bin-map-note">Containers are out, but none have map '
+            'coordinates yet — new drops geocode automatically, or run the '
+            'backfill script to geocode the current ones.</div>'
+        ) if not geocoded else ""
+        # Leaflet's CSS must load (and cascade) BEFORE shell_page()'s own
+        # <style> block, or its default white popup/control styling wins
+        # over the dark-theme overrides below — hence extra_head, not body.
+        map_head = """
+        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+              integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+        """
+        map_script = f"""
+        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+                integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+        <script>
+        (function() {{
+            var POINTS = {json.dumps(map_points)};
+            var FALLBACK_CENTER = [36.85, -76.28];  // Hampton Roads, VA
+
+            function escHtml(s) {{
+                return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {{
+                    return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c];
+                }});
+            }}
+
+            function makeIcon(overdue) {{
+                var color = overdue ? '#FF5252' : '#FF6B1A';
+                return L.divIcon({{
+                    className: 'bin-map-pin',
+                    html: '<div style="width:16px;height:16px;border-radius:50% 50% 50% 0;' +
+                          'transform:rotate(-45deg);background:' + color + ';' +
+                          'border:2px solid rgba(0,0,0,0.45);box-shadow:0 2px 6px rgba(0,0,0,0.55);"></div>',
+                    iconSize: [16, 16],
+                    iconAnchor: [8, 16],
+                    popupAnchor: [0, -18],
+                }});
+            }}
+
+            function popupHtml(p) {{
+                var overdueBadge = p.overdue
+                    ? '<div style="color:#FF5252;font-weight:700;font-size:11px;margin-top:4px;">&#9888; OVERDUE</div>'
+                    : '';
+                return '<div style="font-family:var(--font-body,inherit);min-width:170px;">' +
+                    '<strong>' + escHtml(p.address) + (p.city ? ', ' + escHtml(p.city) : '') + '</strong>' +
+                    (p.customer ? '<div style="margin-top:2px;">' + escHtml(p.customer) + '</div>' : '') +
+                    (p.size ? '<div style="color:#A6A69E;font-size:12px;margin-top:2px;">' + escHtml(p.size) + '</div>' : '') +
+                    '<div style="font-size:12px;margin-top:4px;">' + escHtml(p.days_label) + '</div>' +
+                    overdueBadge +
+                    '</div>';
+            }}
+
+            var map = L.map('bin-map', {{ scrollWheelZoom: true }}).setView(FALLBACK_CENTER, 11);
+            L.tileLayer('https://{{s}}.basemaps.cartocdn.com/dark_all/{{z}}/{{x}}/{{y}}{{r}}.png', {{
+                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
+                subdomains: 'abcd',
+                maxZoom: 19,
+            }}).addTo(map);
+
+            var markersByStopId = {{}};
+            var latLngs = [];
+            POINTS.forEach(function(p) {{
+                var marker = L.marker([p.lat, p.lng], {{ icon: makeIcon(p.overdue) }}).addTo(map);
+                marker.bindPopup(popupHtml(p));
+                markersByStopId[p.stop_id] = marker;
+                latLngs.push([p.lat, p.lng]);
+            }});
+            if (latLngs.length > 1) {{
+                map.fitBounds(latLngs, {{ padding: [30, 30], maxZoom: 15 }});
+            }} else if (latLngs.length === 1) {{
+                map.setView(latLngs[0], 14);
+            }}
+
+            window.panToContainer = function(stopId) {{
+                var marker = markersByStopId[stopId];
+                if (!marker) return;
+                map.setView(marker.getLatLng(), 15, {{ animate: true }});
+                marker.openPopup();
+                var card = document.getElementById('bin-card-' + stopId);
+                if (card && card.scrollIntoView) {{
+                    card.scrollIntoView({{ behavior: 'smooth', block: 'nearest' }});
+                }}
+            }};
+        }})();
+        </script>
+        """
 
     body = f"""
     <div class="hero">
@@ -13213,6 +13458,7 @@ def bin_tracker():
     <div class="bin-tracker-grid">
         <div class="bin-map-col">
             {map_panel}
+            {map_extra_html}
         </div>
         <div class="bin-list-col">
             <div class="bin-list-header">
@@ -13230,8 +13476,9 @@ def bin_tracker():
             </div>
         </div>
     </div>
+    {map_script}
     """
-    return render_template_string(shell_page("Bin Tracker", body))
+    return render_template_string(shell_page("Bin Tracker", body, extra_head=map_head))
 
 
 # =========================================================
