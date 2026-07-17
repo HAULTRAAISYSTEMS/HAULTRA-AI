@@ -8721,8 +8721,8 @@ def driver_route_detail(route_id):
           enctype="multipart/form-data" id="cab-photo-form" style="margin-bottom:10px;">
         <input type="file" name="photos" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple
                capture="environment" id="cab-photo-input" style="display:none;">
-        <button type="button" class="btn secondary" style="width:100%;min-height:48px;"
-                onclick="document.getElementById('cab-photo-input').click();">
+        <button type="button" class="btn secondary" id="cab-add-photo-btn" style="width:100%;min-height:48px;"
+                onclick="triggerAddPhoto();">
             &#128247; {"Add Another Photo" if has_photo else "Add Photo"}
         </button>
     </form>
@@ -8918,7 +8918,9 @@ def driver_route_detail(route_id):
 
     // Photo input opens the camera/file picker directly and uploads on
     // selection — no separate Upload press, multi-photo still supported
-    // via the `multiple` attribute on the hidden input.
+    // via the `multiple` attribute on the hidden input. This is the web
+    // path; inside the Capacitor app, triggerAddPhoto() below uses the
+    // native Camera plugin instead and this input is never clicked.
     var photoInput = document.getElementById('cab-photo-input');
     var photoForm = document.getElementById('cab-photo-form');
     if (photoInput && photoForm) {{
@@ -8928,6 +8930,52 @@ def driver_route_detail(route_id):
             }}
         }});
     }}
+
+    // Add Photo — native Camera plugin when running inside the Capacitor
+    // app (this site has no Capacitor wrapper today, so on the web this
+    // always falls through to the plain file input, unchanged from before).
+    function getCapacitorCamera() {{
+        try {{
+            var cap = window.Capacitor;
+            if (cap && typeof cap.isNativePlatform === 'function' && cap.isNativePlatform() &&
+                cap.Plugins && cap.Plugins.Camera) {{
+                return cap.Plugins.Camera;
+            }}
+        }} catch (e) {{}}
+        return null;
+    }}
+
+    window.triggerAddPhoto = function() {{
+        var camera = getCapacitorCamera();
+        if (!camera || !photoForm) {{
+            if (photoInput) photoInput.click();
+            return;
+        }}
+        var btn = document.getElementById('cab-add-photo-btn');
+        var originalLabel = btn ? btn.textContent : '';
+        camera.getPhoto({{
+            quality: 85,
+            allowEditing: false,
+            resultType: 'uri',
+            source: 'PROMPT',
+        }}).then(function(photo) {{
+            if (btn) {{ btn.disabled = true; btn.textContent = 'Uploading…'; }}
+            return fetch(photo.webPath).then(function(r) {{ return r.blob(); }}).then(function(blob) {{
+                var fd = new FormData();
+                var csrf = (document.querySelector('meta[name="csrf-token"]') || {{}}).content || '';
+                fd.append('_csrf_token', csrf);
+                fd.append('photos', blob, 'photo.' + (photo.format || 'jpeg'));
+                return fetch(photoForm.action, {{ method: 'POST', body: fd }});
+            }});
+        }}).then(function() {{
+            window.location.reload();
+        }}).catch(function() {{
+            // Driver cancelled the native camera sheet, or capture failed —
+            // stay silent and restore the button, same as cancelling the
+            // web file picker does nothing either.
+            if (btn) {{ btn.disabled = false; btn.textContent = originalLabel; }}
+        }});
+    }};
 
     // Submit Complete Stop via AJAX (X-Requested-With) so the shared
     // /stop/<id>/toggle endpoint takes its JSON branch instead of its
@@ -11678,11 +11726,17 @@ def upload_stop_photo(stop_id):
         flash("Access denied.", "error")
         return redirect(url_for("dashboard"))
 
+    redirect_target = (
+        url_for("driver_route_detail", route_id=route_id)
+        if session.get("role") != "boss"
+        else url_for("view_route", route_id=route_id)
+    )
+
     files = request.files.getlist("photos")
     if not files or all(f.filename == "" for f in files):
         conn.close()
         flash("No file selected.", "error")
-        return redirect(url_for("view_route", route_id=route_id))
+        return redirect(redirect_target)
 
     saved = 0
     for file in files:
@@ -11707,7 +11761,7 @@ def upload_stop_photo(stop_id):
     else:
         flash("No valid files uploaded.", "error")
     conn.close()
-    return redirect(url_for("view_route", route_id=route_id))
+    return redirect(redirect_target)
 
 
 # =========================================================
@@ -15195,6 +15249,48 @@ def service_worker_file():
     response = send_from_directory('static', 'service-worker.js')
     response.headers['Service-Worker-Allowed'] = '/'
     return response
+
+
+# =========================================================
+# CAPACITOR APP LINKS — Universal Links (iOS) / App Links (Android)
+# so haultra-systems.com links open the app instead of a browser tab
+# (see @capacitor/app in package.json and STORE_LAUNCH.md).
+#
+# PLACEHOLDER VALUES — these must be filled in with real credentials
+# before deep-linking will actually work; until then these routes are
+# harmless (the OS just won't verify the app for these domains):
+#   - REPLACE_WITH_APPLE_TEAM_ID: your 10-character Apple Developer Team ID
+#   - REPLACE_WITH_ANDROID_SHA256_FINGERPRINT: your release keystore's
+#     SHA-256 signing certificate fingerprint
+# See STORE_LAUNCH.md for exactly where to find both.
+# =========================================================
+@app.route('/.well-known/apple-app-site-association')
+def apple_app_site_association():
+    return jsonify({
+        "applinks": {
+            "apps": [],
+            "details": [
+                {
+                    "appID": "REPLACE_WITH_APPLE_TEAM_ID.com.rockkstaar.haultra",
+                    "paths": ["*"],
+                }
+            ],
+        }
+    })
+
+
+@app.route('/.well-known/assetlinks.json')
+def android_asset_links():
+    return jsonify([
+        {
+            "relation": ["delegate_permission/common.handle_all_urls"],
+            "target": {
+                "namespace": "android_app",
+                "package_name": "com.rockkstaar.haultra",
+                "sha256_cert_fingerprints": ["REPLACE_WITH_ANDROID_SHA256_FINGERPRINT"],
+            },
+        }
+    ])
 
 
 init_db()
