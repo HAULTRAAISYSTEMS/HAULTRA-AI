@@ -13,9 +13,19 @@ services:
         value: haultra.db
       - key: UPLOAD_FOLDER
         value: static/uploads
-      - key: NEBIUS_API_KEY
-        sync: false   # set manually in Render dashboard — never commit the value
       - key: ANTHROPIC_API_KEY
+        sync: false   # set manually in Render dashboard — never commit the value
+      - key: RESEND_API_KEY
+        sync: false   # set manually in Render dashboard — never commit the value. Required for password-reset emails.
+      - key: RESEND_FROM_EMAIL
+        sync: false   # set manually in Render dashboard — e.g. "HAULTRA <noreply@haultra-systems.com>"
+      - key: STRIPE_SECRET_KEY
+        sync: false   # set manually in Render dashboard — never commit the value
+      - key: STRIPE_PRICE_STARTER
+        sync: false   # set manually in Render dashboard — Stripe Price ID for the Starter plan
+      - key: STRIPE_PRICE_PRO
+        sync: false   # set manually in Render dashboard — Stripe Price ID for the Pro plan
+      - key: STRIPE_WEBHOOK_SECRET
         sync: false   # set manually in Render dashboard — never commit the value
     disk:
       name: haultra-data

@@ -14,3 +14,10 @@ node_modules/
 # Editor
 .vscode/
 .idea/
+
+# Database — never commit real data or credentials
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+scripts/backups/

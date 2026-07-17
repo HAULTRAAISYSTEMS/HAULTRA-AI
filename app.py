@@ -88,6 +88,73 @@ app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # 32 MB upload limit
 
 
 # =========================================================
+# ERROR HANDLERS
+# Without these, an unhandled exception anywhere in any route falls
+# through to Flask's bare default response with nothing logged beyond
+# whatever Render's raw process logs happen to capture, and no
+# on-brand fallback shown to the user. debug=False already prevents any
+# stack trace leaking to the client either way — these just make sure
+# the failure is (a) actually logged server-side and (b) doesn't look
+# broken to whoever hit it.
+# =========================================================
+_ERROR_PAGE_TEMPLATE = """
+<!doctype html><html><head><title>{title}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  * {{ box-sizing: border-box; }}
+  html, body {{ background: #121212; margin: 0; min-height: 100%; }}
+  body {{
+    color: #F5F5F0; font-family: -apple-system, "Segoe UI", sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; text-align: center; padding: 24px;
+  }}
+  .box {{ max-width: 420px; }}
+  h1 {{
+    font-family: 'Bebas Neue', 'Anton', sans-serif;
+    font-size: 64px; margin: 0 0 8px; letter-spacing: 1px;
+    background: linear-gradient(130deg, #ffffff 0%, #F5F5F0 55%, #FF6B1A 100%);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+  }}
+  p {{ color: #A6A69E; font-size: 14px; line-height: 1.6; margin-bottom: 22px; }}
+  a {{
+    display: inline-block; padding: 10px 22px; border-radius: 9px;
+    background: linear-gradient(135deg, #FF8A42 0%, #FF6B1A 100%);
+    color: #1A1000; text-decoration: none; font-weight: 700; font-size: 13px;
+  }}
+</style></head><body><div class="box">
+  <h1>{code}</h1>
+  <p>{message}</p>
+  <a href="/">&larr; Back to HAULTRA</a>
+</div></body></html>
+"""
+
+
+@app.errorhandler(404)
+def _handle_not_found(err):
+    if request.path.startswith("/api/") or request.is_json:
+        return jsonify({"error": "Not found."}), 404
+    return render_template_string(
+        _ERROR_PAGE_TEMPLATE.format(
+            title="Not Found", code="404",
+            message="That page doesn&rsquo;t exist, or you don&rsquo;t have access to it.",
+        )
+    ), 404
+
+
+@app.errorhandler(500)
+def _handle_server_error(err):
+    app.logger.error("Unhandled exception on %s %s", request.method, request.path, exc_info=True)
+    if request.path.startswith("/api/") or request.is_json:
+        return jsonify({"error": "Something went wrong on our end. Try again in a moment."}), 500
+    return render_template_string(
+        _ERROR_PAGE_TEMPLATE.format(
+            title="Something Went Wrong", code="500",
+            message="Something went wrong on our end. It&rsquo;s been logged &mdash; try again in a moment.",
+        )
+    ), 500
+
+
+# =========================================================
 # HELPERS
 # =========================================================
 def e(value):
@@ -617,8 +684,16 @@ def get_db():
     db_dir = os.path.dirname(DATABASE)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
-    conn = sqlite3.connect(DATABASE)
+    # timeout=30: how long a connection waits on a lock before raising
+    # "database is locked", instead of the sqlite3 default of 5s. WAL mode
+    # lets readers proceed while a write is in progress instead of the
+    # default rollback-journal's whole-file lock — both matter more now
+    # that background threads (geocoding) open their own connections
+    # alongside the 2 gunicorn workers x 2 threads handling requests.
+    conn = sqlite3.connect(DATABASE, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
@@ -667,7 +742,7 @@ def send_email(to_email, subject, html_body):
 
 
 # Endpoints that legitimately receive POST from external servers (no session/CSRF)
-_CSRF_EXEMPT_ENDPOINTS = {"stripe_webhook", "api_parse_dispatch"}
+_CSRF_EXEMPT_ENDPOINTS = {"stripe_webhook"}
 
 @app.before_request
 def csrf_protect():
@@ -1470,12 +1545,16 @@ def load_stop_photos(conn, stop_ids):
 
 
 def build_photo_gallery_html(photos):
-    """Render a gallery of uploaded photos with uploader name and timestamp."""
+    """Render a gallery of uploaded photos with uploader name and timestamp.
+    Links go through serve_stop_photo (login + company + ownership checked)
+    rather than the raw /static/uploads/... path, which Flask's default
+    static handler would otherwise serve to anyone with the URL, logged in
+    or not, from any company."""
     if not photos:
         return ""
     items = []
     for p in photos:
-        path = "/" + p["file_path"].replace("\\", "/")
+        path = url_for("serve_stop_photo", photo_id=p["id"])
         ext = p["file_path"].rsplit(".", 1)[-1].lower() if "." in p["file_path"] else ""
         if ext == "pdf":
             media = f'<a class="photo-pdf-link" href="{e(path)}" target="_blank">&#128196; PDF Document</a>'
@@ -3765,9 +3844,12 @@ def shell_page(title, body, extra_head=""):
    <head>
     <title>{e(title)}</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#121212">
     <meta name="csrf-token" content="{csrf_token}">
 
-    <link rel="apple-touch-icon" href="/static/logo.png">
+    <link rel="manifest" href="/static/manifest.json">
+    <link rel="apple-touch-icon" href="/static/icon-512.png">
+    <link rel="icon" href="/static/icon-192.png" sizes="192x192">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="/static/css/haultra-theme.css">
@@ -6324,7 +6406,7 @@ def dashboard():
     return render_template_string(shell_page("Owner", body))
 
 @app.route("/analytics")
-@login_required
+@boss_required
 def analytics_page():
     conn = get_db()
     company_id = cid()
@@ -10454,6 +10536,8 @@ def mark_route_in_progress(route_id):
     conn.close()
 
     flash("Route marked in progress.", "success")
+    if session.get("role") != "boss":
+        return redirect(url_for("driver_route_detail", route_id=route_id))
     return redirect(url_for("view_route", route_id=route_id))
 
 
@@ -10483,6 +10567,8 @@ def mark_route_completed(route_id):
     conn.close()
 
     flash("Route marked completed.", "success")
+    if session.get("role") != "boss":
+        return redirect(url_for("driver_route_detail", route_id=route_id))
     return redirect(url_for("view_route", route_id=route_id))
 
 
@@ -10512,6 +10598,8 @@ def reopen_route(route_id):
     conn.close()
 
     flash("Route reopened.", "success")
+    if session.get("role") != "boss":
+        return redirect(url_for("driver_route_detail", route_id=route_id))
     return redirect(url_for("view_route", route_id=route_id))
 
 
@@ -11739,21 +11827,34 @@ def upload_stop_photo(stop_id):
         return redirect(redirect_target)
 
     saved = 0
-    for file in files:
-        if file.filename == "" or not allowed_file(file.filename):
-            continue
-        uid = secrets.token_hex(8)
-        filename = f"{stop_id}_{uid}_{secure_filename(file.filename)}"
-        path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-        file.save(path)
-        # Always store a web-relative path so the URL builder at load_stop_photos works
-        # regardless of whether UPLOAD_FOLDER is absolute or relative.
-        db_path = os.path.join("static", "uploads", filename)
-        conn.execute(
-            "INSERT INTO route_photos (stop_id, file_path, uploaded_at, uploaded_by) VALUES (?,?,?,?)",
-            (stop_id, db_path, now_ts(), session.get("user_id")),
+    try:
+        for file in files:
+            if file.filename == "" or not allowed_file(file.filename):
+                continue
+            uid = secrets.token_hex(8)
+            filename = f"{stop_id}_{uid}_{secure_filename(file.filename)}"
+            path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+            file.save(path)
+            # Always store a web-relative path so the URL builder at load_stop_photos works
+            # regardless of whether UPLOAD_FOLDER is absolute or relative.
+            db_path = os.path.join("static", "uploads", filename)
+            conn.execute(
+                "INSERT INTO route_photos (stop_id, file_path, uploaded_at, uploaded_by) VALUES (?,?,?,?)",
+                (stop_id, db_path, now_ts(), session.get("user_id")),
+            )
+            saved += 1
+    except OSError as exc:
+        app.logger.error("upload_stop_photo: failed writing to disk for stop %s: %s", stop_id, exc)
+        if saved:
+            conn.commit()
+        conn.close()
+        flash(
+            f"{saved} photo(s) uploaded before a storage error interrupted the rest — try the remaining ones again."
+            if saved else
+            "Could not save the photo — try again.",
+            "error" if not saved else "warning",
         )
-        saved += 1
+        return redirect(redirect_target)
 
     if saved:
         conn.commit()
@@ -11762,6 +11863,33 @@ def upload_stop_photo(stop_id):
         flash("No valid files uploaded.", "error")
     conn.close()
     return redirect(redirect_target)
+
+
+@app.route("/photo/<int:photo_id>")
+@login_required
+def serve_stop_photo(photo_id):
+    """Serve an uploaded stop photo/PDF — company- and ownership-checked,
+    unlike a raw /static/uploads/... URL (which Flask's default static
+    handler would serve to anyone, logged in or not, from any company)."""
+    conn = get_db()
+    photo = conn.execute("""
+        SELECT rp.file_path, r.assigned_to
+        FROM route_photos rp
+        JOIN stops s ON rp.stop_id = s.id
+        JOIN routes r ON s.route_id = r.id
+        WHERE rp.id=? AND r.company_id=?
+    """, (photo_id, cid())).fetchone()
+    conn.close()
+
+    if not photo:
+        abort(404)
+    if session.get("role") != "boss" and photo["assigned_to"] != session["user_id"]:
+        abort(403)
+
+    full_path = os.path.join(app.root_path, photo["file_path"])
+    if not os.path.isfile(full_path):
+        abort(404)
+    return send_file(full_path)
 
 
 # =========================================================
@@ -11803,11 +11931,16 @@ def export_day_csv():
 @login_required
 def export_route_csv(route_id):
     conn = get_db()
-    if not conn.execute(
-        "SELECT id FROM routes WHERE id=? AND company_id=?", (route_id, cid())
-    ).fetchone():
+    route = conn.execute(
+        "SELECT id, assigned_to FROM routes WHERE id=? AND company_id=?", (route_id, cid())
+    ).fetchone()
+    if not route:
         conn.close()
         abort(404)
+    if session.get("role") != "boss" and route["assigned_to"] != session["user_id"]:
+        conn.close()
+        flash("Access denied.", "error")
+        return redirect(url_for("dashboard"))
     stops = conn.execute("SELECT * FROM stops WHERE route_id=?", (route_id,)).fetchall()
     conn.close()
 
@@ -11943,7 +12076,7 @@ def api_parse_dispatch():
         return jsonify({"error": "ANTHROPIC_API_KEY not configured on server."}), 500
 
     try:
-        client = anthropic.Anthropic(api_key=api_key)
+        client = anthropic.Anthropic(api_key=api_key, timeout=20.0)
         resp = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=4096,
@@ -11953,8 +12086,18 @@ def api_parse_dispatch():
         raw_reply = "".join(
             block.text for block in resp.content if getattr(block, "type", None) == "text"
         ).strip()
+    except anthropic.APITimeoutError:
+        return jsonify({"error": "The AI parser took too long to respond — try again."}), 504
+    except anthropic.APIConnectionError:
+        return jsonify({"error": "Couldn't reach the AI parser — check your connection and try again."}), 502
+    except anthropic.RateLimitError:
+        return jsonify({"error": "The AI parser is rate-limited right now — wait a moment and try again."}), 429
+    except anthropic.APIStatusError as ex:
+        app.logger.warning("api_parse_dispatch: Anthropic API error: %s", ex)
+        return jsonify({"error": "The AI parser is temporarily unavailable — try again shortly."}), 502
     except Exception as ex:
-        return jsonify({"error": str(ex)}), 500
+        app.logger.warning("api_parse_dispatch: unexpected error: %s", ex)
+        return jsonify({"error": "Something went wrong parsing that text — try again."}), 500
 
     cleaned = raw_reply.strip()
     if cleaned.startswith("```"):
@@ -12848,37 +12991,6 @@ def stripe_webhook():
 def subscription_success():
     flash("Payment successful! Your plan is now active.", "success")
     return redirect(url_for("billing"))
-
-
-@app.route("/debug-stripe")
-@superadmin_required
-def debug_stripe():
-    """
-    Safe Stripe config check — only accessible to superadmins.
-    Shows whether each var is set and a masked preview; never returns the full key.
-    Remove or gate this route before going live.
-    """
-    import os
-    def _mask(val):
-        if not val:
-            return "MISSING"
-        if len(val) <= 8:
-            return "SET (too short to preview)"
-        return val[:7] + "..." + val[-4:]
-
-    sk  = os.getenv("STRIPE_SECRET_KEY")    or ""
-    ps  = os.getenv("STRIPE_PRICE_STARTER") or ""
-    pp  = os.getenv("STRIPE_PRICE_PRO")     or ""
-    wh  = os.getenv("STRIPE_WEBHOOK_SECRET") or ""
-
-    return jsonify({
-        "stripe_configured": bool(sk and ps and pp),
-        "STRIPE_SECRET_KEY":     _mask(sk),
-        "STRIPE_PRICE_STARTER":  ps  or "MISSING",
-        "STRIPE_PRICE_PRO":      pp  or "MISSING",
-        "STRIPE_WEBHOOK_SECRET": "SET" if wh else "MISSING",
-        "key_mode": ("live" if sk.startswith("sk_live_") else "test" if sk.startswith("sk_test_") else "unknown") if sk else "n/a",
-    })
 
 
 @app.route("/billing")
@@ -14666,6 +14778,48 @@ _SW_JS = r"""
 const CACHE   = 'haultra-v3';
 const OFFLINE = '/offline';
 
+// --- Firebase Cloud Messaging (background push for Live Dispatch) ---
+// This is the ONE service worker for the whole origin — FCM handling lives
+// here rather than in a second registered worker to avoid two SWs fighting
+// over the '/' scope.
+importScripts('https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js');
+importScripts('https://www.gstatic.com/firebasejs/10.12.0/firebase-messaging-compat.js');
+
+firebase.initializeApp({
+  apiKey: "AIzaSyBAWm08bVHH5uia21H5VPd1mAW0Ei0MnV4",
+  authDomain: "haultra-dispatch.firebaseapp.com",
+  projectId: "haultra-dispatch",
+  storageBucket: "haultra-dispatch.firebasestorage.app",
+  messagingSenderId: "66096047367",
+  appId: "1:66096047367:web:a7a3da473ba9d0bf5b51a2"
+});
+
+const messaging = firebase.messaging();
+
+messaging.onBackgroundMessage((payload) => {
+  const { title, body, stopId } = payload.data || {};
+  self.registration.showNotification(title || 'New Stop Assigned', {
+    body: body || 'You have a new stop. Tap to view.',
+    icon: '/static/icon-192.png',
+    badge: '/static/icon-192.png',
+    tag: stopId || 'haultra-stop',
+    data: { stopId }
+  });
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  event.waitUntil(
+    clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientList) => {
+      for (const client of clientList) {
+        if (client.url.includes('/driver') && 'focus' in client) return client.focus();
+      }
+      if (clients.openWindow) return clients.openWindow('/driver');
+    })
+  );
+});
+
+// --- Offline caching ---
 // Pages pre-cached at install so drivers can use them without network
 const PRECACHE = ['/driver', '/driver/clock', '/offline'];
 
@@ -15243,13 +15397,6 @@ def parser_view():
     html = html.replace('<!--ROUTE_SEQ_SLOT-->', route_seq_html)
     html = html.replace('__ROUTE_MODE_JSON__', route_mode_js)
     return html
-
-@app.route('/service-worker.js')
-def service_worker_file():
-    response = send_from_directory('static', 'service-worker.js')
-    response.headers['Service-Worker-Allowed'] = '/'
-    return response
-
 
 # =========================================================
 # CAPACITOR APP LINKS — Universal Links (iOS) / App Links (Android)
