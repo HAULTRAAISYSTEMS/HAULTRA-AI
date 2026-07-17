@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-One-time bulk close-out of legacy "containers out".
+Bulk close-out of legacy "containers out".
 
 Why this exists
 ---------------
 The containers showing in the Bin Tracker are real historical drops, but the
 pulls happened off-app, so the "still out" list is stale and unverifiable.
-This script closes every currently-out container by recording a *return*,
-so the Bin Tracker resets to zero and only new, app-tracked drops show up
-going forward.
+This script closes those legacy containers by recording a *return*, so the
+Bin Tracker only reflects real, app-tracked drops going forward.
 
 How it closes them (and why history is preserved)
 --------------------------------------------------
@@ -22,34 +21,57 @@ a completed **Pull** stop at that same address, dated now, carrying the note
 
   * the original delivery rows stay exactly as they were (full history),
   * the replay now sees a Pull after each delivery, so the address drops off
-    the on-site list -> Bin Tracker shows zero out,
+    the on-site list,
   * a *new* delivery completed later still re-appears (it's replayed after
     this close-out), so real app-tracked drops going forward are unaffected.
 
 Each company's close-out pulls are grouped under one clearly-labelled route
 ("Legacy container close-out (unverified)") so the audit trail is obvious.
 
+Only closing OLD drops (--before)
+---------------------------------
+Live drops from a route dispatched today must stay open and on the map. Pass
+--before YYYY-MM-DD to close only containers whose drop date is strictly
+before that date; anything dropped on or after the cutoff is left open and
+listed as "keep open" in the preview.
+
+    --before 2026-07-17   # closes drops up to 2026-07-16; today's stay out
+
+Undoing a close-out (--undo)
+----------------------------
+If a close-out was too broad (e.g. it swept up a live can), --undo deletes the
+"Legacy container close-out" route(s) and their Pull stops, which reopens
+every container they closed — a clean, self-contained reversal that touches
+nothing else. Re-run with the right --before afterward. Typical repair:
+
+    python3 scripts/close_legacy_containers.py --undo --yes
+    python3 scripts/close_legacy_containers.py --before 2026-07-17 --dry-run
+    python3 scripts/close_legacy_containers.py --before 2026-07-17 --yes
+
 Safety
 ------
   * Snapshots the database first (sqlite online-backup API, same as
     scripts/backup_db.py) before touching anything. Skip with --no-snapshot
     only if you've already taken your own snapshot.
-  * --dry-run shows exactly what would be closed and writes nothing.
+  * --dry-run shows exactly what would change and writes nothing.
   * Requires confirmation before writing (interactive "yes", or --yes for
     non-interactive shells).
-  * Idempotent: re-running finds zero containers out and does nothing.
+  * Idempotent: re-running a close finds nothing eligible and does nothing;
+    re-running an undo finds no close-out route and does nothing.
 
 Usage (Render Shell)
 --------------------
-    python3 scripts/close_legacy_containers.py --dry-run          # preview all
-    python3 scripts/close_legacy_containers.py --yes              # close all
-    python3 scripts/close_legacy_containers.py <company_id> --yes # one company
-    python3 scripts/close_legacy_containers.py --no-snapshot --yes
+    python3 scripts/close_legacy_containers.py --dry-run              # preview all
+    python3 scripts/close_legacy_containers.py --before 2026-07-17 --dry-run
+    python3 scripts/close_legacy_containers.py --before 2026-07-17 --yes
+    python3 scripts/close_legacy_containers.py --undo --yes           # reopen close-out
+    python3 scripts/close_legacy_containers.py <company_id> --before 2026-07-17 --yes
 
 DATABASE_PATH (and SECRET_KEY) must be set in the environment, same as the
 web service — importing app relies on them.
 """
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -61,11 +83,43 @@ CLOSE_NOTE = "closed as unverified legacy data"
 CLOSEOUT_ROUTE_NAME = "Legacy container close-out (unverified)"
 
 
+def parse_args(argv):
+    """Manual arg parse so a --before value isn't mistaken for a company id."""
+    opts = {
+        "dry_run": False, "no_snapshot": False, "yes": False,
+        "undo": False, "before": None, "company_id": None,
+    }
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--dry-run", "-n"):
+            opts["dry_run"] = True
+        elif a == "--no-snapshot":
+            opts["no_snapshot"] = True
+        elif a in ("--yes", "-y"):
+            opts["yes"] = True
+        elif a == "--undo":
+            opts["undo"] = True
+        elif a == "--before":
+            i += 1
+            opts["before"] = argv[i] if i < len(argv) else None
+        elif a.startswith("--before="):
+            opts["before"] = a.split("=", 1)[1]
+        elif not a.startswith("-"):
+            opts["company_id"] = int(a)
+        i += 1
+    return opts
+
+
+def drop_date(container):
+    """Date portion (YYYY-MM-DD) of a container's drop timestamp, or ''."""
+    return (container["since"] or "")[:10]
+
+
 def snapshot_db():
     """Take a consistent online-backup snapshot before mutating anything."""
     backup_dir = os.path.join(os.path.dirname(os.path.abspath(DATABASE)) or ".", "backups")
-    dest = backup(DATABASE, backup_dir)
-    return dest
+    return backup(DATABASE, backup_dir)
 
 
 def pick_created_by(conn, company_id):
@@ -88,27 +142,32 @@ def pick_created_by(conn, company_id):
     return row["id"] if row else None
 
 
-def close_company(conn, company_id, dry_run):
-    """Close every currently-out container for one company.
+def close_company(conn, company_id, dry_run, before=None):
+    """Close currently-out containers for one company (drop < `before` if set).
 
-    Returns the number of containers closed (or that would be closed on a
-    dry run).
+    Returns the number of containers closed (or that would be closed on a dry
+    run).
     """
     out = compute_containers_out(conn, company_id)
     if not out:
         print(f"Company {company_id}: 0 containers out — nothing to close.")
         return 0
 
-    print(f"Company {company_id}: {len(out)} container(s) out.")
-    for c in out:
-        addr = c["address"] or ""
-        city = f', {c["city"]}' if c["city"] else ""
-        size = f' [{c["size"]}]' if c["size"] else ""
-        cust = f' — {c["customer_name"]}' if c["customer_name"] else ""
-        print(f"    close: {addr}{city}{size}{cust}")
+    if before:
+        eligible = [c for c in out if drop_date(c) < before]
+        keep_open = [c for c in out if drop_date(c) >= before]
+    else:
+        eligible, keep_open = out, []
 
-    if dry_run:
-        return len(out)
+    print(f"Company {company_id}: {len(out)} out — "
+          f"{len(eligible)} to close, {len(keep_open)} kept open.")
+    for c in eligible:
+        print(f"    close: {_desc(c)}  (dropped {drop_date(c) or '?'})")
+    for c in keep_open:
+        print(f"    keep open (on/after {before}): {_desc(c)}  (dropped {drop_date(c) or '?'})")
+
+    if dry_run or not eligible:
+        return len(eligible)
 
     created_by = pick_created_by(conn, company_id)
     if created_by is None:
@@ -125,7 +184,7 @@ def close_company(conn, company_id, dry_run):
     )
     route_id = cur.lastrowid
 
-    for i, c in enumerate(out, start=1):
+    for i, c in enumerate(eligible, start=1):
         cur.execute(
             """INSERT INTO stops (route_id, stop_order, customer_name, address, city,
                                   state, action, container_size, notes, status,
@@ -137,12 +196,52 @@ def close_company(conn, company_id, dry_run):
             ),
         )
     conn.commit()
-    print(f"    closed {len(out)} container(s) under route #{route_id}.")
-    return len(out)
+    print(f"    closed {len(eligible)} container(s) under route #{route_id}.")
+    return len(eligible)
 
 
-def confirm(prompt):
-    if "--yes" in sys.argv or "-y" in sys.argv:
+def undo_company(conn, company_id, dry_run):
+    """Delete this company's legacy close-out route(s), reopening their cans.
+
+    Returns the number of close-out Pull stops removed (= containers reopened).
+    """
+    routes = conn.execute(
+        "SELECT id FROM routes WHERE company_id=? AND route_name=?",
+        (company_id, CLOSEOUT_ROUTE_NAME),
+    ).fetchall()
+    route_ids = [r["id"] for r in routes]
+    if not route_ids:
+        print(f"Company {company_id}: no close-out route found — nothing to undo.")
+        return 0
+
+    placeholders = ",".join("?" for _ in route_ids)
+    n = conn.execute(
+        f"SELECT COUNT(*) c FROM stops WHERE route_id IN ({placeholders})",
+        route_ids,
+    ).fetchone()["c"]
+    print(f"Company {company_id}: reopening {n} container(s) from route(s) "
+          f"{', '.join('#' + str(r) for r in route_ids)}.")
+
+    if dry_run:
+        return n
+
+    conn.execute(f"DELETE FROM stops WHERE route_id IN ({placeholders})", route_ids)
+    conn.execute(f"DELETE FROM routes WHERE id IN ({placeholders})", route_ids)
+    conn.commit()
+    print(f"    reopened {n} container(s).")
+    return n
+
+
+def _desc(c):
+    addr = c["address"] or ""
+    city = f', {c["city"]}' if c["city"] else ""
+    size = f' [{c["size"]}]' if c["size"] else ""
+    cust = f' — {c["customer_name"]}' if c["customer_name"] else ""
+    return f"{addr}{city}{size}{cust}"
+
+
+def confirm(opts, prompt):
+    if opts["yes"]:
         return True
     if not sys.stdin.isatty():
         print("Refusing to write without confirmation. Re-run with --yes.")
@@ -151,14 +250,15 @@ def confirm(prompt):
 
 
 def main():
-    dry_run = "--dry-run" in sys.argv or "-n" in sys.argv
-    no_snapshot = "--no-snapshot" in sys.argv
+    opts = parse_args(sys.argv[1:])
 
-    positional = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if opts["before"] is not None and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", opts["before"]):
+        print(f"--before must be a date like 2026-07-17 (got {opts['before']!r}).")
+        return
 
     conn = get_db()
-    if positional:
-        company_ids = [int(positional[0])]
+    if opts["company_id"] is not None:
+        company_ids = [opts["company_id"]]
     else:
         company_ids = [r["id"] for r in conn.execute("SELECT id FROM companies ORDER BY id").fetchall()]
 
@@ -167,56 +267,62 @@ def main():
         conn.close()
         return
 
-    # Preview first (this also tells us whether there's anything to do).
-    print("=== Preview: containers currently out ===")
+    def run(company_id, dry_run):
+        if opts["undo"]:
+            return undo_company(conn, company_id, dry_run)
+        return close_company(conn, company_id, dry_run, before=opts["before"])
+
+    verb = "reopen" if opts["undo"] else "close"
+    past = "reopened" if opts["undo"] else "closed"
+    if opts["before"] and not opts["undo"]:
+        print(f"=== Preview: containers to close (dropped before {opts['before']}) ===")
+    elif opts["undo"]:
+        print("=== Preview: close-out to undo (reopen) ===")
+    else:
+        print("=== Preview: containers currently out ===")
+
     total = 0
     for company_id in company_ids:
-        total += close_company(conn, company_id, dry_run=True)
+        total += run(company_id, dry_run=True)
 
     if total == 0:
-        print("\nNothing to close. Bin Tracker already shows zero containers out.")
+        print(f"\nNothing to {verb}. No changes needed.")
         conn.close()
         return
 
-    if dry_run:
-        print(f"\nDry run: {total} container(s) would be closed. No changes written.")
+    if opts["dry_run"]:
+        print(f"\nDry run: {total} container(s) would be {past}. No changes written.")
         conn.close()
         return
 
-    if not confirm(f"\nClose {total} container(s) as '{CLOSE_NOTE}'? [y/N] "):
+    noun = "reopen" if opts["undo"] else f"close as '{CLOSE_NOTE}'"
+    if not confirm(opts, f"\n{verb.capitalize()} {total} container(s) ({noun})? [y/N] "):
         print("Aborted. No changes written.")
         conn.close()
         return
 
     conn.close()  # release the read connection before snapshot/writes
 
-    if not no_snapshot:
+    if not opts["no_snapshot"]:
         print("\n=== Snapshotting database ===")
         snapshot_db()
     else:
         print("\nSkipping snapshot (--no-snapshot).")
 
-    print("\n=== Closing containers ===")
+    print(f"\n=== {'Reopening' if opts['undo'] else 'Closing'} containers ===")
     conn = get_db()
-    closed = 0
+    changed = 0
     for company_id in company_ids:
-        closed += close_company(conn, company_id, dry_run=False)
+        changed += run(company_id, dry_run=False)
 
-    # Verify the Bin Tracker view is now empty for the affected companies.
+    # Report the resulting Bin Tracker state for the affected companies.
     print("\n=== Verifying ===")
-    remaining = 0
     for company_id in company_ids:
         n = len(compute_containers_out(conn, company_id))
-        remaining += n
-        if n:
-            print(f"    Company {company_id}: {n} still out (unexpected).")
+        print(f"    Company {company_id}: {n} container(s) now out.")
     conn.close()
 
-    print(f"\nDone. Closed {closed} container(s).")
-    if remaining == 0:
-        print("Bin Tracker now shows zero containers out for the processed companies.")
-    else:
-        print(f"WARNING: {remaining} container(s) still show as out — investigate before re-running.")
+    print(f"\nDone. {'Reopened' if opts['undo'] else 'Closed'} {changed} container(s).")
 
 
 if __name__ == "__main__":
