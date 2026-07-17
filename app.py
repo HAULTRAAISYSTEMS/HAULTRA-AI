@@ -2600,7 +2600,10 @@ _CITY_CODES = {
     "nn":          ("Newport News",   "VA"),
     "york":        ("Yorktown",       "VA"),
     "isle":        ("Isle of Wight",  "VA"),
-    # Full city names (used in free-form text like RELOCATE lines)
+    # Full city names (used in free-form text like RELOCATE lines, and now
+    # also recognized by the roll-off shorthand gate below — see
+    # _ROLLOFF_CITY_RE, built from this dict so a boss can type either the
+    # short code or the full name and still get the precise parser)
     "norfolk":       ("Norfolk",        "VA"),
     "chesapeake":    ("Chesapeake",     "VA"),
     "portsmouth":    ("Portsmouth",     "VA"),
@@ -2612,6 +2615,8 @@ _CITY_CODES = {
     "gloucester":    ("Gloucester",     "VA"),
     "camden":        ("Camden",         "NC"),
     "currituck":     ("Currituck",      "NC"),
+    "newport":       ("Newport News",   "VA"),
+    "newport news":  ("Newport News",   "VA"),
 }
 
 # Dump site short names → canonical display names
@@ -2640,9 +2645,16 @@ _DUMP_SITES = {
 # before the house number and body = merged[m.end():] keeps the full address.
 _ROLLOFF_LINE_RE = re.compile(r"^(PR|PULL|DEL|DELIVERY|SWAP|MOVE|RELOCATE|RELOC|D|P|R)\s+(?=\d)", re.IGNORECASE)
 
-# Matches the city-shorthand pattern that confirms roll-off format
+# Matches the city-shorthand pattern that confirms roll-off format. Built
+# from _CITY_CODES itself (short codes AND full names) so a line using
+# either "vb" or "Virginia Beach" is recognized the same way, and so this
+# never drifts out of sync with _CITY_CODES again — longest keys first so
+# "newport news" matches before the shorter "newport" substring.
+_ROLLOFF_CITY_ALTERNATION = "|".join(
+    re.escape(_k) for _k in sorted(_CITY_CODES.keys(), key=len, reverse=True)
+)
 _ROLLOFF_CITY_RE = re.compile(
-    r",\s*(orf|norf|vb|nb|suff|ches|port|ports|prt|smith|hamp|nn|york|isle)\s*,",
+    r",\s*(" + _ROLLOFF_CITY_ALTERNATION + r")\s*,",
     re.IGNORECASE
 )
 
