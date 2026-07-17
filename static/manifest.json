@@ -2,10 +2,10 @@
   "name": "HAULTRA Dispatch",
   "short_name": "HAULTRA",
   "description": "Roll-off trucking dispatch system",
-  "start_url": "/static/route.html",
+  "start_url": "/",
   "display": "standalone",
-  "background_color": "#0a0a0f",
-  "theme_color": "#00d4ff",
+  "background_color": "#121212",
+  "theme_color": "#FF6B1A",
   "orientation": "portrait",
   "icons": [
     { "src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png" },
