@@ -1884,6 +1884,8 @@ def init_db():
     # Nullable; no existing stop behavior depends on these.
     safe_add_column(conn, "stops", "request_id INTEGER")
     safe_add_column(conn, "stops", "customer_id INTEGER")
+    # Customer Request System (Phase 3): boss's reason when denying a request.
+    safe_add_column(conn, "requests", "deny_reason TEXT")
 
     # --- Per-route boss <-> driver messages: minimal thread, one row per
     #     message. "Unread" is derived per-viewer as "not sent by me and
@@ -3828,6 +3830,29 @@ def nav_link(href, label, current_path):
     return f'<a class="nav-item {active}" href="{href}">{label}</a>'
 
 
+# Boss-only: keep the nav "Requests" badge live without a full reload. Plain
+# (non-f) string so its JS braces don't collide with the sidebar f-string.
+_REQ_BADGE_POLLER_JS = """
+<script>
+(function(){
+  var badge = document.getElementById('req-nav-badge');
+  if (!badge) return;
+  function refresh(){
+    fetch('/api/requests?status=pending', {headers:{'X-Requested-With':'XMLHttpRequest'}})
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(list){
+        if (!Array.isArray(list)) return;
+        if (list.length > 0){ badge.textContent = list.length; badge.hidden = false; }
+        else { badge.hidden = true; }
+      })
+      .catch(function(){ /* offline/transient — retry next cycle */ });
+  }
+  setInterval(refresh, 45000);
+})();
+</script>
+"""
+
+
 def shell_page(title, body, extra_head=""):
     user = get_current_user()
     path = request.path
@@ -3838,9 +3863,26 @@ def shell_page(title, body, extra_head=""):
 
         # ── Primary top-nav items (role-aware) ──────────────────────────
         if user["role"] == "boss":
+            _rc = get_db()
+            _pending_reqs = _rc.execute(
+                """SELECT COUNT(*) AS n FROM requests r
+                     JOIN customers c ON r.customer_id = c.id
+                    WHERE c.company_id = ? AND r.status = 'pending'""",
+                (session.get("company_id"),),
+            ).fetchone()["n"]
+            _rc.close()
+            _req_badge = (
+                '<span id="req-nav-badge" '
+                'style="display:inline-block;min-width:16px;padding:1px 6px;margin-left:6px;'
+                'border-radius:999px;background:var(--cyan);color:#121212;font-size:10px;'
+                'font-weight:800;line-height:16px;text-align:center;vertical-align:middle;"'
+                + ("" if _pending_reqs else " hidden") + ">"
+                + (str(_pending_reqs) if _pending_reqs else "") + "</span>"
+            )
             primary_items = (
                 nav_link('/parser', '✦ Parser', path)
                 + nav_link(url_for("routes_page"), 'Route Board', path)
+                + nav_link(url_for("requests_page"), '✉ Requests' + _req_badge, path)
                 + nav_link(url_for("bin_tracker"), 'Bin Tracker', path)
                 + nav_link(url_for("dashboard"), 'Owner', path)
             )
@@ -3906,6 +3948,10 @@ def shell_page(title, body, extra_head=""):
             </div>
         </nav>
         """
+        # Live pending-requests badge poll (every 45s), boss only. Mirrors the
+        # existing message-badge poll pattern; no-op if the badge isn't present.
+        if user["role"] == "boss":
+            sidebar += _REQ_BADGE_POLLER_JS
 
     from flask import get_flashed_messages
     flashes = get_flashed_messages(with_categories=True)
@@ -11105,6 +11151,9 @@ def toggle_stop_complete(stop_id):
           stop_id))
     if new_status == "completed":
         update_container_flow(conn, stop_id)
+    # Customer Request System: mirror completion/reopen onto a linked request
+    # (no-op for normal stops with no request_id).
+    cascade_request_from_stop(conn, stop_id)
     conn.commit()
 
     if new_status == "completed":
@@ -11231,6 +11280,9 @@ def stop_driver_action(stop_id):
         flash(f"Stop was already updated by another action. Current status: '{current_status}'.", "error")
         return redirect(url_for("driver_route_detail", route_id=stop["rid"]))
 
+    # Customer Request System: a driver starting/advancing the stop moves a
+    # linked request to 'in_progress' (no-op for normal stops).
+    cascade_request_from_stop(conn, stop_id)
     conn.commit()
     route_id = stop["rid"]
     conn.close()
@@ -11343,6 +11395,9 @@ def dump_ticket(stop_id):
                 )
                 update_container_flow(conn, stop_id)
 
+        # Customer Request System: keep a linked request in sync if this dump
+        # step just completed the stop (no-op for normal stops).
+        cascade_request_from_stop(conn, stop_id)
         conn.commit()
         conn.close()
         flash("Dump ticket saved.", "success")
@@ -15551,6 +15606,365 @@ def boss_list_requests():
     ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+# =========================================================
+# CUSTOMER REQUEST SYSTEM — boss approval flow (Phase 3)
+#
+# Approving a request creates a real stop via the same route/stop shape the
+# AI dispatcher uses (api_dispatch), so it renders on the Route Board and the
+# driver side like any other stop. The request is then linked to that stop
+# and its status tracks the stop's lifecycle (scheduled -> in_progress ->
+# done) via cascade_request_from_stop, wired into the existing completion and
+# driver-action handlers. Denying just closes the request out.
+# =========================================================
+
+# Request type -> AI-parser action code -> canonical action label. NEW_BIN is
+# a fresh drop, so it maps to a Delivery like a plain D.
+_REQUEST_TO_PARSER_CODE = {"PR": "PR", "P": "P", "D": "D", "NEW_BIN": "D"}
+
+
+def cascade_request_from_stop(conn, stop_id):
+    """Keep a linked customer request's status in sync with its stop, derived
+    from the stop's authoritative state. No-op for stops with no request_id
+    (i.e. every normal parsed/boss stop), so existing driver/boss completion
+    behavior is unchanged. Idempotent — safe to call after any stop mutation.
+
+        stop completed              -> request 'done'
+        stop started (driver_status past 'pending') -> request 'in_progress'
+        otherwise (open, not started, e.g. reopened) -> request 'scheduled'
+    """
+    row = conn.execute(
+        "SELECT request_id, status, driver_status FROM stops WHERE id=?", (stop_id,)
+    ).fetchone()
+    if not row or not row["request_id"]:
+        return
+    if row["status"] == "completed":
+        new_status = "done"
+    elif (row["driver_status"] or "pending") != "pending":
+        new_status = "in_progress"
+    else:
+        new_status = "scheduled"
+    conn.execute(
+        "UPDATE requests SET status=?, updated_at=? WHERE id=? AND status != ?",
+        (new_status, now_ts(), row["request_id"], new_status),
+    )
+
+
+@app.route("/api/requests/<int:req_id>/approve", methods=["PATCH"])
+@boss_required
+def approve_request(req_id):
+    """Approve a pending request: create the stop and link it, atomically."""
+    data = request.get_json(silent=True) or {}
+    conn = get_db()
+
+    def fail(code, msg):
+        conn.close()
+        return jsonify({"error": msg}), code
+
+    req = conn.execute(
+        """SELECT r.*, c.business_name, c.contact_name,
+                  s.address AS site_address, b.size AS bin_size
+             FROM requests r
+             JOIN customers c ON r.customer_id = c.id
+             JOIN sites     s ON r.site_id     = s.id
+        LEFT JOIN bins      b ON r.bin_id      = b.id
+            WHERE r.id = ? AND c.company_id = ?""",
+        (req_id, cid()),
+    ).fetchone()
+    if req is None:
+        return fail(404, "not found")
+    if req["status"] != "pending":
+        return fail(409, "request is not pending")
+
+    # --- driver: required, must exist and be a driver in this company ---
+    driver_id_raw = data.get("driver_id")
+    if not (isinstance(driver_id_raw, int) or (isinstance(driver_id_raw, str) and driver_id_raw.isdigit())):
+        return fail(400, "driver_id is required")
+    driver_id = int(driver_id_raw)
+    driver = conn.execute(
+        "SELECT id, username FROM users WHERE id=? AND company_id=? AND role='driver'",
+        (driver_id, cid()),
+    ).fetchone()
+    if not driver:
+        return fail(400, "selected driver not found")
+
+    # --- scheduled_date: boss's choice wins; default from preferred_date
+    #     ("asap" -> today). Must be a valid ISO date, today or later. ---
+    scheduled_date = (data.get("scheduled_date") or "").strip()
+    if not scheduled_date:
+        scheduled_date = today_str() if req["preferred_date"] == "asap" else req["preferred_date"]
+    try:
+        sd = datetime.strptime(scheduled_date, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return fail(400, "scheduled_date must be an ISO date (YYYY-MM-DD)")
+    if sd < datetime.strptime(today_str(), "%Y-%m-%d").date():
+        return fail(400, "scheduled_date cannot be in the past")
+
+    # --- optional overrides (address / size / notes) ---
+    address = (str(data.get("address") or "").strip()) or (req["site_address"] or "")
+    if not address:
+        return fail(400, "no address on the site — provide an address override")
+    size = (str(data.get("size") or "").strip()) or (req["size_requested"] or req["bin_size"] or "")
+    if "notes" in data and data.get("notes") is not None:
+        notes = str(data.get("notes")).strip()[:500]
+    else:
+        notes = req["notes"] or ""
+
+    action_label  = _PARSER_ACTION_MAP[_REQUEST_TO_PARSER_CODE[req["type"]]]
+    customer_name = req["business_name"] or req["contact_name"] or ""
+
+    # --- create stop (find-or-create the driver's route for that date), link
+    #     the request, all in one transaction ---
+    try:
+        cur = conn.cursor()
+        route = conn.execute(
+            """SELECT id FROM routes
+                WHERE company_id=? AND assigned_to=? AND route_date=?
+                  AND status IN ('open','in_progress')
+                ORDER BY id LIMIT 1""",
+            (cid(), driver_id, scheduled_date),
+        ).fetchone()
+        if route:
+            route_id = route["id"]
+        else:
+            cur.execute(
+                """INSERT INTO routes (route_date, route_name, raw_text, assigned_to,
+                                       created_by, status, notes, company_id, created_at)
+                   VALUES (?, ?, '', ?, ?, 'open', '', ?, ?)""",
+                (scheduled_date, f"{driver['username']} — {scheduled_date}",
+                 driver_id, session["user_id"], cid(), now_ts()),
+            )
+            route_id = cur.lastrowid
+
+        next_order = conn.execute(
+            "SELECT COALESCE(MAX(stop_order), 0) + 1 AS n FROM stops WHERE route_id=?",
+            (route_id,),
+        ).fetchone()["n"]
+
+        cur.execute(
+            """INSERT INTO stops (route_id, stop_order, customer_name, address, action,
+                                  container_size, notes, status, request_id, customer_id,
+                                  created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)""",
+            (route_id, next_order, customer_name, address, action_label, size, notes,
+             req_id, req["customer_id"], now_ts()),
+        )
+        stop_id = cur.lastrowid
+
+        conn.execute(
+            "UPDATE requests SET status='scheduled', stop_id=?, updated_at=? WHERE id=?",
+            (stop_id, now_ts(), req_id),
+        )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        app.logger.warning("approve_request %s failed: %s", req_id, exc)
+        return jsonify({"error": "could not approve request"}), 500
+
+    # Best-effort, same as api_dispatch — a can-flow hiccup must not undo the
+    # approval that already committed above.
+    try:
+        compute_can_flow(conn, route_id)
+        conn.commit()
+    except Exception as exc:
+        app.logger.warning("approve_request: compute_can_flow error: %s", exc)
+    conn.close()
+
+    return jsonify({
+        "success":    True,
+        "request_id": req_id,
+        "stop_id":    stop_id,
+        "route_id":   route_id,
+        "status":     "scheduled",
+    })
+
+
+@app.route("/api/requests/<int:req_id>/deny", methods=["PATCH"])
+@boss_required
+def deny_request(req_id):
+    """Deny a pending request; optionally store a reason (<=300 chars)."""
+    data = request.get_json(silent=True) or {}
+    reason = data.get("reason")
+    if reason is not None:
+        reason = str(reason).strip()
+        if len(reason) > 300:
+            return jsonify({"error": "reason must be 300 characters or fewer"}), 400
+        reason = reason or None
+
+    conn = get_db()
+    req = conn.execute(
+        """SELECT r.id, r.status FROM requests r
+             JOIN customers c ON r.customer_id = c.id
+            WHERE r.id = ? AND c.company_id = ?""",
+        (req_id, cid()),
+    ).fetchone()
+    if req is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if req["status"] != "pending":
+        conn.close()
+        return jsonify({"error": "request is not pending"}), 409
+
+    conn.execute(
+        "UPDATE requests SET status='denied', deny_reason=?, updated_at=? WHERE id=?",
+        (reason, now_ts(), req_id),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "request_id": req_id, "status": "denied"})
+
+
+# Requests page client script. Plain (non-f) string — its JS braces must not
+# collide with the page's f-string. Approve/Deny call the PATCH endpoints and
+# remove the card on success; errors render inline per card.
+_REQUESTS_PAGE_JS = """
+<script>
+(function(){
+  var CSRF = (document.querySelector('meta[name=csrf-token]')||{}).content || '';
+  function hideForms(id){
+    var a=document.getElementById('approve-form-'+id); if(a) a.hidden=true;
+    var d=document.getElementById('deny-form-'+id); if(d) d.hidden=true;
+    var e=document.getElementById('err-'+id); if(e){ e.hidden=true; e.textContent=''; }
+  }
+  window.hideReqForms = hideForms;
+  window.showApprove=function(id){ hideForms(id); var a=document.getElementById('approve-form-'+id); if(a) a.hidden=false; };
+  window.showDeny=function(id){ hideForms(id); var d=document.getElementById('deny-form-'+id); if(d) d.hidden=false; };
+  function err(id,msg){ var e=document.getElementById('err-'+id); if(e){ e.textContent=msg; e.hidden=false; } }
+  function removeCard(id){
+    var c=document.getElementById('req-card-'+id); if(c) c.remove();
+    var list=document.getElementById('req-list');
+    if(list && !list.querySelector('.bin-card')){
+      var empty=document.getElementById('req-empty'); if(empty) empty.hidden=false;
+    }
+    var badge=document.getElementById('req-nav-badge');
+    if(badge){ var n=parseInt(badge.textContent||'0',10)-1;
+      if(n>0){ badge.textContent=n; } else { badge.hidden=true; badge.textContent=''; } }
+  }
+  function patch(url, body, id){
+    fetch(url, {method:'PATCH', headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
+                body:JSON.stringify(body)})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
+      .then(function(res){ if(res.ok){ removeCard(id); }
+                           else { err(id, (res.j && res.j.error) || 'Something went wrong.'); } })
+      .catch(function(){ err(id, 'Network error — try again.'); });
+  }
+  window.submitApprove=function(id){
+    var drv=document.getElementById('drv-'+id).value;
+    var date=document.getElementById('date-'+id).value;
+    if(!drv){ err(id,'Pick a driver.'); return; }
+    patch('/api/requests/'+id+'/approve', {driver_id: parseInt(drv,10), scheduled_date: date}, id);
+  };
+  window.submitDeny=function(id){
+    var reason=(document.getElementById('reason-'+id)||{value:''}).value || '';
+    patch('/api/requests/'+id+'/deny', {reason: reason}, id);
+  };
+})();
+</script>
+"""
+
+
+@app.route("/requests")
+@boss_required
+def requests_page():
+    """Boss UI: pending customer requests as approve/deny cards."""
+    conn = get_db()
+    reqs = conn.execute(
+        """SELECT r.*,
+                  c.business_name AS customer_business_name,
+                  c.contact_name  AS customer_contact_name,
+                  s.address       AS site_address,
+                  b.size          AS bin_size
+             FROM requests r
+             JOIN customers c ON r.customer_id = c.id
+             JOIN sites     s ON r.site_id     = s.id
+        LEFT JOIN bins      b ON r.bin_id      = b.id
+            WHERE c.company_id = ? AND r.status = 'pending'
+            ORDER BY r.created_at DESC, r.id DESC""",
+        (cid(),),
+    ).fetchall()
+    drivers = conn.execute(
+        "SELECT id, username FROM users WHERE role='driver' AND company_id=? ORDER BY username",
+        (cid(),),
+    ).fetchall()
+    conn.close()
+
+    driver_options = '<option value="">Select driver…</option>' + "".join(
+        f'<option value="{d["id"]}">{e(d["username"])}</option>' for d in drivers
+    )
+
+    _TYPE_LABEL = {"PR": "PR · Pull & Return", "P": "P · Pickup",
+                   "D": "D · Drop", "NEW_BIN": "NEW BIN"}
+
+    cards = ""
+    for r in reqs:
+        rid  = r["id"]
+        name = e(r["customer_business_name"] or r["customer_contact_name"] or "Customer")
+        addr = e(r["site_address"] or "—")
+        size = r["bin_size"] if r["type"] in ("PR", "P") else r["size_requested"]
+        size_html = f'<div style="color:var(--slate);font-size:13px;margin-top:2px;">{e(size)}</div>' if size else ""
+        pref = r["preferred_date"]
+        pref_label = "ASAP" if pref == "asap" else e(pref)
+        default_date = today_str() if pref == "asap" else e(pref)
+        notes_html = (
+            f'<div style="margin-top:8px;padding:8px 10px;background:rgba(255,255,255,0.03);'
+            f'border-radius:8px;font-size:13px;color:#C9C9C2;">{e(r["notes"])}</div>'
+        ) if r["notes"] else ""
+        type_badge = (
+            f'<span style="display:inline-block;padding:3px 10px;border-radius:999px;'
+            f'font-size:10px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;'
+            f'background:var(--cyan-dim);color:var(--cyan);border:1px solid var(--border-glow);">'
+            f'{e(_TYPE_LABEL.get(r["type"], r["type"]))}</span>'
+        )
+        cards += f"""
+        <div class="bin-card" id="req-card-{rid}" style="padding:16px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
+                {type_badge}
+                <span style="color:var(--slate);font-size:12px;white-space:nowrap;">📅 {pref_label}</span>
+            </div>
+            <div style="font-weight:700;font-size:15px;margin-top:8px;">{name}</div>
+            <div style="color:var(--slate);font-size:13px;margin-top:2px;">📍 {addr}</div>
+            {size_html}
+            {notes_html}
+            <div style="display:flex;gap:8px;margin-top:12px;">
+                <button class="btn green" style="flex:1;" onclick="showApprove({rid})">Approve</button>
+                <button class="btn red" style="flex:1;" onclick="showDeny({rid})">Deny</button>
+            </div>
+            <div id="err-{rid}" hidden style="color:#FF5252;font-size:12px;margin-top:8px;"></div>
+            <div id="approve-form-{rid}" hidden style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
+                <label style="display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Driver</label>
+                <select id="drv-{rid}" style="width:100%;margin-bottom:10px;">{driver_options}</select>
+                <label style="display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Scheduled date</label>
+                <input type="date" id="date-{rid}" value="{default_date}" style="width:100%;margin-bottom:12px;">
+                <div style="display:flex;gap:8px;">
+                    <button class="btn green" style="flex:1;" onclick="submitApprove({rid})">Confirm approve</button>
+                    <button class="btn secondary" onclick="hideReqForms({rid})">Cancel</button>
+                </div>
+            </div>
+            <div id="deny-form-{rid}" hidden style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
+                <label style="display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Reason (optional)</label>
+                <textarea id="reason-{rid}" maxlength="300" rows="2" style="width:100%;margin-bottom:12px;" placeholder="Why is this being denied?"></textarea>
+                <div style="display:flex;gap:8px;">
+                    <button class="btn red" style="flex:1;" onclick="submitDeny({rid})">Confirm deny</button>
+                    <button class="btn secondary" onclick="hideReqForms({rid})">Cancel</button>
+                </div>
+            </div>
+        </div>
+        """
+
+    empty_hidden = "" if not reqs else " hidden"
+    body = f"""
+    <div class="hero">
+        <h1>Requests</h1>
+        <p>Customer requests awaiting your approval. Approving one schedules a stop on the driver's route.</p>
+    </div>
+    <div id="req-empty" class="empty-state" style="padding:32px 0;"{empty_hidden}>No pending requests.</div>
+    <div id="req-list" class="bin-list" style="display:grid;gap:12px;max-width:640px;">
+        {cards}
+    </div>
+    """ + _REQUESTS_PAGE_JS
+    return render_template_string(shell_page("Requests", body))
 
 
 # =========================================================
