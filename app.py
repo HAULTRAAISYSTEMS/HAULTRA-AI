@@ -15443,11 +15443,26 @@ def customer_dashboard(token):
         (customer["id"],),
     ).fetchall()
 
+    # Open requests, plus denied and just-completed (<=24h) ones so the
+    # customer portal can show "denied — call us" and "Completed ✓" chips.
+    # scheduled_date / driver_name come from the linked stop's route (the
+    # boss's confirmed schedule), left-joined so unlinked requests still list.
+    _now_local = datetime.now(_EASTERN) if _EASTERN else datetime.now()
+    _24h_ago = (_now_local - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
     reqs = conn.execute(
-        """SELECT * FROM requests
-            WHERE customer_id = ? AND status NOT IN ('done','denied')
-            ORDER BY created_at DESC, id DESC""",
-        (customer["id"],),
+        """SELECT r.*,
+                  ro.route_date AS scheduled_date,
+                  u.username     AS driver_name
+             FROM requests r
+        LEFT JOIN stops  st ON r.stop_id     = st.id
+        LEFT JOIN routes ro ON st.route_id   = ro.id
+        LEFT JOIN users  u  ON ro.assigned_to = u.id
+            WHERE r.customer_id = ?
+              AND ( r.status NOT IN ('done','denied')
+                    OR r.status = 'denied'
+                    OR (r.status = 'done' AND r.updated_at >= ?) )
+            ORDER BY r.created_at DESC, r.id DESC""",
+        (customer["id"], _24h_ago),
     ).fetchall()
     conn.close()
 
@@ -15575,6 +15590,342 @@ def customer_create_request(token):
     ).fetchone()
     conn.close()
     return jsonify(dict(new_row)), 201
+
+
+# =========================================================
+# CUSTOMER PORTAL — the page customers actually tap (Phase 4)
+#
+# Public, token-only, no login. Server renders the styled shell + an embedded
+# boot payload; all data/rendering is client-side against the existing
+# customer API (GET dashboard, POST requests). Returned as the shell string
+# directly (not via render_template_string) so the client JS is emitted
+# verbatim without Jinja re-parsing its braces.
+# =========================================================
+_PORTAL_INVALID_BODY = """
+    <div class="hero"><h1>Link not valid</h1></div>
+    <div class="empty-state" style="max-width:520px;margin:0 auto;padding:36px 18px;
+         font-size:17px;line-height:1.6;text-align:center;">
+        This link isn&rsquo;t valid or has expired.<br>
+        Please contact your hauler for a new one.
+    </div>
+"""
+
+_PORTAL_JS = r"""
+<style>
+  /* Portal buttons use !important to escape the app's aggressive global
+     button:not(...) rule (~7-specificity, forces an orange gradient on every
+     <button>). Self-contained; no shared CSS is modified. */
+  .portal { max-width: 560px; margin: 0 auto; }
+  .portal-greeting { margin: 4px 0 20px; }
+  .portal-greeting .co { font-family: var(--font-head, inherit); font-size: 13px;
+      letter-spacing: 2px; text-transform: uppercase; color: var(--cyan); }
+  .portal-greeting .hi { font-size: 26px; font-weight: 800; margin-top: 4px; }
+  .p-card { background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: 16px; padding: 18px 16px; margin-bottom: 16px; }
+  .p-card-head { font-size: 19px; font-weight: 800; }
+  .p-card-sub { color: var(--slate); font-size: 14px; margin-top: 2px; }
+  .portal .p-btn { display: block; width: 100%; min-height: 62px; margin-top: 12px;
+      border: none !important; border-radius: 14px !important; padding: 13px 16px !important;
+      cursor: pointer; text-align: left; font-family: inherit; color: #121212 !important;
+      box-shadow: none !important; }
+  .portal .p-btn .l { display: block; font-size: 17px; font-weight: 800; letter-spacing: .3px; }
+  .portal .p-btn .s { display: block; font-size: 13px; font-weight: 600; opacity: .85; margin-top: 3px; }
+  .portal .p-btn.pr { background: #FF6B1A !important; }
+  .portal .p-btn.p  { background: #FFB27A !important; }
+  .portal .p-btn.d  { background: #3DDC84 !important; }
+  .portal .p-btn:active { transform: translateY(1px); }
+  .portal .p-btn[disabled] { opacity: .45 !important; cursor: default; }
+  .chip { display: block; border-radius: 12px; padding: 10px 12px; margin-top: 10px;
+      font-size: 14px; font-weight: 700; line-height: 1.35; }
+  .chip.orange { background: rgba(255,107,26,0.15); color: #FF8A3D; border: 1px solid rgba(255,107,26,0.4); }
+  .chip.green  { background: rgba(61,220,132,0.14); color: #3DDC84; border: 1px solid rgba(61,220,132,0.4); }
+  .chip.blue   { background: rgba(0,229,204,0.12);  color: #00E5CC; border: 1px solid rgba(0,229,204,0.4); }
+  .chip.red    { background: rgba(255,82,82,0.14);  color: #FF7A7A; border: 1px solid rgba(255,82,82,0.45); }
+  .chip.gray   { background: rgba(140,160,179,0.16); color: #ADC0D1; border: 1px solid rgba(140,160,179,0.4); }
+  .size-grid { display: grid; gap: 12px; margin-top: 6px; }
+  .portal .size-card { display: flex; align-items: center; justify-content: flex-start; gap: 14px;
+      width: 100%; min-height: 66px; border: 1px solid var(--border-glow) !important;
+      background: var(--bg-card) !important; color: #F5F5F0 !important; border-radius: 14px !important;
+      padding: 12px 16px !important; cursor: pointer; text-align: left; font-family: inherit;
+      box-shadow: none !important; }
+  .portal .size-card:active { transform: translateY(1px); }
+  .portal .size-card .sz { font-size: 20px; font-weight: 800; color: var(--cyan) !important; min-width: 64px; }
+  .portal .size-card .cue { font-size: 14px; color: #D8D8D0; }
+  .p-restate { font-size: 20px; font-weight: 800; line-height: 1.35; margin: 6px 0 18px; }
+  .when-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .portal .when-btn { min-height: 56px; border-radius: 14px !important;
+      border: 1px solid var(--border-glow) !important; background: var(--bg-card) !important;
+      color: #F5F5F0 !important; font-size: 16px; font-weight: 700; cursor: pointer;
+      font-family: inherit; box-shadow: none !important; }
+  .portal .when-btn.sel { background: var(--cyan) !important; color: #121212 !important;
+      border-color: var(--cyan) !important; }
+  .p-input, .p-textarea { width: 100%; margin-top: 12px; padding: 14px; font-size: 16px;
+      border-radius: 12px; border: 1px solid var(--border); background: rgba(255,255,255,0.04);
+      color: #F5F5F0; font-family: inherit; }
+  .p-textarea { min-height: 90px; resize: vertical; }
+  .portal .p-send { width: 100%; min-height: 60px; margin-top: 18px; border: none !important;
+      border-radius: 14px !important; background: var(--cyan) !important; color: #121212 !important;
+      font-size: 18px; font-weight: 800; cursor: pointer; font-family: inherit; box-shadow: none !important; }
+  .portal .p-send[disabled] { opacity: .5 !important; cursor: default; }
+  .portal .p-back { display: block; width: 100%; margin-top: 10px; background: transparent !important;
+      border: none !important; box-shadow: none !important; color: var(--slate) !important;
+      font-size: 15px; font-weight: 700; padding: 14px; cursor: pointer; font-family: inherit; }
+  .p-err { background: rgba(255,82,82,0.14); color: #FF7A7A; border: 1px solid rgba(255,82,82,0.45);
+      border-radius: 12px; padding: 12px 14px; margin-top: 14px; font-size: 15px; font-weight: 600; }
+  .p-ok { background: rgba(61,220,132,0.14); color: #3DDC84; border: 1px solid rgba(61,220,132,0.4);
+      border-radius: 12px; padding: 14px; margin-bottom: 16px; font-size: 16px; font-weight: 700; text-align: center; }
+</style>
+<script>
+(function(){
+  var BOOT  = JSON.parse(document.getElementById('portal-boot').textContent);
+  var TOKEN = BOOT.token, TODAY = BOOT.today, SIZES = BOOT.sizes;
+  var CUES = {'10yd':'Fits a garage cleanout','15yd':'Kitchen remodel','20yd':'Roof tear-off','30yd':'Full house cleanout','40yd':'Construction / commercial'};
+  var root  = document.getElementById('portal-root');
+  var st = { view:'home', data:null, action:null, when:'asap', date:'', note:'', sending:false, error:'', ok:'' };
+  var OPEN = ['pending','approved','scheduled','in_progress'];
+
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+      return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+
+  function api(path, opts){ return fetch(path, opts); }
+
+  function load(cb){
+    api('/api/c/'+encodeURIComponent(TOKEN)+'/dashboard', {headers:{'X-Requested-With':'XMLHttpRequest'}})
+      .then(function(r){ if(!r.ok) throw new Error('bad'); return r.json(); })
+      .then(function(d){ st.data=d; if(cb) cb(); if(st.view==='home') render(); })
+      .catch(function(){ if(!st.data) root.innerHTML = '<div class="p-err">Couldn&rsquo;t load your info &mdash; check your signal and refresh.</div>'; });
+  }
+
+  function openReq(type, binId, siteId){
+    if(!st.data) return null;
+    for(var i=0;i<st.data.requests.length;i++){ var r=st.data.requests[i];
+      if(OPEN.indexOf(r.status)<0 || r.type!==type) continue;
+      if((type==='PR'||type==='P') && r.bin_id===binId) return r;
+      if(type==='D' && r.site_id===siteId) return r;
+    }
+    return null;
+  }
+  function infoReqs(binId, siteId){
+    if(!st.data) return [];
+    return st.data.requests.filter(function(r){
+      if(r.status!=='denied' && r.status!=='done') return false;
+      return r.bin_id ? (r.bin_id===binId) : (r.site_id===siteId);
+    });
+  }
+  function chip(r){
+    var cls='gray', txt=esc(r.status);
+    if(r.status==='pending'){ cls='orange'; txt='Request received &mdash; waiting on confirmation'; }
+    else if(r.status==='scheduled'){ cls='green'; txt='Scheduled &#10003;'+(r.scheduled_date?(' for '+esc(r.scheduled_date)):'')+(r.driver_name?' &middot; driver assigned':''); }
+    else if(r.status==='in_progress'){ cls='blue'; txt='Driver is on it today'; }
+    else if(r.status==='done'){ cls='green'; txt='Completed &#10003;'; }
+    else if(r.status==='denied'){ cls='red'; txt='We couldn&rsquo;t do this one &mdash; call us'+(r.deny_reason?(': '+esc(r.deny_reason)):''); }
+    var typ = r.type==='PR'?'Empty &amp; return':(r.type==='P'?'Pick up':'New bin');
+    return '<div class="chip '+cls+'"><span style="opacity:.75;font-weight:800;">'+typ+':</span> '+txt+'</div>';
+  }
+
+  function actionBtn(cls, type, label, sub, binId, siteId, onclickIdx){
+    var r = openReq(type, binId, siteId);
+    if(r) return chip(r);
+    return '<button class="p-btn '+cls+'" data-act="'+onclickIdx+'"><span class="l">'+label+'</span><span class="s">'+sub+'</span></button>';
+  }
+
+  function render(){
+    if(st.view==='home')    return renderHome();
+    if(st.view==='size')    return renderSize();
+    if(st.view==='confirm') return renderConfirm();
+  }
+
+  var acts = []; // click handlers stashed by index for delegation
+
+  function renderHome(){
+    acts = [];
+    var d = st.data || {bins:[], sites:[], requests:[]};
+    var hi = BOOT.contact_name ? ('Hi, '+esc(BOOT.contact_name)) : 'Hi there';
+    var html = '<div class="portal-greeting"><div class="co">'+esc(BOOT.company_name)+'</div><div class="hi">'+hi+'</div></div>';
+    if(st.ok){ html += '<div class="p-ok">'+esc(st.ok)+'</div>'; st.ok=''; }
+
+    if(d.bins.length){
+      d.bins.forEach(function(b){
+        html += '<div class="p-card"><div class="p-card-head">'+esc(b.size||'Dumpster')+'</div>'+
+                '<div class="p-card-sub">at '+esc(b.site_address||'your site')+'</div>';
+        infoReqs(b.id, b.site_id).forEach(function(r){ html += chip(r); });
+        var iPR = acts.push(function(){ startPR_P('PR', b); })-1;
+        html += actionBtn('pr','PR','EMPTY &amp; RETURN','We dump it and bring the same bin back', b.id, b.site_id, iPR);
+        var iP = acts.push(function(){ startPR_P('P', b); })-1;
+        html += actionBtn('p','P','PICK UP &mdash; I&rsquo;M DONE','We take the bin away for good', b.id, b.site_id, iP);
+        var iD = acts.push(function(){ startD(b.site_id, b.site_address); })-1;
+        html += actionBtn('d','D','NEED ANOTHER BIN','Bring an additional dumpster to this site', null, b.site_id, iD);
+        html += '</div>';
+      });
+    } else {
+      html += '<div class="p-card"><div class="p-card-head">No dumpsters on site</div>'+
+              '<div class="p-card-sub">Request one and your hauler will schedule a drop-off.</div>';
+      if(d.sites.length){
+        var i0 = acts.push(function(){ startNewBin(); })-1;
+        html += '<button class="p-btn d" data-act="'+i0+'"><span class="l">REQUEST A BIN</span><span class="s">Pick a size and we&rsquo;ll bring it out</span></button>';
+      } else {
+        html += '<div class="chip gray">No service address on file &mdash; contact your hauler.</div>';
+      }
+      html += '</div>';
+    }
+    root.innerHTML = html;
+    wire();
+  }
+
+  function startPR_P(type, bin){
+    st.action = { type:type, binId:bin.id, siteId:bin.site_id, size:bin.size, address:bin.site_address };
+    goConfirm();
+  }
+  function startD(siteId, address){
+    st.action = { type:'D', binId:null, siteId:siteId, size:null, address:address };
+    st.view='size'; st.error=''; render();
+  }
+  function startNewBin(){
+    var sites = st.data.sites;
+    if(sites.length===1){ startD(sites[0].id, sites[0].address); return; }
+    // multiple sites: pick one first
+    st.view='sitepick'; st.error=''; renderSitePick();
+  }
+
+  function renderSitePick(){
+    acts=[];
+    var html = '<div class="p-restate">Which site needs a bin?</div>';
+    st.data.sites.forEach(function(s){
+      var i = acts.push(function(){ startD(s.id, s.address); })-1;
+      html += '<button class="size-card" data-act="'+i+'"><span class="cue">'+esc(s.address)+'</span></button>';
+    });
+    var bi = acts.push(function(){ st.view='home'; render(); })-1;
+    html += '<button class="p-back" data-act="'+bi+'">&larr; Back</button>';
+    root.innerHTML = html; wire();
+  }
+
+  function renderSize(){
+    acts=[];
+    var html = '<div class="p-restate">What size dumpster?</div><div class="size-grid">';
+    SIZES.forEach(function(sz){
+      var i = acts.push(function(){ st.action.size=sz; goConfirm(); })-1;
+      html += '<button class="size-card" data-act="'+i+'"><span class="sz">'+esc(sz)+'</span><span class="cue">'+esc(CUES[sz]||'')+'</span></button>';
+    });
+    html += '</div>';
+    var bi = acts.push(function(){ st.view='home'; render(); })-1;
+    html += '<button class="p-back" data-act="'+bi+'">&larr; Back</button>';
+    root.innerHTML = html; wire();
+  }
+
+  function goConfirm(){ st.view='confirm'; st.when='asap'; st.date=''; st.note=''; st.error=''; st.sending=false; render(); }
+
+  function restate(a){
+    var sz = a.size ? (esc(a.size)+' ') : '';
+    if(a.type==='PR') return 'Empty the '+sz+'dumpster at '+esc(a.address)+' and bring it back';
+    if(a.type==='P')  return 'Pick up the '+sz+'dumpster at '+esc(a.address);
+    return 'Drop off a '+sz+'dumpster at '+esc(a.address);
+  }
+
+  function renderConfirm(){
+    acts=[];
+    var a = st.action;
+    var html = '<div class="p-restate">'+restate(a)+'</div>';
+    html += '<div style="font-size:13px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">When?</div>';
+    html += '<div class="when-row">'+
+            '<button class="when-btn '+(st.when==='asap'?'sel':'')+'" data-act="'+(acts.push(function(){ st.when='asap'; render(); })-1)+'">ASAP</button>'+
+            '<button class="when-btn '+(st.when==='date'?'sel':'')+'" data-act="'+(acts.push(function(){ st.when='date'; render(); })-1)+'">Pick a day</button>'+
+            '</div>';
+    if(st.when==='date'){
+      html += '<input class="p-input" type="date" id="p-date" min="'+TODAY+'" value="'+(st.date||TODAY)+'">';
+    }
+    html += '<textarea class="p-textarea" id="p-note" maxlength="500" placeholder="Gate code, bin location, anything the driver should know">'+esc(st.note)+'</textarea>';
+    if(st.error){ html += '<div class="p-err">'+st.error+'</div>'; }
+    html += '<button class="p-send" id="p-send" data-act="'+(acts.push(submit)-1)+'"'+(st.sending?' disabled':'')+'>'+(st.sending?'Sending&hellip;':'SEND REQUEST')+'</button>';
+    html += '<button class="p-back" data-act="'+(acts.push(function(){ st.view='home'; render(); })-1)+'">Cancel</button>';
+    root.innerHTML = html; wire();
+  }
+
+  function captureConfirmInputs(){
+    var dt = document.getElementById('p-date'); if(dt) st.date = dt.value;
+    var nt = document.getElementById('p-note'); if(nt) st.note = nt.value;
+  }
+
+  function submit(){
+    captureConfirmInputs();
+    if(st.sending) return;
+    var a = st.action;
+    var pref = 'asap';
+    if(st.when==='date'){
+      if(!st.date || st.date < TODAY){ st.error = 'Please pick today or a later day.'; render(); return; }
+      pref = st.date;
+    }
+    var body = { type:a.type, site_id:a.siteId, preferred_date:pref };
+    if(a.type==='PR' || a.type==='P') body.bin_id = a.binId;
+    else body.size_requested = a.size;
+    if(st.note && st.note.trim()) body.notes = st.note.trim();
+
+    st.sending=true; st.error=''; render();
+    api('/api/c/'+encodeURIComponent(TOKEN)+'/requests', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
+    }).then(function(r){
+      return r.json().then(function(j){ return {ok:r.ok, status:r.status, j:j}; });
+    }).then(function(res){
+      st.sending=false;
+      if(res.ok){ st.ok='Request sent! Your hauler will confirm shortly.'; st.view='home'; load(function(){ /* refreshed */ }); render(); return; }
+      if(res.status===409){ st.error='You&rsquo;ve already got an open request for this bin.'; render(); return; }
+      st.error = (res.j && res.j.error) ? esc(res.j.error) : 'Something went wrong. Please try again.';
+      render();
+    }).catch(function(){
+      st.sending=false;
+      st.error='Couldn&rsquo;t send &mdash; check your signal and try again.';
+      render();
+    });
+  }
+
+  function wire(){
+    // capture typed values before any re-render triggered by taps
+    root.querySelectorAll('[data-act]').forEach(function(el){
+      el.addEventListener('click', function(){
+        if(st.view==='confirm') captureConfirmInputs();
+        var fn = acts[parseInt(el.getAttribute('data-act'),10)];
+        if(typeof fn==='function') fn();
+      });
+    });
+  }
+
+  // first paint from embedded boot (fast), then live data + polling
+  renderHome();
+  load();
+  setInterval(function(){ if(st.view==='home' && !st.sending) load(); }, 35000);
+})();
+</script>
+"""
+
+
+@app.route("/c/<token>")
+def customer_portal(token):
+    """Public token-only portal page. No login. Renders the styled shell with
+    an embedded boot payload; the client renders/refreshes from the existing
+    customer API. Invalid token -> friendly page, no data leak."""
+    conn = get_db()
+    customer = _customer_by_token(conn, token)
+    if customer is None:
+        conn.close()
+        return shell_page("Link not valid", _PORTAL_INVALID_BODY), 404
+    co = conn.execute(
+        "SELECT name FROM companies WHERE id = ?", (customer["company_id"],)
+    ).fetchone()
+    conn.close()
+
+    boot = {
+        "token":         token,
+        "company_name":  (co["name"] if co and co["name"] else "HAULTRA"),
+        "contact_name":  customer["contact_name"] or "",
+        "sizes":         REQUEST_SIZES,
+        "today":         today_str(),
+    }
+    body = (
+        '<div id="portal-root" class="portal"></div>'
+        '<script id="portal-boot" type="application/json">'
+        + json.dumps(boot) + '</script>'
+        + _PORTAL_JS
+    )
+    return shell_page("Request Service", body)
 
 
 @app.route("/api/requests")
