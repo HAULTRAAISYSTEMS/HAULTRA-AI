@@ -741,8 +741,11 @@ def send_email(to_email, subject, html_body):
         return False
 
 
-# Endpoints that legitimately receive POST from external servers (no session/CSRF)
-_CSRF_EXEMPT_ENDPOINTS = {"stripe_webhook"}
+# Endpoints that legitimately receive POST from external clients (no session/CSRF).
+# customer_create_request is authenticated by the URL portal token, not a
+# session cookie, so there is no session for CSRF to protect and it must be
+# exempt (same rationale as the Stripe webhook).
+_CSRF_EXEMPT_ENDPOINTS = {"stripe_webhook", "customer_create_request"}
 
 @app.before_request
 def csrf_protect():
@@ -1876,6 +1879,11 @@ def init_db():
     safe_add_column(conn, "stops", "gps_lng REAL")
     safe_add_column(conn, "stops", "gps_accuracy REAL")
     safe_add_column(conn, "stops", "gps_captured_at TEXT")
+    # Customer Request System: link a stop back to the customer request it
+    # fulfills (set later when the boss approves a request — future phase).
+    # Nullable; no existing stop behavior depends on these.
+    safe_add_column(conn, "stops", "request_id INTEGER")
+    safe_add_column(conn, "stops", "customer_id INTEGER")
 
     # --- Per-route boss <-> driver messages: minimal thread, one row per
     #     message. "Unread" is derived per-viewer as "not sent by me and
@@ -1954,6 +1962,75 @@ def init_db():
         last_used_at     TEXT NOT NULL,
         UNIQUE(saved_address_id, action, container_size, dump_location),
         FOREIGN KEY (saved_address_id) REFERENCES saved_addresses(id)
+    )
+    """)
+
+    # =========================================================
+    # CUSTOMER REQUEST SYSTEM (Phase 1 — data layer)
+    #
+    # Customers submit REQUESTS (intent only). A request never becomes
+    # driver work until the boss approves it (approval flow is a future
+    # phase). Customers authenticate ONLY by a URL portal_token — no
+    # sessions, no passwords. company_id ties each customer to a company
+    # so the boss/admin side stays company-scoped like the rest of the app.
+    # =========================================================
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS customers (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id    INTEGER NOT NULL,
+        business_name TEXT,
+        contact_name  TEXT,
+        phone         TEXT,
+        portal_token  TEXT NOT NULL UNIQUE,
+        created_at    TEXT NOT NULL,
+        FOREIGN KEY (company_id) REFERENCES companies(id)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS sites (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        customer_id INTEGER NOT NULL,
+        address     TEXT,
+        lat         REAL,
+        lng         REAL,
+        notes       TEXT,
+        created_at  TEXT NOT NULL,
+        FOREIGN KEY (customer_id) REFERENCES customers(id)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS bins (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        customer_id INTEGER NOT NULL,
+        site_id     INTEGER NOT NULL,
+        size        TEXT,
+        dropped_at  TEXT,
+        FOREIGN KEY (customer_id) REFERENCES customers(id),
+        FOREIGN KEY (site_id) REFERENCES sites(id)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS requests (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        customer_id    INTEGER NOT NULL,
+        site_id        INTEGER NOT NULL,
+        type           TEXT NOT NULL CHECK(type IN ('PR','P','D','NEW_BIN')),
+        bin_id         INTEGER,
+        size_requested TEXT,
+        preferred_date TEXT NOT NULL,
+        notes          TEXT,
+        status         TEXT NOT NULL DEFAULT 'pending'
+            CHECK(status IN ('pending','approved','scheduled','in_progress','done','denied')),
+        stop_id        INTEGER,
+        created_at     TEXT NOT NULL,
+        updated_at     TEXT NOT NULL,
+        FOREIGN KEY (customer_id) REFERENCES customers(id),
+        FOREIGN KEY (site_id) REFERENCES sites(id),
+        FOREIGN KEY (bin_id) REFERENCES bins(id),
+        FOREIGN KEY (stop_id) REFERENCES stops(id)
     )
     """)
 
@@ -15254,6 +15331,224 @@ def address_suggestions():
         ORDER BY sa.times_used DESC, sa.last_used_at DESC
         LIMIT 10
     """, (cid(), like, like)).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+# =========================================================
+# CUSTOMER REQUEST SYSTEM — API (Phase 2)
+#
+# Customer-facing endpoints are authenticated ONLY by the URL portal token
+# (no session, no password). Requests are intent only: creating one never
+# creates driver work — the boss approves them in a future phase. All
+# validation is server-side. Errors are {"error": "..."} with the right code.
+# =========================================================
+REQUEST_TYPES     = {"PR", "P", "D", "NEW_BIN"}
+REQUEST_SIZES     = ["10yd", "15yd", "20yd", "30yd", "40yd"]
+REQUEST_STATUSES  = {"pending", "approved", "scheduled", "in_progress", "done", "denied"}
+REQUEST_OPEN      = ("pending", "approved", "scheduled", "in_progress")  # dupe-guard scope
+
+
+def _customer_by_token(conn, token):
+    """Resolve a portal token to its customer row, or None. Constant-shape
+    lookup so a bad token is indistinguishable from an unknown one."""
+    if not token:
+        return None
+    return conn.execute(
+        "SELECT * FROM customers WHERE portal_token = ?", (token,)
+    ).fetchone()
+
+
+def _not_found():
+    """Generic 404 that never reveals whether a token/site was 'close'."""
+    return jsonify({"error": "not found"}), 404
+
+
+@app.route("/api/c/<token>/dashboard")
+def customer_dashboard(token):
+    conn = get_db()
+    customer = _customer_by_token(conn, token)
+    if customer is None:
+        conn.close()
+        return _not_found()
+
+    sites = conn.execute(
+        "SELECT id, address, lat, lng, notes, created_at FROM sites "
+        "WHERE customer_id = ? ORDER BY id",
+        (customer["id"],),
+    ).fetchall()
+
+    bins = conn.execute(
+        """SELECT b.id, b.customer_id, b.site_id, b.size, b.dropped_at,
+                  s.address AS site_address
+             FROM bins b
+             JOIN sites s ON b.site_id = s.id
+            WHERE b.customer_id = ?
+            ORDER BY b.id""",
+        (customer["id"],),
+    ).fetchall()
+
+    reqs = conn.execute(
+        """SELECT * FROM requests
+            WHERE customer_id = ? AND status NOT IN ('done','denied')
+            ORDER BY created_at DESC, id DESC""",
+        (customer["id"],),
+    ).fetchall()
+    conn.close()
+
+    return jsonify({
+        "customer": {
+            "id":            customer["id"],
+            "name":          customer["business_name"] or customer["contact_name"],
+            "business_name": customer["business_name"],
+            "contact_name":  customer["contact_name"],
+            "phone":         customer["phone"],
+        },
+        "sites":    [dict(s) for s in sites],
+        "bins":     [dict(b) for b in bins],
+        "requests": [dict(r) for r in reqs],
+    })
+
+
+@app.route("/api/c/<token>/requests", methods=["POST"])
+def customer_create_request(token):
+    conn = get_db()
+    customer = _customer_by_token(conn, token)
+    if customer is None:
+        conn.close()
+        return _not_found()
+
+    def bad(msg):
+        conn.close()
+        return jsonify({"error": msg}), 400
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return bad("invalid or missing JSON body")
+
+    # --- type ---
+    rtype = data.get("type")
+    if rtype not in REQUEST_TYPES:
+        return bad("type must be one of PR, P, D, NEW_BIN")
+
+    # --- site_id: must exist AND belong to this customer (else generic 404) ---
+    site_id = data.get("site_id")
+    if not isinstance(site_id, int):
+        return bad("site_id is required")
+    site = conn.execute(
+        "SELECT id FROM sites WHERE id = ? AND customer_id = ?",
+        (site_id, customer["id"]),
+    ).fetchone()
+    if site is None:
+        conn.close()
+        return _not_found()
+
+    bin_id = data.get("bin_id")
+    size_requested = data.get("size_requested")
+
+    # --- type-specific requirements ---
+    if rtype in ("PR", "P"):
+        if not isinstance(bin_id, int):
+            return bad("bin_id is required for PR and P requests")
+        owned_bin = conn.execute(
+            "SELECT id FROM bins WHERE id = ? AND customer_id = ? AND site_id = ?",
+            (bin_id, customer["id"], site_id),
+        ).fetchone()
+        if owned_bin is None:
+            return bad("bin_id is not a container at this site")
+        size_requested = None  # not used for PR/P
+    else:  # D or NEW_BIN
+        if not isinstance(size_requested, str) or size_requested not in REQUEST_SIZES:
+            return bad("size_requested must be one of " + ", ".join(REQUEST_SIZES))
+        bin_id = None  # not used for D/NEW_BIN
+
+    # --- preferred_date: "asap" or ISO date today-or-future ---
+    preferred_date = data.get("preferred_date")
+    if preferred_date != "asap":
+        try:
+            pd = datetime.strptime(str(preferred_date), "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            return bad('preferred_date must be "asap" or an ISO date (YYYY-MM-DD)')
+        if pd < datetime.strptime(today_str(), "%Y-%m-%d").date():
+            return bad("preferred_date cannot be in the past")
+
+    # --- notes: optional, stripped, <= 500 chars ---
+    notes = data.get("notes")
+    if notes is not None:
+        if not isinstance(notes, str):
+            return bad("notes must be text")
+        notes = notes.strip()
+        if len(notes) > 500:
+            return bad("notes must be 500 characters or fewer")
+        notes = notes or None
+
+    # --- duplicate guard: one open request per (customer, type, bin) for
+    #     PR/P, or per (customer, type, site) for D/NEW_BIN ---
+    open_ph = ",".join("?" for _ in REQUEST_OPEN)
+    if rtype in ("PR", "P"):
+        dupe = conn.execute(
+            f"""SELECT id FROM requests
+                 WHERE customer_id = ? AND type = ? AND bin_id = ?
+                   AND status IN ({open_ph})""",
+            (customer["id"], rtype, bin_id, *REQUEST_OPEN),
+        ).fetchone()
+    else:
+        dupe = conn.execute(
+            f"""SELECT id FROM requests
+                 WHERE customer_id = ? AND type = ? AND site_id = ?
+                   AND status IN ({open_ph})""",
+            (customer["id"], rtype, site_id, *REQUEST_OPEN),
+        ).fetchone()
+    if dupe is not None:
+        conn.close()
+        return jsonify({"error": "You already have an open request for this."}), 409
+
+    # --- create ---
+    ts = now_ts()
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO requests
+               (customer_id, site_id, type, bin_id, size_requested,
+                preferred_date, notes, status, stop_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)""",
+        (customer["id"], site_id, rtype, bin_id, size_requested,
+         preferred_date, notes, ts, ts),
+    )
+    conn.commit()
+    new_row = conn.execute(
+        "SELECT * FROM requests WHERE id = ?", (cur.lastrowid,)
+    ).fetchone()
+    conn.close()
+    return jsonify(dict(new_row)), 201
+
+
+@app.route("/api/requests")
+@boss_required
+def boss_list_requests():
+    """Read-only for now: list requests (default pending) for the boss's
+    company, joined with customer/site/bin so the future UI renders cards
+    with no extra calls. Uses the existing session-based boss auth."""
+    status = (request.args.get("status") or "pending").strip()
+    if status not in REQUEST_STATUSES:
+        return jsonify({"error": "invalid status filter"}), 400
+
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT r.*,
+                  c.business_name  AS customer_business_name,
+                  c.contact_name   AS customer_contact_name,
+                  c.phone          AS customer_phone,
+                  s.address        AS site_address,
+                  b.size           AS bin_size,
+                  b.dropped_at     AS bin_dropped_at
+             FROM requests r
+             JOIN customers c ON r.customer_id = c.id
+             JOIN sites     s ON r.site_id     = s.id
+        LEFT JOIN bins      b ON r.bin_id      = b.id
+            WHERE c.company_id = ? AND r.status = ?
+            ORDER BY r.created_at DESC, r.id DESC""",
+        (cid(), status),
+    ).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
 
