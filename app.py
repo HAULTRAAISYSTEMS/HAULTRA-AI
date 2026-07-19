@@ -1932,7 +1932,8 @@ def init_db():
                 size_requested TEXT,
                 preferred_date TEXT NOT NULL,
                 notes          TEXT,
-                status         TEXT NOT NULL DEFAULT 'pending',
+                status         TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','accepted','approved','scheduled','in_progress','done','denied')),
                 stop_id        INTEGER,
                 deny_reason    TEXT,
                 customer_note  TEXT,
@@ -2217,6 +2218,15 @@ def user_role_set(user_row):
         roles.add("customer_manager")
     if u.get("role_dispatcher"):
         roles.add("dispatcher")
+    # Backward-compat / safety net: a plain "boss" carrying none of the Phase 5
+    # flags is a full-access owner (the pre-Phase-5 meaning of "boss"). This
+    # covers a freshly-registered company owner and any "boss" created on the
+    # team page before init_db's one-time promotion runs, so nobody is ever
+    # locked out of the management UI between deploy and the next restart.
+    if u.get("role") == "boss" and not (
+        u.get("role_owner") or u.get("role_customer_manager") or u.get("role_dispatcher")
+    ):
+        roles.update(("owner", "customer_manager", "dispatcher"))
     return roles
 
 
@@ -12479,8 +12489,9 @@ def company_register():
             company_id = _crow["id"]
 
             conn.execute(
-                """INSERT INTO users (username, password_hash, role, full_name, phone, email,
-                   company_id, created_at) VALUES (?,?,?,?,?,?,?,?)""",
+                """INSERT INTO users (username, password_hash, role, role_owner,
+                   full_name, phone, email, company_id, created_at)
+                   VALUES (?,?,?,1,?,?,?,?,?)""",
                 (username, generate_password_hash(password), "boss",
                  full_name, phone, email or None, company_id, now_ts())
             )
@@ -15579,7 +15590,7 @@ def address_suggestions():
 # =========================================================
 REQUEST_TYPES     = {"PR", "P", "D", "NEW_BIN"}
 REQUEST_SIZES     = ["10yd", "15yd", "20yd", "30yd", "40yd"]
-REQUEST_STATUSES  = {"pending", "approved", "scheduled", "in_progress", "done", "denied"}
+REQUEST_STATUSES  = {"pending", "accepted", "approved", "scheduled", "in_progress", "done", "denied"}
 REQUEST_OPEN      = ("pending", "accepted", "approved", "scheduled", "in_progress")  # dupe-guard scope
 
 
