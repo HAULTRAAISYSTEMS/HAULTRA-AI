@@ -2070,16 +2070,10 @@ def init_db():
     # default; deactivating hides them from management lists and kills portal
     # token access without destroying history.
     safe_add_column(conn, "customers", "is_active INTEGER NOT NULL DEFAULT 1")
-
-    # Phase 7A — costs on repaired defects. Money is stored as INTEGER CENTS,
-    # never a float. All nullable/additive; existing repair fields untouched.
-    safe_add_column(conn, "inspection_items", "cost_cents INTEGER")
-    safe_add_column(conn, "inspection_items", "vendor TEXT")
-    # Phase 7B — optional customer-visible bin label ("by the front gate"),
-    # plus a "where I left it" drop photo captured by the driver at delivery.
-    safe_add_column(conn, "bins", "label TEXT")
-    safe_add_column(conn, "bins", "drop_photo_path TEXT")
-    safe_add_column(conn, "bins", "drop_stop_id INTEGER")
+    # NOTE: Phase 7 additive columns for inspection_items / maintenance_entries /
+    # trucks / bins live AFTER those tables are created (search "_phase7_migrate")
+    # — placing them here would no-op on a fresh DB's first init_db because the
+    # target tables don't exist yet.
 
     # --- Per-route boss <-> driver messages: minimal thread, one row per
     #     message. "Unread" is derived per-viewer as "not sent by me and
@@ -2368,6 +2362,43 @@ def init_db():
         FOREIGN KEY (company_id) REFERENCES companies(id)
     )
     """)
+
+    # Phase 7A revision — company vendor/shop accounts. Repairs & manual entries
+    # can reference one (or stay in-house/blank). Many companies run on vendor
+    # accounts and never enter costs, so the log's primary value is the event
+    # trail, not dollars.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS vendors (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id INTEGER NOT NULL,
+        name       TEXT NOT NULL,
+        phone      TEXT,
+        notes      TEXT,
+        is_active  INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (company_id) REFERENCES companies(id)
+    )
+    """)
+
+    # _phase7_migrate — additive columns on tables created ABOVE in this same
+    # init_db pass (inspection_items / maintenance_entries / trucks / bins), so
+    # they exist on a fresh DB's very first boot, not only after a restart.
+    # Money is INTEGER CENTS, never a float.
+    safe_add_column(conn, "inspection_items", "cost_cents INTEGER")
+    safe_add_column(conn, "inspection_items", "vendor TEXT")
+    safe_add_column(conn, "inspection_items", "vendor_id INTEGER")
+    safe_add_column(conn, "inspection_items", "at_vendor INTEGER NOT NULL DEFAULT 0")
+    safe_add_column(conn, "inspection_items", "sent_vendor_id INTEGER")
+    safe_add_column(conn, "inspection_items", "sent_at TEXT")
+    safe_add_column(conn, "maintenance_entries", "vendor_id INTEGER")
+    safe_add_column(conn, "maintenance_entries", "at_vendor INTEGER NOT NULL DEFAULT 0")
+    safe_add_column(conn, "maintenance_entries", "sent_vendor_id INTEGER")
+    safe_add_column(conn, "maintenance_entries", "sent_at TEXT")
+    safe_add_column(conn, "maintenance_entries", "completed_at TEXT")
+    safe_add_column(conn, "trucks", "at_vendor INTEGER NOT NULL DEFAULT 0")
+    safe_add_column(conn, "bins", "label TEXT")
+    safe_add_column(conn, "bins", "drop_photo_path TEXT")
+    safe_add_column(conn, "bins", "drop_stop_id INTEGER")
 
     # --- default company bootstrap ---
     default_co = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()
@@ -4383,6 +4414,7 @@ def shell_page(title, body, extra_head=""):
             # Trucks/fleet — any management role can view (add/edit is gated
             # server-side to owner/dispatcher).
             _mparts.append(nav_link(url_for("trucks_page"), "🚛 Trucks", path))
+            _mparts.append(nav_link(url_for("vendors_page"), "🔧 Vendors", path))
             if is_disp:
                 _mparts.append(nav_link(url_for("team_page"), "👥 Team", path))
             if is_own:
@@ -17539,7 +17571,7 @@ def _truck_maintenance_log(conn, truck_id, date_from=None, date_to=None, categor
     # Repaired defects — dated by resolved_at.
     defects = conn.execute(
         """SELECT ii.id AS ref_id, ii.label, ii.resolution_note, ii.cost_cents,
-                  ii.vendor, ii.resolved_at, i.truck_id, i.id AS inspection_id
+                  ii.vendor_id, ii.resolved_at, i.truck_id, i.id AS inspection_id
              FROM inspection_items ii
              JOIN inspections i ON ii.inspection_id = i.id
             WHERE i.company_id=? AND i.truck_id=? AND ii.result='defect'
@@ -17550,6 +17582,7 @@ def _truck_maintenance_log(conn, truck_id, date_from=None, date_to=None, categor
         "SELECT * FROM maintenance_entries WHERE company_id=? AND truck_id=?",
         (cid(), truck_id),
     ).fetchall()
+    vmap = _vendor_map(conn)
 
     rows = []
     for d in defects:
@@ -17559,18 +17592,19 @@ def _truck_maintenance_log(conn, truck_id, date_from=None, date_to=None, categor
             "sort_key": d["resolved_at"] or "",
             "category": "Repair",
             "description": d["label"] + (f" — {d['resolution_note']}" if d["resolution_note"] else ""),
-            "cost_cents": d["cost_cents"], "vendor": d["vendor"],
-            "voided": 0,
+            "cost_cents": d["cost_cents"], "vendor": vmap.get(d["vendor_id"]),
+            "at_vendor": 0, "voided": 0,
         })
     for m in manuals:
+        md = dict(m)
         rows.append({
             "source": "manual", "ref_id": m["id"],
             "date": m["entry_date"] or "",
             "sort_key": (m["entry_date"] or "") + " " + (m["created_at"] or ""),
             "category": m["category"],
             "description": m["description"],
-            "cost_cents": m["cost_cents"], "vendor": m["vendor"],
-            "voided": m["voided"],
+            "cost_cents": m["cost_cents"], "vendor": vmap.get(md.get("vendor_id")),
+            "at_vendor": md.get("at_vendor") or 0, "voided": m["voided"],
         })
 
     def _keep(r):
@@ -17615,6 +17649,111 @@ def _truck_spend(conn, truck_id):
     return month, year, life
 
 
+# ── Phase 7A revision: vendors + "at vendor" state ────────────────────────
+def _company_vendors(conn):
+    return conn.execute(
+        "SELECT id, name, phone, notes FROM vendors WHERE company_id=? AND is_active=1 ORDER BY LOWER(name), id",
+        (cid(),)).fetchall()
+
+
+def _vendor_map(conn):
+    return {v["id"]: v["name"] for v in conn.execute(
+        "SELECT id, name FROM vendors WHERE company_id=?", (cid(),)).fetchall()}
+
+
+def _vendor_options_html(vendors, selected_id=None):
+    """<option>s for a vendor picker; leading blank == in-house / none."""
+    opts = ['<option value="">In-house / none</option>']
+    for v in vendors:
+        sel = " selected" if selected_id is not None and v["id"] == selected_id else ""
+        opts.append(f'<option value="{v["id"]}"{sel}>{e(v["name"])}</option>')
+    return "".join(opts)
+
+
+def _clean_vendor_id(conn, raw):
+    """Validate an incoming vendor_id against the company's active vendors.
+    '' / None → None (in-house). Bad id → None (treated as in-house, never a
+    cross-company leak). Returns int|None."""
+    s = str(raw or "").strip()
+    if not s.isdigit():
+        return None
+    row = conn.execute("SELECT id FROM vendors WHERE id=? AND company_id=?",
+                       (int(s), cid())).fetchone()
+    return int(s) if row else None
+
+
+def _recompute_truck_at_vendor(conn, truck_id):
+    """Set trucks.at_vendor = 1 iff any open defect or active manual entry for
+    the truck is currently 'sent to vendor'. Called after every send/repair
+    transition so the informational flag is always accurate."""
+    d = conn.execute(
+        """SELECT 1 FROM inspection_items ii JOIN inspections i ON ii.inspection_id=i.id
+            WHERE i.company_id=? AND i.truck_id=? AND ii.result='defect'
+              AND ii.defect_status='open' AND ii.at_vendor=1 LIMIT 1""",
+        (cid(), truck_id)).fetchone()
+    m = conn.execute(
+        """SELECT 1 FROM maintenance_entries
+            WHERE company_id=? AND truck_id=? AND voided=0 AND at_vendor=1
+              AND completed_at IS NULL LIMIT 1""",
+        (cid(), truck_id)).fetchone()
+    conn.execute("UPDATE trucks SET at_vendor=? WHERE id=?",
+                 (1 if (d or m) else 0, truck_id))
+
+
+def _truck_at_vendor_badge(row):
+    """Yellow, informational (non-blocking) 'At vendor' pill — mirrors the OOS
+    badge shape. Shown wherever a truck currently out at a shop appears."""
+    d = dict(row) if row is not None else {}
+    if not d.get("at_vendor") or d.get("out_of_service"):
+        return ""  # OOS takes visual precedence
+    return ('<span style="display:inline-block;padding:2px 9px;border-radius:999px;'
+            'font-size:10px;font-weight:800;letter-spacing:.5px;text-transform:uppercase;'
+            'background:rgba(245,180,60,0.16);color:#F5B43C;border:1px solid rgba(245,180,60,0.45);'
+            'margin-left:6px;">🔧 At vendor</span>')
+
+
+def _truck_status_badges(row):
+    """OOS (blocking) + At-vendor (informational) badges, in priority order."""
+    return _truck_oos_badge(row) + _truck_at_vendor_badge(row)
+
+
+def _company_has_costs(conn):
+    """True if ANY maintenance record (repaired defect or non-voided manual
+    entry) in the company carries a cost — decides spend-table vs event-count."""
+    d = conn.execute(
+        """SELECT 1 FROM inspection_items ii JOIN inspections i ON ii.inspection_id=i.id
+            WHERE i.company_id=? AND ii.cost_cents IS NOT NULL LIMIT 1""", (cid(),)).fetchone()
+    if d:
+        return True
+    m = conn.execute(
+        "SELECT 1 FROM maintenance_entries WHERE company_id=? AND voided=0 AND cost_cents IS NOT NULL LIMIT 1",
+        (cid(),)).fetchone()
+    return bool(m)
+
+
+def _truck_event_counts(conn, truck_id):
+    """(month, year, lifetime) COUNT of maintenance events for a truck — the
+    fallback metric when no costs are tracked. Repaired defects + non-voided
+    manual entries."""
+    today = today_str()
+    mp, yp = today[:7], today[:4]
+    d_rows = conn.execute(
+        """SELECT substr(ii.resolved_at,1,10) AS dt FROM inspection_items ii
+             JOIN inspections i ON ii.inspection_id=i.id
+            WHERE i.company_id=? AND i.truck_id=? AND ii.result='defect' AND ii.defect_status='repaired'""",
+        (cid(), truck_id)).fetchall()
+    m_rows = conn.execute(
+        "SELECT entry_date AS dt FROM maintenance_entries WHERE company_id=? AND truck_id=? AND voided=0",
+        (cid(), truck_id)).fetchall()
+    month = year = life = 0
+    for r in list(d_rows) + list(m_rows):
+        dt = r["dt"] or ""
+        life += 1
+        if dt[:4] == yp: year += 1
+        if dt[:7] == mp: month += 1
+    return month, year, life
+
+
 @app.route("/trucks")
 @roles_required("owner", "customer_manager", "dispatcher")
 def trucks_page():
@@ -17648,7 +17787,7 @@ def trucks_page():
         <a class="bin-card" href="{url_for('truck_detail_page', truck_id=t['id'])}"
            style="padding:16px;display:block;text-decoration:none;color:inherit;">
             <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
-                <div style="font-weight:700;font-size:15px;">🚛 {name}{_truck_oos_badge(t)}</div>
+                <div style="font-weight:700;font-size:15px;">🚛 {name}{_truck_status_badges(t)}</div>
                 {defect_badge}
             </div>
             {sub}
@@ -17857,7 +17996,14 @@ def truck_detail_page(truck_id):
         rc = (_maintenance_receipts(conn, defect_item_id=r["ref_id"]) if r["source"] == "defect"
               else _maintenance_receipts(conn, manual_entry_id=r["ref_id"]))
         mlog_thumbs[(r["source"], r["ref_id"])] = rc
-    spend_month, spend_year, spend_life = _truck_spend(conn, truck_id)
+    truck_has_costs = _company_has_costs(conn)
+    if truck_has_costs:
+        spend_month, spend_year, spend_life = _truck_spend(conn, truck_id)
+    else:
+        spend_month, spend_year, spend_life = _truck_event_counts(conn, truck_id)
+    vendors = _company_vendors(conn)
+    vmap = _vendor_map(conn)
+    vendor_opts = _vendor_options_html(vendors)
     conn.close()
     can_action = _can_action_fleet()
 
@@ -17920,14 +18066,16 @@ def truck_detail_page(truck_id):
                    if can_action else "")
     sub_bits = " · ".join(b for b in [e(truck["make_model"] or ""), e(truck["plate"] or "")] if b) or "—"
 
-    # ── Phase 7A: spend totals card ──
+    # ── Phase 7A: totals card — spend when costs exist, else event counts ──
+    _tfmt = (lambda v: format_cents(v)) if truck_has_costs else (lambda v: str(v))
+    _tlabel = "Maintenance spend" if truck_has_costs else "Maintenance events"
     totals_card = f"""
     <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
-        <h2 style="font-size:15px;margin:0 0 10px;">Maintenance spend</h2>
+        <h2 style="font-size:15px;margin:0 0 10px;">{_tlabel}</h2>
         <div style="display:flex;gap:10px;text-align:center;">
-            <div style="flex:1;"><div style="color:var(--slate);font-size:11px;text-transform:uppercase;letter-spacing:.5px;">This month</div><div style="font-weight:800;font-size:18px;margin-top:2px;">{e(format_cents(spend_month))}</div></div>
-            <div style="flex:1;"><div style="color:var(--slate);font-size:11px;text-transform:uppercase;letter-spacing:.5px;">This year</div><div style="font-weight:800;font-size:18px;margin-top:2px;">{e(format_cents(spend_year))}</div></div>
-            <div style="flex:1;"><div style="color:var(--slate);font-size:11px;text-transform:uppercase;letter-spacing:.5px;">Lifetime</div><div style="font-weight:800;font-size:18px;margin-top:2px;">{e(format_cents(spend_life))}</div></div>
+            <div style="flex:1;"><div style="color:var(--slate);font-size:11px;text-transform:uppercase;letter-spacing:.5px;">This month</div><div style="font-weight:800;font-size:18px;margin-top:2px;">{e(_tfmt(spend_month))}</div></div>
+            <div style="flex:1;"><div style="color:var(--slate);font-size:11px;text-transform:uppercase;letter-spacing:.5px;">This year</div><div style="font-weight:800;font-size:18px;margin-top:2px;">{e(_tfmt(spend_year))}</div></div>
+            <div style="flex:1;"><div style="color:var(--slate);font-size:11px;text-transform:uppercase;letter-spacing:.5px;">Lifetime</div><div style="font-weight:800;font-size:18px;margin-top:2px;">{e(_tfmt(spend_life))}</div></div>
         </div>
     </div>"""
 
@@ -17946,12 +18094,19 @@ def truck_detail_page(truck_id):
                 </div>
                 <label class="uw-lbl" style="margin-top:10px;">Description</label>
                 <textarea id="tm-desc" rows="2" style="width:100%;margin-bottom:8px;" placeholder="e.g. Oil change + filter"></textarea>
-                <div style="display:flex;gap:8px;">
-                    <div style="flex:1;"><label class="uw-lbl">Cost (optional)</label><input id="tm-cost" inputmode="decimal" placeholder="89.00" style="width:100%;"></div>
-                    <div style="flex:1;"><label class="uw-lbl">Vendor (optional)</label><input id="tm-vendor" placeholder="Shop" style="width:100%;"></div>
-                </div>
-                <label class="uw-lbl" style="margin-top:8px;">Receipt photo(s) (optional)</label>
-                <input id="tm-receipts" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple capture="environment" style="width:100%;margin-bottom:10px;">
+                <label class="uw-lbl">Vendor</label>
+                <select id="tm-vendor" style="width:100%;margin-bottom:8px;">{vendor_opts}</select>
+                <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--slate);margin-bottom:8px;">
+                    <input id="tm-sent" type="checkbox"> Truck is currently at this vendor
+                </label>
+                <details style="margin-bottom:10px;">
+                    <summary style="color:var(--slate);font-size:12px;cursor:pointer;">Add cost / receipt (optional)</summary>
+                    <div style="margin-top:8px;">
+                        <label class="uw-lbl">Cost</label><input id="tm-cost" inputmode="decimal" placeholder="89.00" style="width:100%;margin-bottom:8px;">
+                        <label class="uw-lbl">Receipt photo(s)</label>
+                        <input id="tm-receipts" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple capture="environment" style="width:100%;">
+                    </div>
+                </details>
                 <div style="display:flex;gap:8px;">
                     <button class="btn green" style="flex:1;" onclick="submitMaint({truck_id})">Save</button>
                     <button class="btn secondary" onclick="toggleAddMaint()">Cancel</button>
@@ -17969,18 +18124,21 @@ def truck_detail_page(truck_id):
     mlog_rows = ""
     for r in mlog:
         thumbs = _receipt_thumbs_html(mlog_thumbs.get((r["source"], r["ref_id"])))
-        cost = format_cents(r["cost_cents"]) if r["cost_cents"] is not None else "—"
+        cost_html = (f'<span style="font-weight:800;font-size:14px;">{e(format_cents(r["cost_cents"]))}</span>'
+                     if r["cost_cents"] is not None else "")
         vendor = f' · {e(r["vendor"])}' if r["vendor"] else ""
         voided_tag = (' <span style="color:#FF7A7A;font-weight:800;font-size:11px;">VOID</span>'
                       if r["voided"] else "")
+        at_vendor_tag = (' <span style="color:#F5B43C;font-weight:800;font-size:11px;">🔧 AT VENDOR</span>'
+                         if r.get("at_vendor") and not r["voided"] else "")
         href = (url_for("inspection_report", inspection_id=r["inspection_id"]) if r["source"] == "defect"
                 else url_for("maintenance_entry_detail", entry_id=r["ref_id"]))
         desc_style = "text-decoration:line-through;opacity:.6;" if r["voided"] else ""
         mlog_rows += f"""
         <a class="bin-card" href="{href}" style="padding:14px;display:block;text-decoration:none;color:inherit;">
             <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;">
-                <span style="font-weight:700;font-size:14px;{desc_style}">{e(r["date"])} · {e(r["category"])}{voided_tag}</span>
-                <span style="font-weight:800;font-size:14px;">{e(cost)}</span>
+                <span style="font-weight:700;font-size:14px;{desc_style}">{e(r["date"])} · {e(r["category"])}{voided_tag}{at_vendor_tag}</span>
+                {cost_html}
             </div>
             <div style="color:#C9C9C2;font-size:13px;margin-top:4px;{desc_style}">{e(r["description"])}{vendor}</div>
             <div style="margin-top:6px;">{_SRC_BADGE.get(r["source"], "")}</div>
@@ -18011,7 +18169,7 @@ def truck_detail_page(truck_id):
     body = f"""
     <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
         <div>
-            <h1 style="margin-bottom:4px;">🚛 {e(truck["name"])}{_truck_oos_badge(truck)}</h1>
+            <h1 style="margin-bottom:4px;">🚛 {e(truck["name"])}{_truck_status_badges(truck)}</h1>
             <p style="margin:0;">{sub_bits}</p>
         </div>
         <a class="btn secondary" href="{url_for('trucks_page')}" style="white-space:nowrap;">← All trucks</a>
@@ -18092,7 +18250,8 @@ def _truck_detail_js(truck_id):
     fd.append('category',(document.getElementById('tm-cat')||{{}}).value||'');
     fd.append('description',desc);
     fd.append('cost',(document.getElementById('tm-cost')||{{}}).value||'');
-    fd.append('vendor',(document.getElementById('tm-vendor')||{{}}).value||'');
+    fd.append('vendor_id',(document.getElementById('tm-vendor')||{{}}).value||'');
+    if((document.getElementById('tm-sent')||{{}}).checked){{ fd.append('sent','1'); }}
     var files=(document.getElementById('tm-receipts')||{{}}).files||[];
     for(var i=0;i<files.length;i++){{ fd.append('receipts', files[i]); }}
     fetch('/api/maintenance/entries',{{method:'POST',headers:{{'X-CSRF-Token':CSRF}},body:fd}})
@@ -18413,7 +18572,7 @@ def my_inspections():
     """A driver's own inspection history, newest first."""
     conn = get_db()
     rows = conn.execute(
-        """SELECT i.*, t.name AS truck_name, t.out_of_service,
+        """SELECT i.*, t.name AS truck_name, t.out_of_service, t.at_vendor,
                   (SELECT COUNT(*) FROM inspection_items ii
                     WHERE ii.inspection_id=i.id AND ii.result='defect') AS defect_count
              FROM inspections i
@@ -18432,7 +18591,7 @@ def my_inspections():
         <a class="bin-card" href="{url_for('inspection_report', inspection_id=i['id'])}"
            style="padding:14px;display:block;text-decoration:none;color:inherit;">
             <div style="display:flex;justify-content:space-between;gap:10px;">
-                <span style="font-weight:700;">🚛 {e(i["truck_name"])}{_truck_oos_badge(i)}</span>
+                <span style="font-weight:700;">🚛 {e(i["truck_name"])}{_truck_status_badges(i)}</span>
                 <span style="color:{color};font-weight:800;font-size:12px;">{e(_INSPECTION_OVERALL_LABEL.get(i["overall"], i["overall"]))}</span>
             </div>
             <div style="color:var(--slate);font-size:13px;margin-top:4px;">
@@ -18455,7 +18614,7 @@ def inspection_report(inspection_id):
     """Read-only full report. Management sees any; a driver sees only their own."""
     conn = get_db()
     insp = conn.execute(
-        """SELECT i.*, t.name AS truck_name, t.make_model, t.plate, t.out_of_service,
+        """SELECT i.*, t.name AS truck_name, t.make_model, t.plate, t.out_of_service, t.at_vendor,
                   COALESCE(u.username,'—') AS driver_name,
                   COALESCE(u.full_name,'') AS driver_full
              FROM inspections i
@@ -18478,7 +18637,9 @@ def inspection_report(inspection_id):
     # their own report never sees it.
     is_mgmt = _is_management()
     receipts_by_item = {}
+    vmap = {}
     if is_mgmt:
+        vmap = _vendor_map(conn)
         for it in items:
             if it["result"] == "defect":
                 rc = _maintenance_receipts(conn, defect_item_id=it["id"])
@@ -18505,18 +18666,24 @@ def inspection_report(inspection_id):
         defstat = ""
         if it["result"] == "defect" and it["defect_status"]:
             dlabel, dcolor = _DEF_STATUS.get(it["defect_status"], (it["defect_status"], "var(--slate)"))
+            # "Sent to vendor" is an open-but-out state (management sees the shop).
+            if it["defect_status"] == "open" and is_mgmt and dict(it).get("at_vendor"):
+                vn = vmap.get(dict(it).get("sent_vendor_id"), "vendor")
+                dlabel, dcolor = (f"Sent to {vn}", "#F5B43C")
             res_note = f' — {e(it["resolution_note"])}' if it["resolution_note"] else ""
             defstat = (f'<div style="font-size:12px;margin-top:4px;color:{dcolor};font-weight:700;">'
-                       f'{dlabel}{res_note}</div>')
+                       f'{e(dlabel)}{res_note}</div>')
         cost_block = ""
-        if is_mgmt and it["result"] == "defect" and (it["cost_cents"] is not None or it["vendor"]):
+        if is_mgmt and it["result"] == "defect":
+            _vn = vmap.get(dict(it).get("vendor_id"))
             _bits = []
             if it["cost_cents"] is not None:
                 _bits.append(f'💵 {e(format_cents(it["cost_cents"]))}')
-            if it["vendor"]:
-                _bits.append(e(it["vendor"]))
-            cost_block = (f'<div style="font-size:12px;margin-top:4px;color:var(--slate);">'
-                          f'{" · ".join(_bits)}</div>')
+            if _vn:
+                _bits.append(e(_vn))
+            if _bits:
+                cost_block = (f'<div style="font-size:12px;margin-top:4px;color:var(--slate);">'
+                              f'{" · ".join(_bits)}</div>')
         receipts_block = _receipt_thumbs_html(receipts_by_item.get(it["id"])) if is_mgmt else ""
         rows_html += f"""
         <div style="border-top:1px solid var(--border);padding:12px 0;">
@@ -18534,7 +18701,7 @@ def inspection_report(inspection_id):
     body = f"""
     <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
         <div>
-            <h1 style="margin-bottom:4px;">🚛 {e(insp["truck_name"])}{_truck_oos_badge(insp)}</h1>
+            <h1 style="margin-bottom:4px;">🚛 {e(insp["truck_name"])}{_truck_status_badges(insp)}</h1>
             <p style="margin:0;">{e(_INSPECTION_TYPE_LABEL.get(insp["type"], insp["type"]))} inspection · {e((insp["created_at"] or ""))}</p>
         </div>
         <a class="btn secondary" href="{back}" style="white-space:nowrap;">← Back</a>
@@ -18601,8 +18768,9 @@ def maintenance_page():
     conn = get_db()
     defects = conn.execute(
         """SELECT ii.id AS item_id, ii.label, ii.note, ii.photo_path, ii.defect_status,
+                  ii.at_vendor AS item_at_vendor, ii.sent_vendor_id,
                   i.id AS inspection_id, i.type, i.created_at, i.truck_id,
-                  t.name AS truck_name, t.out_of_service,
+                  t.name AS truck_name, t.out_of_service, t.at_vendor,
                   COALESCE(u.username,'—') AS reporter
              FROM inspection_items ii
              JOIN inspections i ON ii.inspection_id=i.id
@@ -18612,20 +18780,27 @@ def maintenance_page():
             ORDER BY t.out_of_service DESC, i.created_at ASC, ii.id ASC""",
         (cid(),),
     ).fetchall()
-    # Per-truck spend table (A4) — month/year, plus fleet total.
+    vendors = _company_vendors(conn)
+    vmap = _vendor_map(conn)
+    has_costs = _company_has_costs(conn)
+    # Per-truck totals — spend when costs exist, else event counts (A4 revision).
     trucks = conn.execute(
-        "SELECT id, name, out_of_service FROM trucks WHERE company_id=? AND is_active=1 ORDER BY LOWER(name), id",
+        "SELECT id, name, out_of_service, at_vendor FROM trucks WHERE company_id=? AND is_active=1 ORDER BY LOWER(name), id",
         (cid(),),
     ).fetchall()
-    spend_rows = []
+    total_rows = []
     fleet_month = fleet_year = 0
     for t in trucks:
-        m, y, _ = _truck_spend(conn, t["id"])
+        if has_costs:
+            m, y, _ = _truck_spend(conn, t["id"])
+        else:
+            m, y, _ = _truck_event_counts(conn, t["id"])
         fleet_month += m
         fleet_year += y
-        spend_rows.append((t, m, y))
+        total_rows.append((t, m, y))
     conn.close()
     can_action = _can_action_fleet()
+    vendor_opts = _vendor_options_html(vendors)
 
     cards = ""
     for d in defects:
@@ -18635,24 +18810,46 @@ def maintenance_page():
             thumb = (f'<a href="{purl}" target="_blank"><img src="{purl}" loading="lazy" '
                      f'style="width:64px;height:64px;object-fit:cover;border-radius:8px;border:1px solid var(--border);"></a>')
         note = f'<div style="font-size:13px;color:#C9C9C2;margin-top:4px;">{e(d["note"])}</div>' if d["note"] else ""
+        sent_chip = ""
+        if d["item_at_vendor"]:
+            vn = vmap.get(d["sent_vendor_id"], "a vendor")
+            sent_chip = (f'<div style="margin-top:6px;"><span style="display:inline-block;padding:2px 9px;'
+                         f'border-radius:999px;font-size:11px;font-weight:800;background:rgba(245,180,60,0.16);'
+                         f'color:#F5B43C;border:1px solid rgba(245,180,60,0.45);">🔧 Sent to {e(vn)}</span></div>')
         repair_form = ""
         actions = ""
         if can_action:
+            _iid = d["item_id"]
+            _send_btn = ("" if d["item_at_vendor"] else
+                         f'<button class="btn secondary" style="flex:1;" onclick="showSend({_iid})">Send to vendor</button>')
             actions = f"""
-            <div style="display:flex;gap:8px;margin-top:10px;">
-                <button class="btn green" style="flex:1;" onclick="showRepair({d['item_id']})">Repaired</button>
-                <button class="btn secondary" style="flex:1;" onclick="deferDefect({d['item_id']})">Defer</button>
+            <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;">
+                <button class="btn green" style="flex:1;min-width:90px;" onclick="showRepair({d['item_id']})">Repaired</button>
+                {_send_btn}
+                <button class="btn secondary" style="flex:1;min-width:70px;" onclick="deferDefect({d['item_id']})">Defer</button>
             </div>"""
             repair_form = f"""
+            <div id="send-form-{d['item_id']}" hidden style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
+                <label class="uw-lbl">Vendor</label>
+                <select id="sd-vendor-{d['item_id']}" style="width:100%;margin-bottom:10px;">{vendor_opts}</select>
+                <div style="display:flex;gap:8px;">
+                    <button class="btn green" style="flex:1;" onclick="submitSend({d['item_id']})">Mark sent</button>
+                    <button class="btn secondary" onclick="hideSend({d['item_id']})">Cancel</button>
+                </div>
+            </div>
             <div id="repair-form-{d['item_id']}" hidden style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
                 <label class="uw-lbl">What was done (required)</label>
                 <textarea id="rp-note-{d['item_id']}" rows="2" style="width:100%;margin-bottom:8px;" placeholder="e.g. Replaced front brake pads"></textarea>
-                <div style="display:flex;gap:8px;">
-                    <div style="flex:1;"><label class="uw-lbl">Cost (optional)</label><input id="rp-cost-{d['item_id']}" inputmode="decimal" placeholder="149.99" style="width:100%;"></div>
-                    <div style="flex:1;"><label class="uw-lbl">Vendor (optional)</label><input id="rp-vendor-{d['item_id']}" placeholder="Shop name" style="width:100%;"></div>
-                </div>
-                <label class="uw-lbl" style="margin-top:8px;">Receipt photo(s) (optional)</label>
-                <input id="rp-receipts-{d['item_id']}" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple capture="environment" style="width:100%;margin-bottom:10px;">
+                <label class="uw-lbl">Vendor</label>
+                <select id="rp-vendor-{d['item_id']}" style="width:100%;margin-bottom:8px;">{vendor_opts}</select>
+                <details style="margin-bottom:10px;">
+                    <summary style="color:var(--slate);font-size:12px;cursor:pointer;">Add cost / receipt (optional)</summary>
+                    <div style="margin-top:8px;">
+                        <label class="uw-lbl">Cost</label><input id="rp-cost-{d['item_id']}" inputmode="decimal" placeholder="149.99" style="width:100%;margin-bottom:8px;">
+                        <label class="uw-lbl">Receipt photo(s)</label>
+                        <input id="rp-receipts-{d['item_id']}" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple capture="environment" style="width:100%;">
+                    </div>
+                </details>
                 <div style="display:flex;gap:8px;">
                     <button class="btn green" style="flex:1;" onclick="submitRepair({d['item_id']})">Save repair</button>
                     <button class="btn secondary" onclick="hideRepair({d['item_id']})">Cancel</button>
@@ -18661,12 +18858,12 @@ def maintenance_page():
         cards += f"""
         <div class="bin-card" id="defect-{d['item_id']}" style="padding:16px;">
             <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;">
-                <div style="font-weight:700;font-size:15px;">🚛 {e(d["truck_name"])}{_truck_oos_badge(d)}</div>
+                <div style="font-weight:700;font-size:15px;">🚛 {e(d["truck_name"])}{_truck_status_badges(d)}</div>
                 <a href="{url_for('inspection_report', inspection_id=d['inspection_id'])}"
                    style="font-size:12px;color:var(--cyan);white-space:nowrap;">View report →</a>
             </div>
             <div style="font-weight:700;font-size:14px;margin-top:8px;color:#FF7A7A;">⚠ {e(d["label"])}</div>
-            {note}
+            {note}{sent_chip}
             <div style="display:flex;gap:10px;align-items:center;margin-top:8px;">
                 {thumb}
                 <div style="color:var(--slate);font-size:12px;">
@@ -18677,29 +18874,37 @@ def maintenance_page():
             {actions}{repair_form}
         </div>"""
 
-    # Spend table HTML
-    spend_html = ""
-    for t, m, y in spend_rows:
-        spend_html += f"""
+    # Totals table — spend (when any cost recorded) or event counts otherwise.
+    def _fmt(v):
+        return format_cents(v) if has_costs else str(v)
+    metric_label = "Spend" if has_costs else "Events"
+    rows_out = ""
+    for t, m, y in total_rows:
+        rows_out += f"""
         <tr style="border-top:1px solid var(--border);">
-            <td style="padding:8px 6px;"><a href="{url_for('truck_detail_page', truck_id=t['id'])}" style="color:inherit;">🚛 {e(t['name'])}{_truck_oos_badge(t)}</a></td>
-            <td style="padding:8px 6px;text-align:right;">{e(format_cents(m))}</td>
-            <td style="padding:8px 6px;text-align:right;">{e(format_cents(y))}</td>
+            <td style="padding:8px 6px;"><a href="{url_for('truck_detail_page', truck_id=t['id'])}" style="color:inherit;">🚛 {e(t['name'])}{_truck_status_badges(t)}</a></td>
+            <td style="padding:8px 6px;text-align:right;">{e(_fmt(m))}</td>
+            <td style="padding:8px 6px;text-align:right;">{e(_fmt(y))}</td>
         </tr>"""
-    if not spend_rows:
-        spend_html = '<tr><td colspan="3" style="padding:12px 6px;color:var(--slate);">No trucks yet.</td></tr>'
-    spend_table = f"""
+    if not total_rows:
+        rows_out = '<tr><td colspan="3" style="padding:12px 6px;color:var(--slate);">No trucks yet.</td></tr>'
+    totals_hint = "" if has_costs else '<div style="color:var(--slate);font-size:12px;margin-bottom:6px;">No costs entered — showing event counts. Add a cost to any record to switch to spend.</div>'
+    totals_table = f"""
     <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:16px;">
-        <h2 style="font-size:15px;margin:0 0 6px;">Spend</h2>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+            <h2 style="font-size:15px;margin:0;">{metric_label}</h2>
+            <a href="{url_for('vendors_page')}" style="font-size:12px;color:var(--cyan);">Vendors →</a>
+        </div>
+        {totals_hint}
         <table style="width:100%;border-collapse:collapse;font-size:13px;">
             <thead><tr style="color:var(--slate);text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">
                 <th style="padding:4px 6px;">Truck</th><th style="padding:4px 6px;text-align:right;">This month</th><th style="padding:4px 6px;text-align:right;">This year</th>
             </tr></thead>
-            <tbody>{spend_html}</tbody>
+            <tbody>{rows_out}</tbody>
             <tfoot><tr style="border-top:2px solid var(--border-glow);font-weight:800;">
                 <td style="padding:8px 6px;">Fleet total</td>
-                <td style="padding:8px 6px;text-align:right;">{e(format_cents(fleet_month))}</td>
-                <td style="padding:8px 6px;text-align:right;">{e(format_cents(fleet_year))}</td>
+                <td style="padding:8px 6px;text-align:right;">{e(_fmt(fleet_month))}</td>
+                <td style="padding:8px 6px;text-align:right;">{e(_fmt(fleet_year))}</td>
             </tr></tfoot>
         </table>
     </div>"""
@@ -18722,12 +18927,19 @@ def maintenance_page():
                 </div>
                 <label class="uw-lbl" style="margin-top:10px;">Description</label>
                 <textarea id="me-desc" rows="2" style="width:100%;margin-bottom:8px;" placeholder="e.g. Oil change + filter"></textarea>
-                <div style="display:flex;gap:8px;">
-                    <div style="flex:1;"><label class="uw-lbl">Cost (optional)</label><input id="me-cost" inputmode="decimal" placeholder="89.00" style="width:100%;"></div>
-                    <div style="flex:1;"><label class="uw-lbl">Vendor (optional)</label><input id="me-vendor" placeholder="Shop name" style="width:100%;"></div>
-                </div>
-                <label class="uw-lbl" style="margin-top:8px;">Receipt photo(s) (optional)</label>
-                <input id="me-receipts" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple capture="environment" style="width:100%;margin-bottom:10px;">
+                <label class="uw-lbl">Vendor</label>
+                <select id="me-vendor" style="width:100%;margin-bottom:8px;">{vendor_opts}</select>
+                <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--slate);margin-bottom:8px;">
+                    <input id="me-sent" type="checkbox"> Truck is currently at this vendor
+                </label>
+                <details style="margin-bottom:10px;">
+                    <summary style="color:var(--slate);font-size:12px;cursor:pointer;">Add cost / receipt (optional)</summary>
+                    <div style="margin-top:8px;">
+                        <label class="uw-lbl">Cost</label><input id="me-cost" inputmode="decimal" placeholder="89.00" style="width:100%;margin-bottom:8px;">
+                        <label class="uw-lbl">Receipt photo(s)</label>
+                        <input id="me-receipts" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple capture="environment" style="width:100%;">
+                    </div>
+                </details>
                 <div style="display:flex;gap:8px;">
                     <button class="btn green" style="flex:1;" onclick="submitEntry()">Save</button>
                     <button class="btn secondary" onclick="toggleAddEntry()">Cancel</button>
@@ -18740,10 +18952,10 @@ def maintenance_page():
     body = f"""
     <div class="hero">
         <h1>Maintenance</h1>
-        <p>Fleet spend, open defects, and manual maintenance. Repaired closes a defect; Defer postpones it.</p>
+        <p>Which truck, which vendor, what, when — and is it back in service. Costs optional.</p>
         {view_note}
     </div>
-    {spend_table}
+    {totals_table}
     {add_entry_block}
     <h2 style="font-size:15px;margin:0 0 8px;max-width:640px;">Open defects</h2>
     <div id="maint-empty" class="empty-state" style="padding:24px 0;"{empty_hidden}>No open defects — the fleet's clean. 🛠️</div>
@@ -18772,6 +18984,16 @@ _MAINTENANCE_PAGE_JS = """
   }
   window.showRepair=function(id){ var f=document.getElementById('repair-form-'+id); if(f) f.hidden=false; };
   window.hideRepair=function(id){ var f=document.getElementById('repair-form-'+id); if(f) f.hidden=true; };
+  window.showSend=function(id){ var f=document.getElementById('send-form-'+id); if(f) f.hidden=false; };
+  window.hideSend=function(id){ var f=document.getElementById('send-form-'+id); if(f) f.hidden=true; };
+  window.submitSend=function(id){
+    fetch('/api/defects/'+id+'/resolve',{method:'POST',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
+        body:JSON.stringify({action:'sent', vendor_id:(document.getElementById('sd-vendor-'+id)||{}).value||''})})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
+      .then(function(res){ if(res.ok){ window.location.reload(); } else { err(id,(res.j&&res.j.error)||'Could not update.'); } })
+      .catch(function(){ err(id,'Network error — try again.'); });
+  };
   window.submitRepair=function(id){
     var note=(document.getElementById('rp-note-'+id)||{}).value||'';
     if(!note.trim()){ err(id,'A note is required.'); return; }
@@ -18779,7 +19001,7 @@ _MAINTENANCE_PAGE_JS = """
     fd.append('_csrf_token', CSRF);
     fd.append('action','repaired'); fd.append('note',note);
     fd.append('cost',(document.getElementById('rp-cost-'+id)||{}).value||'');
-    fd.append('vendor',(document.getElementById('rp-vendor-'+id)||{}).value||'');
+    fd.append('vendor_id',(document.getElementById('rp-vendor-'+id)||{}).value||'');
     var files=(document.getElementById('rp-receipts-'+id)||{}).files||[];
     for(var i=0;i<files.length;i++){ fd.append('receipts', files[i]); }
     fetch('/api/defects/'+id+'/resolve',{method:'POST',headers:{'X-CSRF-Token':CSRF},body:fd})
@@ -18810,7 +19032,8 @@ _MAINTENANCE_PAGE_JS = """
     fd.append('category',(document.getElementById('me-cat')||{}).value||'');
     fd.append('description',desc);
     fd.append('cost',(document.getElementById('me-cost')||{}).value||'');
-    fd.append('vendor',(document.getElementById('me-vendor')||{}).value||'');
+    fd.append('vendor_id',(document.getElementById('me-vendor')||{}).value||'');
+    if((document.getElementById('me-sent')||{}).checked){ fd.append('sent','1'); }
     var files=(document.getElementById('me-receipts')||{}).files||[];
     for(var i=0;i<files.length;i++){ fd.append('receipts', files[i]); }
     fetch('/api/maintenance/entries',{method:'POST',headers:{'X-CSRF-Token':CSRF},body:fd})
@@ -18838,20 +19061,22 @@ def resolve_defect(item_id):
     src = request.form if request.form else (request.get_json(silent=True) or {})
     action = src.get("action")
     note = str(src.get("note") or "").strip()[:500]
-    if action not in ("repaired", "deferred"):
+    # 'sent' = intermediate "sent to vendor" state (stays open, flags the truck);
+    # 'repaired' closes it; 'deferred' postpones it.
+    if action not in ("repaired", "deferred", "sent"):
         return jsonify({"error": "invalid action"}), 400
-    if not note:
+    if action != "sent" and not note:
         return jsonify({"error": "a note is required"}), 400
+    conn = get_db()
+    vendor_id = _clean_vendor_id(conn, src.get("vendor_id"))
     cost_cents = None
-    vendor = None
     if action == "repaired":
         cost_cents, cost_err = parse_cost_cents(src.get("cost"))
         if cost_err:
+            conn.close()
             return jsonify({"error": cost_err}), 400
-        vendor = (str(src.get("vendor") or "").strip()[:120]) or None
-    conn = get_db()
     row = conn.execute(
-        """SELECT ii.id, ii.defect_status
+        """SELECT ii.id, ii.defect_status, i.truck_id
              FROM inspection_items ii
              JOIN inspections i ON ii.inspection_id=i.id
             WHERE ii.id=? AND i.company_id=? AND ii.result='defect'""",
@@ -18863,14 +19088,25 @@ def resolve_defect(item_id):
     if row["defect_status"] != "open":
         conn.close()
         return jsonify({"error": "defect is not open"}), 409
-    conn.execute(
-        """UPDATE inspection_items SET defect_status=?, resolution_note=?,
-                   resolved_by=?, resolved_at=?, cost_cents=?, vendor=? WHERE id=?""",
-        (action, note, session["user_id"], now_ts(), cost_cents, vendor, item_id),
-    )
-    if action == "repaired":
-        _save_maintenance_receipts(conn, request.files.getlist("receipts"),
-                                   defect_item_id=item_id)
+
+    if action == "sent":
+        # Out to a shop — still an open defect, but flag the truck "at vendor".
+        conn.execute(
+            """UPDATE inspection_items SET at_vendor=1, sent_vendor_id=?, sent_at=?,
+                       vendor_id=COALESCE(?, vendor_id) WHERE id=?""",
+            (vendor_id, now_ts(), vendor_id, item_id),
+        )
+    else:
+        conn.execute(
+            """UPDATE inspection_items SET defect_status=?, resolution_note=?,
+                       resolved_by=?, resolved_at=?, cost_cents=?, vendor_id=?,
+                       at_vendor=0 WHERE id=?""",
+            (action, note, session["user_id"], now_ts(), cost_cents, vendor_id, item_id),
+        )
+        if action == "repaired":
+            _save_maintenance_receipts(conn, request.files.getlist("receipts"),
+                                       defect_item_id=item_id)
+    _recompute_truck_at_vendor(conn, row["truck_id"])
     conn.commit()
     conn.close()
     return jsonify({"success": True, "status": action})
@@ -18930,17 +19166,24 @@ def create_maintenance_entry():
     if cost_err:
         conn.close()
         return jsonify({"error": cost_err}), 400
-    vendor = (str(src.get("vendor") or "").strip()[:120]) or None
+    vendor_id = _clean_vendor_id(conn, src.get("vendor_id"))
+    # Optional: log it already "sent to vendor" (flags the truck at-vendor).
+    sent = str(src.get("sent") or "").strip() in ("1", "true", "on", "yes")
+    at_vendor = 1 if (sent and vendor_id) else 0
     cur = conn.cursor()
     cur.execute(
         """INSERT INTO maintenance_entries (company_id, truck_id, entry_date, category,
-               description, cost_cents, vendor, created_by, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
-        (cid(), truck["id"], entry_date, category, description, cost_cents, vendor,
+               description, cost_cents, vendor_id, at_vendor, sent_vendor_id, sent_at,
+               created_by, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (cid(), truck["id"], entry_date, category, description, cost_cents, vendor_id,
+         at_vendor, (vendor_id if at_vendor else None), (now_ts() if at_vendor else None),
          session["user_id"], now_ts()),
     )
     entry_id = cur.lastrowid
     _save_maintenance_receipts(conn, request.files.getlist("receipts"), manual_entry_id=entry_id)
+    if at_vendor:
+        _recompute_truck_at_vendor(conn, truck["id"])
     conn.commit()
     conn.close()
     return jsonify({"success": True, "id": entry_id})
@@ -18997,13 +19240,58 @@ def edit_maintenance_entry(entry_id):
     if cost_err:
         conn.close()
         return jsonify({"error": cost_err}), 400
-    vendor = (str(src.get("vendor") or "").strip()[:120]) or None
+    vendor_id = _clean_vendor_id(conn, src.get("vendor_id"))
     conn.execute(
         """UPDATE maintenance_entries SET entry_date=?, category=?, description=?,
-               cost_cents=?, vendor=?, updated_at=? WHERE id=?""",
-        (entry_date, category, description, cost_cents, vendor, now_ts(), entry_id),
+               cost_cents=?, vendor_id=?, updated_at=? WHERE id=?""",
+        (entry_date, category, description, cost_cents, vendor_id, now_ts(), entry_id),
     )
     _save_maintenance_receipts(conn, request.files.getlist("receipts"), manual_entry_id=entry_id)
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/maintenance/entries/<int:entry_id>/send", methods=["POST"])
+@login_required
+def send_maintenance_entry(entry_id):
+    """Mark a manual entry 'sent to [vendor]' — flags the truck at-vendor."""
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    entry = _load_manual_entry(conn, entry_id)
+    if entry is None or entry["voided"]:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    src = request.form if request.form else (request.get_json(silent=True) or {})
+    vendor_id = _clean_vendor_id(conn, src.get("vendor_id"))
+    conn.execute(
+        """UPDATE maintenance_entries SET at_vendor=1, sent_vendor_id=?, sent_at=?,
+               vendor_id=COALESCE(?, vendor_id), completed_at=NULL WHERE id=?""",
+        (vendor_id, now_ts(), vendor_id, entry_id),
+    )
+    _recompute_truck_at_vendor(conn, entry["truck_id"])
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/maintenance/entries/<int:entry_id>/back", methods=["POST"])
+@login_required
+def back_maintenance_entry(entry_id):
+    """Mark a sent manual entry back/repaired — clears the truck at-vendor flag."""
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    entry = _load_manual_entry(conn, entry_id)
+    if entry is None or entry["voided"]:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    conn.execute(
+        "UPDATE maintenance_entries SET at_vendor=0, completed_at=? WHERE id=?",
+        (now_ts(), entry_id),
+    )
+    _recompute_truck_at_vendor(conn, entry["truck_id"])
     conn.commit()
     conn.close()
     return jsonify({"success": True})
@@ -19032,6 +19320,125 @@ def void_maintenance_entry(entry_id):
         "UPDATE maintenance_entries SET voided=1, void_note=?, voided_by=?, voided_at=? WHERE id=?",
         (note, session["user_id"], now_ts(), entry_id),
     )
+    _recompute_truck_at_vendor(conn, entry["truck_id"])
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+# ── Vendors CRUD (owner/dispatcher manage; any management views) ──────────
+@app.route("/vendors")
+@roles_required("owner", "customer_manager", "dispatcher")
+def vendors_page():
+    conn = get_db()
+    vendors = _company_vendors(conn)
+    conn.close()
+    can_action = _can_action_fleet()
+    rows = ""
+    for v in vendors:
+        sub = " · ".join(b for b in [e(v["phone"] or ""), e(v["notes"] or "")] if b)
+        del_btn = (f'<button class="btn secondary" style="padding:4px 12px;font-size:12px;" '
+                   f'onclick="delVendor({v["id"]})">Remove</button>') if can_action else ""
+        rows += f"""
+        <div class="bin-card" id="vendor-{v['id']}" style="padding:14px;display:flex;justify-content:space-between;align-items:center;gap:10px;">
+            <div><div style="font-weight:700;">{e(v["name"])}</div>
+                 <div style="color:var(--slate);font-size:13px;">{sub or "—"}</div></div>
+            {del_btn}
+        </div>"""
+    if not vendors:
+        rows = '<div class="empty-state" style="padding:24px 0;">No vendors yet.</div>'
+    add = ""
+    if can_action:
+        add = """
+        <div style="max-width:640px;margin-bottom:16px;">
+            <button class="btn green" onclick="toggleAddVendor()">+ Add vendor</button>
+            <div id="add-vendor-form" hidden class="bin-card" style="padding:16px;margin-top:12px;">
+                <div id="add-vendor-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
+                <label class="uw-lbl">Name</label>
+                <input id="vn-name" style="width:100%;margin-bottom:10px;" placeholder="Bob's Truck Repair">
+                <label class="uw-lbl">Phone (optional)</label>
+                <input id="vn-phone" style="width:100%;margin-bottom:10px;" placeholder="757-555-0100">
+                <label class="uw-lbl">Notes (optional)</label>
+                <input id="vn-notes" style="width:100%;margin-bottom:12px;" placeholder="Account #1234">
+                <div style="display:flex;gap:8px;">
+                    <button class="btn green" style="flex:1;" onclick="submitVendor()">Save</button>
+                    <button class="btn secondary" onclick="toggleAddVendor()">Cancel</button>
+                </div>
+            </div>
+        </div>"""
+    body = f"""
+    <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+        <div><h1 style="margin-bottom:4px;">Vendors</h1><p style="margin:0;">Shops &amp; accounts you send trucks to.</p></div>
+        <a class="btn secondary" href="{url_for('maintenance_page')}" style="white-space:nowrap;">← Maintenance</a>
+    </div>
+    {add}
+    <div class="bin-list" style="display:grid;gap:10px;max-width:640px;">{rows}</div>
+    <style>.uw-lbl{{display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;}}</style>
+    {_VENDORS_PAGE_JS}
+    """
+    return render_template_string(shell_page("Vendors", body))
+
+
+_VENDORS_PAGE_JS = """
+<script>
+(function(){
+  var CSRF=(document.querySelector('meta[name=csrf-token]')||{}).content||'';
+  window.toggleAddVendor=function(){ var f=document.getElementById('add-vendor-form'); if(f) f.hidden=!f.hidden; };
+  function verr(m){ var e=document.getElementById('add-vendor-err'); if(e){ e.textContent=m; e.hidden=false; } }
+  window.submitVendor=function(){
+    var name=(document.getElementById('vn-name')||{}).value||'';
+    if(!name.trim()){ verr('A name is required.'); return; }
+    fetch('/api/vendors',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
+        body:JSON.stringify({name:name,phone:(document.getElementById('vn-phone')||{}).value||'',notes:(document.getElementById('vn-notes')||{}).value||''})})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
+      .then(function(res){ if(res.ok){ window.location.reload(); } else { verr((res.j&&res.j.error)||'Could not save.'); } })
+      .catch(function(){ verr('Network error — try again.'); });
+  };
+  window.delVendor=function(id){
+    if(!confirm('Remove this vendor? Past records keep its name.')) return;
+    fetch('/api/vendors/'+id+'/deactivate',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF}})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
+      .then(function(res){ if(res.ok){ var c=document.getElementById('vendor-'+id); if(c) c.remove(); } else { alert((res.j&&res.j.error)||'Could not remove.'); } })
+      .catch(function(){ alert('Network error — try again.'); });
+  };
+})();
+</script>
+"""
+
+
+@app.route("/api/vendors", methods=["POST"])
+@login_required
+def create_vendor():
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name") or "").strip()[:120]
+    if not name:
+        return jsonify({"error": "a name is required"}), 400
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO vendors (company_id, name, phone, notes, is_active, created_at) VALUES (?,?,?,?,1,?)",
+        (cid(), name, str(data.get("phone") or "").strip()[:50] or None,
+         str(data.get("notes") or "").strip()[:200] or None, now_ts()),
+    )
+    vid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "id": vid})
+
+
+@app.route("/api/vendors/<int:vendor_id>/deactivate", methods=["POST"])
+@login_required
+def deactivate_vendor(vendor_id):
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    row = conn.execute("SELECT id FROM vendors WHERE id=? AND company_id=?", (vendor_id, cid())).fetchone()
+    if row is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    conn.execute("UPDATE vendors SET is_active=0 WHERE id=?", (vendor_id,))
     conn.commit()
     conn.close()
     return jsonify({"success": True})
@@ -19048,17 +19455,37 @@ def maintenance_entry_detail(entry_id):
         conn.close()
         flash("Maintenance entry not found.", "error")
         return redirect(url_for("maintenance_page"))
-    truck = conn.execute("SELECT id, name, out_of_service FROM trucks WHERE id=? AND company_id=?",
+    truck = conn.execute("SELECT id, name, out_of_service, at_vendor FROM trucks WHERE id=? AND company_id=?",
                          (entry["truck_id"], cid())).fetchone()
     receipts = _maintenance_receipts(conn, manual_entry_id=entry_id)
     creator = conn.execute("SELECT COALESCE(full_name, username) AS n FROM users WHERE id=?",
                            (entry["created_by"],)).fetchone()
+    vendors = _company_vendors(conn)
+    vmap = _vendor_map(conn)
     conn.close()
+
+    ed = dict(entry)
+    entry_vendor_name = vmap.get(ed.get("vendor_id"))
+    entry_at_vendor = ed.get("at_vendor") and not entry["voided"]
 
     can_action = _can_action_fleet()
     editable = can_action and _entry_editable(entry)
-    truck_link = (f'<a href="{url_for("truck_detail_page", truck_id=truck["id"])}" style="color:inherit;">🚛 {e(truck["name"])}</a>'
+    truck_link = (f'<a href="{url_for("truck_detail_page", truck_id=truck["id"])}" style="color:inherit;">🚛 {e(truck["name"])}{_truck_status_badges(truck)}</a>'
                   if truck else "—")
+    # Send-to-vendor / mark-back controls (owner/dispatcher, non-voided).
+    sent_ui = ""
+    if can_action and not entry["voided"]:
+        if entry_at_vendor:
+            sent_ui = (f'<div style="max-width:640px;margin-bottom:12px;">'
+                       f'<div style="color:#F5B43C;font-size:13px;font-weight:700;margin-bottom:6px;">🔧 At '
+                       f'{e(entry_vendor_name or "vendor")}</div>'
+                       f'<button class="btn green" style="width:100%;" onclick="markBack()">Mark back / repaired</button></div>')
+        else:
+            _vo = _vendor_options_html(vendors, selected_id=ed.get("vendor_id"))
+            sent_ui = (f'<div class="bin-card" style="padding:14px;max-width:640px;margin-bottom:12px;">'
+                       f'<label class="uw-lbl">Send truck to a vendor</label>'
+                       f'<div style="display:flex;gap:8px;"><select id="snd-vendor" style="flex:1;">{_vo}</select>'
+                       f'<button class="btn secondary" onclick="markSent()">Send</button></div></div>')
     voided_banner = ""
     if entry["voided"]:
         voided_banner = f"""
@@ -19087,12 +19514,16 @@ def maintenance_entry_detail(entry_id):
             </div>
             <label class="uw-lbl" style="margin-top:10px;">Description</label>
             <textarea id="ed-desc" rows="2" style="width:100%;margin-bottom:8px;">{e(entry["description"])}</textarea>
-            <div style="display:flex;gap:8px;">
-                <div style="flex:1;"><label class="uw-lbl">Cost</label><input id="ed-cost" inputmode="decimal" value="{cost_val}" style="width:100%;"></div>
-                <div style="flex:1;"><label class="uw-lbl">Vendor</label><input id="ed-vendor" value="{e(entry["vendor"] or "")}" style="width:100%;"></div>
-            </div>
-            <label class="uw-lbl" style="margin-top:8px;">Add receipt photo(s)</label>
-            <input id="ed-receipts" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple capture="environment" style="width:100%;margin-bottom:10px;">
+            <label class="uw-lbl">Vendor</label>
+            <select id="ed-vendor" style="width:100%;margin-bottom:8px;">{_vendor_options_html(vendors, selected_id=ed.get("vendor_id"))}</select>
+            <details style="margin-bottom:10px;">
+                <summary style="color:var(--slate);font-size:12px;cursor:pointer;">Cost / receipt (optional)</summary>
+                <div style="margin-top:8px;">
+                    <label class="uw-lbl">Cost</label><input id="ed-cost" inputmode="decimal" value="{cost_val}" style="width:100%;margin-bottom:8px;">
+                    <label class="uw-lbl">Add receipt photo(s)</label>
+                    <input id="ed-receipts" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple capture="environment" style="width:100%;">
+                </div>
+            </details>
             <div style="display:flex;gap:8px;">
                 <button class="btn green" style="flex:1;" onclick="submitEdit()">Save</button>
                 <button class="btn secondary" onclick="toggleEdit()">Cancel</button>
@@ -19112,15 +19543,16 @@ def maintenance_entry_detail(entry_id):
     <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
         <div style="display:flex;justify-content:space-between;gap:10px;">
             <span style="font-weight:800;font-size:16px;">{e(entry["entry_date"])} · {e(entry["category"])}</span>
-            <span style="font-weight:800;font-size:16px;">{e(format_cents(entry["cost_cents"]))}</span>
+            {('<span style="font-weight:800;font-size:16px;">' + e(format_cents(entry["cost_cents"])) + '</span>') if entry["cost_cents"] is not None else ''}
         </div>
         <div style="color:#C9C9C2;font-size:14px;margin-top:8px;">{e(entry["description"])}</div>
         <div style="color:var(--slate);font-size:13px;margin-top:8px;">
-            {('Vendor: ' + e(entry["vendor"]) + '<br>') if entry["vendor"] else ''}
+            {('Vendor: ' + e(entry_vendor_name) + '<br>') if entry_vendor_name else ''}
             Logged by {e(creator["n"] if creator else "—")} · {e(entry["created_at"])}
         </div>
         {_receipt_thumbs_html(receipts)}
     </div>
+    {sent_ui}
     {edit_ui}
     <style>.uw-lbl{{display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;}}</style>
     {_maintenance_entry_js(entry_id, entry["truck_id"])}
@@ -19146,13 +19578,28 @@ def _maintenance_entry_js(entry_id, truck_id):
     fd.append('category',(document.getElementById('ed-cat')||{{}}).value||'');
     fd.append('description',desc);
     fd.append('cost',(document.getElementById('ed-cost')||{{}}).value||'');
-    fd.append('vendor',(document.getElementById('ed-vendor')||{{}}).value||'');
+    fd.append('vendor_id',(document.getElementById('ed-vendor')||{{}}).value||'');
     var files=(document.getElementById('ed-receipts')||{{}}).files||[];
     for(var i=0;i<files.length;i++){{ fd.append('receipts', files[i]); }}
     fetch('/api/maintenance/entries/'+EID+'/edit',{{method:'POST',headers:{{'X-CSRF-Token':CSRF}},body:fd}})
       .then(function(r){{return r.json().then(function(j){{return {{ok:r.ok,j:j}};}});}})
       .then(function(res){{ if(res.ok){{ window.location.reload(); }} else {{ eerr((res.j&&res.j.error)||'Could not save.'); }} }})
       .catch(function(){{ eerr('Network error — try again.'); }});
+  }};
+  window.markSent=function(){{
+    fetch('/api/maintenance/entries/'+EID+'/send',{{method:'POST',
+        headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},
+        body:JSON.stringify({{vendor_id:(document.getElementById('snd-vendor')||{{}}).value||''}})}})
+      .then(function(r){{return r.json().then(function(j){{return {{ok:r.ok,j:j}};}});}})
+      .then(function(res){{ if(res.ok){{ window.location.reload(); }} else {{ alert((res.j&&res.j.error)||'Could not update.'); }} }})
+      .catch(function(){{ alert('Network error — try again.'); }});
+  }};
+  window.markBack=function(){{
+    fetch('/api/maintenance/entries/'+EID+'/back',{{method:'POST',
+        headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}}}})
+      .then(function(r){{return r.json().then(function(j){{return {{ok:r.ok,j:j}};}});}})
+      .then(function(res){{ if(res.ok){{ window.location.reload(); }} else {{ alert((res.j&&res.j.error)||'Could not update.'); }} }})
+      .catch(function(){{ alert('Network error — try again.'); }});
   }};
   window.voidEntry=function(){{
     var note=prompt('Void this entry? Add a note (required):');
