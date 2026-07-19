@@ -1947,6 +1947,11 @@ def init_db():
         """)
         conn.commit()
 
+    # Phase 5 §4 — customers can be deactivated (soft delete). Active by
+    # default; deactivating hides them from management lists and kills portal
+    # token access without destroying history.
+    safe_add_column(conn, "customers", "is_active INTEGER NOT NULL DEFAULT 1")
+
     # --- Per-route boss <-> driver messages: minimal thread, one row per
     #     message. "Unread" is derived per-viewer as "not sent by me and
     #     read_at IS NULL" rather than tracked per-recipient, since a route
@@ -2044,6 +2049,7 @@ def init_db():
         contact_name  TEXT,
         phone         TEXT,
         portal_token  TEXT NOT NULL UNIQUE,
+        is_active     INTEGER NOT NULL DEFAULT 1,
         created_at    TEXT NOT NULL,
         FOREIGN KEY (company_id) REFERENCES companies(id)
     )
@@ -15583,7 +15589,7 @@ def _customer_by_token(conn, token):
     if not token:
         return None
     return conn.execute(
-        "SELECT * FROM customers WHERE portal_token = ?", (token,)
+        "SELECT * FROM customers WHERE portal_token = ? AND is_active = 1", (token,)
     ).fetchone()
 
 
@@ -16641,15 +16647,468 @@ def unassigned_work():
     return render_template_string(shell_page("Unassigned Work", body))
 
 
+def _new_portal_token(conn):
+    """A URL-safe token guaranteed unique across customers."""
+    for _ in range(8):
+        tok = secrets.token_urlsafe(32)
+        if not conn.execute(
+            "SELECT 1 FROM customers WHERE portal_token=?", (tok,)
+        ).fetchone():
+            return tok
+    return secrets.token_urlsafe(48)  # astronomically unlikely fallback
+
+
+def _portal_url(token):
+    return url_for("customer_portal", token=token, _external=True)
+
+
+def _load_customer_scoped(conn, customer_id):
+    """An active customer in the session's company, or None."""
+    return conn.execute(
+        "SELECT * FROM customers WHERE id=? AND company_id=? AND is_active=1",
+        (customer_id, cid()),
+    ).fetchone()
+
+
 @app.route("/customers")
 @roles_required("customer_manager")
 def customers_page():
-    """Customer_manager/owner: customer list + management. (Section 4 fills
-    this in; stub keeps the nav's url_for resolvable.)"""
-    return render_template_string(shell_page(
-        "Customers",
-        '<div class="hero"><h1>Customers</h1></div>'
-        '<div class="empty-state" style="padding:32px 0;">Loading&hellip;</div>'))
+    """Customer_manager/owner: active customers with at-a-glance counts, plus
+    an Add Customer form."""
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT c.id, c.business_name, c.contact_name, c.phone,
+                  (SELECT COUNT(*) FROM bins b WHERE b.customer_id = c.id) AS bin_count,
+                  (SELECT COUNT(*) FROM requests r
+                     WHERE r.customer_id = c.id
+                       AND r.status IN ('pending','accepted','approved','scheduled','in_progress')
+                  ) AS open_count
+             FROM customers c
+            WHERE c.company_id = ? AND c.is_active = 1
+            ORDER BY LOWER(COALESCE(c.business_name, c.contact_name, '')), c.id""",
+        (cid(),),
+    ).fetchall()
+    conn.close()
+
+    size_opts = "".join(f'<option value="{s}">{s}</option>' for s in REQUEST_SIZES)
+
+    cards = ""
+    for c in rows:
+        name = e(c["business_name"] or c["contact_name"] or "Customer")
+        contact = e(c["contact_name"] or "")
+        phone = e(c["phone"] or "")
+        meta_bits = " · ".join(b for b in [contact, phone] if b)
+        meta_html = (f'<div style="color:var(--slate);font-size:13px;margin-top:2px;">{meta_bits}</div>'
+                     if meta_bits else "")
+        open_badge = (
+            f'<span style="display:inline-block;padding:2px 9px;border-radius:999px;'
+            f'font-size:11px;font-weight:800;background:var(--cyan-dim);color:var(--cyan);'
+            f'border:1px solid var(--border-glow);">{c["open_count"]} open</span>'
+        ) if c["open_count"] else ""
+        cards += f"""
+        <a class="bin-card" href="{url_for('customer_detail_page', customer_id=c['id'])}"
+           style="padding:16px;display:block;text-decoration:none;color:inherit;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
+                <div style="font-weight:700;font-size:15px;">{name}</div>
+                {open_badge}
+            </div>
+            {meta_html}
+            <div style="color:var(--slate);font-size:12px;margin-top:6px;">
+                🗑️ {c["bin_count"]} active bin{"" if c["bin_count"]==1 else "s"}
+            </div>
+        </a>
+        """
+
+    empty_hidden = "" if not rows else " hidden"
+    body = f"""
+    <div class="hero">
+        <h1>Customers</h1>
+        <p>Everyone you serve. Add a customer to generate their self-service portal link.</p>
+    </div>
+    <div style="max-width:640px;margin-bottom:16px;">
+        <button class="btn green" id="add-cust-toggle" onclick="toggleAdd()">+ Add Customer</button>
+        <div id="add-cust-form" hidden class="bin-card" style="padding:16px;margin-top:12px;">
+            <div id="add-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
+            <label class="uw-lbl">Business name</label>
+            <input id="ac-business" style="width:100%;margin-bottom:10px;" placeholder="ABC Demolition">
+            <label class="uw-lbl">Contact name</label>
+            <input id="ac-contact" style="width:100%;margin-bottom:10px;" placeholder="Sam Rivera">
+            <label class="uw-lbl">Phone</label>
+            <input id="ac-phone" style="width:100%;margin-bottom:10px;" placeholder="757-555-0142">
+            <label class="uw-lbl">Site address</label>
+            <input id="ac-address" style="width:100%;margin-bottom:10px;" placeholder="1200 Industrial Blvd, Norfolk, VA">
+            <label class="uw-lbl">Initial bin size (optional)</label>
+            <select id="ac-size" style="width:100%;margin-bottom:12px;"><option value="">None yet</option>{size_opts}</select>
+            <div style="display:flex;gap:8px;">
+                <button class="btn green" style="flex:1;" onclick="submitAdd()">Create customer</button>
+                <button class="btn secondary" onclick="toggleAdd()">Cancel</button>
+            </div>
+        </div>
+    </div>
+    <div id="cust-empty" class="empty-state" style="padding:32px 0;"{empty_hidden}>No customers yet — add your first one above.</div>
+    <div class="bin-list" style="display:grid;gap:12px;max-width:640px;">
+        {cards}
+    </div>
+    <style>.uw-lbl{{display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;}}</style>
+    """ + _CUSTOMERS_PAGE_JS
+    return render_template_string(shell_page("Customers", body))
+
+
+_CUSTOMERS_PAGE_JS = """
+<script>
+(function(){
+  var CSRF = (document.querySelector('meta[name=csrf-token]')||{}).content || '';
+  window.toggleAdd=function(){
+    var f=document.getElementById('add-cust-form');
+    if(f) f.hidden=!f.hidden;
+  };
+  function err(msg){ var e=document.getElementById('add-err'); if(e){ e.textContent=msg; e.hidden=false; } }
+  window.submitAdd=function(){
+    var body={
+      business_name:(document.getElementById('ac-business')||{}).value||'',
+      contact_name:(document.getElementById('ac-contact')||{}).value||'',
+      phone:(document.getElementById('ac-phone')||{}).value||'',
+      site_address:(document.getElementById('ac-address')||{}).value||'',
+      bin_size:(document.getElementById('ac-size')||{}).value||''
+    };
+    if(!body.business_name.trim() && !body.contact_name.trim()){ err('Enter a business or contact name.'); return; }
+    fetch('/api/customers', {method:'POST',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
+        body:JSON.stringify(body)})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
+      .then(function(res){ if(res.ok && res.j.id){ window.location='/customers/'+res.j.id; }
+                           else { err((res.j && res.j.error) || 'Could not create customer.'); } })
+      .catch(function(){ err('Network error — try again.'); });
+  };
+})();
+</script>
+"""
+
+
+@app.route("/api/customers", methods=["POST"])
+@login_required
+def create_customer():
+    """Create a customer (+ optional first site and bin) and mint a portal
+    token. customer_manager/owner only."""
+    if not has_role("customer_manager"):
+        return jsonify({"error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    business = str(data.get("business_name") or "").strip()[:200]
+    contact  = str(data.get("contact_name") or "").strip()[:200]
+    phone    = str(data.get("phone") or "").strip()[:50]
+    address  = str(data.get("site_address") or "").strip()[:300]
+    bin_size = str(data.get("bin_size") or "").strip()
+    if not business and not contact:
+        return jsonify({"error": "a business or contact name is required"}), 400
+    if bin_size and bin_size not in REQUEST_SIZES:
+        return jsonify({"error": "invalid bin size"}), 400
+    if bin_size and not address:
+        return jsonify({"error": "a site address is required to add a bin"}), 400
+
+    conn = get_db()
+    try:
+        token = _new_portal_token(conn)
+        ts = now_ts()
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO customers (company_id, business_name, contact_name, phone,
+                                      portal_token, is_active, created_at)
+               VALUES (?, ?, ?, ?, ?, 1, ?)""",
+            (cid(), business or None, contact or None, phone or None, token, ts),
+        )
+        customer_id = cur.lastrowid
+        if address:
+            cur.execute(
+                "INSERT INTO sites (customer_id, address, created_at) VALUES (?, ?, ?)",
+                (customer_id, address, ts),
+            )
+            site_id = cur.lastrowid
+            if bin_size:
+                cur.execute(
+                    "INSERT INTO bins (customer_id, site_id, size, dropped_at) VALUES (?, ?, ?, ?)",
+                    (customer_id, site_id, bin_size, today_str()),
+                )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        app.logger.warning("create customer failed: %s", exc)
+        return jsonify({"error": "could not create customer"}), 500
+    conn.close()
+    return jsonify({"success": True, "id": customer_id, "portal_token": token})
+
+
+@app.route("/api/customers/<int:customer_id>", methods=["PATCH"])
+@login_required
+def update_customer(customer_id):
+    """Edit a customer's business name / contact / phone. cm/owner only."""
+    if not has_role("customer_manager"):
+        return jsonify({"error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    conn = get_db()
+    cust = _load_customer_scoped(conn, customer_id)
+    if cust is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    business = str(data.get("business_name") or "").strip()[:200]
+    contact  = str(data.get("contact_name") or "").strip()[:200]
+    phone    = str(data.get("phone") or "").strip()[:50]
+    if not business and not contact:
+        conn.close()
+        return jsonify({"error": "a business or contact name is required"}), 400
+    conn.execute(
+        "UPDATE customers SET business_name=?, contact_name=?, phone=? WHERE id=?",
+        (business or None, contact or None, phone or None, customer_id),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/customers/<int:customer_id>/regenerate-token", methods=["POST"])
+@login_required
+def regenerate_customer_token(customer_id):
+    """Mint a fresh portal token, invalidating the old link. cm/owner only."""
+    if not has_role("customer_manager"):
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    cust = _load_customer_scoped(conn, customer_id)
+    if cust is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    token = _new_portal_token(conn)
+    conn.execute("UPDATE customers SET portal_token=? WHERE id=?", (token, customer_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "portal_token": token, "portal_url": _portal_url(token)})
+
+
+@app.route("/api/customers/<int:customer_id>/deactivate", methods=["POST"])
+@login_required
+def deactivate_customer(customer_id):
+    """Soft-delete: hide from lists and kill portal access. History is kept.
+    cm/owner only."""
+    if not has_role("customer_manager"):
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    cust = _load_customer_scoped(conn, customer_id)
+    if cust is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    conn.execute("UPDATE customers SET is_active=0 WHERE id=?", (customer_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/customers/<int:customer_id>")
+@roles_required("customer_manager")
+def customer_detail_page(customer_id):
+    """One customer: info, sites, bins, request history, and the portal link
+    with copy / text / regenerate controls."""
+    conn = get_db()
+    cust = _load_customer_scoped(conn, customer_id)
+    if cust is None:
+        conn.close()
+        flash("Customer not found.", "error")
+        return redirect(url_for("customers_page"))
+
+    sites = conn.execute(
+        "SELECT id, address, notes FROM sites WHERE customer_id=? ORDER BY id",
+        (customer_id,),
+    ).fetchall()
+    bins = conn.execute(
+        """SELECT b.id, b.size, b.dropped_at, s.address AS site_address
+             FROM bins b LEFT JOIN sites s ON b.site_id = s.id
+            WHERE b.customer_id=? ORDER BY b.id""",
+        (customer_id,),
+    ).fetchall()
+    reqs = conn.execute(
+        """SELECT r.id, r.type, r.status, r.preferred_date, r.created_at,
+                  ro.route_date AS scheduled_date
+             FROM requests r
+        LEFT JOIN stops st ON r.stop_id = st.id
+        LEFT JOIN routes ro ON st.route_id = ro.id
+            WHERE r.customer_id=? ORDER BY r.created_at DESC, r.id DESC""",
+        (customer_id,),
+    ).fetchall()
+    conn.close()
+
+    portal_url = _portal_url(cust["portal_token"])
+    company_name = session.get("company_name") or "HAULTRA"
+    name = e(cust["business_name"] or cust["contact_name"] or "Customer")
+    contact = cust["contact_name"] or ""
+    # SMS body: greeting uses contact if we have one.
+    greet = f"Hi {contact}, " if contact else "Hi, "
+    sms_body = (f"{greet}here's your {company_name} service portal — request pickups, "
+                f"swaps, or extra bins anytime: {portal_url}")
+    sms_href = ("sms:" + (e(cust["phone"]) if cust["phone"] else "")
+                + "?&body=" + urllib.parse.quote(sms_body))
+
+    _TYPE_LABEL = {"PR": "PR · Pull & Return", "P": "P · Pickup",
+                   "D": "D · Drop", "NEW_BIN": "NEW BIN"}
+    _STATUS_LABEL = {"pending": "Pending", "accepted": "Accepted",
+                     "approved": "Approved", "scheduled": "Scheduled",
+                     "in_progress": "In progress", "done": "Done", "denied": "Denied"}
+
+    _site_rows = []
+    for s in sites:
+        note = (f'<div style="color:var(--slate);font-size:12px;margin-top:2px;">{e(s["notes"])}</div>'
+                if s["notes"] else "")
+        _site_rows.append(
+            f'<div style="padding:8px 0;border-bottom:1px solid var(--border);">'
+            f'📍 {e(s["address"] or "—")}{note}</div>'
+        )
+    sites_html = "".join(_site_rows) or '<div style="color:var(--slate);font-size:13px;">No sites yet.</div>'
+
+    _bin_rows = []
+    for b in bins:
+        dropped = f' · dropped {e(b["dropped_at"])}' if b["dropped_at"] else ""
+        _bin_rows.append(
+            f'<div style="padding:8px 0;border-bottom:1px solid var(--border);">'
+            f'🗑️ {e(b["size"] or "Dumpster")} '
+            f'<span style="color:var(--slate);font-size:12px;">at {e(b["site_address"] or "—")}{dropped}</span></div>'
+        )
+    bins_html = "".join(_bin_rows) or '<div style="color:var(--slate);font-size:13px;">No active bins.</div>'
+
+    def _status_chip(st):
+        color = {"denied": "#FF7A7A", "done": "#3DDC84", "pending": "#FF8A3D"}.get(st, "var(--cyan)")
+        return (f'<span style="color:{color};font-weight:700;font-size:12px;">'
+                f'{e(_STATUS_LABEL.get(st, st))}</span>')
+
+    reqs_html = "".join(
+        f'<div style="display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid var(--border);">'
+        f'<span style="font-size:13px;">{e(_TYPE_LABEL.get(r["type"], r["type"]))}'
+        f'<span style="color:var(--slate);"> · {e((r["created_at"] or "")[:10])}</span></span>'
+        f'{_status_chip(r["status"])}</div>'
+        for r in reqs
+    ) or '<div style="color:var(--slate);font-size:13px;">No requests yet.</div>'
+
+    body = f"""
+    <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+        <div>
+            <h1 style="margin-bottom:4px;">{name}</h1>
+            <p style="margin:0;">Customer details &amp; portal link.</p>
+        </div>
+        <a class="btn secondary" href="{url_for('customers_page')}" style="white-space:nowrap;">← All customers</a>
+    </div>
+
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+            <h2 style="font-size:15px;margin:0;">Info</h2>
+            <button class="btn secondary" onclick="toggleEdit()" style="padding:4px 12px;font-size:12px;">Edit</button>
+        </div>
+        <div id="cust-view" style="margin-top:10px;">
+            <div style="font-size:14px;">👤 {e(contact) or "—"}</div>
+            <div style="font-size:14px;color:var(--slate);margin-top:4px;">📞 {e(cust["phone"] or "—")}</div>
+        </div>
+        <div id="cust-edit" hidden style="margin-top:10px;">
+            <div id="edit-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
+            <label class="uw-lbl">Business name</label>
+            <input id="ed-business" style="width:100%;margin-bottom:10px;" value="{e(cust["business_name"] or "")}">
+            <label class="uw-lbl">Contact name</label>
+            <input id="ed-contact" style="width:100%;margin-bottom:10px;" value="{e(cust["contact_name"] or "")}">
+            <label class="uw-lbl">Phone</label>
+            <input id="ed-phone" style="width:100%;margin-bottom:12px;" value="{e(cust["phone"] or "")}">
+            <div style="display:flex;gap:8px;">
+                <button class="btn green" style="flex:1;" onclick="submitEdit()">Save</button>
+                <button class="btn secondary" onclick="toggleEdit()">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+        <h2 style="font-size:15px;margin:0 0 10px;">Portal link</h2>
+        <div id="portal-url-box" style="word-break:break-all;font-size:13px;color:var(--cyan);
+             background:rgba(255,255,255,0.03);border-radius:8px;padding:10px;">{e(portal_url)}</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">
+            <button class="btn secondary" onclick="copyLink()" style="flex:1;min-width:110px;">Copy link</button>
+            <a class="btn secondary" href="{sms_href}" style="flex:1;min-width:110px;text-align:center;">Text link</a>
+            <button class="btn secondary" onclick="regen()" style="flex:1;min-width:110px;">Regenerate</button>
+        </div>
+        <div id="portal-msg" hidden style="font-size:12px;margin-top:8px;color:var(--slate);"></div>
+    </div>
+
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+        <h2 style="font-size:15px;margin:0 0 6px;">Sites</h2>
+        {sites_html}
+    </div>
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+        <h2 style="font-size:15px;margin:0 0 6px;">Bins</h2>
+        {bins_html}
+    </div>
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+        <h2 style="font-size:15px;margin:0 0 6px;">Request history</h2>
+        {reqs_html}
+    </div>
+    <div style="max-width:640px;margin-bottom:24px;">
+        <button class="btn red" onclick="deactivate()" style="width:100%;">Deactivate customer</button>
+        <div style="color:var(--slate);font-size:12px;margin-top:6px;text-align:center;">
+            Hides them from lists and disables their portal link. History is kept.
+        </div>
+    </div>
+    <style>.uw-lbl{{display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;}}</style>
+    {_customer_detail_js(customer_id)}
+    """
+    return render_template_string(shell_page("Customer", body))
+
+
+def _customer_detail_js(customer_id):
+    """Per-customer detail script. f-string only interpolates the id and the
+    customers list URL; all JS braces are doubled."""
+    list_url = url_for("customers_page")
+    return f"""
+<script>
+(function(){{
+  var CSRF = (document.querySelector('meta[name=csrf-token]')||{{}}).content || '';
+  var CID = {customer_id};
+  function msg(t){{ var m=document.getElementById('portal-msg'); if(m){{ m.textContent=t; m.hidden=false; }} }}
+  window.toggleEdit=function(){{
+    var v=document.getElementById('cust-view'), ed=document.getElementById('cust-edit');
+    if(v&&ed){{ var show=ed.hidden; ed.hidden=!show; v.hidden=show; }}
+  }};
+  window.submitEdit=function(){{
+    var body={{business_name:(document.getElementById('ed-business')||{{}}).value||'',
+              contact_name:(document.getElementById('ed-contact')||{{}}).value||'',
+              phone:(document.getElementById('ed-phone')||{{}}).value||''}};
+    fetch('/api/customers/'+CID, {{method:'PATCH',
+        headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},
+        body:JSON.stringify(body)}})
+      .then(function(r){{ return r.json().then(function(j){{ return {{ok:r.ok,j:j}}; }}); }})
+      .then(function(res){{ if(res.ok){{ window.location.reload(); }}
+        else {{ var e=document.getElementById('edit-err'); if(e){{ e.textContent=(res.j&&res.j.error)||'Could not save.'; e.hidden=false; }} }} }})
+      .catch(function(){{ var e=document.getElementById('edit-err'); if(e){{ e.textContent='Network error.'; e.hidden=false; }} }});
+  }};
+  window.copyLink=function(){{
+    var url=(document.getElementById('portal-url-box')||{{}}).textContent||'';
+    if(navigator.clipboard&&navigator.clipboard.writeText){{
+      navigator.clipboard.writeText(url).then(function(){{ msg('Link copied.'); }},
+        function(){{ msg('Copy failed — select and copy manually.'); }});
+    }} else {{ msg('Copy not supported — select the link manually.'); }}
+  }};
+  window.regen=function(){{
+    if(!confirm('Regenerate the portal link? The current link will stop working immediately.')) return;
+    fetch('/api/customers/'+CID+'/regenerate-token', {{method:'POST',
+        headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}}}})
+      .then(function(r){{ return r.json().then(function(j){{ return {{ok:r.ok,j:j}}; }}); }})
+      .then(function(res){{ if(res.ok&&res.j.portal_url){{
+          var box=document.getElementById('portal-url-box'); if(box) box.textContent=res.j.portal_url;
+          msg('New link generated — the old one no longer works.');
+        }} else {{ msg((res.j&&res.j.error)||'Could not regenerate.'); }} }})
+      .catch(function(){{ msg('Network error — try again.'); }});
+  }};
+  window.deactivate=function(){{
+    if(!confirm('Deactivate this customer? They disappear from your lists and their portal link stops working. History is kept.')) return;
+    fetch('/api/customers/'+CID+'/deactivate', {{method:'POST',
+        headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}}}})
+      .then(function(r){{ return r.json().then(function(j){{ return {{ok:r.ok,j:j}}; }}); }})
+      .then(function(res){{ if(res.ok){{ window.location='{list_url}'; }}
+        else {{ msg((res.j&&res.j.error)||'Could not deactivate.'); }} }})
+      .catch(function(){{ msg('Network error — try again.'); }});
+  }};
+}})();
+</script>
+"""
 
 
 @app.route("/requests")
