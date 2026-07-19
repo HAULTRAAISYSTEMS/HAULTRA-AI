@@ -10581,8 +10581,18 @@ def view_route(route_id):
     """
 
     if session.get("role") == "boss":
+        # Paste Route is dispatch tooling (parses text → builds stops), so it's
+        # dispatcher/owner only — not a customer-manager-only boss — consistent
+        # with the /api/parse-route-text gate. Daily Log / Optimize / Delete stay
+        # available to any management boss.
+        _paste_route_btn = (
+            '<button class="btn" type="button" onclick="_haulsTogglePaste()" '
+            'style="background:linear-gradient(135deg,#FF8A42,#FF6B1A);border:1px solid rgba(255,107,26,.3);">'
+            '&#x1F4CB; Paste Route</button>'
+            if has_role("dispatcher") else ''
+        )
         route_action_buttons += f"""
-    <button class="btn" type="button" onclick="_haulsTogglePaste()" style="background:linear-gradient(135deg,#FF8A42,#FF6B1A);border:1px solid rgba(255,107,26,.3);">&#x1F4CB; Paste Route</button>
+    {_paste_route_btn}
     <a class="btn secondary" href="{url_for('route_daily_log', route_id=route_id)}">&#x1F4CB; Daily Log</a>
     <form class="inline" method="POST" action="{url_for('optimize_route', route_id=route_id)}"
           id="optimize-form"
@@ -10759,7 +10769,7 @@ def view_route(route_id):
         """
 
     paste_panel_block = ""
-    if session.get("role") == "boss":
+    if has_role("dispatcher"):  # dispatch tooling — dispatcher/owner only (matches the button)
         _dump_locs_json = json.dumps([dl["name"] for dl in dump_locs_for_form])
         paste_panel_block = f"""
         {_PASTE_ROUTE_CSS}
