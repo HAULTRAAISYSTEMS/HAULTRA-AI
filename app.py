@@ -16259,8 +16259,9 @@ def customer_bin_photo(token, bin_id):
 @app.route("/api/bins/<int:bin_id>/label", methods=["POST"])
 @login_required
 def manage_rename_bin(bin_id):
-    """Dispatcher/owner renames a bin from the management side (company-scoped)."""
-    if not has_role("dispatcher"):
+    """Any management role renames a bin from the management side
+    (company-scoped) — used from the customer detail page (B6)."""
+    if not _is_management():
         return jsonify({"error": "forbidden"}), 403
     conn = get_db()
     owned = conn.execute(
@@ -17288,12 +17289,20 @@ def customers_page():
             <input id="ac-phone" style="width:100%;margin-bottom:10px;" placeholder="757-555-0142">
             <label class="uw-lbl">Site address</label>
             <input id="ac-address" style="width:100%;margin-bottom:10px;" placeholder="1200 Industrial Blvd, Norfolk, VA">
-            <label class="uw-lbl">Initial bin size (optional)</label>
-            <select id="ac-size" style="width:100%;margin-bottom:12px;"><option value="">None yet</option>{size_opts}</select>
+            <label class="uw-lbl">Bins on site (optional)</label>
+            <div id="ac-bins"></div>
+            <button class="btn secondary" style="padding:6px 12px;font-size:12px;margin:4px 0 12px;" onclick="addBinRow()">+ Add another bin</button>
             <div style="display:flex;gap:8px;">
                 <button class="btn green" style="flex:1;" onclick="submitAdd()">Create customer</button>
                 <button class="btn secondary" onclick="toggleAdd()">Cancel</button>
             </div>
+            <template id="ac-bin-row-tpl">
+                <div class="ac-bin-row" style="display:flex;gap:8px;margin-bottom:8px;align-items:center;">
+                    <select class="ac-bin-size" style="flex:0 0 110px;"><option value="">None yet</option>{size_opts}</select>
+                    <input class="ac-bin-label" style="flex:1;" placeholder="Label (optional) — e.g. front gate">
+                    <button class="btn secondary ac-bin-del" style="padding:6px 10px;font-size:12px;" onclick="delBinRow(this)">✕</button>
+                </div>
+            </template>
         </div>
     </div>
     <div id="cust-empty" class="empty-state" style="padding:32px 0;"{empty_hidden}>No customers yet — add your first one above.</div>
@@ -17309,20 +17318,40 @@ _CUSTOMERS_PAGE_JS = """
 <script>
 (function(){
   var CSRF = (document.querySelector('meta[name=csrf-token]')||{}).content || '';
+  window.addBinRow=function(){
+    var tpl=document.getElementById('ac-bin-row-tpl');
+    var box=document.getElementById('ac-bins');
+    if(tpl && box){ box.appendChild(tpl.content.cloneNode(true)); }
+  };
+  window.delBinRow=function(btn){
+    var row=btn.closest('.ac-bin-row'); if(row) row.remove();
+  };
   window.toggleAdd=function(){
     var f=document.getElementById('add-cust-form');
-    if(f) f.hidden=!f.hidden;
+    if(!f) return;
+    f.hidden=!f.hidden;
+    // Seed one empty bin row on first open so the form matches the old
+    // single-bin layout (one size dropdown, empty by default).
+    var box=document.getElementById('ac-bins');
+    if(!f.hidden && box && !box.querySelector('.ac-bin-row')){ addBinRow(); }
   };
   function err(msg){ var e=document.getElementById('add-err'); if(e){ e.textContent=msg; e.hidden=false; } }
   window.submitAdd=function(){
+    var bins=[];
+    document.querySelectorAll('#ac-bins .ac-bin-row').forEach(function(row){
+      var size=(row.querySelector('.ac-bin-size')||{}).value||'';
+      var label=(row.querySelector('.ac-bin-label')||{}).value||'';
+      if(size){ bins.push({size:size, label:label}); }
+    });
     var body={
       business_name:(document.getElementById('ac-business')||{}).value||'',
       contact_name:(document.getElementById('ac-contact')||{}).value||'',
       phone:(document.getElementById('ac-phone')||{}).value||'',
       site_address:(document.getElementById('ac-address')||{}).value||'',
-      bin_size:(document.getElementById('ac-size')||{}).value||''
+      bins:bins
     };
     if(!body.business_name.trim() && !body.contact_name.trim()){ err('Enter a business or contact name.'); return; }
+    if(bins.length && !body.site_address.trim()){ err('Add a site address for the bins.'); return; }
     fetch('/api/customers', {method:'POST',
         headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
         body:JSON.stringify(body)})
@@ -17348,13 +17377,29 @@ def create_customer():
     contact  = str(data.get("contact_name") or "").strip()[:200]
     phone    = str(data.get("phone") or "").strip()[:50]
     address  = str(data.get("site_address") or "").strip()[:300]
-    bin_size = str(data.get("bin_size") or "").strip()
     if not business and not contact:
         return jsonify({"error": "a business or contact name is required"}), 400
-    if bin_size and bin_size not in REQUEST_SIZES:
-        return jsonify({"error": "invalid bin size"}), 400
-    if bin_size and not address:
-        return jsonify({"error": "a site address is required to add a bin"}), 400
+
+    # Bins to place at the site now. Accepts the new `bins` list
+    # [{size, label}, ...]; falls back to the legacy single `bin_size`. Empty
+    # rows (no size) are skipped, so the form's default one-empty-row creates 0
+    # bins — identical to today's single-bin behavior.
+    raw_bins = data.get("bins")
+    if not isinstance(raw_bins, list):
+        _bs = str(data.get("bin_size") or "").strip()
+        raw_bins = [{"size": _bs}] if _bs else []
+    clean_bins = []
+    for row in raw_bins:
+        if not isinstance(row, dict):
+            continue
+        size = str(row.get("size") or "").strip()
+        if not size:
+            continue  # empty row
+        if size not in REQUEST_SIZES:
+            return jsonify({"error": f"invalid bin size: {size}"}), 400
+        clean_bins.append((size, _sanitize_bin_label(row.get("label"))))
+    if clean_bins and not address:
+        return jsonify({"error": "a site address is required to add bins"}), 400
 
     conn = get_db()
     try:
@@ -17374,10 +17419,10 @@ def create_customer():
                 (customer_id, address, ts),
             )
             site_id = cur.lastrowid
-            if bin_size:
+            for size, label in clean_bins:
                 cur.execute(
-                    "INSERT INTO bins (customer_id, site_id, size, dropped_at) VALUES (?, ?, ?, ?)",
-                    (customer_id, site_id, bin_size, today_str()),
+                    "INSERT INTO bins (customer_id, site_id, size, label, dropped_at) VALUES (?, ?, ?, ?, ?)",
+                    (customer_id, site_id, size, label, today_str()),
                 )
         conn.commit()
     except Exception as exc:
@@ -17387,6 +17432,54 @@ def create_customer():
         return jsonify({"error": "could not create customer"}), 500
     conn.close()
     return jsonify({"success": True, "id": customer_id, "portal_token": token})
+
+
+@app.route("/api/customers/<int:customer_id>/bins", methods=["POST"])
+@login_required
+def add_customer_bin(customer_id):
+    """Record a bin that physically exists at the customer's site (outside the
+    request flow). owner/customer_manager/dispatcher. Body: size (required),
+    label (optional), and either site_id (existing) or site_address (new site).
+    This does NOT create a request — requesting NEW bins stays the portal flow."""
+    if not _is_management():
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    cust = _load_customer_scoped(conn, customer_id)
+    if cust is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    data = request.get_json(silent=True) or {}
+    size = str(data.get("size") or "").strip()
+    if size not in REQUEST_SIZES:
+        conn.close()
+        return jsonify({"error": "a bin size is required"}), 400
+    label = _sanitize_bin_label(data.get("label"))
+    # Resolve the site: an existing owned site, or create one from an address.
+    site_id = None
+    raw_site = data.get("site_id")
+    if isinstance(raw_site, int) or (isinstance(raw_site, str) and raw_site.isdigit()):
+        row = conn.execute("SELECT id FROM sites WHERE id=? AND customer_id=?",
+                           (int(raw_site), customer_id)).fetchone()
+        if row:
+            site_id = row["id"]
+    if site_id is None:
+        addr = str(data.get("site_address") or "").strip()[:300]
+        if not addr:
+            conn.close()
+            return jsonify({"error": "a site is required"}), 400
+        cur = conn.cursor()
+        cur.execute("INSERT INTO sites (customer_id, address, created_at) VALUES (?, ?, ?)",
+                   (customer_id, addr, now_ts()))
+        site_id = cur.lastrowid
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO bins (customer_id, site_id, size, label, dropped_at) VALUES (?, ?, ?, ?, ?)",
+        (customer_id, site_id, size, label, today_str()),
+    )
+    bin_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "id": bin_id})
 
 
 @app.route("/api/customers/<int:customer_id>", methods=["PATCH"])
@@ -17512,7 +17605,9 @@ def customer_detail_page(customer_id):
         )
     sites_html = "".join(_site_rows) or '<div style="color:var(--slate);font-size:13px;">No sites yet.</div>'
 
-    _can_rename = has_role("dispatcher")
+    # B6: any management role (owner/customer_manager/dispatcher) may add bins
+    # and edit labels from the customer detail page.
+    _can_rename = _is_management()
     _bin_rows = []
     for b in bins:
         dropped = f' · dropped {e(b["dropped_at"])}' if b["dropped_at"] else ""
@@ -17542,6 +17637,36 @@ def customer_detail_page(customer_id):
         f'{_status_chip(r["status"])}</div>'
         for r in reqs
     ) or '<div style="color:var(--slate);font-size:13px;">No requests yet.</div>'
+
+    # B6: record a bin that physically exists (not a request). Any management role.
+    add_bin_html = ""
+    if _can_rename:
+        _size_opts = "".join(f'<option value="{s}">{s}</option>' for s in REQUEST_SIZES)
+        _site_opts = "".join(f'<option value="{s["id"]}">{e(s["address"] or "site")}</option>' for s in sites)
+        _site_field = (
+            f'<label class="uw-lbl">Site</label>'
+            f'<select id="ab-site" style="width:100%;margin-bottom:8px;" onchange="abSiteChange()">{_site_opts}'
+            f'<option value="__new__">+ New site…</option></select>'
+            if sites else "")
+        _addr_hidden = " hidden" if sites else ""
+        add_bin_html = f"""
+        <button class="btn secondary" style="padding:6px 12px;font-size:12px;margin-top:10px;" onclick="toggleAddBin()">+ Add bin</button>
+        <div id="add-bin-form" hidden style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px;">
+            <div id="add-bin-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
+            {_site_field}
+            <div id="ab-addr-wrap"{_addr_hidden}><label class="uw-lbl">Site address</label>
+                <input id="ab-address" style="width:100%;margin-bottom:8px;" placeholder="1200 Industrial Blvd"></div>
+            <div style="display:flex;gap:8px;">
+                <div style="flex:0 0 110px;"><label class="uw-lbl">Size</label>
+                    <select id="ab-size" style="width:100%;"><option value="">Size…</option>{_size_opts}</select></div>
+                <div style="flex:1;"><label class="uw-lbl">Label (optional)</label>
+                    <input id="ab-label" style="width:100%;" placeholder="e.g. front gate"></div>
+            </div>
+            <div style="display:flex;gap:8px;margin-top:10px;">
+                <button class="btn green" style="flex:1;" onclick="submitAddBin()">Add bin</button>
+                <button class="btn secondary" onclick="toggleAddBin()">Cancel</button>
+            </div>
+        </div>"""
 
     body = f"""
     <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
@@ -17595,6 +17720,7 @@ def customer_detail_page(customer_id):
     <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
         <h2 style="font-size:15px;margin:0 0 6px;">Bins</h2>
         {bins_html}
+        {add_bin_html}
     </div>
     <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
         <h2 style="font-size:15px;margin:0 0 6px;">Request history</h2>
@@ -17631,6 +17757,28 @@ def _customer_detail_js(customer_id):
       .then(function(r){{ return r.json().then(function(j){{ return {{ok:r.ok,j:j}}; }}); }})
       .then(function(res){{ if(res.ok){{ window.location.reload(); }} else {{ alert((res.j&&res.j.error)||'Could not save.'); }} }})
       .catch(function(){{ alert('Network error — try again.'); }});
+  }};
+  window.toggleAddBin=function(){{ var f=document.getElementById('add-bin-form'); if(f) f.hidden=!f.hidden; }};
+  window.abSiteChange=function(){{
+    var sel=document.getElementById('ab-site'), wrap=document.getElementById('ab-addr-wrap');
+    if(sel && wrap){{ wrap.hidden = (sel.value!=='__new__'); }}
+  }};
+  window.submitAddBin=function(){{
+    var eb=document.getElementById('add-bin-err');
+    function aberr(m){{ if(eb){{ eb.textContent=m; eb.hidden=false; }} }}
+    var size=(document.getElementById('ab-size')||{{}}).value||'';
+    if(!size){{ aberr('Pick a bin size.'); return; }}
+    var body={{ size:size, label:(document.getElementById('ab-label')||{{}}).value||'' }};
+    var siteSel=document.getElementById('ab-site');
+    if(siteSel && siteSel.value && siteSel.value!=='__new__'){{ body.site_id=siteSel.value; }}
+    else {{ body.site_address=(document.getElementById('ab-address')||{{}}).value||'';
+            if(!body.site_address.trim()){{ aberr('Enter a site address.'); return; }} }}
+    fetch('/api/customers/'+CID+'/bins', {{method:'POST',
+        headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},
+        body:JSON.stringify(body)}})
+      .then(function(r){{ return r.json().then(function(j){{ return {{ok:r.ok,j:j}}; }}); }})
+      .then(function(res){{ if(res.ok){{ window.location.reload(); }} else {{ aberr((res.j&&res.j.error)||'Could not add bin.'); }} }})
+      .catch(function(){{ aberr('Network error — try again.'); }});
   }};
   window.toggleEdit=function(){{
     var v=document.getElementById('cust-view'), ed=document.getElementById('cust-edit');
