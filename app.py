@@ -745,7 +745,7 @@ def send_email(to_email, subject, html_body):
 # customer_create_request is authenticated by the URL portal token, not a
 # session cookie, so there is no session for CSRF to protect and it must be
 # exempt (same rationale as the Stripe webhook).
-_CSRF_EXEMPT_ENDPOINTS = {"stripe_webhook", "customer_create_request"}
+_CSRF_EXEMPT_ENDPOINTS = {"stripe_webhook", "customer_create_request", "customer_rename_bin"}
 
 @app.before_request
 def csrf_protect():
@@ -1602,6 +1602,55 @@ _INSPECTION_OVERALL_LABEL = {
     "out_of_service": "OUT OF SERVICE (unsafe)",
 }
 
+# Phase 7A — data-driven maintenance category pick list (validated server-side).
+# Repaired inspection defects are surfaced in the log under "Repair".
+MAINTENANCE_CATEGORIES = [
+    "Oil/Fluids", "Tires", "Brakes", "Hydraulics/Hoist",
+    "Electrical", "PM Service", "Repair", "Other",
+]
+# How long after creation a manual maintenance entry stays editable (then locked).
+MAINTENANCE_EDIT_WINDOW_SECONDS = 24 * 3600
+
+
+def parse_cost_cents(raw):
+    """Parse a user-entered dollar amount into INTEGER CENTS without ever
+    touching a float (float cents are lossy). Accepts '', '12', '12.5',
+    '$1,250.00'. Returns (cents:int|None, error:str|None). Empty → (None, None)
+    since cost is optional. Negative or >~$1M rejected."""
+    if raw is None:
+        return None, None
+    s = str(raw).strip().replace("$", "").replace(",", "")
+    if s == "":
+        return None, None
+    neg = s.startswith("-")
+    if neg:
+        return None, "cost cannot be negative"
+    if "." in s:
+        whole, _, frac = s.partition(".")
+    else:
+        whole, frac = s, ""
+    whole = whole or "0"
+    # ASCII-only digit check: str.isdigit() also accepts unicode digits like "²"
+    # that int() then rejects with ValueError. Require plain 0-9.
+    _ascii_digits = lambda x: x.isascii() and x.isdigit()
+    if not _ascii_digits(whole) or (frac and not _ascii_digits(frac)):
+        return None, "cost must be a number like 149.99"
+    frac = (frac + "00")[:2]  # pad/truncate to exactly 2 decimals, integer-only
+    cents = int(whole) * 100 + int(frac)
+    if cents > 100_000_000:  # $1,000,000 sanity ceiling
+        return None, "cost is too large"
+    return cents, None
+
+
+def format_cents(cents):
+    """Integer cents → '$1,250.00'. None → '—'."""
+    if cents is None:
+        return "—"
+    neg = cents < 0
+    cents = abs(int(cents))
+    dollars, rem = divmod(cents, 100)
+    return f"{'-' if neg else ''}${dollars:,}.{rem:02d}"
+
 
 def init_db():
     conn = get_db()
@@ -1979,10 +2028,55 @@ def init_db():
         """)
         conn.commit()
 
+    # Phase 7B — add 'S' (Swap) to the requests.type CHECK. SQLite can't ALTER a
+    # CHECK, so rebuild once (guarded: only when 'S' isn't already allowed).
+    # Column-safe copy by intersection, same pattern as the P5 rebuild above.
+    _rq_type_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='requests'"
+    ).fetchone()
+    if _rq_type_row and "'S'" not in (_rq_type_row["sql"] or ""):
+        _old_cols = [r[1] for r in conn.execute("PRAGMA table_info(requests)").fetchall()]
+        _new_cols = ["id", "customer_id", "site_id", "type", "bin_id", "size_requested",
+                     "preferred_date", "notes", "status", "stop_id", "deny_reason",
+                     "customer_note", "created_at", "updated_at"]
+        _copy = [c for c in _new_cols if c in _old_cols]
+        _copy_csv = ", ".join(_copy)
+        conn.executescript(f"""
+            PRAGMA foreign_keys=off;
+            BEGIN;
+            CREATE TABLE requests_p7_new (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                customer_id    INTEGER NOT NULL,
+                site_id        INTEGER NOT NULL,
+                type           TEXT NOT NULL CHECK(type IN ('PR','P','D','NEW_BIN','S')),
+                bin_id         INTEGER,
+                size_requested TEXT,
+                preferred_date TEXT NOT NULL,
+                notes          TEXT,
+                status         TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','accepted','approved','scheduled','in_progress','done','denied')),
+                stop_id        INTEGER,
+                deny_reason    TEXT,
+                customer_note  TEXT,
+                created_at     TEXT NOT NULL,
+                updated_at     TEXT NOT NULL
+            );
+            INSERT INTO requests_p7_new ({_copy_csv}) SELECT {_copy_csv} FROM requests;
+            DROP TABLE requests;
+            ALTER TABLE requests_p7_new RENAME TO requests;
+            COMMIT;
+            PRAGMA foreign_keys=on;
+        """)
+        conn.commit()
+
     # Phase 5 §4 — customers can be deactivated (soft delete). Active by
     # default; deactivating hides them from management lists and kills portal
     # token access without destroying history.
     safe_add_column(conn, "customers", "is_active INTEGER NOT NULL DEFAULT 1")
+    # NOTE: Phase 7 additive columns for inspection_items / maintenance_entries /
+    # trucks / bins live AFTER those tables are created (search "_phase7_migrate")
+    # — placing them here would no-op on a fresh DB's first init_db because the
+    # target tables don't exist yet.
 
     # --- Per-route boss <-> driver messages: minimal thread, one row per
     #     message. "Unread" is derived per-viewer as "not sent by me and
@@ -2117,7 +2211,7 @@ def init_db():
         id             INTEGER PRIMARY KEY AUTOINCREMENT,
         customer_id    INTEGER NOT NULL,
         site_id        INTEGER NOT NULL,
-        type           TEXT NOT NULL CHECK(type IN ('PR','P','D','NEW_BIN')),
+        type           TEXT NOT NULL CHECK(type IN ('PR','P','D','NEW_BIN','S')),
         bin_id         INTEGER,
         size_requested TEXT,
         preferred_date TEXT NOT NULL,
@@ -2228,6 +2322,86 @@ def init_db():
             [(lbl, hint, i, _ts) for i, (lbl, hint) in enumerate(DEFAULT_CHECKLIST)],
         )
         conn.commit()
+
+    # Phase 7A — manual (non-inspection) maintenance entries. Money is stored as
+    # INTEGER CENTS (cost_cents), never a float. Editable by owner/dispatcher for
+    # EDIT_WINDOW after creation, then locked; never deleted — a `voided` flag +
+    # required note preserves the record.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS maintenance_entries (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id  INTEGER NOT NULL,
+        truck_id    INTEGER NOT NULL,
+        entry_date  TEXT NOT NULL,
+        category    TEXT NOT NULL,
+        description TEXT NOT NULL,
+        cost_cents  INTEGER,
+        vendor      TEXT,
+        created_by  INTEGER NOT NULL,
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT,
+        voided      INTEGER NOT NULL DEFAULT 0,
+        void_note   TEXT,
+        voided_by   INTEGER,
+        voided_at   TEXT,
+        FOREIGN KEY (company_id) REFERENCES companies(id),
+        FOREIGN KEY (truck_id)   REFERENCES trucks(id)
+    )
+    """)
+
+    # Receipt photos for maintenance — attaches to EITHER a repaired defect
+    # (inspection_items.id) or a manual entry (maintenance_entries.id). Exactly
+    # one of the two link columns is set. Multiple rows per record = multiple
+    # receipts. Cost data → management-only serving.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS maintenance_photos (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id     INTEGER NOT NULL,
+        defect_item_id INTEGER,
+        manual_entry_id INTEGER,
+        file_path      TEXT NOT NULL,
+        uploaded_at    TEXT NOT NULL,
+        uploaded_by    INTEGER,
+        FOREIGN KEY (company_id) REFERENCES companies(id)
+    )
+    """)
+
+    # Phase 7A revision — company vendor/shop accounts. Repairs & manual entries
+    # can reference one (or stay in-house/blank). Many companies run on vendor
+    # accounts and never enter costs, so the log's primary value is the event
+    # trail, not dollars.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS vendors (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id INTEGER NOT NULL,
+        name       TEXT NOT NULL,
+        phone      TEXT,
+        notes      TEXT,
+        is_active  INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (company_id) REFERENCES companies(id)
+    )
+    """)
+
+    # _phase7_migrate — additive columns on tables created ABOVE in this same
+    # init_db pass (inspection_items / maintenance_entries / trucks / bins), so
+    # they exist on a fresh DB's very first boot, not only after a restart.
+    # Money is INTEGER CENTS, never a float.
+    safe_add_column(conn, "inspection_items", "cost_cents INTEGER")
+    safe_add_column(conn, "inspection_items", "vendor TEXT")
+    safe_add_column(conn, "inspection_items", "vendor_id INTEGER")
+    safe_add_column(conn, "inspection_items", "at_vendor INTEGER NOT NULL DEFAULT 0")
+    safe_add_column(conn, "inspection_items", "sent_vendor_id INTEGER")
+    safe_add_column(conn, "inspection_items", "sent_at TEXT")
+    safe_add_column(conn, "maintenance_entries", "vendor_id INTEGER")
+    safe_add_column(conn, "maintenance_entries", "at_vendor INTEGER NOT NULL DEFAULT 0")
+    safe_add_column(conn, "maintenance_entries", "sent_vendor_id INTEGER")
+    safe_add_column(conn, "maintenance_entries", "sent_at TEXT")
+    safe_add_column(conn, "maintenance_entries", "completed_at TEXT")
+    safe_add_column(conn, "trucks", "at_vendor INTEGER NOT NULL DEFAULT 0")
+    safe_add_column(conn, "bins", "label TEXT")
+    safe_add_column(conn, "bins", "drop_photo_path TEXT")
+    safe_add_column(conn, "bins", "drop_stop_id INTEGER")
 
     # --- default company bootstrap ---
     default_co = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()
@@ -4243,6 +4417,7 @@ def shell_page(title, body, extra_head=""):
             # Trucks/fleet — any management role can view (add/edit is gated
             # server-side to owner/dispatcher).
             _mparts.append(nav_link(url_for("trucks_page"), "🚛 Trucks", path))
+            _mparts.append(nav_link(url_for("vendors_page"), "🔧 Vendors", path))
             if is_disp:
                 _mparts.append(nav_link(url_for("team_page"), "👥 Team", path))
             if is_own:
@@ -12277,6 +12452,77 @@ def optimize_route(route_id):
     return redirect(url_for("view_route", route_id=route_id))
 
 
+@app.route("/stop/<int:stop_id>/drop-bin", methods=["POST"])
+@login_required
+def stop_drop_bin(stop_id):
+    """Phase 7B — at a Drop/Delivery completion the driver can optionally label
+    the bin ('where I left it') and attach a photo. Resolves the bin the stop
+    dropped: the request's existing bin for PR/P/S, else find-or-create one for
+    the customer/site of a delivery so it appears on the customer's portal.
+    Multipart: label, photo. Both optional."""
+    conn = get_db()
+    stop = conn.execute(
+        """SELECT s.id, s.customer_id, s.request_id, r.assigned_to, r.company_id
+             FROM stops s JOIN routes r ON s.route_id=r.id
+            WHERE s.id=? AND r.company_id=?""",
+        (stop_id, cid()),
+    ).fetchone()
+    if not stop:
+        conn.close()
+        abort(404)
+    # Driver may only touch their own stop (boss/dispatcher may too).
+    if session.get("role") != "boss" and stop["assigned_to"] != session.get("user_id"):
+        conn.close()
+        abort(403)
+    req = None
+    if stop["request_id"]:
+        req = conn.execute(
+            "SELECT id, type, bin_id, site_id, customer_id, size_requested FROM requests WHERE id=?",
+            (stop["request_id"],),
+        ).fetchone()
+    # Resolve target bin.
+    bin_id = None
+    if req and req["bin_id"]:
+        bin_id = req["bin_id"]
+    elif req and req["customer_id"] and req["site_id"]:
+        existing = conn.execute(
+            "SELECT id FROM bins WHERE customer_id=? AND site_id=? AND drop_stop_id=?",
+            (req["customer_id"], req["site_id"], stop_id),
+        ).fetchone()
+        if existing:
+            bin_id = existing["id"]
+        else:
+            cur = conn.cursor()
+            cur.execute(
+                """INSERT INTO bins (customer_id, site_id, size, dropped_at, drop_stop_id)
+                   VALUES (?,?,?,?,?)""",
+                (req["customer_id"], req["site_id"], req["size_requested"], today_str(), stop_id),
+            )
+            bin_id = cur.lastrowid
+    if bin_id is None:
+        conn.close()
+        return jsonify({"error": "no bin to label for this stop"}), 400
+
+    label = _sanitize_bin_label(request.form.get("label"))
+    updates, params = [], []
+    if request.form.get("label") is not None:
+        updates.append("label=?"); params.append(label)
+    photo = request.files.get("photo")
+    if photo and photo.filename and allowed_file(photo.filename):
+        try:
+            fname = f"drop_{bin_id}_{secrets.token_hex(6)}_{secure_filename(photo.filename)}"
+            photo.save(os.path.join(app.config["UPLOAD_FOLDER"], fname))
+            updates.append("drop_photo_path=?"); params.append(os.path.join("static", "uploads", fname))
+        except OSError as exc:
+            app.logger.warning("drop photo save failed: %s", exc)
+    if updates:
+        params.append(bin_id)
+        conn.execute(f"UPDATE bins SET {', '.join(updates)} WHERE id=?", params)
+        conn.commit()
+    conn.close()
+    return jsonify({"success": True, "bin_id": bin_id, "label": label})
+
+
 # =========================================================
 # PHOTO UPLOAD
 # =========================================================
@@ -15754,7 +16000,7 @@ def address_suggestions():
 # creates driver work — the boss approves them in a future phase. All
 # validation is server-side. Errors are {"error": "..."} with the right code.
 # =========================================================
-REQUEST_TYPES     = {"PR", "P", "D", "NEW_BIN"}
+REQUEST_TYPES     = {"PR", "P", "D", "NEW_BIN", "S"}  # S = Swap (Phase 7B)
 REQUEST_SIZES     = ["10yd", "15yd", "20yd", "30yd", "40yd"]
 REQUEST_STATUSES  = {"pending", "accepted", "approved", "scheduled", "in_progress", "done", "denied"}
 REQUEST_OPEN      = ("pending", "accepted", "approved", "scheduled", "in_progress")  # dupe-guard scope
@@ -15791,6 +16037,7 @@ def customer_dashboard(token):
 
     bins = conn.execute(
         """SELECT b.id, b.customer_id, b.site_id, b.size, b.dropped_at,
+                  b.label, b.drop_photo_path,
                   s.address AS site_address
              FROM bins b
              JOIN sites s ON b.site_id = s.id
@@ -15831,7 +16078,14 @@ def customer_dashboard(token):
             "phone":         customer["phone"],
         },
         "sites":    [dict(s) for s in sites],
-        "bins":     [dict(b) for b in bins],
+        "bins":     [
+            {**dict(b),
+             "drop_photo_url": (url_for("customer_bin_photo", token=token, bin_id=b["id"])
+                                if b["drop_photo_path"] else None),
+             # never leak the filesystem path to the client
+             "drop_photo_path": None}
+            for b in bins
+        ],
         "requests": [dict(r) for r in reqs],
     })
 
@@ -15873,16 +16127,16 @@ def customer_create_request(token):
     size_requested = data.get("size_requested")
 
     # --- type-specific requirements ---
-    if rtype in ("PR", "P"):
+    if rtype in ("PR", "P", "S"):  # S (Swap) acts on an existing bin, like PR/P
         if not isinstance(bin_id, int):
-            return bad("bin_id is required for PR and P requests")
+            return bad("bin_id is required for PR, P and S requests")
         owned_bin = conn.execute(
             "SELECT id FROM bins WHERE id = ? AND customer_id = ? AND site_id = ?",
             (bin_id, customer["id"], site_id),
         ).fetchone()
         if owned_bin is None:
             return bad("bin_id is not a container at this site")
-        size_requested = None  # not used for PR/P
+        size_requested = None  # not used for PR/P/S
     else:  # D or NEW_BIN
         if not isinstance(size_requested, str) or size_requested not in REQUEST_SIZES:
             return bad("size_requested must be one of " + ", ".join(REQUEST_SIZES))
@@ -15909,9 +16163,9 @@ def customer_create_request(token):
         notes = notes or None
 
     # --- duplicate guard: one open request per (customer, type, bin) for
-    #     PR/P, or per (customer, type, site) for D/NEW_BIN ---
+    #     PR/P/S, or per (customer, type, site) for D/NEW_BIN ---
     open_ph = ",".join("?" for _ in REQUEST_OPEN)
-    if rtype in ("PR", "P"):
+    if rtype in ("PR", "P", "S"):
         dupe = conn.execute(
             f"""SELECT id FROM requests
                  WHERE customer_id = ? AND type = ? AND bin_id = ?
@@ -15946,6 +16200,83 @@ def customer_create_request(token):
     ).fetchone()
     conn.close()
     return jsonify(dict(new_row)), 201
+
+
+def _sanitize_bin_label(raw):
+    """A bin label is short free text the customer/driver/dispatcher can set.
+    Strip control chars, collapse whitespace, cap at 40 chars. '' → None."""
+    s = str(raw or "").replace("\n", " ").replace("\r", " ").strip()
+    s = re.sub(r"\s+", " ", s)
+    s = "".join(ch for ch in s if ch >= " ")  # drop control chars
+    return s[:40] or None
+
+
+@app.route("/api/c/<token>/bins/<int:bin_id>/label", methods=["POST"])
+def customer_rename_bin(token, bin_id):
+    """Customer renames their own bin from the portal (token-authed, CSRF-exempt
+    like customer_create_request). Sanitized, max 40 chars."""
+    conn = get_db()
+    customer = _customer_by_token(conn, token)
+    if customer is None:
+        conn.close()
+        return _not_found()
+    owned = conn.execute(
+        "SELECT id FROM bins WHERE id=? AND customer_id=?", (bin_id, customer["id"])
+    ).fetchone()
+    if owned is None:
+        conn.close()
+        return _not_found()
+    data = request.get_json(silent=True) or {}
+    label = _sanitize_bin_label(data.get("label"))
+    conn.execute("UPDATE bins SET label=? WHERE id=?", (label, bin_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "label": label})
+
+
+@app.route("/api/c/<token>/bin-photo/<int:bin_id>")
+def customer_bin_photo(token, bin_id):
+    """Serve a bin's 'where we left it' drop photo to the owning customer,
+    token-scoped (no session)."""
+    conn = get_db()
+    customer = _customer_by_token(conn, token)
+    if customer is None:
+        conn.close()
+        return _not_found()
+    row = conn.execute(
+        "SELECT drop_photo_path FROM bins WHERE id=? AND customer_id=?",
+        (bin_id, customer["id"]),
+    ).fetchone()
+    conn.close()
+    if not row or not row["drop_photo_path"]:
+        abort(404)
+    full = os.path.join(app.root_path, row["drop_photo_path"])
+    if not os.path.isfile(full):
+        abort(404)
+    return send_file(full)
+
+
+@app.route("/api/bins/<int:bin_id>/label", methods=["POST"])
+@login_required
+def manage_rename_bin(bin_id):
+    """Dispatcher/owner renames a bin from the management side (company-scoped)."""
+    if not has_role("dispatcher"):
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    owned = conn.execute(
+        """SELECT b.id FROM bins b JOIN customers c ON b.customer_id=c.id
+            WHERE b.id=? AND c.company_id=?""",
+        (bin_id, cid()),
+    ).fetchone()
+    if owned is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    data = request.get_json(silent=True) or {}
+    label = _sanitize_bin_label(data.get("label"))
+    conn.execute("UPDATE bins SET label=? WHERE id=?", (label, bin_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "label": label})
 
 
 # =========================================================
@@ -15988,8 +16319,16 @@ _PORTAL_JS = r"""
   .portal .p-btn .s { display: block; font-size: 13px; font-weight: 600; opacity: .85; margin-top: 3px; }
   .portal .p-btn.pr { background: #FF6B1A !important; }
   .portal .p-btn.p  { background: #FFB27A !important; }
+  .portal .p-btn.s  { background: #00E5CC !important; }
   .portal .p-btn.d  { background: #3DDC84 !important; }
   .portal .p-btn:active { transform: translateY(1px); }
+  .p-site-head { font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: .6px;
+      color: var(--slate); margin: 22px 2px 4px; }
+  .portal .p-rename { background: transparent !important; border: none !important; box-shadow: none !important;
+      color: var(--cyan) !important; font-size: 13px; font-weight: 800; cursor: pointer; padding: 2px 4px;
+      font-family: inherit; white-space: nowrap; min-height: 0 !important; }
+  .p-drop-photo { display: block; width: 100%; max-height: 180px; object-fit: cover; border-radius: 12px;
+      margin-top: 10px; border: 1px solid var(--border); }
   .portal .p-btn[disabled] { opacity: .45 !important; cursor: default; }
   .chip { display: block; border-radius: 12px; padding: 10px 12px; margin-top: 10px;
       font-size: 14px; font-weight: 700; line-height: 1.35; }
@@ -16056,7 +16395,7 @@ _PORTAL_JS = r"""
     if(!st.data) return null;
     for(var i=0;i<st.data.requests.length;i++){ var r=st.data.requests[i];
       if(OPEN.indexOf(r.status)<0 || r.type!==type) continue;
-      if((type==='PR'||type==='P') && r.bin_id===binId) return r;
+      if((type==='PR'||type==='P'||type==='S') && r.bin_id===binId) return r;
       if(type==='D' && r.site_id===siteId) return r;
     }
     return null;
@@ -16076,7 +16415,7 @@ _PORTAL_JS = r"""
     else if(r.status==='in_progress'){ cls='blue'; txt='Driver is on it today'; }
     else if(r.status==='done'){ cls='green'; txt='Completed &#10003;'; }
     else if(r.status==='denied'){ cls='red'; txt='We couldn&rsquo;t do this one &mdash; call us'+(r.deny_reason?(': '+esc(r.deny_reason)):''); }
-    var typ = r.type==='PR'?'Empty &amp; return':(r.type==='P'?'Pick up':'New bin');
+    var typ = r.type==='PR'?'Empty &amp; return':(r.type==='P'?'Pick up':(r.type==='S'?'Swap':'New bin'));
     return '<div class="chip '+cls+'"><span style="opacity:.75;font-weight:800;">'+typ+':</span> '+txt+'</div>';
   }
 
@@ -16102,14 +16441,33 @@ _PORTAL_JS = r"""
     if(st.ok){ html += '<div class="p-ok">'+esc(st.ok)+'</div>'; st.ok=''; }
 
     if(d.bins.length){
+      // Group bins by site; show a site-address header only when the customer
+      // has bins at more than one site (single-site looks unchanged — B5).
+      var siteIds = {}; d.bins.forEach(function(b){ siteIds[b.site_id]=1; });
+      var multiSite = Object.keys(siteIds).length > 1;
+      var lastSite = null;
       d.bins.forEach(function(b){
-        html += '<div class="p-card"><div class="p-card-head">'+esc(b.size||'Dumpster')+'</div>'+
-                '<div class="p-card-sub">at '+esc(b.site_address||'your site')+'</div>';
+        if(multiSite && b.site_id!==lastSite){
+          html += '<div class="p-site-head">'+esc(b.site_address||'Site')+'</div>';
+          lastSite = b.site_id;
+        }
+        var head = esc(b.size||'Dumpster') + (b.label ? (' &mdash; '+esc(b.label)) : '');
+        var iRen = acts.push(function(){ renameBin(b); })-1;
+        html += '<div class="p-card">'+
+                '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;">'+
+                '<div class="p-card-head">'+head+'</div>'+
+                '<button class="p-rename" data-act="'+iRen+'">'+(b.label?'Rename':'+ Label')+'</button></div>';
+        if(!multiSite){ html += '<div class="p-card-sub">at '+esc(b.site_address||'your site')+'</div>'; }
+        if(b.drop_photo_url){
+          html += '<a href="'+esc(b.drop_photo_url)+'" target="_blank"><img class="p-drop-photo" src="'+esc(b.drop_photo_url)+'" alt="where we left it"></a>';
+        }
         infoReqs(b.id, b.site_id).forEach(function(r){ html += chip(r); });
         var iPR = acts.push(function(){ startPR_P('PR', b); })-1;
         html += actionBtn('pr','PR','EMPTY &amp; RETURN','We dump it and bring the same bin back', b.id, b.site_id, iPR);
         var iP = acts.push(function(){ startPR_P('P', b); })-1;
         html += actionBtn('p','P','PICK UP &mdash; I&rsquo;M DONE','We take the bin away for good', b.id, b.site_id, iP);
+        var iS = acts.push(function(){ startPR_P('S', b); })-1;
+        html += actionBtn('s','S','SWAP','Empty this one, bring another', b.id, b.site_id, iS);
         var iD = acts.push(function(){ startD(b.site_id, b.site_address); })-1;
         html += actionBtn('d','D','NEED ANOTHER BIN','Bring an additional dumpster to this site', null, b.site_id, iD);
         html += '</div>';
@@ -16175,7 +16533,17 @@ _PORTAL_JS = r"""
     var sz = a.size ? (esc(a.size)+' ') : '';
     if(a.type==='PR') return 'Empty the '+sz+'dumpster at '+esc(a.address)+' and bring it back';
     if(a.type==='P')  return 'Pick up the '+sz+'dumpster at '+esc(a.address);
+    if(a.type==='S')  return 'Swap the '+sz+'dumpster at '+esc(a.address)+' &mdash; empty this one and leave a replacement';
     return 'Drop off a '+sz+'dumpster at '+esc(a.address);
+  }
+  function renameBin(bin){
+    var cur = bin.label || '';
+    var v = window.prompt('Label this dumpster so everyone knows which is which (e.g. "by the front gate"):', cur);
+    if(v===null) return;
+    api('/api/c/'+encodeURIComponent(TOKEN)+'/bins/'+bin.id+'/label', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({label:v})
+    }).then(function(r){ return r.json(); }).then(function(){ load(function(){}); render(); })
+      .catch(function(){ st.error='Could not save the label — try again.'; render(); });
   }
 
   function renderConfirm(){
@@ -16212,7 +16580,7 @@ _PORTAL_JS = r"""
       pref = st.date;
     }
     var body = { type:a.type, site_id:a.siteId, preferred_date:pref };
-    if(a.type==='PR' || a.type==='P') body.bin_id = a.binId;
+    if(a.type==='PR' || a.type==='P' || a.type==='S') body.bin_id = a.binId;
     else body.size_requested = a.size;
     if(st.note && st.note.trim()) body.notes = st.note.trim();
 
@@ -16329,7 +16697,9 @@ def boss_list_requests():
 
 # Request type -> AI-parser action code -> canonical action label. NEW_BIN is
 # a fresh drop, so it maps to a Delivery like a plain D.
-_REQUEST_TO_PARSER_CODE = {"PR": "PR", "P": "P", "D": "D", "NEW_BIN": "D"}
+# S (Swap) reuses the PR ("Pickup and Return") stop path plus a flagged note,
+# rather than inventing new stop mechanics (per spec).
+_REQUEST_TO_PARSER_CODE = {"PR": "PR", "P": "P", "D": "D", "NEW_BIN": "D", "S": "PR"}
 
 
 def cascade_request_from_stop(conn, stop_id):
@@ -16417,6 +16787,10 @@ def _perform_assignment(conn, req, req_id, data):
         notes = req["notes"] or ""
 
     action_label  = _PARSER_ACTION_MAP[_REQUEST_TO_PARSER_CODE[req["type"]]]
+    # Swap reuses the Pickup-and-Return stop path; flag the note so the driver
+    # knows to bring an empty to replace the one being pulled.
+    if req["type"] == "S":
+        notes = ("[SWAP — empty this one, leave a replacement] " + notes).strip()
     customer_name = req["business_name"] or req["contact_name"] or ""
 
     try:
@@ -16729,7 +17103,7 @@ def unassigned_work():
     )
 
     _TYPE_LABEL = {"PR": "PR · Pull & Return", "P": "P · Pickup",
-                   "D": "D · Drop", "NEW_BIN": "NEW BIN"}
+                   "D": "D · Drop", "NEW_BIN": "NEW BIN", "S": "S · Swap"}
 
     def age_label(created_at):
         """Whole days since the request came in, e.g. 'new', '3d old'."""
@@ -17095,7 +17469,7 @@ def customer_detail_page(customer_id):
         (customer_id,),
     ).fetchall()
     bins = conn.execute(
-        """SELECT b.id, b.size, b.dropped_at, s.address AS site_address
+        """SELECT b.id, b.size, b.dropped_at, b.label, s.address AS site_address
              FROM bins b LEFT JOIN sites s ON b.site_id = s.id
             WHERE b.customer_id=? ORDER BY b.id""",
         (customer_id,),
@@ -17123,7 +17497,7 @@ def customer_detail_page(customer_id):
                 + "?&body=" + urllib.parse.quote(sms_body))
 
     _TYPE_LABEL = {"PR": "PR · Pull & Return", "P": "P · Pickup",
-                   "D": "D · Drop", "NEW_BIN": "NEW BIN"}
+                   "D": "D · Drop", "NEW_BIN": "NEW BIN", "S": "S · Swap"}
     _STATUS_LABEL = {"pending": "Pending", "accepted": "Accepted",
                      "approved": "Approved", "scheduled": "Scheduled",
                      "in_progress": "In progress", "done": "Done", "denied": "Denied"}
@@ -17138,13 +17512,21 @@ def customer_detail_page(customer_id):
         )
     sites_html = "".join(_site_rows) or '<div style="color:var(--slate);font-size:13px;">No sites yet.</div>'
 
+    _can_rename = has_role("dispatcher")
     _bin_rows = []
     for b in bins:
         dropped = f' · dropped {e(b["dropped_at"])}' if b["dropped_at"] else ""
+        label_html = (f' <span style="color:var(--cyan);font-weight:700;">— {e(b["label"])}</span>'
+                      if b["label"] else "")
+        rename_btn = (f'<button class="btn secondary" style="padding:2px 10px;font-size:11px;" '
+                      f'onclick="renameBin({b["id"]}, {e(json.dumps(b["label"] or ""))})">Label</button>'
+                      if _can_rename else "")
         _bin_rows.append(
-            f'<div style="padding:8px 0;border-bottom:1px solid var(--border);">'
-            f'🗑️ {e(b["size"] or "Dumpster")} '
+            f'<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;'
+            f'padding:8px 0;border-bottom:1px solid var(--border);">'
+            f'<div>🗑️ {e(b["size"] or "Dumpster")}{label_html} '
             f'<span style="color:var(--slate);font-size:12px;">at {e(b["site_address"] or "—")}{dropped}</span></div>'
+            f'{rename_btn}</div>'
         )
     bins_html = "".join(_bin_rows) or '<div style="color:var(--slate);font-size:13px;">No active bins.</div>'
 
@@ -17240,6 +17622,16 @@ def _customer_detail_js(customer_id):
   var CSRF = (document.querySelector('meta[name=csrf-token]')||{{}}).content || '';
   var CID = {customer_id};
   function msg(t){{ var m=document.getElementById('portal-msg'); if(m){{ m.textContent=t; m.hidden=false; }} }}
+  window.renameBin=function(binId, cur){{
+    var v=window.prompt('Label this bin (e.g. "by the front gate"):', cur||'');
+    if(v===null) return;
+    fetch('/api/bins/'+binId+'/label', {{method:'POST',
+        headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},
+        body:JSON.stringify({{label:v}})}})
+      .then(function(r){{ return r.json().then(function(j){{ return {{ok:r.ok,j:j}}; }}); }})
+      .then(function(res){{ if(res.ok){{ window.location.reload(); }} else {{ alert((res.j&&res.j.error)||'Could not save.'); }} }})
+      .catch(function(){{ alert('Network error — try again.'); }});
+  }};
   window.toggleEdit=function(){{
     var v=document.getElementById('cust-view'), ed=document.getElementById('cust-edit');
     if(v&&ed){{ var show=ed.hidden; ed.hidden=!show; v.hidden=show; }}
@@ -17336,6 +17728,246 @@ def _open_defect_count(conn):
     ).fetchone()["n"]
 
 
+# ── Phase 7A maintenance-log helpers ──────────────────────────────────────
+def _save_maintenance_receipts(conn, files, defect_item_id=None, manual_entry_id=None):
+    """Persist any uploaded receipt photos (reuses the stop-photo pipeline:
+    filesystem + web-relative path row). Returns count saved. Skips silently on
+    a disk error so a receipt hiccup never rolls back the maintenance write."""
+    saved = 0
+    for f in files or []:
+        if not f or not f.filename or not allowed_file(f.filename):
+            continue
+        try:
+            fname = f"mnt_{secrets.token_hex(8)}_{secure_filename(f.filename)}"
+            f.save(os.path.join(app.config["UPLOAD_FOLDER"], fname))
+            conn.execute(
+                """INSERT INTO maintenance_photos (company_id, defect_item_id,
+                       manual_entry_id, file_path, uploaded_at, uploaded_by)
+                   VALUES (?,?,?,?,?,?)""",
+                (cid(), defect_item_id, manual_entry_id,
+                 os.path.join("static", "uploads", fname), now_ts(), session.get("user_id")),
+            )
+            saved += 1
+        except OSError as exc:
+            app.logger.warning("maintenance receipt save failed: %s", exc)
+    return saved
+
+
+def _maintenance_receipts(conn, defect_item_id=None, manual_entry_id=None):
+    """Rows of receipt photos for one record (company-scoped)."""
+    if defect_item_id is not None:
+        return conn.execute(
+            "SELECT * FROM maintenance_photos WHERE company_id=? AND defect_item_id=? ORDER BY id",
+            (cid(), defect_item_id)).fetchall()
+    return conn.execute(
+        "SELECT * FROM maintenance_photos WHERE company_id=? AND manual_entry_id=? ORDER BY id",
+        (cid(), manual_entry_id)).fetchall()
+
+
+def _receipt_thumbs_html(rows):
+    """Small thumbnail gallery for receipt photos (management views only)."""
+    if not rows:
+        return ""
+    imgs = "".join(
+        f'<a href="{url_for("serve_maintenance_photo", photo_id=r["id"])}" target="_blank">'
+        f'<img src="{url_for("serve_maintenance_photo", photo_id=r["id"])}" loading="lazy" '
+        f'style="width:54px;height:54px;object-fit:cover;border-radius:8px;border:1px solid var(--border);"></a>'
+        for r in rows
+    )
+    return f'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">{imgs}</div>'
+
+
+def _truck_maintenance_log(conn, truck_id, date_from=None, date_to=None, category=None):
+    """Merged chronological maintenance log for one truck: repaired inspection
+    defects + manual entries. Returns a list of uniform dicts (newest first).
+    cost_cents is None when not recorded. Voided manual entries are included but
+    flagged (and excluded from spend totals by the caller)."""
+    # Repaired defects — dated by resolved_at.
+    defects = conn.execute(
+        """SELECT ii.id AS ref_id, ii.label, ii.resolution_note, ii.cost_cents,
+                  ii.vendor_id, ii.resolved_at, i.truck_id, i.id AS inspection_id
+             FROM inspection_items ii
+             JOIN inspections i ON ii.inspection_id = i.id
+            WHERE i.company_id=? AND i.truck_id=? AND ii.result='defect'
+              AND ii.defect_status='repaired'""",
+        (cid(), truck_id),
+    ).fetchall()
+    manuals = conn.execute(
+        "SELECT * FROM maintenance_entries WHERE company_id=? AND truck_id=?",
+        (cid(), truck_id),
+    ).fetchall()
+    vmap = _vendor_map(conn)
+
+    rows = []
+    for d in defects:
+        rows.append({
+            "source": "defect", "ref_id": d["ref_id"], "inspection_id": d["inspection_id"],
+            "date": (d["resolved_at"] or "")[:10],
+            "sort_key": d["resolved_at"] or "",
+            "category": "Repair",
+            "description": d["label"] + (f" — {d['resolution_note']}" if d["resolution_note"] else ""),
+            "cost_cents": d["cost_cents"], "vendor": vmap.get(d["vendor_id"]),
+            "at_vendor": 0, "voided": 0,
+        })
+    for m in manuals:
+        md = dict(m)
+        rows.append({
+            "source": "manual", "ref_id": m["id"],
+            "date": m["entry_date"] or "",
+            "sort_key": (m["entry_date"] or "") + " " + (m["created_at"] or ""),
+            "category": m["category"],
+            "description": m["description"],
+            "cost_cents": m["cost_cents"], "vendor": vmap.get(md.get("vendor_id")),
+            "at_vendor": md.get("at_vendor") or 0, "voided": m["voided"],
+        })
+
+    def _keep(r):
+        if date_from and r["date"] and r["date"] < date_from:
+            return False
+        if date_to and r["date"] and r["date"] > date_to:
+            return False
+        if category and r["category"] != category:
+            return False
+        return True
+
+    rows = [r for r in rows if _keep(r)]
+    rows.sort(key=lambda r: r["sort_key"], reverse=True)
+    return rows
+
+
+def _truck_spend(conn, truck_id):
+    """(month, year, lifetime) spend in cents for a truck across repaired
+    defects + non-voided manual entries. Voided entries never count."""
+    today = today_str()
+    month_prefix = today[:7]   # YYYY-MM
+    year_prefix = today[:4]    # YYYY
+    d_rows = conn.execute(
+        """SELECT ii.cost_cents AS c, substr(ii.resolved_at,1,10) AS dt
+             FROM inspection_items ii JOIN inspections i ON ii.inspection_id=i.id
+            WHERE i.company_id=? AND i.truck_id=? AND ii.result='defect'
+              AND ii.defect_status='repaired' AND ii.cost_cents IS NOT NULL""",
+        (cid(), truck_id)).fetchall()
+    m_rows = conn.execute(
+        """SELECT cost_cents AS c, entry_date AS dt FROM maintenance_entries
+            WHERE company_id=? AND truck_id=? AND voided=0 AND cost_cents IS NOT NULL""",
+        (cid(), truck_id)).fetchall()
+    month = year = life = 0
+    for r in list(d_rows) + list(m_rows):
+        c = r["c"] or 0
+        dt = r["dt"] or ""
+        life += c
+        if dt[:4] == year_prefix:
+            year += c
+        if dt[:7] == month_prefix:
+            month += c
+    return month, year, life
+
+
+# ── Phase 7A revision: vendors + "at vendor" state ────────────────────────
+def _company_vendors(conn):
+    return conn.execute(
+        "SELECT id, name, phone, notes FROM vendors WHERE company_id=? AND is_active=1 ORDER BY LOWER(name), id",
+        (cid(),)).fetchall()
+
+
+def _vendor_map(conn):
+    return {v["id"]: v["name"] for v in conn.execute(
+        "SELECT id, name FROM vendors WHERE company_id=?", (cid(),)).fetchall()}
+
+
+def _vendor_options_html(vendors, selected_id=None):
+    """<option>s for a vendor picker; leading blank == in-house / none."""
+    opts = ['<option value="">In-house / none</option>']
+    for v in vendors:
+        sel = " selected" if selected_id is not None and v["id"] == selected_id else ""
+        opts.append(f'<option value="{v["id"]}"{sel}>{e(v["name"])}</option>')
+    return "".join(opts)
+
+
+def _clean_vendor_id(conn, raw):
+    """Validate an incoming vendor_id against the company's active vendors.
+    '' / None → None (in-house). Bad id → None (treated as in-house, never a
+    cross-company leak). Returns int|None."""
+    s = str(raw or "").strip()
+    if not s.isdigit():
+        return None
+    row = conn.execute("SELECT id FROM vendors WHERE id=? AND company_id=?",
+                       (int(s), cid())).fetchone()
+    return int(s) if row else None
+
+
+def _recompute_truck_at_vendor(conn, truck_id):
+    """Set trucks.at_vendor = 1 iff any open defect or active manual entry for
+    the truck is currently 'sent to vendor'. Called after every send/repair
+    transition so the informational flag is always accurate."""
+    d = conn.execute(
+        """SELECT 1 FROM inspection_items ii JOIN inspections i ON ii.inspection_id=i.id
+            WHERE i.company_id=? AND i.truck_id=? AND ii.result='defect'
+              AND ii.defect_status='open' AND ii.at_vendor=1 LIMIT 1""",
+        (cid(), truck_id)).fetchone()
+    m = conn.execute(
+        """SELECT 1 FROM maintenance_entries
+            WHERE company_id=? AND truck_id=? AND voided=0 AND at_vendor=1
+              AND completed_at IS NULL LIMIT 1""",
+        (cid(), truck_id)).fetchone()
+    conn.execute("UPDATE trucks SET at_vendor=? WHERE id=?",
+                 (1 if (d or m) else 0, truck_id))
+
+
+def _truck_at_vendor_badge(row):
+    """Yellow, informational (non-blocking) 'At vendor' pill — mirrors the OOS
+    badge shape. Shown wherever a truck currently out at a shop appears."""
+    d = dict(row) if row is not None else {}
+    if not d.get("at_vendor") or d.get("out_of_service"):
+        return ""  # OOS takes visual precedence
+    return ('<span style="display:inline-block;padding:2px 9px;border-radius:999px;'
+            'font-size:10px;font-weight:800;letter-spacing:.5px;text-transform:uppercase;'
+            'background:rgba(245,180,60,0.16);color:#F5B43C;border:1px solid rgba(245,180,60,0.45);'
+            'margin-left:6px;">🔧 At vendor</span>')
+
+
+def _truck_status_badges(row):
+    """OOS (blocking) + At-vendor (informational) badges, in priority order."""
+    return _truck_oos_badge(row) + _truck_at_vendor_badge(row)
+
+
+def _company_has_costs(conn):
+    """True if ANY maintenance record (repaired defect or non-voided manual
+    entry) in the company carries a cost — decides spend-table vs event-count."""
+    d = conn.execute(
+        """SELECT 1 FROM inspection_items ii JOIN inspections i ON ii.inspection_id=i.id
+            WHERE i.company_id=? AND ii.cost_cents IS NOT NULL LIMIT 1""", (cid(),)).fetchone()
+    if d:
+        return True
+    m = conn.execute(
+        "SELECT 1 FROM maintenance_entries WHERE company_id=? AND voided=0 AND cost_cents IS NOT NULL LIMIT 1",
+        (cid(),)).fetchone()
+    return bool(m)
+
+
+def _truck_event_counts(conn, truck_id):
+    """(month, year, lifetime) COUNT of maintenance events for a truck — the
+    fallback metric when no costs are tracked. Repaired defects + non-voided
+    manual entries."""
+    today = today_str()
+    mp, yp = today[:7], today[:4]
+    d_rows = conn.execute(
+        """SELECT substr(ii.resolved_at,1,10) AS dt FROM inspection_items ii
+             JOIN inspections i ON ii.inspection_id=i.id
+            WHERE i.company_id=? AND i.truck_id=? AND ii.result='defect' AND ii.defect_status='repaired'""",
+        (cid(), truck_id)).fetchall()
+    m_rows = conn.execute(
+        "SELECT entry_date AS dt FROM maintenance_entries WHERE company_id=? AND truck_id=? AND voided=0",
+        (cid(), truck_id)).fetchall()
+    month = year = life = 0
+    for r in list(d_rows) + list(m_rows):
+        dt = r["dt"] or ""
+        life += 1
+        if dt[:4] == yp: year += 1
+        if dt[:7] == mp: month += 1
+    return month, year, life
+
+
 @app.route("/trucks")
 @roles_required("owner", "customer_manager", "dispatcher")
 def trucks_page():
@@ -17369,7 +18001,7 @@ def trucks_page():
         <a class="bin-card" href="{url_for('truck_detail_page', truck_id=t['id'])}"
            style="padding:16px;display:block;text-decoration:none;color:inherit;">
             <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
-                <div style="font-weight:700;font-size:15px;">🚛 {name}{_truck_oos_badge(t)}</div>
+                <div style="font-weight:700;font-size:15px;">🚛 {name}{_truck_status_badges(t)}</div>
                 {defect_badge}
             </div>
             {sub}
@@ -17563,6 +18195,29 @@ def truck_detail_page(truck_id):
              ORDER BY i.created_at DESC, i.id DESC""",
         params,
     ).fetchall()
+
+    # Phase 7A — spend totals + merged maintenance log (same from/to filter,
+    # plus a category filter).
+    cat_filter = (request.args.get("cat") or "").strip()
+    if cat_filter not in MAINTENANCE_CATEGORIES:
+        cat_filter = ""
+    _df = date_from if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_from) else None
+    _dt = date_to if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_to) else None
+    mlog = _truck_maintenance_log(conn, truck_id, date_from=_df, date_to=_dt, category=(cat_filter or None))
+    # receipt thumbs per log row
+    mlog_thumbs = {}
+    for r in mlog:
+        rc = (_maintenance_receipts(conn, defect_item_id=r["ref_id"]) if r["source"] == "defect"
+              else _maintenance_receipts(conn, manual_entry_id=r["ref_id"]))
+        mlog_thumbs[(r["source"], r["ref_id"])] = rc
+    truck_has_costs = _company_has_costs(conn)
+    if truck_has_costs:
+        spend_month, spend_year, spend_life = _truck_spend(conn, truck_id)
+    else:
+        spend_month, spend_year, spend_life = _truck_event_counts(conn, truck_id)
+    vendors = _company_vendors(conn)
+    vmap = _vendor_map(conn)
+    vendor_opts = _vendor_options_html(vendors)
     conn.close()
     can_action = _can_action_fleet()
 
@@ -17624,10 +18279,111 @@ def truck_detail_page(truck_id):
     edit_toggle = ('<button class="btn secondary" onclick="toggleEditTruck()" style="padding:4px 12px;font-size:12px;">Edit</button>'
                    if can_action else "")
     sub_bits = " · ".join(b for b in [e(truck["make_model"] or ""), e(truck["plate"] or "")] if b) or "—"
+
+    # ── Phase 7A: totals card — spend when costs exist, else event counts ──
+    _tfmt = (lambda v: format_cents(v)) if truck_has_costs else (lambda v: str(v))
+    _tlabel = "Maintenance spend" if truck_has_costs else "Maintenance events"
+    totals_card = f"""
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+        <h2 style="font-size:15px;margin:0 0 10px;">{_tlabel}</h2>
+        <div style="display:flex;gap:10px;text-align:center;">
+            <div style="flex:1;"><div style="color:var(--slate);font-size:11px;text-transform:uppercase;letter-spacing:.5px;">This month</div><div style="font-weight:800;font-size:18px;margin-top:2px;">{e(_tfmt(spend_month))}</div></div>
+            <div style="flex:1;"><div style="color:var(--slate);font-size:11px;text-transform:uppercase;letter-spacing:.5px;">This year</div><div style="font-weight:800;font-size:18px;margin-top:2px;">{e(_tfmt(spend_year))}</div></div>
+            <div style="flex:1;"><div style="color:var(--slate);font-size:11px;text-transform:uppercase;letter-spacing:.5px;">Lifetime</div><div style="font-weight:800;font-size:18px;margin-top:2px;">{e(_tfmt(spend_life))}</div></div>
+        </div>
+    </div>"""
+
+    # ── Phase 7A: add manual maintenance (owner/dispatcher) ──
+    add_maint = ""
+    if can_action:
+        cat_opts = "".join(f'<option value="{e(c)}">{e(c)}</option>' for c in MAINTENANCE_CATEGORIES)
+        add_maint = f"""
+        <div style="max-width:640px;margin-bottom:12px;">
+            <button class="btn green" onclick="toggleAddMaint()">+ Log maintenance</button>
+            <div id="add-maint-form" hidden class="bin-card" style="padding:16px;margin-top:12px;">
+                <div id="add-maint-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
+                <div style="display:flex;gap:8px;">
+                    <div style="flex:1;"><label class="uw-lbl">Date</label><input id="tm-date" type="date" value="{today_str()}" style="width:100%;"></div>
+                    <div style="flex:1;"><label class="uw-lbl">Category</label><select id="tm-cat" style="width:100%;">{cat_opts}</select></div>
+                </div>
+                <label class="uw-lbl" style="margin-top:10px;">Description</label>
+                <textarea id="tm-desc" rows="2" style="width:100%;margin-bottom:8px;" placeholder="e.g. Oil change + filter"></textarea>
+                <label class="uw-lbl">Vendor</label>
+                <select id="tm-vendor" style="width:100%;margin-bottom:8px;">{vendor_opts}</select>
+                <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--slate);margin-bottom:8px;">
+                    <input id="tm-sent" type="checkbox"> Truck is currently at this vendor
+                </label>
+                <details style="margin-bottom:10px;">
+                    <summary style="color:var(--slate);font-size:12px;cursor:pointer;">Add cost / receipt (optional)</summary>
+                    <div style="margin-top:8px;">
+                        <label class="uw-lbl">Cost</label><input id="tm-cost" inputmode="decimal" placeholder="89.00" style="width:100%;margin-bottom:8px;">
+                        <label class="uw-lbl">Receipt photo(s)</label>
+                        <input id="tm-receipts" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple capture="environment" style="width:100%;">
+                    </div>
+                </details>
+                <div style="display:flex;gap:8px;">
+                    <button class="btn green" style="flex:1;" onclick="submitMaint({truck_id})">Save</button>
+                    <button class="btn secondary" onclick="toggleAddMaint()">Cancel</button>
+                </div>
+            </div>
+        </div>"""
+
+    # ── Phase 7A: merged maintenance log ──
+    _SRC_BADGE = {
+        "defect": ('<span style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:10px;'
+                   'font-weight:800;background:var(--cyan-dim);color:var(--cyan);border:1px solid var(--border-glow);">From inspection</span>'),
+        "manual": ('<span style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:10px;'
+                   'font-weight:800;background:rgba(140,160,179,0.16);color:#ADC0D1;border:1px solid rgba(140,160,179,0.4);">Manual</span>'),
+    }
+    mlog_rows = ""
+    for r in mlog:
+        thumbs = _receipt_thumbs_html(mlog_thumbs.get((r["source"], r["ref_id"])))
+        cost_html = (f'<span style="font-weight:800;font-size:14px;">{e(format_cents(r["cost_cents"]))}</span>'
+                     if r["cost_cents"] is not None else "")
+        vendor = f' · {e(r["vendor"])}' if r["vendor"] else ""
+        voided_tag = (' <span style="color:#FF7A7A;font-weight:800;font-size:11px;">VOID</span>'
+                      if r["voided"] else "")
+        at_vendor_tag = (' <span style="color:#F5B43C;font-weight:800;font-size:11px;">🔧 AT VENDOR</span>'
+                         if r.get("at_vendor") and not r["voided"] else "")
+        href = (url_for("inspection_report", inspection_id=r["inspection_id"]) if r["source"] == "defect"
+                else url_for("maintenance_entry_detail", entry_id=r["ref_id"]))
+        desc_style = "text-decoration:line-through;opacity:.6;" if r["voided"] else ""
+        mlog_rows += f"""
+        <a class="bin-card" href="{href}" style="padding:14px;display:block;text-decoration:none;color:inherit;">
+            <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;">
+                <span style="font-weight:700;font-size:14px;{desc_style}">{e(r["date"])} · {e(r["category"])}{voided_tag}{at_vendor_tag}</span>
+                {cost_html}
+            </div>
+            <div style="color:#C9C9C2;font-size:13px;margin-top:4px;{desc_style}">{e(r["description"])}{vendor}</div>
+            <div style="margin-top:6px;">{_SRC_BADGE.get(r["source"], "")}</div>
+            {thumbs}
+        </a>"""
+    if not mlog:
+        mlog_rows = '<div class="empty-state" style="padding:24px 0;">No maintenance in this range.</div>'
+
+    cat_filter_opts = '<option value="">All categories</option>' + "".join(
+        f'<option value="{e(c)}"{" selected" if c==cat_filter else ""}>{e(c)}</option>' for c in MAINTENANCE_CATEGORIES)
+    maint_section = f"""
+    {totals_card}
+    {add_maint}
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:8px;">
+        <h2 style="font-size:15px;margin:0 0 10px;">Maintenance log</h2>
+        <form method="GET" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:6px;">
+            <div><label class="uw-lbl">From</label><input type="date" name="from" value="{e(date_from)}"></div>
+            <div><label class="uw-lbl">To</label><input type="date" name="to" value="{e(date_to)}"></div>
+            <div><label class="uw-lbl">Category</label><select name="cat">{cat_filter_opts}</select></div>
+            <button class="btn secondary" type="submit" style="padding:8px 14px;">Filter</button>
+            <a class="btn secondary" href="{url_for('truck_detail_page', truck_id=truck_id)}" style="padding:8px 14px;">Reset</a>
+        </form>
+    </div>
+    <div class="bin-list" style="display:grid;gap:10px;max-width:640px;margin-bottom:16px;">
+        {mlog_rows}
+    </div>"""
+
     body = f"""
     <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
         <div>
-            <h1 style="margin-bottom:4px;">🚛 {e(truck["name"])}{_truck_oos_badge(truck)}</h1>
+            <h1 style="margin-bottom:4px;">🚛 {e(truck["name"])}{_truck_status_badges(truck)}</h1>
             <p style="margin:0;">{sub_bits}</p>
         </div>
         <a class="btn secondary" href="{url_for('trucks_page')}" style="white-space:nowrap;">← All trucks</a>
@@ -17641,6 +18397,7 @@ def truck_detail_page(truck_id):
         <div id="truck-view" style="margin-top:10px;color:var(--slate);font-size:14px;">{sub_bits}</div>
     </div>
     {edit_block}
+    {maint_section}
     <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:8px;">
         <h2 style="font-size:15px;margin:0 0 10px;">Inspection history</h2>
         <form method="GET" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:6px;">
@@ -17694,6 +18451,27 @@ def _truck_detail_js(truck_id):
       .then(function(r){{return r.json().then(function(j){{return {{ok:r.ok,j:j}};}});}})
       .then(function(res){{ if(res.ok){{ window.location.reload(); }} else {{ msg((res.j&&res.j.error)||'Could not clear.'); }} }})
       .catch(function(){{ msg('Network error — try again.'); }});
+  }};
+  window.toggleAddMaint=function(){{ var f=document.getElementById('add-maint-form'); if(f) f.hidden=!f.hidden; }};
+  window.submitMaint=function(tid){{
+    var desc=(document.getElementById('tm-desc')||{{}}).value||'';
+    var eb=document.getElementById('add-maint-err');
+    if(!desc.trim()){{ if(eb){{eb.textContent='A description is required.';eb.hidden=false;}} return; }}
+    var fd=new FormData();
+    fd.append('_csrf_token', CSRF);
+    fd.append('truck_id',tid);
+    fd.append('entry_date',(document.getElementById('tm-date')||{{}}).value||'');
+    fd.append('category',(document.getElementById('tm-cat')||{{}}).value||'');
+    fd.append('description',desc);
+    fd.append('cost',(document.getElementById('tm-cost')||{{}}).value||'');
+    fd.append('vendor_id',(document.getElementById('tm-vendor')||{{}}).value||'');
+    if((document.getElementById('tm-sent')||{{}}).checked){{ fd.append('sent','1'); }}
+    var files=(document.getElementById('tm-receipts')||{{}}).files||[];
+    for(var i=0;i<files.length;i++){{ fd.append('receipts', files[i]); }}
+    fetch('/api/maintenance/entries',{{method:'POST',headers:{{'X-CSRF-Token':CSRF}},body:fd}})
+      .then(function(r){{return r.json().then(function(j){{return {{ok:r.ok,j:j}};}});}})
+      .then(function(res){{ if(res.ok){{ window.location.reload(); }} else {{ if(eb){{eb.textContent=(res.j&&res.j.error)||'Could not save.';eb.hidden=false;}} }} }})
+      .catch(function(){{ if(eb){{eb.textContent='Network error — try again.';eb.hidden=false;}} }});
   }};
 }})();
 </script>
@@ -18008,7 +18786,7 @@ def my_inspections():
     """A driver's own inspection history, newest first."""
     conn = get_db()
     rows = conn.execute(
-        """SELECT i.*, t.name AS truck_name, t.out_of_service,
+        """SELECT i.*, t.name AS truck_name, t.out_of_service, t.at_vendor,
                   (SELECT COUNT(*) FROM inspection_items ii
                     WHERE ii.inspection_id=i.id AND ii.result='defect') AS defect_count
              FROM inspections i
@@ -18050,7 +18828,7 @@ def inspection_report(inspection_id):
     """Read-only full report. Management sees any; a driver sees only their own."""
     conn = get_db()
     insp = conn.execute(
-        """SELECT i.*, t.name AS truck_name, t.make_model, t.plate, t.out_of_service,
+        """SELECT i.*, t.name AS truck_name, t.make_model, t.plate, t.out_of_service, t.at_vendor,
                   COALESCE(u.username,'—') AS driver_name,
                   COALESCE(u.full_name,'') AS driver_full
              FROM inspections i
@@ -18069,6 +18847,18 @@ def inspection_report(inspection_id):
         "SELECT * FROM inspection_items WHERE inspection_id=? ORDER BY id",
         (inspection_id,),
     ).fetchall()
+    # Cost data (cost/vendor/receipts) is MANAGEMENT-ONLY — a driver viewing
+    # their own report never sees it.
+    is_mgmt = _is_management()
+    receipts_by_item = {}
+    vmap = {}
+    if is_mgmt:
+        vmap = _vendor_map(conn)
+        for it in items:
+            if it["result"] == "defect":
+                rc = _maintenance_receipts(conn, defect_item_id=it["id"])
+                if rc:
+                    receipts_by_item[it["id"]] = rc
     conn.close()
 
     _RES = {
@@ -18090,16 +18880,32 @@ def inspection_report(inspection_id):
         defstat = ""
         if it["result"] == "defect" and it["defect_status"]:
             dlabel, dcolor = _DEF_STATUS.get(it["defect_status"], (it["defect_status"], "var(--slate)"))
+            # "Sent to vendor" is an open-but-out state (management sees the shop).
+            if it["defect_status"] == "open" and is_mgmt and dict(it).get("at_vendor"):
+                vn = vmap.get(dict(it).get("sent_vendor_id"), "vendor")
+                dlabel, dcolor = (f"Sent to {vn}", "#F5B43C")
             res_note = f' — {e(it["resolution_note"])}' if it["resolution_note"] else ""
             defstat = (f'<div style="font-size:12px;margin-top:4px;color:{dcolor};font-weight:700;">'
-                       f'{dlabel}{res_note}</div>')
+                       f'{e(dlabel)}{res_note}</div>')
+        cost_block = ""
+        if is_mgmt and it["result"] == "defect":
+            _vn = vmap.get(dict(it).get("vendor_id"))
+            _bits = []
+            if it["cost_cents"] is not None:
+                _bits.append(f'💵 {e(format_cents(it["cost_cents"]))}')
+            if _vn:
+                _bits.append(e(_vn))
+            if _bits:
+                cost_block = (f'<div style="font-size:12px;margin-top:4px;color:var(--slate);">'
+                              f'{" · ".join(_bits)}</div>')
+        receipts_block = _receipt_thumbs_html(receipts_by_item.get(it["id"])) if is_mgmt else ""
         rows_html += f"""
         <div style="border-top:1px solid var(--border);padding:12px 0;">
             <div style="display:flex;justify-content:space-between;gap:10px;">
                 <span style="font-weight:700;font-size:14px;">{e(it["label"])}</span>
                 <span style="color:{color};font-weight:800;font-size:12px;">{label_txt}</span>
             </div>
-            {note}{photo}{defstat}
+            {note}{photo}{defstat}{cost_block}{receipts_block}
         </div>"""
 
     _OVR_COLOR = {"safe": "#3DDC84", "defects_safe": "#FF8A3D", "out_of_service": "#FF7A7A"}
@@ -18109,7 +18915,7 @@ def inspection_report(inspection_id):
     body = f"""
     <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
         <div>
-            <h1 style="margin-bottom:4px;">🚛 {e(insp["truck_name"])}{_truck_oos_badge(insp)}</h1>
+            <h1 style="margin-bottom:4px;">🚛 {e(insp["truck_name"])}{_truck_oos_badge(insp)}{_truck_at_vendor_badge(insp) if is_mgmt else ""}</h1>
             <p style="margin:0;">{e(_INSPECTION_TYPE_LABEL.get(insp["type"], insp["type"]))} inspection · {e((insp["created_at"] or ""))}</p>
         </div>
         <a class="btn secondary" href="{back}" style="white-space:nowrap;">← Back</a>
@@ -18176,8 +18982,9 @@ def maintenance_page():
     conn = get_db()
     defects = conn.execute(
         """SELECT ii.id AS item_id, ii.label, ii.note, ii.photo_path, ii.defect_status,
+                  ii.at_vendor AS item_at_vendor, ii.sent_vendor_id,
                   i.id AS inspection_id, i.type, i.created_at, i.truck_id,
-                  t.name AS truck_name, t.out_of_service,
+                  t.name AS truck_name, t.out_of_service, t.at_vendor,
                   COALESCE(u.username,'—') AS reporter
              FROM inspection_items ii
              JOIN inspections i ON ii.inspection_id=i.id
@@ -18187,8 +18994,27 @@ def maintenance_page():
             ORDER BY t.out_of_service DESC, i.created_at ASC, ii.id ASC""",
         (cid(),),
     ).fetchall()
+    vendors = _company_vendors(conn)
+    vmap = _vendor_map(conn)
+    has_costs = _company_has_costs(conn)
+    # Per-truck totals — spend when costs exist, else event counts (A4 revision).
+    trucks = conn.execute(
+        "SELECT id, name, out_of_service, at_vendor FROM trucks WHERE company_id=? AND is_active=1 ORDER BY LOWER(name), id",
+        (cid(),),
+    ).fetchall()
+    total_rows = []
+    fleet_month = fleet_year = 0
+    for t in trucks:
+        if has_costs:
+            m, y, _ = _truck_spend(conn, t["id"])
+        else:
+            m, y, _ = _truck_event_counts(conn, t["id"])
+        fleet_month += m
+        fleet_year += y
+        total_rows.append((t, m, y))
     conn.close()
     can_action = _can_action_fleet()
+    vendor_opts = _vendor_options_html(vendors)
 
     cards = ""
     for d in defects:
@@ -18198,22 +19024,60 @@ def maintenance_page():
             thumb = (f'<a href="{purl}" target="_blank"><img src="{purl}" loading="lazy" '
                      f'style="width:64px;height:64px;object-fit:cover;border-radius:8px;border:1px solid var(--border);"></a>')
         note = f'<div style="font-size:13px;color:#C9C9C2;margin-top:4px;">{e(d["note"])}</div>' if d["note"] else ""
+        sent_chip = ""
+        if d["item_at_vendor"]:
+            vn = vmap.get(d["sent_vendor_id"], "a vendor")
+            sent_chip = (f'<div style="margin-top:6px;"><span style="display:inline-block;padding:2px 9px;'
+                         f'border-radius:999px;font-size:11px;font-weight:800;background:rgba(245,180,60,0.16);'
+                         f'color:#F5B43C;border:1px solid rgba(245,180,60,0.45);">🔧 Sent to {e(vn)}</span></div>')
+        repair_form = ""
         actions = ""
         if can_action:
+            _iid = d["item_id"]
+            _send_btn = ("" if d["item_at_vendor"] else
+                         f'<button class="btn secondary" style="flex:1;" onclick="showSend({_iid})">Send to vendor</button>')
             actions = f"""
-            <div style="display:flex;gap:8px;margin-top:10px;">
-                <button class="btn green" style="flex:1;" onclick="resolveDefect({d['item_id']},'repaired')">Repaired</button>
-                <button class="btn secondary" style="flex:1;" onclick="resolveDefect({d['item_id']},'deferred')">Defer</button>
+            <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;">
+                <button class="btn green" style="flex:1;min-width:90px;" onclick="showRepair({d['item_id']})">Repaired</button>
+                {_send_btn}
+                <button class="btn secondary" style="flex:1;min-width:70px;" onclick="deferDefect({d['item_id']})">Defer</button>
+            </div>"""
+            repair_form = f"""
+            <div id="send-form-{d['item_id']}" hidden style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
+                <label class="uw-lbl">Vendor</label>
+                <select id="sd-vendor-{d['item_id']}" style="width:100%;margin-bottom:10px;">{vendor_opts}</select>
+                <div style="display:flex;gap:8px;">
+                    <button class="btn green" style="flex:1;" onclick="submitSend({d['item_id']})">Mark sent</button>
+                    <button class="btn secondary" onclick="hideSend({d['item_id']})">Cancel</button>
+                </div>
+            </div>
+            <div id="repair-form-{d['item_id']}" hidden style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
+                <label class="uw-lbl">What was done (required)</label>
+                <textarea id="rp-note-{d['item_id']}" rows="2" style="width:100%;margin-bottom:8px;" placeholder="e.g. Replaced front brake pads"></textarea>
+                <label class="uw-lbl">Vendor</label>
+                <select id="rp-vendor-{d['item_id']}" style="width:100%;margin-bottom:8px;">{vendor_opts}</select>
+                <details style="margin-bottom:10px;">
+                    <summary style="color:var(--slate);font-size:12px;cursor:pointer;">Add cost / receipt (optional)</summary>
+                    <div style="margin-top:8px;">
+                        <label class="uw-lbl">Cost</label><input id="rp-cost-{d['item_id']}" inputmode="decimal" placeholder="149.99" style="width:100%;margin-bottom:8px;">
+                        <label class="uw-lbl">Receipt photo(s)</label>
+                        <input id="rp-receipts-{d['item_id']}" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple capture="environment" style="width:100%;">
+                    </div>
+                </details>
+                <div style="display:flex;gap:8px;">
+                    <button class="btn green" style="flex:1;" onclick="submitRepair({d['item_id']})">Save repair</button>
+                    <button class="btn secondary" onclick="hideRepair({d['item_id']})">Cancel</button>
+                </div>
             </div>"""
         cards += f"""
         <div class="bin-card" id="defect-{d['item_id']}" style="padding:16px;">
             <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;">
-                <div style="font-weight:700;font-size:15px;">🚛 {e(d["truck_name"])}{_truck_oos_badge(d)}</div>
+                <div style="font-weight:700;font-size:15px;">🚛 {e(d["truck_name"])}{_truck_status_badges(d)}</div>
                 <a href="{url_for('inspection_report', inspection_id=d['inspection_id'])}"
                    style="font-size:12px;color:var(--cyan);white-space:nowrap;">View report →</a>
             </div>
             <div style="font-weight:700;font-size:14px;margin-top:8px;color:#FF7A7A;">⚠ {e(d["label"])}</div>
-            {note}
+            {note}{sent_chip}
             <div style="display:flex;gap:10px;align-items:center;margin-top:8px;">
                 {thumb}
                 <div style="color:var(--slate);font-size:12px;">
@@ -18221,21 +19085,98 @@ def maintenance_page():
                 </div>
             </div>
             <div id="defect-err-{d['item_id']}" hidden style="color:#FF5252;font-size:12px;margin-top:8px;"></div>
-            {actions}
+            {actions}{repair_form}
+        </div>"""
+
+    # Totals table — spend (when any cost recorded) or event counts otherwise.
+    def _fmt(v):
+        return format_cents(v) if has_costs else str(v)
+    metric_label = "Spend" if has_costs else "Events"
+    rows_out = ""
+    for t, m, y in total_rows:
+        rows_out += f"""
+        <tr style="border-top:1px solid var(--border);">
+            <td style="padding:8px 6px;"><a href="{url_for('truck_detail_page', truck_id=t['id'])}" style="color:inherit;">🚛 {e(t['name'])}{_truck_status_badges(t)}</a></td>
+            <td style="padding:8px 6px;text-align:right;">{e(_fmt(m))}</td>
+            <td style="padding:8px 6px;text-align:right;">{e(_fmt(y))}</td>
+        </tr>"""
+    if not total_rows:
+        rows_out = '<tr><td colspan="3" style="padding:12px 6px;color:var(--slate);">No trucks yet.</td></tr>'
+    totals_hint = "" if has_costs else '<div style="color:var(--slate);font-size:12px;margin-bottom:6px;">No costs entered — showing event counts. Add a cost to any record to switch to spend.</div>'
+    totals_table = f"""
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:16px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+            <h2 style="font-size:15px;margin:0;">{metric_label}</h2>
+            <a href="{url_for('vendors_page')}" style="font-size:12px;color:var(--cyan);">Vendors →</a>
+        </div>
+        {totals_hint}
+        <table style="width:100%;border-collapse:collapse;font-size:13px;">
+            <thead><tr style="color:var(--slate);text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">
+                <th style="padding:4px 6px;">Truck</th><th style="padding:4px 6px;text-align:right;">This month</th><th style="padding:4px 6px;text-align:right;">This year</th>
+            </tr></thead>
+            <tbody>{rows_out}</tbody>
+            <tfoot><tr style="border-top:2px solid var(--border-glow);font-weight:800;">
+                <td style="padding:8px 6px;">Fleet total</td>
+                <td style="padding:8px 6px;text-align:right;">{e(_fmt(fleet_month))}</td>
+                <td style="padding:8px 6px;text-align:right;">{e(_fmt(fleet_year))}</td>
+            </tr></tfoot>
+        </table>
+    </div>"""
+
+    # Add-manual-entry form (owner/dispatcher)
+    add_entry_block = ""
+    if can_action:
+        truck_opts = "".join(f'<option value="{t["id"]}">{e(t["name"])}</option>' for t in trucks)
+        cat_opts = "".join(f'<option value="{e(c)}">{e(c)}</option>' for c in MAINTENANCE_CATEGORIES)
+        add_entry_block = f"""
+        <div style="max-width:640px;margin-bottom:16px;">
+            <button class="btn green" onclick="toggleAddEntry()">+ Log maintenance</button>
+            <div id="add-entry-form" hidden class="bin-card" style="padding:16px;margin-top:12px;">
+                <div id="add-entry-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
+                <label class="uw-lbl">Truck</label>
+                <select id="me-truck" style="width:100%;margin-bottom:10px;">{truck_opts}</select>
+                <div style="display:flex;gap:8px;">
+                    <div style="flex:1;"><label class="uw-lbl">Date</label><input id="me-date" type="date" value="{today_str()}" style="width:100%;"></div>
+                    <div style="flex:1;"><label class="uw-lbl">Category</label><select id="me-cat" style="width:100%;">{cat_opts}</select></div>
+                </div>
+                <label class="uw-lbl" style="margin-top:10px;">Description</label>
+                <textarea id="me-desc" rows="2" style="width:100%;margin-bottom:8px;" placeholder="e.g. Oil change + filter"></textarea>
+                <label class="uw-lbl">Vendor</label>
+                <select id="me-vendor" style="width:100%;margin-bottom:8px;">{vendor_opts}</select>
+                <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:var(--slate);margin-bottom:8px;">
+                    <input id="me-sent" type="checkbox"> Truck is currently at this vendor
+                </label>
+                <details style="margin-bottom:10px;">
+                    <summary style="color:var(--slate);font-size:12px;cursor:pointer;">Add cost / receipt (optional)</summary>
+                    <div style="margin-top:8px;">
+                        <label class="uw-lbl">Cost</label><input id="me-cost" inputmode="decimal" placeholder="89.00" style="width:100%;margin-bottom:8px;">
+                        <label class="uw-lbl">Receipt photo(s)</label>
+                        <input id="me-receipts" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple capture="environment" style="width:100%;">
+                    </div>
+                </details>
+                <div style="display:flex;gap:8px;">
+                    <button class="btn green" style="flex:1;" onclick="submitEntry()">Save</button>
+                    <button class="btn secondary" onclick="toggleAddEntry()">Cancel</button>
+                </div>
+            </div>
         </div>"""
 
     empty_hidden = "" if defects else " hidden"
-    view_note = "" if can_action else '<p style="color:var(--slate);font-size:13px;">View-only — an owner or dispatcher resolves defects.</p>'
+    view_note = "" if can_action else '<p style="color:var(--slate);font-size:13px;">View-only — an owner or dispatcher resolves defects and logs maintenance.</p>'
     body = f"""
     <div class="hero">
         <h1>Maintenance</h1>
-        <p>Open defects reported on inspections. Repaired closes a defect; Defer postpones it.</p>
+        <p>Which truck, which vendor, what, when — and is it back in service. Costs optional.</p>
         {view_note}
     </div>
-    <div id="maint-empty" class="empty-state" style="padding:32px 0;"{empty_hidden}>No open defects — the fleet's clean. 🛠️</div>
+    {totals_table}
+    {add_entry_block}
+    <h2 style="font-size:15px;margin:0 0 8px;max-width:640px;">Open defects</h2>
+    <div id="maint-empty" class="empty-state" style="padding:24px 0;"{empty_hidden}>No open defects — the fleet's clean. 🛠️</div>
     <div id="maint-list" class="bin-list" style="display:grid;gap:12px;max-width:640px;">
         {cards}
     </div>
+    <style>.uw-lbl{{display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;}}</style>
     {_MAINTENANCE_PAGE_JS}
     """
     return render_template_string(shell_page("Maintenance", body))
@@ -18246,24 +19187,73 @@ _MAINTENANCE_PAGE_JS = """
 (function(){
   var CSRF=(document.querySelector('meta[name=csrf-token]')||{}).content||'';
   function err(id,m){ var e=document.getElementById('defect-err-'+id); if(e){ e.textContent=m; e.hidden=false; } }
-  window.resolveDefect=function(id,action){
-    var verb = action==='repaired' ? 'Mark this defect repaired' : 'Defer this defect';
-    var note=prompt(verb+'. Add a note (what was done / why):');
+  function bump(){ var badge=document.getElementById('maint-nav-badge');
+    if(badge){ var n=parseInt(badge.textContent||'0',10)-1;
+      if(n>0){ badge.textContent=n; } else { badge.hidden=true; badge.textContent=''; } } }
+  function removeCard(id){
+    var c=document.getElementById('defect-'+id); if(c) c.remove();
+    var list=document.getElementById('maint-list');
+    if(list && !list.querySelector('.bin-card')){ var em=document.getElementById('maint-empty'); if(em) em.hidden=false; }
+    bump();
+  }
+  window.showRepair=function(id){ var f=document.getElementById('repair-form-'+id); if(f) f.hidden=false; };
+  window.hideRepair=function(id){ var f=document.getElementById('repair-form-'+id); if(f) f.hidden=true; };
+  window.showSend=function(id){ var f=document.getElementById('send-form-'+id); if(f) f.hidden=false; };
+  window.hideSend=function(id){ var f=document.getElementById('send-form-'+id); if(f) f.hidden=true; };
+  window.submitSend=function(id){
+    fetch('/api/defects/'+id+'/resolve',{method:'POST',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
+        body:JSON.stringify({action:'sent', vendor_id:(document.getElementById('sd-vendor-'+id)||{}).value||''})})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
+      .then(function(res){ if(res.ok){ window.location.reload(); } else { err(id,(res.j&&res.j.error)||'Could not update.'); } })
+      .catch(function(){ err(id,'Network error — try again.'); });
+  };
+  window.submitRepair=function(id){
+    var note=(document.getElementById('rp-note-'+id)||{}).value||'';
+    if(!note.trim()){ err(id,'A note is required.'); return; }
+    var fd=new FormData();
+    fd.append('_csrf_token', CSRF);
+    fd.append('action','repaired'); fd.append('note',note);
+    fd.append('cost',(document.getElementById('rp-cost-'+id)||{}).value||'');
+    fd.append('vendor_id',(document.getElementById('rp-vendor-'+id)||{}).value||'');
+    var files=(document.getElementById('rp-receipts-'+id)||{}).files||[];
+    for(var i=0;i<files.length;i++){ fd.append('receipts', files[i]); }
+    fetch('/api/defects/'+id+'/resolve',{method:'POST',headers:{'X-CSRF-Token':CSRF},body:fd})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
+      .then(function(res){ if(res.ok){ removeCard(id); } else { err(id,(res.j&&res.j.error)||'Could not save.'); } })
+      .catch(function(){ err(id,'Network error — try again.'); });
+  };
+  window.deferDefect=function(id){
+    var note=prompt('Defer this defect. Add a note (why):');
     if(note===null) return;
     if(!note.trim()){ err(id,'A note is required.'); return; }
     fetch('/api/defects/'+id+'/resolve',{method:'POST',
         headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
-        body:JSON.stringify({action:action, note:note})})
+        body:JSON.stringify({action:'deferred', note:note})})
       .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
-      .then(function(res){ if(res.ok){
-            var c=document.getElementById('defect-'+id); if(c) c.remove();
-            var list=document.getElementById('maint-list');
-            if(list && !list.querySelector('.bin-card')){ var em=document.getElementById('maint-empty'); if(em) em.hidden=false; }
-            var badge=document.getElementById('maint-nav-badge');
-            if(badge){ var n=parseInt(badge.textContent||'0',10)-1;
-              if(n>0){ badge.textContent=n; } else { badge.hidden=true; badge.textContent=''; } }
-          } else { err(id,(res.j&&res.j.error)||'Could not update.'); } })
+      .then(function(res){ if(res.ok){ removeCard(id); } else { err(id,(res.j&&res.j.error)||'Could not update.'); } })
       .catch(function(){ err(id,'Network error — try again.'); });
+  };
+  window.toggleAddEntry=function(){ var f=document.getElementById('add-entry-form'); if(f) f.hidden=!f.hidden; };
+  function eerr(m){ var e=document.getElementById('add-entry-err'); if(e){ e.textContent=m; e.hidden=false; } }
+  window.submitEntry=function(){
+    var desc=(document.getElementById('me-desc')||{}).value||'';
+    if(!desc.trim()){ eerr('A description is required.'); return; }
+    var fd=new FormData();
+    fd.append('_csrf_token', CSRF);
+    fd.append('truck_id',(document.getElementById('me-truck')||{}).value||'');
+    fd.append('entry_date',(document.getElementById('me-date')||{}).value||'');
+    fd.append('category',(document.getElementById('me-cat')||{}).value||'');
+    fd.append('description',desc);
+    fd.append('cost',(document.getElementById('me-cost')||{}).value||'');
+    fd.append('vendor_id',(document.getElementById('me-vendor')||{}).value||'');
+    if((document.getElementById('me-sent')||{}).checked){ fd.append('sent','1'); }
+    var files=(document.getElementById('me-receipts')||{}).files||[];
+    for(var i=0;i<files.length;i++){ fd.append('receipts', files[i]); }
+    fetch('/api/maintenance/entries',{method:'POST',headers:{'X-CSRF-Token':CSRF},body:fd})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
+      .then(function(res){ if(res.ok){ window.location.reload(); } else { eerr((res.j&&res.j.error)||'Could not save.'); } })
+      .catch(function(){ eerr('Network error — try again.'); });
   };
 })();
 </script>
@@ -18274,20 +19264,33 @@ _MAINTENANCE_PAGE_JS = """
 @login_required
 def resolve_defect(item_id):
     """Owner/dispatcher marks a defect Repaired (closes) or Deferred, with a
-    required note. Only the defect lifecycle fields change — the inspection
-    report itself stays immutable."""
+    required note. Repaired accepts optional cost (integer cents), vendor, and
+    receipt photos (multipart). Only the defect lifecycle + cost fields change —
+    the driver's inspection report content stays immutable, and cost data is
+    never shown to the driver (see inspection_report / serve_maintenance_photo).
+    Accepts multipart (with receipts) or JSON."""
     if not _can_action_fleet():
         return jsonify({"error": "forbidden"}), 403
-    data = request.get_json(silent=True) or {}
-    action = data.get("action")
-    note = str(data.get("note") or "").strip()[:500]
-    if action not in ("repaired", "deferred"):
+    # Read from form (multipart) first, else JSON.
+    src = request.form if request.form else (request.get_json(silent=True) or {})
+    action = src.get("action")
+    note = str(src.get("note") or "").strip()[:500]
+    # 'sent' = intermediate "sent to vendor" state (stays open, flags the truck);
+    # 'repaired' closes it; 'deferred' postpones it.
+    if action not in ("repaired", "deferred", "sent"):
         return jsonify({"error": "invalid action"}), 400
-    if not note:
+    if action != "sent" and not note:
         return jsonify({"error": "a note is required"}), 400
     conn = get_db()
+    vendor_id = _clean_vendor_id(conn, src.get("vendor_id"))
+    cost_cents = None
+    if action == "repaired":
+        cost_cents, cost_err = parse_cost_cents(src.get("cost"))
+        if cost_err:
+            conn.close()
+            return jsonify({"error": cost_err}), 400
     row = conn.execute(
-        """SELECT ii.id, ii.defect_status
+        """SELECT ii.id, ii.defect_status, i.truck_id
              FROM inspection_items ii
              JOIN inspections i ON ii.inspection_id=i.id
             WHERE ii.id=? AND i.company_id=? AND ii.result='defect'""",
@@ -18299,14 +19302,532 @@ def resolve_defect(item_id):
     if row["defect_status"] != "open":
         conn.close()
         return jsonify({"error": "defect is not open"}), 409
-    conn.execute(
-        """UPDATE inspection_items SET defect_status=?, resolution_note=?,
-                                       resolved_by=?, resolved_at=? WHERE id=?""",
-        (action, note, session["user_id"], now_ts(), item_id),
-    )
+
+    if action == "sent":
+        # Out to a shop — still an open defect, but flag the truck "at vendor".
+        conn.execute(
+            """UPDATE inspection_items SET at_vendor=1, sent_vendor_id=?, sent_at=?,
+                       vendor_id=COALESCE(?, vendor_id) WHERE id=?""",
+            (vendor_id, now_ts(), vendor_id, item_id),
+        )
+    else:
+        conn.execute(
+            """UPDATE inspection_items SET defect_status=?, resolution_note=?,
+                       resolved_by=?, resolved_at=?, cost_cents=?, vendor_id=?,
+                       at_vendor=0 WHERE id=?""",
+            (action, note, session["user_id"], now_ts(), cost_cents, vendor_id, item_id),
+        )
+        if action == "repaired":
+            _save_maintenance_receipts(conn, request.files.getlist("receipts"),
+                                       defect_item_id=item_id)
+    _recompute_truck_at_vendor(conn, row["truck_id"])
     conn.commit()
     conn.close()
     return jsonify({"success": True, "status": action})
+
+
+@app.route("/maintenance-photo/<int:photo_id>")
+@login_required
+def serve_maintenance_photo(photo_id):
+    """Serve a receipt photo — MANAGEMENT ONLY (cost data). Drivers get 403
+    even for their own inspection's defect receipts."""
+    if not _is_management():
+        abort(403)
+    conn = get_db()
+    row = conn.execute(
+        "SELECT file_path FROM maintenance_photos WHERE id=? AND company_id=?",
+        (photo_id, cid()),
+    ).fetchone()
+    conn.close()
+    if not row:
+        abort(404)
+    full = os.path.join(app.root_path, row["file_path"])
+    if not os.path.isfile(full):
+        abort(404)
+    return send_file(full)
+
+
+@app.route("/api/maintenance/entries", methods=["POST"])
+@login_required
+def create_maintenance_entry():
+    """Owner/dispatcher logs a manual (non-inspection) maintenance record.
+    Multipart: truck_id, entry_date, category, description, cost, vendor,
+    receipts[]. cost/vendor/receipts optional."""
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    src = request.form if request.form else (request.get_json(silent=True) or {})
+    truck_id_raw = str(src.get("truck_id") or "")
+    if not truck_id_raw.isdigit():
+        return jsonify({"error": "truck is required"}), 400
+    conn = get_db()
+    truck = _load_truck_scoped(conn, int(truck_id_raw), active_only=True)
+    if truck is None:
+        conn.close()
+        return jsonify({"error": "truck not found"}), 404
+    entry_date = (str(src.get("entry_date") or "").strip()) or today_str()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", entry_date):
+        conn.close()
+        return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+    category = str(src.get("category") or "").strip()
+    if category not in MAINTENANCE_CATEGORIES:
+        conn.close()
+        return jsonify({"error": "invalid category"}), 400
+    description = str(src.get("description") or "").strip()[:1000]
+    if not description:
+        conn.close()
+        return jsonify({"error": "a description is required"}), 400
+    cost_cents, cost_err = parse_cost_cents(src.get("cost"))
+    if cost_err:
+        conn.close()
+        return jsonify({"error": cost_err}), 400
+    vendor_id = _clean_vendor_id(conn, src.get("vendor_id"))
+    # Optional: log it already "sent to vendor" (flags the truck at-vendor).
+    sent = str(src.get("sent") or "").strip() in ("1", "true", "on", "yes")
+    at_vendor = 1 if (sent and vendor_id) else 0
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO maintenance_entries (company_id, truck_id, entry_date, category,
+               description, cost_cents, vendor_id, at_vendor, sent_vendor_id, sent_at,
+               created_by, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (cid(), truck["id"], entry_date, category, description, cost_cents, vendor_id,
+         at_vendor, (vendor_id if at_vendor else None), (now_ts() if at_vendor else None),
+         session["user_id"], now_ts()),
+    )
+    entry_id = cur.lastrowid
+    _save_maintenance_receipts(conn, request.files.getlist("receipts"), manual_entry_id=entry_id)
+    if at_vendor:
+        _recompute_truck_at_vendor(conn, truck["id"])
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "id": entry_id})
+
+
+def _load_manual_entry(conn, entry_id):
+    return conn.execute(
+        "SELECT * FROM maintenance_entries WHERE id=? AND company_id=?",
+        (entry_id, cid()),
+    ).fetchone()
+
+
+def _entry_editable(entry):
+    """A manual entry is editable by owner/dispatcher only within the edit
+    window after creation, and never once voided."""
+    if entry["voided"]:
+        return False
+    try:
+        created = datetime.strptime(entry["created_at"], "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return False
+    now = datetime.strptime(now_ts(), "%Y-%m-%d %H:%M:%S")
+    return (now - created).total_seconds() <= MAINTENANCE_EDIT_WINDOW_SECONDS
+
+
+@app.route("/api/maintenance/entries/<int:entry_id>/edit", methods=["POST"])
+@login_required
+def edit_maintenance_entry(entry_id):
+    """Edit a manual entry — owner/dispatcher, only within the edit window."""
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    entry = _load_manual_entry(conn, entry_id)
+    if entry is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if not _entry_editable(entry):
+        conn.close()
+        return jsonify({"error": "this entry is locked (edit window has passed or it is voided)"}), 409
+    src = request.form if request.form else (request.get_json(silent=True) or {})
+    entry_date = (str(src.get("entry_date") or "").strip()) or entry["entry_date"]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", entry_date):
+        conn.close()
+        return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+    category = str(src.get("category") or "").strip()
+    if category not in MAINTENANCE_CATEGORIES:
+        conn.close()
+        return jsonify({"error": "invalid category"}), 400
+    description = str(src.get("description") or "").strip()[:1000]
+    if not description:
+        conn.close()
+        return jsonify({"error": "a description is required"}), 400
+    cost_cents, cost_err = parse_cost_cents(src.get("cost"))
+    if cost_err:
+        conn.close()
+        return jsonify({"error": cost_err}), 400
+    vendor_id = _clean_vendor_id(conn, src.get("vendor_id"))
+    conn.execute(
+        """UPDATE maintenance_entries SET entry_date=?, category=?, description=?,
+               cost_cents=?, vendor_id=?, updated_at=? WHERE id=?""",
+        (entry_date, category, description, cost_cents, vendor_id, now_ts(), entry_id),
+    )
+    _save_maintenance_receipts(conn, request.files.getlist("receipts"), manual_entry_id=entry_id)
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/maintenance/entries/<int:entry_id>/send", methods=["POST"])
+@login_required
+def send_maintenance_entry(entry_id):
+    """Mark a manual entry 'sent to [vendor]' — flags the truck at-vendor."""
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    entry = _load_manual_entry(conn, entry_id)
+    if entry is None or entry["voided"]:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    src = request.form if request.form else (request.get_json(silent=True) or {})
+    vendor_id = _clean_vendor_id(conn, src.get("vendor_id"))
+    conn.execute(
+        """UPDATE maintenance_entries SET at_vendor=1, sent_vendor_id=?, sent_at=?,
+               vendor_id=COALESCE(?, vendor_id), completed_at=NULL WHERE id=?""",
+        (vendor_id, now_ts(), vendor_id, entry_id),
+    )
+    _recompute_truck_at_vendor(conn, entry["truck_id"])
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/maintenance/entries/<int:entry_id>/back", methods=["POST"])
+@login_required
+def back_maintenance_entry(entry_id):
+    """Mark a sent manual entry back/repaired — clears the truck at-vendor flag."""
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    entry = _load_manual_entry(conn, entry_id)
+    if entry is None or entry["voided"]:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    conn.execute(
+        "UPDATE maintenance_entries SET at_vendor=0, completed_at=? WHERE id=?",
+        (now_ts(), entry_id),
+    )
+    _recompute_truck_at_vendor(conn, entry["truck_id"])
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/maintenance/entries/<int:entry_id>/void", methods=["POST"])
+@login_required
+def void_maintenance_entry(entry_id):
+    """Void (never delete) a manual entry — owner/dispatcher, required note.
+    Voided entries drop out of spend totals and are flagged in the log."""
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    src = request.form if request.form else (request.get_json(silent=True) or {})
+    note = str(src.get("note") or "").strip()[:500]
+    if not note:
+        return jsonify({"error": "a note is required to void"}), 400
+    conn = get_db()
+    entry = _load_manual_entry(conn, entry_id)
+    if entry is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if entry["voided"]:
+        conn.close()
+        return jsonify({"error": "already voided"}), 409
+    conn.execute(
+        "UPDATE maintenance_entries SET voided=1, void_note=?, voided_by=?, voided_at=? WHERE id=?",
+        (note, session["user_id"], now_ts(), entry_id),
+    )
+    _recompute_truck_at_vendor(conn, entry["truck_id"])
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+# ── Vendors CRUD (owner/dispatcher manage; any management views) ──────────
+@app.route("/vendors")
+@roles_required("owner", "customer_manager", "dispatcher")
+def vendors_page():
+    conn = get_db()
+    vendors = _company_vendors(conn)
+    conn.close()
+    can_action = _can_action_fleet()
+    rows = ""
+    for v in vendors:
+        sub = " · ".join(b for b in [e(v["phone"] or ""), e(v["notes"] or "")] if b)
+        del_btn = (f'<button class="btn secondary" style="padding:4px 12px;font-size:12px;" '
+                   f'onclick="delVendor({v["id"]})">Remove</button>') if can_action else ""
+        rows += f"""
+        <div class="bin-card" id="vendor-{v['id']}" style="padding:14px;display:flex;justify-content:space-between;align-items:center;gap:10px;">
+            <div><div style="font-weight:700;">{e(v["name"])}</div>
+                 <div style="color:var(--slate);font-size:13px;">{sub or "—"}</div></div>
+            {del_btn}
+        </div>"""
+    if not vendors:
+        rows = '<div class="empty-state" style="padding:24px 0;">No vendors yet.</div>'
+    add = ""
+    if can_action:
+        add = """
+        <div style="max-width:640px;margin-bottom:16px;">
+            <button class="btn green" onclick="toggleAddVendor()">+ Add vendor</button>
+            <div id="add-vendor-form" hidden class="bin-card" style="padding:16px;margin-top:12px;">
+                <div id="add-vendor-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
+                <label class="uw-lbl">Name</label>
+                <input id="vn-name" style="width:100%;margin-bottom:10px;" placeholder="Bob's Truck Repair">
+                <label class="uw-lbl">Phone (optional)</label>
+                <input id="vn-phone" style="width:100%;margin-bottom:10px;" placeholder="757-555-0100">
+                <label class="uw-lbl">Notes (optional)</label>
+                <input id="vn-notes" style="width:100%;margin-bottom:12px;" placeholder="Account #1234">
+                <div style="display:flex;gap:8px;">
+                    <button class="btn green" style="flex:1;" onclick="submitVendor()">Save</button>
+                    <button class="btn secondary" onclick="toggleAddVendor()">Cancel</button>
+                </div>
+            </div>
+        </div>"""
+    body = f"""
+    <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+        <div><h1 style="margin-bottom:4px;">Vendors</h1><p style="margin:0;">Shops &amp; accounts you send trucks to.</p></div>
+        <a class="btn secondary" href="{url_for('maintenance_page')}" style="white-space:nowrap;">← Maintenance</a>
+    </div>
+    {add}
+    <div class="bin-list" style="display:grid;gap:10px;max-width:640px;">{rows}</div>
+    <style>.uw-lbl{{display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;}}</style>
+    {_VENDORS_PAGE_JS}
+    """
+    return render_template_string(shell_page("Vendors", body))
+
+
+_VENDORS_PAGE_JS = """
+<script>
+(function(){
+  var CSRF=(document.querySelector('meta[name=csrf-token]')||{}).content||'';
+  window.toggleAddVendor=function(){ var f=document.getElementById('add-vendor-form'); if(f) f.hidden=!f.hidden; };
+  function verr(m){ var e=document.getElementById('add-vendor-err'); if(e){ e.textContent=m; e.hidden=false; } }
+  window.submitVendor=function(){
+    var name=(document.getElementById('vn-name')||{}).value||'';
+    if(!name.trim()){ verr('A name is required.'); return; }
+    fetch('/api/vendors',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
+        body:JSON.stringify({name:name,phone:(document.getElementById('vn-phone')||{}).value||'',notes:(document.getElementById('vn-notes')||{}).value||''})})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
+      .then(function(res){ if(res.ok){ window.location.reload(); } else { verr((res.j&&res.j.error)||'Could not save.'); } })
+      .catch(function(){ verr('Network error — try again.'); });
+  };
+  window.delVendor=function(id){
+    if(!confirm('Remove this vendor? Past records keep its name.')) return;
+    fetch('/api/vendors/'+id+'/deactivate',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF}})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
+      .then(function(res){ if(res.ok){ var c=document.getElementById('vendor-'+id); if(c) c.remove(); } else { alert((res.j&&res.j.error)||'Could not remove.'); } })
+      .catch(function(){ alert('Network error — try again.'); });
+  };
+})();
+</script>
+"""
+
+
+@app.route("/api/vendors", methods=["POST"])
+@login_required
+def create_vendor():
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name") or "").strip()[:120]
+    if not name:
+        return jsonify({"error": "a name is required"}), 400
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO vendors (company_id, name, phone, notes, is_active, created_at) VALUES (?,?,?,?,1,?)",
+        (cid(), name, str(data.get("phone") or "").strip()[:50] or None,
+         str(data.get("notes") or "").strip()[:200] or None, now_ts()),
+    )
+    vid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "id": vid})
+
+
+@app.route("/api/vendors/<int:vendor_id>/deactivate", methods=["POST"])
+@login_required
+def deactivate_vendor(vendor_id):
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    row = conn.execute("SELECT id FROM vendors WHERE id=? AND company_id=?", (vendor_id, cid())).fetchone()
+    if row is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    conn.execute("UPDATE vendors SET is_active=0 WHERE id=?", (vendor_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/maintenance/entry/<int:entry_id>")
+@roles_required("owner", "customer_manager", "dispatcher")
+def maintenance_entry_detail(entry_id):
+    """Full detail of a manual maintenance entry. Any management role views;
+    owner/dispatcher can edit (within the window) or void."""
+    conn = get_db()
+    entry = _load_manual_entry(conn, entry_id)
+    if entry is None:
+        conn.close()
+        flash("Maintenance entry not found.", "error")
+        return redirect(url_for("maintenance_page"))
+    truck = conn.execute("SELECT id, name, out_of_service, at_vendor FROM trucks WHERE id=? AND company_id=?",
+                         (entry["truck_id"], cid())).fetchone()
+    receipts = _maintenance_receipts(conn, manual_entry_id=entry_id)
+    creator = conn.execute("SELECT COALESCE(full_name, username) AS n FROM users WHERE id=?",
+                           (entry["created_by"],)).fetchone()
+    vendors = _company_vendors(conn)
+    vmap = _vendor_map(conn)
+    conn.close()
+
+    ed = dict(entry)
+    entry_vendor_name = vmap.get(ed.get("vendor_id"))
+    entry_at_vendor = ed.get("at_vendor") and not entry["voided"]
+
+    can_action = _can_action_fleet()
+    editable = can_action and _entry_editable(entry)
+    truck_link = (f'<a href="{url_for("truck_detail_page", truck_id=truck["id"])}" style="color:inherit;">🚛 {e(truck["name"])}{_truck_status_badges(truck)}</a>'
+                  if truck else "—")
+    # Send-to-vendor / mark-back controls (owner/dispatcher, non-voided).
+    sent_ui = ""
+    if can_action and not entry["voided"]:
+        if entry_at_vendor:
+            sent_ui = (f'<div style="max-width:640px;margin-bottom:12px;">'
+                       f'<div style="color:#F5B43C;font-size:13px;font-weight:700;margin-bottom:6px;">🔧 At '
+                       f'{e(entry_vendor_name or "vendor")}</div>'
+                       f'<button class="btn green" style="width:100%;" onclick="markBack()">Mark back / repaired</button></div>')
+        else:
+            _vo = _vendor_options_html(vendors, selected_id=ed.get("vendor_id"))
+            sent_ui = (f'<div class="bin-card" style="padding:14px;max-width:640px;margin-bottom:12px;">'
+                       f'<label class="uw-lbl">Send truck to a vendor</label>'
+                       f'<div style="display:flex;gap:8px;"><select id="snd-vendor" style="flex:1;">{_vo}</select>'
+                       f'<button class="btn secondary" onclick="markSent()">Send</button></div></div>')
+    voided_banner = ""
+    if entry["voided"]:
+        voided_banner = f"""
+        <div class="bin-card" style="padding:14px;max-width:640px;margin-bottom:12px;border:1px solid rgba(255,82,82,0.45);">
+            <div style="color:#FF7A7A;font-weight:800;">VOIDED</div>
+            <div style="font-size:13px;color:#C9C9C2;margin-top:4px;">{e(entry["void_note"] or "")}</div>
+            <div style="font-size:12px;color:var(--slate);margin-top:4px;">{e(entry["voided_at"] or "")}</div>
+        </div>"""
+
+    edit_ui = ""
+    if editable:
+        cat_opts = "".join(
+            f'<option value="{e(c)}"{" selected" if c==entry["category"] else ""}>{e(c)}</option>'
+            for c in MAINTENANCE_CATEGORIES)
+        cost_val = "" if entry["cost_cents"] is None else f'{entry["cost_cents"]//100}.{entry["cost_cents"]%100:02d}'
+        edit_ui = f"""
+        <div style="max-width:640px;margin-bottom:12px;display:flex;gap:8px;">
+            <button class="btn secondary" style="flex:1;" onclick="toggleEdit()">Edit</button>
+            <button class="btn red" style="flex:1;" onclick="voidEntry()">Void</button>
+        </div>
+        <div id="edit-form" hidden class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+            <div id="edit-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
+            <div style="display:flex;gap:8px;">
+                <div style="flex:1;"><label class="uw-lbl">Date</label><input id="ed-date" type="date" value="{e(entry["entry_date"])}" style="width:100%;"></div>
+                <div style="flex:1;"><label class="uw-lbl">Category</label><select id="ed-cat" style="width:100%;">{cat_opts}</select></div>
+            </div>
+            <label class="uw-lbl" style="margin-top:10px;">Description</label>
+            <textarea id="ed-desc" rows="2" style="width:100%;margin-bottom:8px;">{e(entry["description"])}</textarea>
+            <label class="uw-lbl">Vendor</label>
+            <select id="ed-vendor" style="width:100%;margin-bottom:8px;">{_vendor_options_html(vendors, selected_id=ed.get("vendor_id"))}</select>
+            <details style="margin-bottom:10px;">
+                <summary style="color:var(--slate);font-size:12px;cursor:pointer;">Cost / receipt (optional)</summary>
+                <div style="margin-top:8px;">
+                    <label class="uw-lbl">Cost</label><input id="ed-cost" inputmode="decimal" value="{cost_val}" style="width:100%;margin-bottom:8px;">
+                    <label class="uw-lbl">Add receipt photo(s)</label>
+                    <input id="ed-receipts" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple capture="environment" style="width:100%;">
+                </div>
+            </details>
+            <div style="display:flex;gap:8px;">
+                <button class="btn green" style="flex:1;" onclick="submitEdit()">Save</button>
+                <button class="btn secondary" onclick="toggleEdit()">Cancel</button>
+            </div>
+        </div>"""
+    elif can_action and not entry["voided"]:
+        edit_ui = ('<div style="max-width:640px;margin-bottom:12px;">'
+                   '<div style="color:var(--slate);font-size:12px;margin-bottom:8px;">Edit window has passed — this entry is locked. It can still be voided.</div>'
+                   '<button class="btn red" style="width:100%;" onclick="voidEntry()">Void</button></div>')
+
+    body = f"""
+    <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+        <div><h1 style="margin-bottom:4px;">Maintenance</h1><p style="margin:0;">{truck_link}</p></div>
+        <a class="btn secondary" href="{url_for('truck_detail_page', truck_id=entry['truck_id'])}" style="white-space:nowrap;">← Truck</a>
+    </div>
+    {voided_banner}
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+        <div style="display:flex;justify-content:space-between;gap:10px;">
+            <span style="font-weight:800;font-size:16px;">{e(entry["entry_date"])} · {e(entry["category"])}</span>
+            {('<span style="font-weight:800;font-size:16px;">' + e(format_cents(entry["cost_cents"])) + '</span>') if entry["cost_cents"] is not None else ''}
+        </div>
+        <div style="color:#C9C9C2;font-size:14px;margin-top:8px;">{e(entry["description"])}</div>
+        <div style="color:var(--slate);font-size:13px;margin-top:8px;">
+            {('Vendor: ' + e(entry_vendor_name) + '<br>') if entry_vendor_name else ''}
+            Logged by {e(creator["n"] if creator else "—")} · {e(entry["created_at"])}
+        </div>
+        {_receipt_thumbs_html(receipts)}
+    </div>
+    {sent_ui}
+    {edit_ui}
+    <style>.uw-lbl{{display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;}}</style>
+    {_maintenance_entry_js(entry_id, entry["truck_id"])}
+    """
+    return render_template_string(shell_page("Maintenance", body))
+
+
+def _maintenance_entry_js(entry_id, truck_id):
+    truck_url = url_for("truck_detail_page", truck_id=truck_id)
+    return f"""
+<script>
+(function(){{
+  var CSRF=(document.querySelector('meta[name=csrf-token]')||{{}}).content||'';
+  var EID={entry_id};
+  window.toggleEdit=function(){{ var f=document.getElementById('edit-form'); if(f) f.hidden=!f.hidden; }};
+  function eerr(m){{ var e=document.getElementById('edit-err'); if(e){{ e.textContent=m; e.hidden=false; }} }}
+  window.submitEdit=function(){{
+    var desc=(document.getElementById('ed-desc')||{{}}).value||'';
+    if(!desc.trim()){{ eerr('A description is required.'); return; }}
+    var fd=new FormData();
+    fd.append('_csrf_token', CSRF);
+    fd.append('entry_date',(document.getElementById('ed-date')||{{}}).value||'');
+    fd.append('category',(document.getElementById('ed-cat')||{{}}).value||'');
+    fd.append('description',desc);
+    fd.append('cost',(document.getElementById('ed-cost')||{{}}).value||'');
+    fd.append('vendor_id',(document.getElementById('ed-vendor')||{{}}).value||'');
+    var files=(document.getElementById('ed-receipts')||{{}}).files||[];
+    for(var i=0;i<files.length;i++){{ fd.append('receipts', files[i]); }}
+    fetch('/api/maintenance/entries/'+EID+'/edit',{{method:'POST',headers:{{'X-CSRF-Token':CSRF}},body:fd}})
+      .then(function(r){{return r.json().then(function(j){{return {{ok:r.ok,j:j}};}});}})
+      .then(function(res){{ if(res.ok){{ window.location.reload(); }} else {{ eerr((res.j&&res.j.error)||'Could not save.'); }} }})
+      .catch(function(){{ eerr('Network error — try again.'); }});
+  }};
+  window.markSent=function(){{
+    fetch('/api/maintenance/entries/'+EID+'/send',{{method:'POST',
+        headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},
+        body:JSON.stringify({{vendor_id:(document.getElementById('snd-vendor')||{{}}).value||''}})}})
+      .then(function(r){{return r.json().then(function(j){{return {{ok:r.ok,j:j}};}});}})
+      .then(function(res){{ if(res.ok){{ window.location.reload(); }} else {{ alert((res.j&&res.j.error)||'Could not update.'); }} }})
+      .catch(function(){{ alert('Network error — try again.'); }});
+  }};
+  window.markBack=function(){{
+    fetch('/api/maintenance/entries/'+EID+'/back',{{method:'POST',
+        headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}}}})
+      .then(function(r){{return r.json().then(function(j){{return {{ok:r.ok,j:j}};}});}})
+      .then(function(res){{ if(res.ok){{ window.location.reload(); }} else {{ alert((res.j&&res.j.error)||'Could not update.'); }} }})
+      .catch(function(){{ alert('Network error — try again.'); }});
+  }};
+  window.voidEntry=function(){{
+    var note=prompt('Void this entry? Add a note (required):');
+    if(note===null) return;
+    if(!note.trim()){{ alert('A note is required.'); return; }}
+    fetch('/api/maintenance/entries/'+EID+'/void',{{method:'POST',
+        headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},body:JSON.stringify({{note:note}})}})
+      .then(function(r){{return r.json().then(function(j){{return {{ok:r.ok,j:j}};}});}})
+      .then(function(res){{ if(res.ok){{ window.location.reload(); }} else {{ alert((res.j&&res.j.error)||'Could not void.'); }} }})
+      .catch(function(){{ alert('Network error — try again.'); }});
+  }};
+}})();
+</script>
+"""
 
 
 @app.route("/requests")
@@ -18344,7 +19865,7 @@ def requests_page():
     can_assign = has_role("dispatcher")
 
     _TYPE_LABEL = {"PR": "PR · Pull & Return", "P": "P · Pickup",
-                   "D": "D · Drop", "NEW_BIN": "NEW BIN"}
+                   "D": "D · Drop", "NEW_BIN": "NEW BIN", "S": "S · Swap"}
 
     cards = ""
     for r in reqs:
