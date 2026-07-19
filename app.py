@@ -745,7 +745,7 @@ def send_email(to_email, subject, html_body):
 # customer_create_request is authenticated by the URL portal token, not a
 # session cookie, so there is no session for CSRF to protect and it must be
 # exempt (same rationale as the Stripe webhook).
-_CSRF_EXEMPT_ENDPOINTS = {"stripe_webhook", "customer_create_request"}
+_CSRF_EXEMPT_ENDPOINTS = {"stripe_webhook", "customer_create_request", "customer_rename_bin"}
 
 @app.before_request
 def csrf_protect():
@@ -12449,6 +12449,77 @@ def optimize_route(route_id):
     return redirect(url_for("view_route", route_id=route_id))
 
 
+@app.route("/stop/<int:stop_id>/drop-bin", methods=["POST"])
+@login_required
+def stop_drop_bin(stop_id):
+    """Phase 7B — at a Drop/Delivery completion the driver can optionally label
+    the bin ('where I left it') and attach a photo. Resolves the bin the stop
+    dropped: the request's existing bin for PR/P/S, else find-or-create one for
+    the customer/site of a delivery so it appears on the customer's portal.
+    Multipart: label, photo. Both optional."""
+    conn = get_db()
+    stop = conn.execute(
+        """SELECT s.id, s.customer_id, s.request_id, r.assigned_to, r.company_id
+             FROM stops s JOIN routes r ON s.route_id=r.id
+            WHERE s.id=? AND r.company_id=?""",
+        (stop_id, cid()),
+    ).fetchone()
+    if not stop:
+        conn.close()
+        abort(404)
+    # Driver may only touch their own stop (boss/dispatcher may too).
+    if session.get("role") != "boss" and stop["assigned_to"] != session.get("user_id"):
+        conn.close()
+        abort(403)
+    req = None
+    if stop["request_id"]:
+        req = conn.execute(
+            "SELECT id, type, bin_id, site_id, customer_id, size_requested FROM requests WHERE id=?",
+            (stop["request_id"],),
+        ).fetchone()
+    # Resolve target bin.
+    bin_id = None
+    if req and req["bin_id"]:
+        bin_id = req["bin_id"]
+    elif req and req["customer_id"] and req["site_id"]:
+        existing = conn.execute(
+            "SELECT id FROM bins WHERE customer_id=? AND site_id=? AND drop_stop_id=?",
+            (req["customer_id"], req["site_id"], stop_id),
+        ).fetchone()
+        if existing:
+            bin_id = existing["id"]
+        else:
+            cur = conn.cursor()
+            cur.execute(
+                """INSERT INTO bins (customer_id, site_id, size, dropped_at, drop_stop_id)
+                   VALUES (?,?,?,?,?)""",
+                (req["customer_id"], req["site_id"], req["size_requested"], today_str(), stop_id),
+            )
+            bin_id = cur.lastrowid
+    if bin_id is None:
+        conn.close()
+        return jsonify({"error": "no bin to label for this stop"}), 400
+
+    label = _sanitize_bin_label(request.form.get("label"))
+    updates, params = [], []
+    if request.form.get("label") is not None:
+        updates.append("label=?"); params.append(label)
+    photo = request.files.get("photo")
+    if photo and photo.filename and allowed_file(photo.filename):
+        try:
+            fname = f"drop_{bin_id}_{secrets.token_hex(6)}_{secure_filename(photo.filename)}"
+            photo.save(os.path.join(app.config["UPLOAD_FOLDER"], fname))
+            updates.append("drop_photo_path=?"); params.append(os.path.join("static", "uploads", fname))
+        except OSError as exc:
+            app.logger.warning("drop photo save failed: %s", exc)
+    if updates:
+        params.append(bin_id)
+        conn.execute(f"UPDATE bins SET {', '.join(updates)} WHERE id=?", params)
+        conn.commit()
+    conn.close()
+    return jsonify({"success": True, "bin_id": bin_id, "label": label})
+
+
 # =========================================================
 # PHOTO UPLOAD
 # =========================================================
@@ -15963,6 +16034,7 @@ def customer_dashboard(token):
 
     bins = conn.execute(
         """SELECT b.id, b.customer_id, b.site_id, b.size, b.dropped_at,
+                  b.label, b.drop_photo_path,
                   s.address AS site_address
              FROM bins b
              JOIN sites s ON b.site_id = s.id
@@ -16003,7 +16075,14 @@ def customer_dashboard(token):
             "phone":         customer["phone"],
         },
         "sites":    [dict(s) for s in sites],
-        "bins":     [dict(b) for b in bins],
+        "bins":     [
+            {**dict(b),
+             "drop_photo_url": (url_for("customer_bin_photo", token=token, bin_id=b["id"])
+                                if b["drop_photo_path"] else None),
+             # never leak the filesystem path to the client
+             "drop_photo_path": None}
+            for b in bins
+        ],
         "requests": [dict(r) for r in reqs],
     })
 
@@ -16120,6 +16199,83 @@ def customer_create_request(token):
     return jsonify(dict(new_row)), 201
 
 
+def _sanitize_bin_label(raw):
+    """A bin label is short free text the customer/driver/dispatcher can set.
+    Strip control chars, collapse whitespace, cap at 40 chars. '' → None."""
+    s = str(raw or "").replace("\n", " ").replace("\r", " ").strip()
+    s = re.sub(r"\s+", " ", s)
+    s = "".join(ch for ch in s if ch >= " ")  # drop control chars
+    return s[:40] or None
+
+
+@app.route("/api/c/<token>/bins/<int:bin_id>/label", methods=["POST"])
+def customer_rename_bin(token, bin_id):
+    """Customer renames their own bin from the portal (token-authed, CSRF-exempt
+    like customer_create_request). Sanitized, max 40 chars."""
+    conn = get_db()
+    customer = _customer_by_token(conn, token)
+    if customer is None:
+        conn.close()
+        return _not_found()
+    owned = conn.execute(
+        "SELECT id FROM bins WHERE id=? AND customer_id=?", (bin_id, customer["id"])
+    ).fetchone()
+    if owned is None:
+        conn.close()
+        return _not_found()
+    data = request.get_json(silent=True) or {}
+    label = _sanitize_bin_label(data.get("label"))
+    conn.execute("UPDATE bins SET label=? WHERE id=?", (label, bin_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "label": label})
+
+
+@app.route("/api/c/<token>/bin-photo/<int:bin_id>")
+def customer_bin_photo(token, bin_id):
+    """Serve a bin's 'where we left it' drop photo to the owning customer,
+    token-scoped (no session)."""
+    conn = get_db()
+    customer = _customer_by_token(conn, token)
+    if customer is None:
+        conn.close()
+        return _not_found()
+    row = conn.execute(
+        "SELECT drop_photo_path FROM bins WHERE id=? AND customer_id=?",
+        (bin_id, customer["id"]),
+    ).fetchone()
+    conn.close()
+    if not row or not row["drop_photo_path"]:
+        abort(404)
+    full = os.path.join(app.root_path, row["drop_photo_path"])
+    if not os.path.isfile(full):
+        abort(404)
+    return send_file(full)
+
+
+@app.route("/api/bins/<int:bin_id>/label", methods=["POST"])
+@login_required
+def manage_rename_bin(bin_id):
+    """Dispatcher/owner renames a bin from the management side (company-scoped)."""
+    if not has_role("dispatcher"):
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    owned = conn.execute(
+        """SELECT b.id FROM bins b JOIN customers c ON b.customer_id=c.id
+            WHERE b.id=? AND c.company_id=?""",
+        (bin_id, cid()),
+    ).fetchone()
+    if owned is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    data = request.get_json(silent=True) or {}
+    label = _sanitize_bin_label(data.get("label"))
+    conn.execute("UPDATE bins SET label=? WHERE id=?", (label, bin_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "label": label})
+
+
 # =========================================================
 # CUSTOMER PORTAL — the page customers actually tap (Phase 4)
 #
@@ -16160,8 +16316,16 @@ _PORTAL_JS = r"""
   .portal .p-btn .s { display: block; font-size: 13px; font-weight: 600; opacity: .85; margin-top: 3px; }
   .portal .p-btn.pr { background: #FF6B1A !important; }
   .portal .p-btn.p  { background: #FFB27A !important; }
+  .portal .p-btn.s  { background: #00E5CC !important; }
   .portal .p-btn.d  { background: #3DDC84 !important; }
   .portal .p-btn:active { transform: translateY(1px); }
+  .p-site-head { font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: .6px;
+      color: var(--slate); margin: 22px 2px 4px; }
+  .portal .p-rename { background: transparent !important; border: none !important; box-shadow: none !important;
+      color: var(--cyan) !important; font-size: 13px; font-weight: 800; cursor: pointer; padding: 2px 4px;
+      font-family: inherit; white-space: nowrap; min-height: 0 !important; }
+  .p-drop-photo { display: block; width: 100%; max-height: 180px; object-fit: cover; border-radius: 12px;
+      margin-top: 10px; border: 1px solid var(--border); }
   .portal .p-btn[disabled] { opacity: .45 !important; cursor: default; }
   .chip { display: block; border-radius: 12px; padding: 10px 12px; margin-top: 10px;
       font-size: 14px; font-weight: 700; line-height: 1.35; }
@@ -16228,7 +16392,7 @@ _PORTAL_JS = r"""
     if(!st.data) return null;
     for(var i=0;i<st.data.requests.length;i++){ var r=st.data.requests[i];
       if(OPEN.indexOf(r.status)<0 || r.type!==type) continue;
-      if((type==='PR'||type==='P') && r.bin_id===binId) return r;
+      if((type==='PR'||type==='P'||type==='S') && r.bin_id===binId) return r;
       if(type==='D' && r.site_id===siteId) return r;
     }
     return null;
@@ -16248,7 +16412,7 @@ _PORTAL_JS = r"""
     else if(r.status==='in_progress'){ cls='blue'; txt='Driver is on it today'; }
     else if(r.status==='done'){ cls='green'; txt='Completed &#10003;'; }
     else if(r.status==='denied'){ cls='red'; txt='We couldn&rsquo;t do this one &mdash; call us'+(r.deny_reason?(': '+esc(r.deny_reason)):''); }
-    var typ = r.type==='PR'?'Empty &amp; return':(r.type==='P'?'Pick up':'New bin');
+    var typ = r.type==='PR'?'Empty &amp; return':(r.type==='P'?'Pick up':(r.type==='S'?'Swap':'New bin'));
     return '<div class="chip '+cls+'"><span style="opacity:.75;font-weight:800;">'+typ+':</span> '+txt+'</div>';
   }
 
@@ -16274,14 +16438,33 @@ _PORTAL_JS = r"""
     if(st.ok){ html += '<div class="p-ok">'+esc(st.ok)+'</div>'; st.ok=''; }
 
     if(d.bins.length){
+      // Group bins by site; show a site-address header only when the customer
+      // has bins at more than one site (single-site looks unchanged — B5).
+      var siteIds = {}; d.bins.forEach(function(b){ siteIds[b.site_id]=1; });
+      var multiSite = Object.keys(siteIds).length > 1;
+      var lastSite = null;
       d.bins.forEach(function(b){
-        html += '<div class="p-card"><div class="p-card-head">'+esc(b.size||'Dumpster')+'</div>'+
-                '<div class="p-card-sub">at '+esc(b.site_address||'your site')+'</div>';
+        if(multiSite && b.site_id!==lastSite){
+          html += '<div class="p-site-head">'+esc(b.site_address||'Site')+'</div>';
+          lastSite = b.site_id;
+        }
+        var head = esc(b.size||'Dumpster') + (b.label ? (' &mdash; '+esc(b.label)) : '');
+        var iRen = acts.push(function(){ renameBin(b); })-1;
+        html += '<div class="p-card">'+
+                '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;">'+
+                '<div class="p-card-head">'+head+'</div>'+
+                '<button class="p-rename" data-act="'+iRen+'">'+(b.label?'Rename':'+ Label')+'</button></div>';
+        if(!multiSite){ html += '<div class="p-card-sub">at '+esc(b.site_address||'your site')+'</div>'; }
+        if(b.drop_photo_url){
+          html += '<a href="'+esc(b.drop_photo_url)+'" target="_blank"><img class="p-drop-photo" src="'+esc(b.drop_photo_url)+'" alt="where we left it"></a>';
+        }
         infoReqs(b.id, b.site_id).forEach(function(r){ html += chip(r); });
         var iPR = acts.push(function(){ startPR_P('PR', b); })-1;
         html += actionBtn('pr','PR','EMPTY &amp; RETURN','We dump it and bring the same bin back', b.id, b.site_id, iPR);
         var iP = acts.push(function(){ startPR_P('P', b); })-1;
         html += actionBtn('p','P','PICK UP &mdash; I&rsquo;M DONE','We take the bin away for good', b.id, b.site_id, iP);
+        var iS = acts.push(function(){ startPR_P('S', b); })-1;
+        html += actionBtn('s','S','SWAP','Empty this one, bring another', b.id, b.site_id, iS);
         var iD = acts.push(function(){ startD(b.site_id, b.site_address); })-1;
         html += actionBtn('d','D','NEED ANOTHER BIN','Bring an additional dumpster to this site', null, b.site_id, iD);
         html += '</div>';
@@ -16347,7 +16530,17 @@ _PORTAL_JS = r"""
     var sz = a.size ? (esc(a.size)+' ') : '';
     if(a.type==='PR') return 'Empty the '+sz+'dumpster at '+esc(a.address)+' and bring it back';
     if(a.type==='P')  return 'Pick up the '+sz+'dumpster at '+esc(a.address);
+    if(a.type==='S')  return 'Swap the '+sz+'dumpster at '+esc(a.address)+' &mdash; empty this one and leave a replacement';
     return 'Drop off a '+sz+'dumpster at '+esc(a.address);
+  }
+  function renameBin(bin){
+    var cur = bin.label || '';
+    var v = window.prompt('Label this dumpster so everyone knows which is which (e.g. "by the front gate"):', cur);
+    if(v===null) return;
+    api('/api/c/'+encodeURIComponent(TOKEN)+'/bins/'+bin.id+'/label', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({label:v})
+    }).then(function(r){ return r.json(); }).then(function(){ load(function(){}); render(); })
+      .catch(function(){ st.error='Could not save the label — try again.'; render(); });
   }
 
   function renderConfirm(){
@@ -16384,7 +16577,7 @@ _PORTAL_JS = r"""
       pref = st.date;
     }
     var body = { type:a.type, site_id:a.siteId, preferred_date:pref };
-    if(a.type==='PR' || a.type==='P') body.bin_id = a.binId;
+    if(a.type==='PR' || a.type==='P' || a.type==='S') body.bin_id = a.binId;
     else body.size_requested = a.size;
     if(st.note && st.note.trim()) body.notes = st.note.trim();
 
@@ -17273,7 +17466,7 @@ def customer_detail_page(customer_id):
         (customer_id,),
     ).fetchall()
     bins = conn.execute(
-        """SELECT b.id, b.size, b.dropped_at, s.address AS site_address
+        """SELECT b.id, b.size, b.dropped_at, b.label, s.address AS site_address
              FROM bins b LEFT JOIN sites s ON b.site_id = s.id
             WHERE b.customer_id=? ORDER BY b.id""",
         (customer_id,),
@@ -17316,13 +17509,21 @@ def customer_detail_page(customer_id):
         )
     sites_html = "".join(_site_rows) or '<div style="color:var(--slate);font-size:13px;">No sites yet.</div>'
 
+    _can_rename = has_role("dispatcher")
     _bin_rows = []
     for b in bins:
         dropped = f' · dropped {e(b["dropped_at"])}' if b["dropped_at"] else ""
+        label_html = (f' <span style="color:var(--cyan);font-weight:700;">— {e(b["label"])}</span>'
+                      if b["label"] else "")
+        rename_btn = (f'<button class="btn secondary" style="padding:2px 10px;font-size:11px;" '
+                      f'onclick="renameBin({b["id"]}, {e(json.dumps(b["label"] or ""))})">Label</button>'
+                      if _can_rename else "")
         _bin_rows.append(
-            f'<div style="padding:8px 0;border-bottom:1px solid var(--border);">'
-            f'🗑️ {e(b["size"] or "Dumpster")} '
+            f'<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;'
+            f'padding:8px 0;border-bottom:1px solid var(--border);">'
+            f'<div>🗑️ {e(b["size"] or "Dumpster")}{label_html} '
             f'<span style="color:var(--slate);font-size:12px;">at {e(b["site_address"] or "—")}{dropped}</span></div>'
+            f'{rename_btn}</div>'
         )
     bins_html = "".join(_bin_rows) or '<div style="color:var(--slate);font-size:13px;">No active bins.</div>'
 
@@ -17418,6 +17619,16 @@ def _customer_detail_js(customer_id):
   var CSRF = (document.querySelector('meta[name=csrf-token]')||{{}}).content || '';
   var CID = {customer_id};
   function msg(t){{ var m=document.getElementById('portal-msg'); if(m){{ m.textContent=t; m.hidden=false; }} }}
+  window.renameBin=function(binId, cur){{
+    var v=window.prompt('Label this bin (e.g. "by the front gate"):', cur||'');
+    if(v===null) return;
+    fetch('/api/bins/'+binId+'/label', {{method:'POST',
+        headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},
+        body:JSON.stringify({{label:v}})}})
+      .then(function(r){{ return r.json().then(function(j){{ return {{ok:r.ok,j:j}}; }}); }})
+      .then(function(res){{ if(res.ok){{ window.location.reload(); }} else {{ alert((res.j&&res.j.error)||'Could not save.'); }} }})
+      .catch(function(){{ alert('Network error — try again.'); }});
+  }};
   window.toggleEdit=function(){{
     var v=document.getElementById('cust-view'), ed=document.getElementById('cust-edit');
     if(v&&ed){{ var show=ed.hidden; ed.hidden=!show; v.hidden=show; }}
