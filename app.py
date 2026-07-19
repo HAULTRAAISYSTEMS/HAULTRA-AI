@@ -15431,7 +15431,7 @@ def api_csrf_token():
 # PASTE ROUTE — PARSE API
 # =========================================================
 @app.route("/api/parse-route-text", methods=["POST"])
-@login_required
+@roles_required("dispatcher", api=True)
 def parse_route_text_api():
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()
