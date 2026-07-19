@@ -1904,6 +1904,48 @@ def init_db():
     safe_add_column(conn, "stops", "customer_id INTEGER")
     # Customer Request System (Phase 3): boss's reason when denying a request.
     safe_add_column(conn, "requests", "deny_reason TEXT")
+    # Phase 5 — two-stage workflow adds the 'accepted' status and a manager's
+    # note-to-customer. The status CHECK from Phase 1 forbids 'accepted', and
+    # SQLite can't ALTER a CHECK, so rebuild the table once (dropping the
+    # status CHECK — transitions are validated in code) when 'accepted' isn't
+    # yet allowed. Column-safe: copies by the intersection of old/new columns.
+    safe_add_column(conn, "requests", "customer_note TEXT")
+    _rq_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='requests'"
+    ).fetchone()
+    if _rq_sql_row and "'accepted'" not in (_rq_sql_row["sql"] or ""):
+        _old_cols = [r[1] for r in conn.execute("PRAGMA table_info(requests)").fetchall()]
+        _new_cols = ["id", "customer_id", "site_id", "type", "bin_id", "size_requested",
+                     "preferred_date", "notes", "status", "stop_id", "deny_reason",
+                     "customer_note", "created_at", "updated_at"]
+        _copy = [c for c in _new_cols if c in _old_cols]
+        _copy_csv = ", ".join(_copy)
+        conn.executescript(f"""
+            PRAGMA foreign_keys=off;
+            BEGIN;
+            CREATE TABLE requests_p5_new (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                customer_id    INTEGER NOT NULL,
+                site_id        INTEGER NOT NULL,
+                type           TEXT NOT NULL CHECK(type IN ('PR','P','D','NEW_BIN')),
+                bin_id         INTEGER,
+                size_requested TEXT,
+                preferred_date TEXT NOT NULL,
+                notes          TEXT,
+                status         TEXT NOT NULL DEFAULT 'pending',
+                stop_id        INTEGER,
+                deny_reason    TEXT,
+                customer_note  TEXT,
+                created_at     TEXT NOT NULL,
+                updated_at     TEXT NOT NULL
+            );
+            INSERT INTO requests_p5_new ({_copy_csv}) SELECT {_copy_csv} FROM requests;
+            DROP TABLE requests;
+            ALTER TABLE requests_p5_new RENAME TO requests;
+            COMMIT;
+            PRAGMA foreign_keys=on;
+        """)
+        conn.commit()
 
     # --- Per-route boss <-> driver messages: minimal thread, one row per
     #     message. "Unread" is derived per-viewer as "not sent by me and
@@ -2043,8 +2085,10 @@ def init_db():
         preferred_date TEXT NOT NULL,
         notes          TEXT,
         status         TEXT NOT NULL DEFAULT 'pending'
-            CHECK(status IN ('pending','approved','scheduled','in_progress','done','denied')),
+            CHECK(status IN ('pending','accepted','approved','scheduled','in_progress','done','denied')),
         stop_id        INTEGER,
+        deny_reason    TEXT,
+        customer_note  TEXT,
         created_at     TEXT NOT NULL,
         updated_at     TEXT NOT NULL,
         FOREIGN KEY (customer_id) REFERENCES customers(id),
@@ -15530,7 +15574,7 @@ def address_suggestions():
 REQUEST_TYPES     = {"PR", "P", "D", "NEW_BIN"}
 REQUEST_SIZES     = ["10yd", "15yd", "20yd", "30yd", "40yd"]
 REQUEST_STATUSES  = {"pending", "approved", "scheduled", "in_progress", "done", "denied"}
-REQUEST_OPEN      = ("pending", "approved", "scheduled", "in_progress")  # dupe-guard scope
+REQUEST_OPEN      = ("pending", "accepted", "approved", "scheduled", "in_progress")  # dupe-guard scope
 
 
 def _customer_by_token(conn, token):
@@ -15811,7 +15855,7 @@ _PORTAL_JS = r"""
   var CUES = {'10yd':'Fits a garage cleanout','15yd':'Kitchen remodel','20yd':'Roof tear-off','30yd':'Full house cleanout','40yd':'Construction / commercial'};
   var root  = document.getElementById('portal-root');
   var st = { view:'home', data:null, action:null, when:'asap', date:'', note:'', sending:false, error:'', ok:'' };
-  var OPEN = ['pending','approved','scheduled','in_progress'];
+  var OPEN = ['pending','accepted','approved','scheduled','in_progress'];
 
   function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){
       return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
@@ -15844,6 +15888,7 @@ _PORTAL_JS = r"""
   function chip(r){
     var cls='gray', txt=esc(r.status);
     if(r.status==='pending'){ cls='orange'; txt='Request received &mdash; waiting on confirmation'; }
+    else if(r.status==='accepted'){ cls='green'; txt='Confirmed &mdash; we&rsquo;re scheduling it'; }
     else if(r.status==='scheduled'){ cls='green'; txt='Scheduled &#10003;'+(r.scheduled_date?(' for '+esc(r.scheduled_date)):'')+(r.driver_name?' &middot; driver assigned':''); }
     else if(r.status==='in_progress'){ cls='blue'; txt='Driver is on it today'; }
     else if(r.status==='done'){ cls='green'; txt='Completed &#10003;'; }
@@ -16131,18 +16176,10 @@ def cascade_request_from_stop(conn, stop_id):
     )
 
 
-@app.route("/api/requests/<int:req_id>/approve", methods=["PATCH"])
-@boss_required
-def approve_request(req_id):
-    """Approve a pending request: create the stop and link it, atomically."""
-    data = request.get_json(silent=True) or {}
-    conn = get_db()
-
-    def fail(code, msg):
-        conn.close()
-        return jsonify({"error": msg}), code
-
-    req = conn.execute(
+def _load_request_for_assignment(conn, req_id):
+    """Fetch a request joined with the fields assignment needs, company-scoped.
+    None if not found / not this company."""
+    return conn.execute(
         """SELECT r.*, c.business_name, c.contact_name,
                   s.address AS site_address, b.size AS bin_size
              FROM requests r
@@ -16152,24 +16189,29 @@ def approve_request(req_id):
             WHERE r.id = ? AND c.company_id = ?""",
         (req_id, cid()),
     ).fetchone()
-    if req is None:
-        return fail(404, "not found")
-    if req["status"] != "pending":
-        return fail(409, "request is not pending")
 
+
+def _perform_assignment(conn, req, req_id, data):
+    """Shared core for one-click approve (Accept & Assign) and the two-stage
+    assign: validate driver + date + optional overrides, create the stop via
+    the same route/stop shape api_dispatch uses, link it, and set the request
+    to 'scheduled' — atomically. Returns (payload, None) on success or
+    (None, (http_code, message)) on failure. Caller owns conn + the status
+    precondition. Identical stop-creation to the original approve so the Route
+    Board / driver side see it exactly as before."""
     # --- driver: required, must exist and be a driver in this company ---
     driver_id_raw = data.get("driver_id")
     if not (isinstance(driver_id_raw, int) or (isinstance(driver_id_raw, str) and driver_id_raw.isdigit())):
-        return fail(400, "driver_id is required")
+        return None, (400, "driver_id is required")
     driver_id = int(driver_id_raw)
     driver = conn.execute(
         "SELECT id, username FROM users WHERE id=? AND company_id=? AND role='driver'",
         (driver_id, cid()),
     ).fetchone()
     if not driver:
-        return fail(400, "selected driver not found")
+        return None, (400, "selected driver not found")
 
-    # --- scheduled_date: boss's choice wins; default from preferred_date
+    # --- scheduled_date: dispatcher's choice wins; default from preferred_date
     #     ("asap" -> today). Must be a valid ISO date, today or later. ---
     scheduled_date = (data.get("scheduled_date") or "").strip()
     if not scheduled_date:
@@ -16177,14 +16219,14 @@ def approve_request(req_id):
     try:
         sd = datetime.strptime(scheduled_date, "%Y-%m-%d").date()
     except (ValueError, TypeError):
-        return fail(400, "scheduled_date must be an ISO date (YYYY-MM-DD)")
+        return None, (400, "scheduled_date must be an ISO date (YYYY-MM-DD)")
     if sd < datetime.strptime(today_str(), "%Y-%m-%d").date():
-        return fail(400, "scheduled_date cannot be in the past")
+        return None, (400, "scheduled_date cannot be in the past")
 
     # --- optional overrides (address / size / notes) ---
     address = (str(data.get("address") or "").strip()) or (req["site_address"] or "")
     if not address:
-        return fail(400, "no address on the site — provide an address override")
+        return None, (400, "no address on the site — provide an address override")
     size = (str(data.get("size") or "").strip()) or (req["size_requested"] or req["bin_size"] or "")
     if "notes" in data and data.get("notes") is not None:
         notes = str(data.get("notes")).strip()[:500]
@@ -16194,8 +16236,6 @@ def approve_request(req_id):
     action_label  = _PARSER_ACTION_MAP[_REQUEST_TO_PARSER_CODE[req["type"]]]
     customer_name = req["business_name"] or req["contact_name"] or ""
 
-    # --- create stop (find-or-create the driver's route for that date), link
-    #     the request, all in one transaction ---
     try:
         cur = conn.cursor()
         route = conn.execute(
@@ -16239,26 +16279,101 @@ def approve_request(req_id):
         conn.commit()
     except Exception as exc:
         conn.rollback()
-        conn.close()
-        app.logger.warning("approve_request %s failed: %s", req_id, exc)
-        return jsonify({"error": "could not approve request"}), 500
+        app.logger.warning("assign request %s failed: %s", req_id, exc)
+        return None, (500, "could not assign request")
 
     # Best-effort, same as api_dispatch — a can-flow hiccup must not undo the
-    # approval that already committed above.
+    # assignment that already committed above.
     try:
         compute_can_flow(conn, route_id)
         conn.commit()
     except Exception as exc:
-        app.logger.warning("approve_request: compute_can_flow error: %s", exc)
-    conn.close()
+        app.logger.warning("assign request: compute_can_flow error: %s", exc)
 
-    return jsonify({
-        "success":    True,
-        "request_id": req_id,
-        "stop_id":    stop_id,
-        "route_id":   route_id,
-        "status":     "scheduled",
-    })
+    return {"success": True, "request_id": req_id, "stop_id": stop_id,
+            "route_id": route_id, "status": "scheduled"}, None
+
+
+@app.route("/api/requests/<int:req_id>/approve", methods=["PATCH"])
+@login_required
+def approve_request(req_id):
+    """Accept & Assign in ONE click — the solo-operator path, unchanged from
+    Phase 3/4. Requires holding BOTH management roles (owner holds both). A
+    pending request goes straight to 'scheduled', creating the stop now."""
+    if not (has_role("customer_manager") and has_role("dispatcher")):
+        return jsonify({"error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    conn = get_db()
+    req = _load_request_for_assignment(conn, req_id)
+    if req is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if req["status"] != "pending":
+        conn.close()
+        return jsonify({"error": "request is not pending"}), 409
+    payload, err = _perform_assignment(conn, req, req_id, data)
+    conn.close()
+    if err:
+        return jsonify({"error": err[1]}), err[0]
+    return jsonify(payload)
+
+
+@app.route("/api/requests/<int:req_id>/accept", methods=["PATCH"])
+@login_required
+def accept_request(req_id):
+    """Stage 1 (customer_manager/owner): confirm a pending request WITHOUT
+    scheduling it — no driver, no date, no stop. It becomes 'accepted' and
+    drops into Unassigned Work. Optional note-to-customer stored for the
+    portal."""
+    if not has_role("customer_manager"):
+        return jsonify({"error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    note = data.get("note")
+    if note is not None:
+        note = str(note).strip()[:500] or None
+    conn = get_db()
+    req = conn.execute(
+        """SELECT r.id, r.status FROM requests r
+             JOIN customers c ON r.customer_id = c.id
+            WHERE r.id = ? AND c.company_id = ?""",
+        (req_id, cid()),
+    ).fetchone()
+    if req is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if req["status"] != "pending":
+        conn.close()
+        return jsonify({"error": "request is not pending"}), 409
+    conn.execute(
+        "UPDATE requests SET status='accepted', customer_note=?, updated_at=? WHERE id=?",
+        (note, now_ts(), req_id),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "request_id": req_id, "status": "accepted"})
+
+
+@app.route("/api/requests/<int:req_id>/assign", methods=["PATCH"])
+@login_required
+def assign_request(req_id):
+    """Stage 2 (dispatcher/owner): assign an accepted request to a driver +
+    date, creating the stop via the exact shared approve path."""
+    if not has_role("dispatcher"):
+        return jsonify({"error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    conn = get_db()
+    req = _load_request_for_assignment(conn, req_id)
+    if req is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if req["status"] != "accepted":
+        conn.close()
+        return jsonify({"error": "request is not awaiting assignment"}), 409
+    payload, err = _perform_assignment(conn, req, req_id, data)
+    conn.close()
+    if err:
+        return jsonify({"error": err[1]}), err[0]
+    return jsonify(payload)
 
 
 @app.route("/api/requests/<int:req_id>/deny", methods=["PATCH"])
@@ -16304,11 +16419,13 @@ _REQUESTS_PAGE_JS = """
 (function(){
   var CSRF = (document.querySelector('meta[name=csrf-token]')||{}).content || '';
   function hideForms(id){
+    var ac=document.getElementById('accept-form-'+id); if(ac) ac.hidden=true;
     var a=document.getElementById('approve-form-'+id); if(a) a.hidden=true;
     var d=document.getElementById('deny-form-'+id); if(d) d.hidden=true;
     var e=document.getElementById('err-'+id); if(e){ e.hidden=true; e.textContent=''; }
   }
   window.hideReqForms = hideForms;
+  window.showAccept=function(id){ hideForms(id); var ac=document.getElementById('accept-form-'+id); if(ac) ac.hidden=false; };
   window.showApprove=function(id){ hideForms(id); var a=document.getElementById('approve-form-'+id); if(a) a.hidden=false; };
   window.showDeny=function(id){ hideForms(id); var d=document.getElementById('deny-form-'+id); if(d) d.hidden=false; };
   function err(id,msg){ var e=document.getElementById('err-'+id); if(e){ e.textContent=msg; e.hidden=false; } }
@@ -16330,6 +16447,10 @@ _REQUESTS_PAGE_JS = """
                            else { err(id, (res.j && res.j.error) || 'Something went wrong.'); } })
       .catch(function(){ err(id, 'Network error — try again.'); });
   }
+  window.submitAccept=function(id){
+    var note=(document.getElementById('note-'+id)||{value:''}).value || '';
+    patch('/api/requests/'+id+'/accept', {note: note}, id);
+  };
   window.submitApprove=function(id){
     var drv=document.getElementById('drv-'+id).value;
     var date=document.getElementById('date-'+id).value;
@@ -16396,6 +16517,11 @@ def requests_page():
         f'<option value="{d["id"]}">{e(d["username"])}</option>' for d in drivers
     )
 
+    # Only a user who also holds the dispatcher role (owner, or someone with
+    # both roles) can schedule in one click — the solo-operator path. A
+    # customer-manager-only user accepts, and a dispatcher assigns later.
+    can_assign = has_role("dispatcher")
+
     _TYPE_LABEL = {"PR": "PR · Pull & Return", "P": "P · Pickup",
                    "D": "D · Drop", "NEW_BIN": "NEW BIN"}
 
@@ -16419,6 +16545,10 @@ def requests_page():
             f'background:var(--cyan-dim);color:var(--cyan);border:1px solid var(--border-glow);">'
             f'{e(_TYPE_LABEL.get(r["type"], r["type"]))}</span>'
         )
+        assign_btn = (
+            f'<button class="btn green" style="flex:1;min-width:120px;" '
+            f'onclick="showApprove({rid})">Accept &amp; Assign</button>'
+        ) if can_assign else ""
         cards += f"""
         <div class="bin-card" id="req-card-{rid}" style="padding:16px;">
             <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
@@ -16429,18 +16559,28 @@ def requests_page():
             <div style="color:var(--slate);font-size:13px;margin-top:2px;">📍 {addr}</div>
             {size_html}
             {notes_html}
-            <div style="display:flex;gap:8px;margin-top:12px;">
-                <button class="btn green" style="flex:1;" onclick="showApprove({rid})">Approve</button>
-                <button class="btn red" style="flex:1;" onclick="showDeny({rid})">Deny</button>
+            <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
+                <button class="btn green" style="flex:1;min-width:90px;" onclick="showAccept({rid})">Accept</button>
+                {assign_btn}
+                <button class="btn red" style="flex:1;min-width:90px;" onclick="showDeny({rid})">Deny</button>
             </div>
             <div id="err-{rid}" hidden style="color:#FF5252;font-size:12px;margin-top:8px;"></div>
+            <div id="accept-form-{rid}" hidden style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
+                <label style="display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Note to customer (optional)</label>
+                <textarea id="note-{rid}" maxlength="500" rows="2" style="width:100%;margin-bottom:6px;" placeholder="e.g. We'll have you scheduled within a day or two."></textarea>
+                <div style="font-size:12px;color:var(--slate);margin-bottom:12px;">Confirms the request without scheduling — it moves to Unassigned Work for a dispatcher to route.</div>
+                <div style="display:flex;gap:8px;">
+                    <button class="btn green" style="flex:1;" onclick="submitAccept({rid})">Confirm accept</button>
+                    <button class="btn secondary" onclick="hideReqForms({rid})">Cancel</button>
+                </div>
+            </div>
             <div id="approve-form-{rid}" hidden style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
                 <label style="display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Driver</label>
                 <select id="drv-{rid}" style="width:100%;margin-bottom:10px;">{driver_options}</select>
                 <label style="display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Scheduled date</label>
                 <input type="date" id="date-{rid}" value="{default_date}" style="width:100%;margin-bottom:12px;">
                 <div style="display:flex;gap:8px;">
-                    <button class="btn green" style="flex:1;" onclick="submitApprove({rid})">Confirm approve</button>
+                    <button class="btn green" style="flex:1;" onclick="submitApprove({rid})">Confirm &amp; schedule</button>
                     <button class="btn secondary" onclick="hideReqForms({rid})">Cancel</button>
                 </div>
             </div>
@@ -16455,11 +16595,15 @@ def requests_page():
         </div>
         """
 
+    accept_assign_hint = (
+        "; <strong>Accept &amp; Assign</strong> schedules it to a driver in one step"
+        if can_assign else ""
+    )
     empty_hidden = "" if not reqs else " hidden"
     body = f"""
     <div class="hero">
         <h1>Requests</h1>
-        <p>Customer requests awaiting your approval. Approving one schedules a stop on the driver's route.</p>
+        <p>Customer requests awaiting your review. <strong>Accept</strong> confirms the job and sends it to Unassigned Work for scheduling{accept_assign_hint}.</p>
     </div>
     <div id="req-empty" class="empty-state" style="padding:32px 0;"{empty_hidden}>No pending requests.</div>
     <div id="req-list" class="bin-list" style="display:grid;gap:12px;max-width:640px;">
