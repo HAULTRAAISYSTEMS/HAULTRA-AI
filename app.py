@@ -1572,6 +1572,37 @@ def build_photo_gallery_html(photos):
     return '<div class="photo-gallery">' + "".join(items) + "</div>"
 
 
+# Phase 6 — default pre-trip checklist for a roll-off truck. This is only the
+# SEED for the checklist_items table (company_id IS NULL); the running app reads
+# the table, never this list, so a company can customize it later without a code
+# change. (label, hint) pairs, rendered top-to-bottom.
+DEFAULT_CHECKLIST = [
+    ("Service brakes", "Pedal feel, air pressure, no drag"),
+    ("Parking brake", "Holds on a grade"),
+    ("Tires, wheels & rims", "Tread, inflation, lugs, no cracks"),
+    ("Lights, reflectors & signals", "Head/tail/brake/turn/markers"),
+    ("Mirrors & glass", "Clean, intact, adjusted"),
+    ("Horn", "Sounds"),
+    ("Windshield wipers", "Blades, washer fluid"),
+    ("Steering", "Free play within limits"),
+    ("Coupling / hoist / hydraulics", "Hoist, cables, rollers, tarp system"),
+    ("Leaks", "Oil, coolant, fuel, hydraulic"),
+    ("Emergency equipment", "Fire extinguisher, triangles, kit"),
+    ("Cab & seatbelt", "Belt latches, cab secure"),
+    ("Overall vehicle condition", "Anything else affecting safe operation"),
+]
+
+# Phase 6 — inspection enums shared by the driver flow and management views.
+INSPECTION_TYPES   = ("pre_trip", "post_trip")
+INSPECTION_OVERALL = ("safe", "defects_safe", "out_of_service")
+_INSPECTION_TYPE_LABEL = {"pre_trip": "Pre-trip", "post_trip": "Post-trip"}
+_INSPECTION_OVERALL_LABEL = {
+    "safe": "Safe to operate",
+    "defects_safe": "Defects — safe to operate",
+    "out_of_service": "OUT OF SERVICE (unsafe)",
+}
+
+
 def init_db():
     conn = get_db()
     cur = conn.cursor()
@@ -2104,6 +2135,99 @@ def init_db():
         FOREIGN KEY (stop_id) REFERENCES stops(id)
     )
     """)
+
+    # =========================================================
+    # Phase 6 — DVIR (Driver Vehicle Inspection Reports) + defect tracking.
+    # Inspections are IMMUTABLE after submit; defect resolution is a separate
+    # management follow-up layered on the inspection_items rows. All tables are
+    # company-scoped. No ELD / Hours-of-Service / GPS — inspections only.
+    # =========================================================
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS trucks (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id     INTEGER NOT NULL,
+        name           TEXT NOT NULL,
+        make_model     TEXT,
+        plate          TEXT,
+        is_active      INTEGER NOT NULL DEFAULT 1,
+        out_of_service INTEGER NOT NULL DEFAULT 0,
+        oos_note       TEXT,
+        oos_at         TEXT,
+        oos_by         INTEGER,
+        oos_inspection_id INTEGER,
+        oos_cleared_note  TEXT,
+        oos_cleared_at    TEXT,
+        oos_cleared_by    INTEGER,
+        created_at     TEXT NOT NULL,
+        FOREIGN KEY (company_id) REFERENCES companies(id)
+    )
+    """)
+
+    # Checklist template, stored as DATA (not hardcoded) so it can become
+    # per-company-customizable later. company_id IS NULL == the shared default
+    # roll-off template seeded below.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS checklist_items (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id  INTEGER,
+        label       TEXT NOT NULL,
+        hint        TEXT,
+        sort_order  INTEGER NOT NULL DEFAULT 0,
+        is_active   INTEGER NOT NULL DEFAULT 1,
+        created_at  TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS inspections (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id     INTEGER NOT NULL,
+        truck_id       INTEGER NOT NULL,
+        driver_id      INTEGER NOT NULL,
+        type           TEXT NOT NULL CHECK(type IN ('pre_trip','post_trip')),
+        overall        TEXT NOT NULL CHECK(overall IN ('safe','defects_safe','out_of_service')),
+        signature_name TEXT NOT NULL,
+        created_at     TEXT NOT NULL,
+        FOREIGN KEY (company_id) REFERENCES companies(id),
+        FOREIGN KEY (truck_id)   REFERENCES trucks(id),
+        FOREIGN KEY (driver_id)  REFERENCES users(id)
+    )
+    """)
+
+    # One row per checklist item answered. label is snapshotted so a report is
+    # immutable even if the template changes later. The defect_* columns are the
+    # ONLY mutable fields — they carry management's follow-up (repair/defer) and
+    # are not part of the driver's immutable report.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS inspection_items (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        inspection_id     INTEGER NOT NULL,
+        checklist_item_id INTEGER,
+        label             TEXT NOT NULL,
+        result            TEXT NOT NULL CHECK(result IN ('pass','defect','na')),
+        note              TEXT,
+        photo_path        TEXT,
+        defect_status     TEXT CHECK(defect_status IN ('open','repaired','deferred')),
+        resolution_note   TEXT,
+        resolved_by       INTEGER,
+        resolved_at       TEXT,
+        FOREIGN KEY (inspection_id) REFERENCES inspections(id)
+    )
+    """)
+
+    # Seed the default roll-off pre-trip template once (idempotent: only if no
+    # global template rows exist yet).
+    _has_tmpl = conn.execute(
+        "SELECT 1 FROM checklist_items WHERE company_id IS NULL LIMIT 1"
+    ).fetchone()
+    if not _has_tmpl:
+        _ts = now_ts()
+        conn.executemany(
+            """INSERT INTO checklist_items (company_id, label, hint, sort_order, is_active, created_at)
+               VALUES (NULL, ?, ?, ?, 1, ?)""",
+            [(lbl, hint, i, _ts) for i, (lbl, hint) in enumerate(DEFAULT_CHECKLIST)],
+        )
+        conn.commit()
 
     # --- default company bootstrap ---
     default_co = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()
@@ -4005,7 +4129,23 @@ _REQ_BADGE_POLLER_JS = """
       })
       .catch(function(){ /* offline/transient — retry next cycle */ });
   }
-  function refresh(){ poll('req-nav-badge','pending'); poll('unassigned-nav-badge','accepted'); }
+  function pollCount(badgeId, url){
+    var badge = document.getElementById(badgeId);
+    if (!badge) return;
+    fetch(url, {headers:{'X-Requested-With':'XMLHttpRequest'}})
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(d){
+        if (!d || typeof d.count !== 'number') return;
+        if (d.count > 0){ badge.textContent = d.count; badge.hidden = false; }
+        else { badge.hidden = true; }
+      })
+      .catch(function(){ /* offline/transient — retry next cycle */ });
+  }
+  function refresh(){
+    poll('req-nav-badge','pending');
+    poll('unassigned-nav-badge','accepted');
+    pollCount('maint-nav-badge','/api/defects/open-count');
+  }
   refresh();
   setInterval(refresh, 45000);
 })();
@@ -4050,6 +4190,13 @@ def shell_page(title, body, extra_head=""):
                     WHERE c.company_id = ? AND r.status = 'accepted'""",
                 (session.get("company_id"),),
             ).fetchone()["n"] if is_disp else 0
+            # Open-defect count — Maintenance is visible to any management role.
+            _open_defects = _rc.execute(
+                """SELECT COUNT(*) AS n FROM inspection_items ii
+                     JOIN inspections i ON ii.inspection_id = i.id
+                    WHERE i.company_id = ? AND ii.result='defect' AND ii.defect_status='open'""",
+                (session.get("company_id"),),
+            ).fetchone()["n"]
             _rc.close()
 
             _parts = []
@@ -4064,6 +4211,9 @@ def shell_page(title, body, extra_head=""):
                 _parts.append(nav_link(url_for("customers_page"), '👤 Customers', path))
             if is_disp:
                 _parts.append(nav_link(url_for("bin_tracker"), 'Bin Tracker', path))
+            # Maintenance/defects — any management role can view.
+            _parts.append(nav_link(url_for("maintenance_page"),
+                          '🔧 Maintenance' + _nav_badge('maint-nav-badge', _open_defects), path))
             if is_own:
                 _parts.append(nav_link(url_for("dashboard"), 'Owner', path))
             primary_items = "".join(_parts)
@@ -4079,6 +4229,7 @@ def shell_page(title, body, extra_head=""):
             primary_items = (
                 nav_link('/parser', '✦ Parser', path)
                 + nav_link(cab_href, 'Cab View', path)
+                + nav_link(url_for("inspection_new"), '🔧 Inspection', path)
                 + nav_link(url_for("dashboard"), 'Owner', path)
             )
 
@@ -4088,6 +4239,9 @@ def shell_page(title, body, extra_head=""):
         # working at their old URLs but no longer have a nav entry (see PR notes).
         if user["role"] == "boss":
             _mparts = []
+            # Trucks/fleet — any management role can view (add/edit is gated
+            # server-side to owner/dispatcher).
+            _mparts.append(nav_link(url_for("trucks_page"), "🚛 Trucks", path))
             if is_disp:
                 _mparts.append(nav_link(url_for("team_page"), "👥 Team", path))
             if is_own:
@@ -4097,6 +4251,7 @@ def shell_page(title, body, extra_head=""):
         else:
             more_items = (
                 nav_link(url_for("driver_dashboard"), "◈ My Routes", path)
+                + nav_link(url_for("my_inspections"), "🛠 My Inspections", path)
                 + nav_link(url_for("driver_clock"), "⏱ Clock In/Out", path)
             )
 
@@ -17120,6 +17275,1011 @@ def _customer_detail_js(customer_id):
 }})();
 </script>
 """
+
+
+# =========================================================
+# Phase 6 — DVIR: Trucks, Inspections, Defects/Maintenance, History
+# Access model (mirrors Phase 5): any management role may VIEW; only
+# owner/dispatcher may ACTION (add/edit trucks, resolve defects, clear OOS).
+# Drivers run inspections and see only their own. All checks are server-side.
+# =========================================================
+
+def _is_management():
+    """Any boss/management role (owner, customer_manager, dispatcher)."""
+    return bool(session_roles().intersection(("owner", "customer_manager", "dispatcher"))) \
+        or session.get("is_superadmin")
+
+
+def _can_action_fleet():
+    """Owner/dispatcher may mutate trucks, resolve defects, clear OOS. Owner
+    expands to include dispatcher, so this one check covers both."""
+    return has_role("dispatcher")
+
+
+def _truck_oos_badge(row):
+    """Red OUT OF SERVICE pill shown anywhere a flagged truck appears."""
+    d = dict(row) if row is not None else {}
+    if not d.get("out_of_service"):
+        return ""
+    return ('<span style="display:inline-block;padding:2px 9px;border-radius:999px;'
+            'font-size:10px;font-weight:800;letter-spacing:.5px;text-transform:uppercase;'
+            'background:rgba(255,82,82,0.16);color:#FF7A7A;border:1px solid rgba(255,82,82,0.45);'
+            'margin-left:6px;">⛔ Out of service</span>')
+
+
+def _load_truck_scoped(conn, truck_id, active_only=False):
+    """A truck in the session's company (any status), or None."""
+    q = "SELECT * FROM trucks WHERE id=? AND company_id=?"
+    if active_only:
+        q += " AND is_active=1"
+    return conn.execute(q, (truck_id, cid())).fetchone()
+
+
+def _open_defect_count(conn):
+    return conn.execute(
+        """SELECT COUNT(*) AS n
+             FROM inspection_items ii
+             JOIN inspections i ON ii.inspection_id = i.id
+            WHERE i.company_id = ? AND ii.result='defect' AND ii.defect_status='open'""",
+        (cid(),),
+    ).fetchone()["n"]
+
+
+@app.route("/trucks")
+@roles_required("owner", "customer_manager", "dispatcher")
+def trucks_page():
+    """Fleet list. Any management role views; owner/dispatcher can add/edit."""
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT t.*,
+                  (SELECT COUNT(*) FROM inspection_items ii
+                     JOIN inspections i ON ii.inspection_id=i.id
+                    WHERE i.truck_id=t.id AND ii.result='defect'
+                      AND ii.defect_status='open') AS open_defects
+             FROM trucks t
+            WHERE t.company_id=? AND t.is_active=1
+            ORDER BY t.out_of_service DESC, LOWER(t.name), t.id""",
+        (cid(),),
+    ).fetchall()
+    conn.close()
+    can_action = _can_action_fleet()
+
+    cards = ""
+    for t in rows:
+        name = e(t["name"])
+        sub_bits = " · ".join(b for b in [e(t["make_model"] or ""), e(t["plate"] or "")] if b)
+        sub = f'<div style="color:var(--slate);font-size:13px;margin-top:2px;">{sub_bits}</div>' if sub_bits else ""
+        defect_badge = (
+            f'<span style="display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;'
+            f'font-weight:800;background:rgba(255,82,82,0.16);color:#FF7A7A;'
+            f'border:1px solid rgba(255,82,82,0.45);">{t["open_defects"]} open</span>'
+        ) if t["open_defects"] else ""
+        cards += f"""
+        <a class="bin-card" href="{url_for('truck_detail_page', truck_id=t['id'])}"
+           style="padding:16px;display:block;text-decoration:none;color:inherit;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
+                <div style="font-weight:700;font-size:15px;">🚛 {name}{_truck_oos_badge(t)}</div>
+                {defect_badge}
+            </div>
+            {sub}
+        </a>
+        """
+
+    add_form = ""
+    if can_action:
+        add_form = f"""
+        <div style="max-width:640px;margin-bottom:16px;">
+            <button class="btn green" onclick="toggleAddTruck()">+ Add Truck</button>
+            <div id="add-truck-form" hidden class="bin-card" style="padding:16px;margin-top:12px;">
+                <div id="add-truck-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
+                <label class="uw-lbl">Name / number</label>
+                <input id="tk-name" style="width:100%;margin-bottom:10px;" placeholder="Truck 3">
+                <label class="uw-lbl">Make &amp; model (optional)</label>
+                <input id="tk-make" style="width:100%;margin-bottom:10px;" placeholder="2019 Peterbilt 348">
+                <label class="uw-lbl">Plate (optional)</label>
+                <input id="tk-plate" style="width:100%;margin-bottom:12px;" placeholder="VA ABC-1234">
+                <div style="display:flex;gap:8px;">
+                    <button class="btn green" style="flex:1;" onclick="submitAddTruck()">Create truck</button>
+                    <button class="btn secondary" onclick="toggleAddTruck()">Cancel</button>
+                </div>
+            </div>
+        </div>"""
+
+    empty_hidden = "" if not rows else " hidden"
+    body = f"""
+    <div class="hero">
+        <h1>Trucks</h1>
+        <p>Your fleet. Drivers run pre/post-trip inspections against these vehicles.</p>
+    </div>
+    {add_form}
+    <div id="truck-empty" class="empty-state" style="padding:32px 0;"{empty_hidden}>No trucks yet{'' if can_action else ' — an owner or dispatcher can add them'}.</div>
+    <div class="bin-list" style="display:grid;gap:12px;max-width:640px;">
+        {cards}
+    </div>
+    <style>.uw-lbl{{display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;}}</style>
+    {_TRUCKS_PAGE_JS}
+    """
+    return render_template_string(shell_page("Trucks", body))
+
+
+_TRUCKS_PAGE_JS = """
+<script>
+(function(){
+  var CSRF = (document.querySelector('meta[name=csrf-token]')||{}).content || '';
+  window.toggleAddTruck=function(){ var f=document.getElementById('add-truck-form'); if(f) f.hidden=!f.hidden; };
+  function err(m){ var e=document.getElementById('add-truck-err'); if(e){ e.textContent=m; e.hidden=false; } }
+  window.submitAddTruck=function(){
+    var body={ name:(document.getElementById('tk-name')||{}).value||'',
+               make_model:(document.getElementById('tk-make')||{}).value||'',
+               plate:(document.getElementById('tk-plate')||{}).value||'' };
+    if(!body.name.trim()){ err('Enter a name or number.'); return; }
+    fetch('/api/trucks', {method:'POST',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF}, body:JSON.stringify(body)})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
+      .then(function(res){ if(res.ok && res.j.id){ window.location='/trucks/'+res.j.id; }
+                           else { err((res.j&&res.j.error)||'Could not create truck.'); } })
+      .catch(function(){ err('Network error — try again.'); });
+  };
+})();
+</script>
+"""
+
+
+@app.route("/api/trucks", methods=["POST"])
+@login_required
+def create_truck():
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name") or "").strip()[:80]
+    make_model = str(data.get("make_model") or "").strip()[:120] or None
+    plate = str(data.get("plate") or "").strip()[:40] or None
+    if not name:
+        return jsonify({"error": "a name or number is required"}), 400
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO trucks (company_id, name, make_model, plate, is_active, created_at)
+           VALUES (?, ?, ?, ?, 1, ?)""",
+        (cid(), name, make_model, plate, now_ts()),
+    )
+    truck_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "id": truck_id})
+
+
+@app.route("/api/trucks/<int:truck_id>", methods=["PATCH"])
+@login_required
+def update_truck(truck_id):
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    conn = get_db()
+    truck = _load_truck_scoped(conn, truck_id, active_only=True)
+    if truck is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    name = str(data.get("name") or "").strip()[:80]
+    if not name:
+        conn.close()
+        return jsonify({"error": "a name or number is required"}), 400
+    conn.execute(
+        "UPDATE trucks SET name=?, make_model=?, plate=? WHERE id=?",
+        (name, str(data.get("make_model") or "").strip()[:120] or None,
+         str(data.get("plate") or "").strip()[:40] or None, truck_id),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/trucks/<int:truck_id>/deactivate", methods=["POST"])
+@login_required
+def deactivate_truck(truck_id):
+    """Soft delete: hide from pickers/lists, keep inspection history."""
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    truck = _load_truck_scoped(conn, truck_id, active_only=True)
+    if truck is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    conn.execute("UPDATE trucks SET is_active=0 WHERE id=?", (truck_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/trucks/<int:truck_id>/clear-oos", methods=["POST"])
+@login_required
+def clear_truck_oos(truck_id):
+    """Owner/dispatcher clears an OUT OF SERVICE flag, with a required note."""
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    note = str(data.get("note") or "").strip()[:500]
+    if not note:
+        return jsonify({"error": "a note is required to clear out-of-service"}), 400
+    conn = get_db()
+    truck = _load_truck_scoped(conn, truck_id)
+    if truck is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if not truck["out_of_service"]:
+        conn.close()
+        return jsonify({"error": "truck is not out of service"}), 409
+    conn.execute(
+        """UPDATE trucks SET out_of_service=0, oos_cleared_note=?, oos_cleared_at=?,
+                            oos_cleared_by=? WHERE id=?""",
+        (note, now_ts(), session["user_id"], truck_id),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/trucks/<int:truck_id>")
+@roles_required("owner", "customer_manager", "dispatcher")
+def truck_detail_page(truck_id):
+    """Truck info + OOS status + inspection history (date-range filter). The
+    'DOT auditor is here' screen for one truck."""
+    conn = get_db()
+    truck = _load_truck_scoped(conn, truck_id, active_only=True)
+    if truck is None:
+        conn.close()
+        flash("Truck not found.", "error")
+        return redirect(url_for("trucks_page"))
+
+    date_from = (request.args.get("from") or "").strip()
+    date_to   = (request.args.get("to") or "").strip()
+    where = ["i.company_id=?", "i.truck_id=?"]
+    params = [cid(), truck_id]
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_from):
+        where.append("substr(i.created_at,1,10) >= ?")
+        params.append(date_from)
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_to):
+        where.append("substr(i.created_at,1,10) <= ?")
+        params.append(date_to)
+    insps = conn.execute(
+        f"""SELECT i.*,
+                   COALESCE(u.username,'—') AS driver_name,
+                   (SELECT COUNT(*) FROM inspection_items ii
+                     WHERE ii.inspection_id=i.id AND ii.result='defect') AS defect_count
+              FROM inspections i
+         LEFT JOIN users u ON i.driver_id=u.id
+             WHERE {' AND '.join(where)}
+             ORDER BY i.created_at DESC, i.id DESC""",
+        params,
+    ).fetchall()
+    conn.close()
+    can_action = _can_action_fleet()
+
+    _OVR_COLOR = {"safe": "#3DDC84", "defects_safe": "#FF8A3D", "out_of_service": "#FF7A7A"}
+    rows_html = ""
+    for i in insps:
+        color = _OVR_COLOR.get(i["overall"], "var(--slate)")
+        rows_html += f"""
+        <a class="bin-card" href="{url_for('inspection_report', inspection_id=i['id'])}"
+           style="padding:14px;display:block;text-decoration:none;color:inherit;">
+            <div style="display:flex;justify-content:space-between;gap:10px;">
+                <span style="font-weight:700;font-size:14px;">{e((i["created_at"] or "")[:16])}</span>
+                <span style="color:{color};font-weight:800;font-size:12px;">{e(_INSPECTION_OVERALL_LABEL.get(i["overall"], i["overall"]))}</span>
+            </div>
+            <div style="color:var(--slate);font-size:13px;margin-top:4px;">
+                {e(_INSPECTION_TYPE_LABEL.get(i["type"], i["type"]))} · {e(i["driver_name"])}
+                {(' · ' + str(i["defect_count"]) + ' defect' + ('' if i["defect_count"]==1 else 's')) if i["defect_count"] else ''}
+            </div>
+        </a>"""
+    if not insps:
+        rows_html = '<div class="empty-state" style="padding:24px 0;">No inspections in this range.</div>'
+
+    oos_html = ""
+    if truck["out_of_service"]:
+        clear_btn = ('<button class="btn secondary" style="margin-top:10px;" onclick="clearOOS()">Clear out-of-service</button>'
+                     if can_action else "")
+        oos_html = f"""
+        <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;border:1px solid rgba(255,82,82,0.45);">
+            <div style="color:#FF7A7A;font-weight:800;">⛔ OUT OF SERVICE</div>
+            <div style="font-size:13px;color:#C9C9C2;margin-top:6px;">{e(truck["oos_note"] or "Flagged unsafe by an inspection.")}</div>
+            <div style="font-size:12px;color:var(--slate);margin-top:4px;">Flagged {e(truck["oos_at"] or "")}</div>
+            <div id="oos-msg" hidden style="font-size:12px;margin-top:8px;color:var(--slate);"></div>
+            {clear_btn}
+        </div>"""
+
+    edit_block = ""
+    if can_action:
+        edit_block = f"""
+        <div id="truck-edit" hidden class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+            <div id="edit-truck-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
+            <label class="uw-lbl">Name / number</label>
+            <input id="te-name" style="width:100%;margin-bottom:10px;" value="{e(truck["name"])}">
+            <label class="uw-lbl">Make &amp; model</label>
+            <input id="te-make" style="width:100%;margin-bottom:10px;" value="{e(truck["make_model"] or "")}">
+            <label class="uw-lbl">Plate</label>
+            <input id="te-plate" style="width:100%;margin-bottom:12px;" value="{e(truck["plate"] or "")}">
+            <div style="display:flex;gap:8px;">
+                <button class="btn green" style="flex:1;" onclick="submitEditTruck()">Save</button>
+                <button class="btn secondary" onclick="toggleEditTruck()">Cancel</button>
+            </div>
+        </div>
+        <div style="max-width:640px;margin-bottom:16px;">
+            <button class="btn red" onclick="deactivateTruck()" style="width:100%;">Deactivate truck</button>
+            <div style="color:var(--slate);font-size:12px;margin-top:6px;text-align:center;">
+                Hides it from inspection pickers. Inspection history is kept.
+            </div>
+        </div>"""
+
+    edit_toggle = ('<button class="btn secondary" onclick="toggleEditTruck()" style="padding:4px 12px;font-size:12px;">Edit</button>'
+                   if can_action else "")
+    sub_bits = " · ".join(b for b in [e(truck["make_model"] or ""), e(truck["plate"] or "")] if b) or "—"
+    body = f"""
+    <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+        <div>
+            <h1 style="margin-bottom:4px;">🚛 {e(truck["name"])}{_truck_oos_badge(truck)}</h1>
+            <p style="margin:0;">{sub_bits}</p>
+        </div>
+        <a class="btn secondary" href="{url_for('trucks_page')}" style="white-space:nowrap;">← All trucks</a>
+    </div>
+    {oos_html}
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+            <h2 style="font-size:15px;margin:0;">Truck info</h2>
+            {edit_toggle}
+        </div>
+        <div id="truck-view" style="margin-top:10px;color:var(--slate);font-size:14px;">{sub_bits}</div>
+    </div>
+    {edit_block}
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:8px;">
+        <h2 style="font-size:15px;margin:0 0 10px;">Inspection history</h2>
+        <form method="GET" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:6px;">
+            <div><label class="uw-lbl">From</label><input type="date" name="from" value="{e(date_from)}"></div>
+            <div><label class="uw-lbl">To</label><input type="date" name="to" value="{e(date_to)}"></div>
+            <button class="btn secondary" type="submit" style="padding:8px 14px;">Filter</button>
+            <a class="btn secondary" href="{url_for('truck_detail_page', truck_id=truck_id)}" style="padding:8px 14px;">Reset</a>
+        </form>
+    </div>
+    <div class="bin-list" style="display:grid;gap:10px;max-width:640px;">
+        {rows_html}
+    </div>
+    <style>.uw-lbl{{display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;}}</style>
+    {_truck_detail_js(truck_id)}
+    """
+    return render_template_string(shell_page("Truck", body))
+
+
+def _truck_detail_js(truck_id):
+    list_url = url_for("trucks_page")
+    return f"""
+<script>
+(function(){{
+  var CSRF=(document.querySelector('meta[name=csrf-token]')||{{}}).content||'';
+  var TID={truck_id};
+  function msg(t){{ var m=document.getElementById('oos-msg'); if(m){{ m.textContent=t; m.hidden=false; }} }}
+  window.toggleEditTruck=function(){{ var v=document.getElementById('truck-view'),ed=document.getElementById('truck-edit');
+    if(ed){{ ed.hidden=!ed.hidden; }} }};
+  window.submitEditTruck=function(){{
+    var body={{name:(document.getElementById('te-name')||{{}}).value||'',
+              make_model:(document.getElementById('te-make')||{{}}).value||'',
+              plate:(document.getElementById('te-plate')||{{}}).value||''}};
+    fetch('/api/trucks/'+TID,{{method:'PATCH',headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},body:JSON.stringify(body)}})
+      .then(function(r){{return r.json().then(function(j){{return {{ok:r.ok,j:j}};}});}})
+      .then(function(res){{ if(res.ok){{ window.location.reload(); }}
+        else {{ var e=document.getElementById('edit-truck-err'); if(e){{e.textContent=(res.j&&res.j.error)||'Could not save.';e.hidden=false;}} }} }})
+      .catch(function(){{ var e=document.getElementById('edit-truck-err'); if(e){{e.textContent='Network error.';e.hidden=false;}} }});
+  }};
+  window.deactivateTruck=function(){{
+    if(!confirm('Deactivate this truck? It disappears from inspection pickers. History is kept.')) return;
+    fetch('/api/trucks/'+TID+'/deactivate',{{method:'POST',headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}}}})
+      .then(function(r){{return r.json().then(function(j){{return {{ok:r.ok,j:j}};}});}})
+      .then(function(res){{ if(res.ok){{ window.location='{list_url}'; }} else {{ alert((res.j&&res.j.error)||'Could not deactivate.'); }} }})
+      .catch(function(){{ alert('Network error — try again.'); }});
+  }};
+  window.clearOOS=function(){{
+    var note=prompt('Clear OUT OF SERVICE for this truck. Add a note (what was fixed / why it is safe):');
+    if(note===null) return;
+    if(!note.trim()){{ msg('A note is required.'); return; }}
+    fetch('/api/trucks/'+TID+'/clear-oos',{{method:'POST',headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},body:JSON.stringify({{note:note}})}})
+      .then(function(r){{return r.json().then(function(j){{return {{ok:r.ok,j:j}};}});}})
+      .then(function(res){{ if(res.ok){{ window.location.reload(); }} else {{ msg((res.j&&res.j.error)||'Could not clear.'); }} }})
+      .catch(function(){{ msg('Network error — try again.'); }});
+  }};
+}})();
+</script>
+"""
+
+
+def _active_checklist(conn):
+    """The checklist a driver fills in: the company's own items if it has any,
+    else the shared default template. (company customization is future-ready —
+    the column exists — but today only the NULL template is seeded.)"""
+    rows = conn.execute(
+        "SELECT * FROM checklist_items WHERE company_id=? AND is_active=1 ORDER BY sort_order, id",
+        (cid(),),
+    ).fetchall()
+    if rows:
+        return rows
+    return conn.execute(
+        "SELECT * FROM checklist_items WHERE company_id IS NULL AND is_active=1 ORDER BY sort_order, id"
+    ).fetchall()
+
+
+@app.route("/inspection", methods=["GET"])
+@driver_required
+def inspection_new():
+    """Driver: start a pre/post-trip inspection. Preselects the truck this
+    driver used last so a clean pre-trip is a fast tap-through."""
+    conn = get_db()
+    trucks = conn.execute(
+        "SELECT * FROM trucks WHERE company_id=? AND is_active=1 ORDER BY LOWER(name), id",
+        (cid(),),
+    ).fetchall()
+    last = conn.execute(
+        "SELECT truck_id FROM inspections WHERE driver_id=? AND company_id=? ORDER BY id DESC LIMIT 1",
+        (session["user_id"], cid()),
+    ).fetchone()
+    last_truck_id = last["truck_id"] if last else None
+    items = _active_checklist(conn)
+    conn.close()
+
+    user = get_current_user()
+    default_sig = e((user["full_name"] if user and user["full_name"] else user["username"]) if user else "")
+
+    if not trucks:
+        body = """
+        <div class="hero"><h1>Inspection</h1></div>
+        <div class="empty-state" style="padding:32px 0;">
+            No trucks are set up yet. Ask an owner or dispatcher to add your truck before running an inspection.
+        </div>"""
+        return render_template_string(shell_page("Inspection", body))
+
+    truck_opts = "".join(
+        f'<option value="{t["id"]}"{" selected" if t["id"]==last_truck_id else ""}>'
+        f'{e(t["name"])}{" — OUT OF SERVICE" if t["out_of_service"] else ""}</option>'
+        for t in trucks
+    )
+
+    rows_html = ""
+    for it in items:
+        iid = it["id"]
+        hint = f'<div style="color:var(--slate);font-size:12px;margin-top:2px;">{e(it["hint"])}</div>' if it["hint"] else ""
+        rows_html += f"""
+        <div class="insp-row" data-iid="{iid}" style="border-top:1px solid var(--border);padding:14px 0;">
+            <input type="hidden" name="result_{iid}" id="result_{iid}" value="">
+            <input type="hidden" name="label_{iid}" value="{e(it["label"])}">
+            <div style="font-weight:700;font-size:15px;">{e(it["label"])}</div>
+            {hint}
+            <div style="display:flex;gap:8px;margin-top:10px;">
+                <button type="button" class="insp-btn pass" data-r="pass"  onclick="setResult({iid},'pass',this)">PASS</button>
+                <button type="button" class="insp-btn defect" data-r="defect" onclick="setResult({iid},'defect',this)">DEFECT</button>
+                <button type="button" class="insp-btn na" data-r="na"   onclick="setResult({iid},'na',this)">N/A</button>
+            </div>
+            <div class="insp-defect" id="defect_{iid}" hidden style="margin-top:10px;">
+                <textarea name="note_{iid}" rows="2" style="width:100%;" placeholder="What's wrong? (required for a defect)"></textarea>
+                <label class="insp-photo-btn" style="display:inline-flex;align-items:center;gap:6px;margin-top:8px;padding:10px 14px;border:1px solid var(--border-glow);border-radius:10px;cursor:pointer;color:var(--cyan);font-weight:700;">
+                    📷 Add photo
+                    <input type="file" name="photo_{iid}" accept=".png,.jpg,.jpeg,.webp" capture="environment" style="display:none;" onchange="photoPicked(this)">
+                </label>
+                <span class="insp-photo-name" style="font-size:12px;color:var(--slate);margin-left:8px;"></span>
+            </div>
+        </div>"""
+
+    body = f"""
+    <div class="hero">
+        <h1>Inspection</h1>
+        <p>Tap Pass, Defect, or N/A for each item. A clean pre-trip takes under a minute.</p>
+    </div>
+    <form method="POST" action="{url_for('inspection_submit')}" enctype="multipart/form-data"
+          id="insp-form" style="max-width:640px;" onsubmit="return prepSubmit()">
+        <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+        <div class="bin-card" style="padding:16px;margin-bottom:12px;">
+            <label class="uw-lbl">Truck</label>
+            <select name="truck_id" style="width:100%;margin-bottom:12px;">{truck_opts}</select>
+            <label class="uw-lbl">Inspection type</label>
+            <div style="display:flex;gap:8px;">
+                <button type="button" class="insp-type active" data-t="pre_trip" onclick="setType('pre_trip',this)">Pre-trip</button>
+                <button type="button" class="insp-type" data-t="post_trip" onclick="setType('post_trip',this)">Post-trip</button>
+            </div>
+            <input type="hidden" name="type" id="insp-type" value="pre_trip">
+        </div>
+
+        <div class="bin-card" style="padding:4px 16px 12px;margin-bottom:12px;">
+            {rows_html}
+        </div>
+
+        <div class="bin-card" style="padding:16px;margin-bottom:12px;">
+            <label class="uw-lbl">Overall judgment</label>
+            <div style="display:grid;gap:8px;">
+                <button type="button" class="insp-overall safe" data-o="safe" onclick="setOverall('safe',this)">✅ Safe to operate</button>
+                <button type="button" class="insp-overall warn" data-o="defects_safe" onclick="setOverall('defects_safe',this)">⚠️ Defects — safe to operate</button>
+                <button type="button" class="insp-overall stop" data-o="out_of_service" onclick="setOverall('out_of_service',this)">⛔ OUT OF SERVICE (unsafe)</button>
+            </div>
+            <input type="hidden" name="overall" id="insp-overall" value="">
+        </div>
+
+        <div class="bin-card" style="padding:16px;margin-bottom:12px;">
+            <label class="uw-lbl">Signature — type your full name</label>
+            <input name="signature_name" id="insp-sig" style="width:100%;" value="{default_sig}" placeholder="Your full name">
+            <div style="color:var(--slate);font-size:12px;margin-top:6px;">By submitting you certify this inspection is accurate. Submitted reports can't be edited — corrections are a new inspection.</div>
+        </div>
+
+        <div id="insp-err" hidden style="color:#FF5252;font-size:13px;margin-bottom:10px;"></div>
+        <button type="submit" class="btn green" style="width:100%;padding:16px;font-size:16px;">Submit inspection</button>
+    </form>
+    {_INSPECTION_FORM_CSS}
+    {_INSPECTION_FORM_JS}
+    """
+    return render_template_string(shell_page("Inspection", body))
+
+
+_INSPECTION_FORM_CSS = """
+<style>
+  .uw-lbl{display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;}
+  .insp-btn{flex:1;padding:16px 8px;border-radius:12px;font-weight:800;font-size:15px;
+    border:1px solid var(--border);background:rgba(255,255,255,0.03);color:var(--slate);cursor:pointer;}
+  .insp-btn.pass.on{background:rgba(61,220,132,0.18);color:#3DDC84;border-color:rgba(61,220,132,0.5);}
+  .insp-btn.defect.on{background:rgba(255,82,82,0.18);color:#FF7A7A;border-color:rgba(255,82,82,0.5);}
+  .insp-btn.na.on{background:rgba(140,160,179,0.22);color:#ADC0D1;border-color:rgba(140,160,179,0.5);}
+  .insp-type,.insp-overall{padding:14px;border-radius:12px;font-weight:800;font-size:15px;
+    border:1px solid var(--border);background:rgba(255,255,255,0.03);color:var(--slate);cursor:pointer;text-align:center;}
+  .insp-type{flex:1;}
+  .insp-type.active{background:var(--cyan-dim);color:var(--cyan);border-color:var(--border-glow);}
+  .insp-overall.safe.on{background:rgba(61,220,132,0.18);color:#3DDC84;border-color:rgba(61,220,132,0.5);}
+  .insp-overall.warn.on{background:rgba(255,138,61,0.18);color:#FF8A3D;border-color:rgba(255,138,61,0.5);}
+  .insp-overall.stop.on{background:rgba(255,82,82,0.2);color:#FF7A7A;border-color:rgba(255,82,82,0.6);}
+</style>
+"""
+
+_INSPECTION_FORM_JS = """
+<script>
+(function(){
+  window.setResult=function(iid,val,btn){
+    document.getElementById('result_'+iid).value=val;
+    var row=btn.closest('.insp-row');
+    row.querySelectorAll('.insp-btn').forEach(function(b){ b.classList.remove('on'); });
+    btn.classList.add('on');
+    var d=document.getElementById('defect_'+iid);
+    if(d) d.hidden = (val!=='defect');
+  };
+  window.setType=function(val,btn){
+    document.getElementById('insp-type').value=val;
+    document.querySelectorAll('.insp-type').forEach(function(b){ b.classList.remove('active'); });
+    btn.classList.add('active');
+  };
+  window.setOverall=function(val,btn){
+    document.getElementById('insp-overall').value=val;
+    document.querySelectorAll('.insp-overall').forEach(function(b){ b.classList.remove('on'); });
+    btn.classList.add('on');
+  };
+  window.photoPicked=function(inp){
+    var name=(inp.files&&inp.files[0])?inp.files[0].name:'';
+    var span=inp.closest('.insp-defect').querySelector('.insp-photo-name');
+    if(span) span.textContent = name ? ('✓ '+name) : '';
+  };
+  function err(m){ var e=document.getElementById('insp-err'); if(e){ e.textContent=m; e.hidden=false; window.scrollTo(0,e.offsetTop-80); } }
+  window.prepSubmit=function(){
+    var rows=document.querySelectorAll('.insp-row'); var unanswered=0; var missingNote=null;
+    rows.forEach(function(r){
+      var iid=r.getAttribute('data-iid');
+      var v=document.getElementById('result_'+iid).value;
+      if(!v){ unanswered++; }
+      if(v==='defect'){
+        var note=r.querySelector('textarea[name=note_'+iid+']');
+        if(note && !note.value.trim() && missingNote===null){ missingNote=r; }
+      }
+    });
+    if(unanswered>0){ err('Answer every item ('+unanswered+' left).'); return false; }
+    if(missingNote){ err('Every defect needs a note.'); return false; }
+    if(!document.getElementById('insp-overall').value){ err('Pick an overall judgment.'); return false; }
+    if(!document.getElementById('insp-sig').value.trim()){ err('Type your name to sign.'); return false; }
+    return true;
+  };
+})();
+</script>
+"""
+
+
+@app.route("/inspection", methods=["POST"])
+@driver_required
+def inspection_submit():
+    """Driver submit → immutable inspection + items (+ optional defect photos).
+    An OUT OF SERVICE overall flags the truck until an owner/dispatcher clears
+    it. Server-side validation mirrors the client so a crafted POST can't slip
+    through."""
+    conn = get_db()
+    truck = None
+    try:
+        truck_id = request.form.get("truck_id", "")
+        truck = _load_truck_scoped(conn, int(truck_id), active_only=True) if truck_id.isdigit() else None
+        if truck is None:
+            conn.close()
+            flash("Pick a valid truck.", "error")
+            return redirect(url_for("inspection_new"))
+
+        itype = request.form.get("type", "")
+        overall = request.form.get("overall", "")
+        signature = (request.form.get("signature_name") or "").strip()[:120]
+        if itype not in INSPECTION_TYPES or overall not in INSPECTION_OVERALL or not signature:
+            conn.close()
+            flash("Fill in type, overall judgment, and signature.", "error")
+            return redirect(url_for("inspection_new"))
+
+        items = _active_checklist(conn)
+        if not items:
+            conn.close()
+            flash("No checklist configured.", "error")
+            return redirect(url_for("inspection_new"))
+
+        # Validate every item before writing anything.
+        answers = []
+        for it in items:
+            iid = it["id"]
+            result = request.form.get(f"result_{iid}", "")
+            if result not in ("pass", "defect", "na"):
+                conn.close()
+                flash("Answer every checklist item before submitting.", "error")
+                return redirect(url_for("inspection_new"))
+            note = (request.form.get(f"note_{iid}") or "").strip()[:1000]
+            if result == "defect" and not note:
+                conn.close()
+                flash("Every defect needs a note.", "error")
+                return redirect(url_for("inspection_new"))
+            answers.append((it, result, note))
+
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO inspections (company_id, truck_id, driver_id, type, overall,
+                                        signature_name, created_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (cid(), truck["id"], session["user_id"], itype, overall, signature, now_ts()),
+        )
+        inspection_id = cur.lastrowid
+
+        for it, result, note in answers:
+            iid = it["id"]
+            photo_db_path = None
+            if result == "defect":
+                photo = request.files.get(f"photo_{iid}")
+                if photo and photo.filename and allowed_file(photo.filename):
+                    fname = f"insp_{inspection_id}_{iid}_{secrets.token_hex(6)}_{secure_filename(photo.filename)}"
+                    try:
+                        photo.save(os.path.join(app.config["UPLOAD_FOLDER"], fname))
+                        photo_db_path = os.path.join("static", "uploads", fname)
+                    except OSError as exc:
+                        app.logger.warning("inspection photo save failed: %s", exc)
+                        photo_db_path = None
+            cur.execute(
+                """INSERT INTO inspection_items (inspection_id, checklist_item_id, label,
+                       result, note, photo_path, defect_status)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (inspection_id, iid, it["label"], result, note or None, photo_db_path,
+                 "open" if result == "defect" else None),
+            )
+
+        if overall == "out_of_service":
+            cur.execute(
+                """UPDATE trucks SET out_of_service=1, oos_note=?, oos_at=?, oos_by=?,
+                                     oos_inspection_id=? WHERE id=?""",
+                (f"Flagged by {signature} on a {_INSPECTION_TYPE_LABEL[itype].lower()} inspection.",
+                 now_ts(), session["user_id"], inspection_id, truck["id"]),
+            )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        app.logger.warning("inspection submit failed: %s", exc)
+        flash("Could not save the inspection — try again.", "error")
+        return redirect(url_for("inspection_new"))
+    conn.close()
+    flash("Inspection submitted.", "success")
+    return redirect(url_for("inspection_report", inspection_id=inspection_id))
+
+
+@app.route("/my-inspections")
+@driver_required
+def my_inspections():
+    """A driver's own inspection history, newest first."""
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT i.*, t.name AS truck_name, t.out_of_service,
+                  (SELECT COUNT(*) FROM inspection_items ii
+                    WHERE ii.inspection_id=i.id AND ii.result='defect') AS defect_count
+             FROM inspections i
+             JOIN trucks t ON i.truck_id=t.id
+            WHERE i.driver_id=? AND i.company_id=?
+            ORDER BY i.created_at DESC, i.id DESC""",
+        (session["user_id"], cid()),
+    ).fetchall()
+    conn.close()
+
+    _OVR_COLOR = {"safe": "#3DDC84", "defects_safe": "#FF8A3D", "out_of_service": "#FF7A7A"}
+    cards = ""
+    for i in rows:
+        color = _OVR_COLOR.get(i["overall"], "var(--slate)")
+        cards += f"""
+        <a class="bin-card" href="{url_for('inspection_report', inspection_id=i['id'])}"
+           style="padding:14px;display:block;text-decoration:none;color:inherit;">
+            <div style="display:flex;justify-content:space-between;gap:10px;">
+                <span style="font-weight:700;">🚛 {e(i["truck_name"])}{_truck_oos_badge(i)}</span>
+                <span style="color:{color};font-weight:800;font-size:12px;">{e(_INSPECTION_OVERALL_LABEL.get(i["overall"], i["overall"]))}</span>
+            </div>
+            <div style="color:var(--slate);font-size:13px;margin-top:4px;">
+                {e((i["created_at"] or "")[:16])} · {e(_INSPECTION_TYPE_LABEL.get(i["type"], i["type"]))}
+                {(' · ' + str(i["defect_count"]) + ' defect' + ('' if i["defect_count"]==1 else 's')) if i["defect_count"] else ''}
+            </div>
+        </a>"""
+    empty = "" if rows else '<div class="empty-state" style="padding:32px 0;">No inspections yet. Tap Inspection to run your first one.</div>'
+    body = f"""
+    <div class="hero"><h1>My Inspections</h1><p>Your submitted reports. Read-only.</p></div>
+    {empty}
+    <div class="bin-list" style="display:grid;gap:10px;max-width:640px;">{cards}</div>
+    """
+    return render_template_string(shell_page("My Inspections", body))
+
+
+@app.route("/inspection/<int:inspection_id>")
+@login_required
+def inspection_report(inspection_id):
+    """Read-only full report. Management sees any; a driver sees only their own."""
+    conn = get_db()
+    insp = conn.execute(
+        """SELECT i.*, t.name AS truck_name, t.make_model, t.plate, t.out_of_service,
+                  COALESCE(u.username,'—') AS driver_name,
+                  COALESCE(u.full_name,'') AS driver_full
+             FROM inspections i
+             JOIN trucks t ON i.truck_id=t.id
+        LEFT JOIN users  u ON i.driver_id=u.id
+            WHERE i.id=? AND i.company_id=?""",
+        (inspection_id, cid()),
+    ).fetchone()
+    if insp is None:
+        conn.close()
+        abort(404)
+    if not _is_management() and insp["driver_id"] != session.get("user_id"):
+        conn.close()
+        abort(403)
+    items = conn.execute(
+        "SELECT * FROM inspection_items WHERE inspection_id=? ORDER BY id",
+        (inspection_id,),
+    ).fetchall()
+    conn.close()
+
+    _RES = {
+        "pass": ("PASS", "#3DDC84"),
+        "defect": ("DEFECT", "#FF7A7A"),
+        "na": ("N/A", "#ADC0D1"),
+    }
+    _DEF_STATUS = {"open": ("Open", "#FF7A7A"), "repaired": ("Repaired", "#3DDC84"),
+                   "deferred": ("Deferred", "#FF8A3D")}
+    rows_html = ""
+    for it in items:
+        label_txt, color = _RES.get(it["result"], (it["result"], "var(--slate)"))
+        note = f'<div style="font-size:13px;color:#C9C9C2;margin-top:4px;">{e(it["note"])}</div>' if it["note"] else ""
+        photo = ""
+        if it["photo_path"]:
+            purl = url_for("serve_inspection_photo", item_id=it["id"])
+            photo = (f'<a href="{purl}" target="_blank"><img src="{purl}" loading="lazy" '
+                     f'style="margin-top:8px;max-width:160px;border-radius:8px;border:1px solid var(--border);"></a>')
+        defstat = ""
+        if it["result"] == "defect" and it["defect_status"]:
+            dlabel, dcolor = _DEF_STATUS.get(it["defect_status"], (it["defect_status"], "var(--slate)"))
+            res_note = f' — {e(it["resolution_note"])}' if it["resolution_note"] else ""
+            defstat = (f'<div style="font-size:12px;margin-top:4px;color:{dcolor};font-weight:700;">'
+                       f'{dlabel}{res_note}</div>')
+        rows_html += f"""
+        <div style="border-top:1px solid var(--border);padding:12px 0;">
+            <div style="display:flex;justify-content:space-between;gap:10px;">
+                <span style="font-weight:700;font-size:14px;">{e(it["label"])}</span>
+                <span style="color:{color};font-weight:800;font-size:12px;">{label_txt}</span>
+            </div>
+            {note}{photo}{defstat}
+        </div>"""
+
+    _OVR_COLOR = {"safe": "#3DDC84", "defects_safe": "#FF8A3D", "out_of_service": "#FF7A7A"}
+    ov_color = _OVR_COLOR.get(insp["overall"], "var(--slate)")
+    back = (url_for("truck_detail_page", truck_id=insp["truck_id"]) if _is_management()
+            else url_for("my_inspections"))
+    body = f"""
+    <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+        <div>
+            <h1 style="margin-bottom:4px;">🚛 {e(insp["truck_name"])}{_truck_oos_badge(insp)}</h1>
+            <p style="margin:0;">{e(_INSPECTION_TYPE_LABEL.get(insp["type"], insp["type"]))} inspection · {e((insp["created_at"] or ""))}</p>
+        </div>
+        <a class="btn secondary" href="{back}" style="white-space:nowrap;">← Back</a>
+    </div>
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+        <div style="font-weight:800;color:{ov_color};font-size:16px;">{e(_INSPECTION_OVERALL_LABEL.get(insp["overall"], insp["overall"]))}</div>
+        <div style="color:var(--slate);font-size:13px;margin-top:6px;">
+            Driver: {e(insp["driver_full"] or insp["driver_name"])}
+        </div>
+    </div>
+    <div class="bin-card" style="padding:4px 16px 12px;max-width:640px;margin-bottom:12px;">
+        {rows_html}
+    </div>
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:24px;">
+        <div style="font-size:12px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;">Signature</div>
+        <div style="font-weight:700;font-size:16px;margin-top:4px;">✍️ {e(insp["signature_name"])}</div>
+        <div style="color:var(--slate);font-size:12px;margin-top:2px;">{e(insp["created_at"])} · immutable record</div>
+    </div>
+    """
+    return render_template_string(shell_page("Inspection Report", body))
+
+
+@app.route("/inspection-photo/<int:item_id>")
+@login_required
+def serve_inspection_photo(item_id):
+    """Serve a defect photo — company-scoped; management sees any, a driver only
+    their own inspection's photos (mirrors serve_stop_photo)."""
+    conn = get_db()
+    row = conn.execute(
+        """SELECT ii.photo_path, i.driver_id
+             FROM inspection_items ii
+             JOIN inspections i ON ii.inspection_id=i.id
+            WHERE ii.id=? AND i.company_id=?""",
+        (item_id, cid()),
+    ).fetchone()
+    conn.close()
+    if not row or not row["photo_path"]:
+        abort(404)
+    if not _is_management() and row["driver_id"] != session.get("user_id"):
+        abort(403)
+    full_path = os.path.join(app.root_path, row["photo_path"])
+    if not os.path.isfile(full_path):
+        abort(404)
+    return send_file(full_path)
+
+
+@app.route("/api/defects/open-count")
+@login_required
+def defects_open_count():
+    """Live count for the Maintenance nav badge. Any management role."""
+    if not _is_management():
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    n = _open_defect_count(conn)
+    conn.close()
+    return jsonify({"count": n})
+
+
+@app.route("/maintenance")
+@roles_required("owner", "customer_manager", "dispatcher")
+def maintenance_page():
+    """Open defects across the fleet. Any management role views; owner/dispatcher
+    can mark Repaired (closes) or Deferred."""
+    conn = get_db()
+    defects = conn.execute(
+        """SELECT ii.id AS item_id, ii.label, ii.note, ii.photo_path, ii.defect_status,
+                  i.id AS inspection_id, i.type, i.created_at, i.truck_id,
+                  t.name AS truck_name, t.out_of_service,
+                  COALESCE(u.username,'—') AS reporter
+             FROM inspection_items ii
+             JOIN inspections i ON ii.inspection_id=i.id
+             JOIN trucks t ON i.truck_id=t.id
+        LEFT JOIN users u ON i.driver_id=u.id
+            WHERE i.company_id=? AND ii.result='defect' AND ii.defect_status='open'
+            ORDER BY t.out_of_service DESC, i.created_at ASC, ii.id ASC""",
+        (cid(),),
+    ).fetchall()
+    conn.close()
+    can_action = _can_action_fleet()
+
+    cards = ""
+    for d in defects:
+        thumb = ""
+        if d["photo_path"]:
+            purl = url_for("serve_inspection_photo", item_id=d["item_id"])
+            thumb = (f'<a href="{purl}" target="_blank"><img src="{purl}" loading="lazy" '
+                     f'style="width:64px;height:64px;object-fit:cover;border-radius:8px;border:1px solid var(--border);"></a>')
+        note = f'<div style="font-size:13px;color:#C9C9C2;margin-top:4px;">{e(d["note"])}</div>' if d["note"] else ""
+        actions = ""
+        if can_action:
+            actions = f"""
+            <div style="display:flex;gap:8px;margin-top:10px;">
+                <button class="btn green" style="flex:1;" onclick="resolveDefect({d['item_id']},'repaired')">Repaired</button>
+                <button class="btn secondary" style="flex:1;" onclick="resolveDefect({d['item_id']},'deferred')">Defer</button>
+            </div>"""
+        cards += f"""
+        <div class="bin-card" id="defect-{d['item_id']}" style="padding:16px;">
+            <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;">
+                <div style="font-weight:700;font-size:15px;">🚛 {e(d["truck_name"])}{_truck_oos_badge(d)}</div>
+                <a href="{url_for('inspection_report', inspection_id=d['inspection_id'])}"
+                   style="font-size:12px;color:var(--cyan);white-space:nowrap;">View report →</a>
+            </div>
+            <div style="font-weight:700;font-size:14px;margin-top:8px;color:#FF7A7A;">⚠ {e(d["label"])}</div>
+            {note}
+            <div style="display:flex;gap:10px;align-items:center;margin-top:8px;">
+                {thumb}
+                <div style="color:var(--slate);font-size:12px;">
+                    {e(_INSPECTION_TYPE_LABEL.get(d["type"], d["type"]))} · {e(d["reporter"])}<br>{e((d["created_at"] or "")[:16])}
+                </div>
+            </div>
+            <div id="defect-err-{d['item_id']}" hidden style="color:#FF5252;font-size:12px;margin-top:8px;"></div>
+            {actions}
+        </div>"""
+
+    empty_hidden = "" if defects else " hidden"
+    view_note = "" if can_action else '<p style="color:var(--slate);font-size:13px;">View-only — an owner or dispatcher resolves defects.</p>'
+    body = f"""
+    <div class="hero">
+        <h1>Maintenance</h1>
+        <p>Open defects reported on inspections. Repaired closes a defect; Defer postpones it.</p>
+        {view_note}
+    </div>
+    <div id="maint-empty" class="empty-state" style="padding:32px 0;"{empty_hidden}>No open defects — the fleet's clean. 🛠️</div>
+    <div id="maint-list" class="bin-list" style="display:grid;gap:12px;max-width:640px;">
+        {cards}
+    </div>
+    {_MAINTENANCE_PAGE_JS}
+    """
+    return render_template_string(shell_page("Maintenance", body))
+
+
+_MAINTENANCE_PAGE_JS = """
+<script>
+(function(){
+  var CSRF=(document.querySelector('meta[name=csrf-token]')||{}).content||'';
+  function err(id,m){ var e=document.getElementById('defect-err-'+id); if(e){ e.textContent=m; e.hidden=false; } }
+  window.resolveDefect=function(id,action){
+    var verb = action==='repaired' ? 'Mark this defect repaired' : 'Defer this defect';
+    var note=prompt(verb+'. Add a note (what was done / why):');
+    if(note===null) return;
+    if(!note.trim()){ err(id,'A note is required.'); return; }
+    fetch('/api/defects/'+id+'/resolve',{method:'POST',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
+        body:JSON.stringify({action:action, note:note})})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
+      .then(function(res){ if(res.ok){
+            var c=document.getElementById('defect-'+id); if(c) c.remove();
+            var list=document.getElementById('maint-list');
+            if(list && !list.querySelector('.bin-card')){ var em=document.getElementById('maint-empty'); if(em) em.hidden=false; }
+            var badge=document.getElementById('maint-nav-badge');
+            if(badge){ var n=parseInt(badge.textContent||'0',10)-1;
+              if(n>0){ badge.textContent=n; } else { badge.hidden=true; badge.textContent=''; } }
+          } else { err(id,(res.j&&res.j.error)||'Could not update.'); } })
+      .catch(function(){ err(id,'Network error — try again.'); });
+  };
+})();
+</script>
+"""
+
+
+@app.route("/api/defects/<int:item_id>/resolve", methods=["POST"])
+@login_required
+def resolve_defect(item_id):
+    """Owner/dispatcher marks a defect Repaired (closes) or Deferred, with a
+    required note. Only the defect lifecycle fields change — the inspection
+    report itself stays immutable."""
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    action = data.get("action")
+    note = str(data.get("note") or "").strip()[:500]
+    if action not in ("repaired", "deferred"):
+        return jsonify({"error": "invalid action"}), 400
+    if not note:
+        return jsonify({"error": "a note is required"}), 400
+    conn = get_db()
+    row = conn.execute(
+        """SELECT ii.id, ii.defect_status
+             FROM inspection_items ii
+             JOIN inspections i ON ii.inspection_id=i.id
+            WHERE ii.id=? AND i.company_id=? AND ii.result='defect'""",
+        (item_id, cid()),
+    ).fetchone()
+    if row is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if row["defect_status"] != "open":
+        conn.close()
+        return jsonify({"error": "defect is not open"}), 409
+    conn.execute(
+        """UPDATE inspection_items SET defect_status=?, resolution_note=?,
+                                       resolved_by=?, resolved_at=? WHERE id=?""",
+        (action, note, session["user_id"], now_ts(), item_id),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "status": action})
 
 
 @app.route("/requests")
