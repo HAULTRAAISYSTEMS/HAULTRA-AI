@@ -4226,11 +4226,12 @@ def shell_page(title, body, extra_head=""):
             _cab_conn.close()
             cab_href = (url_for('driver_route_detail', route_id=_active_route_id)
                         if _active_route_id else url_for('driver_dashboard'))
+            # Driver nav is deliberately work-DOING only — no parser / dispatch
+            # tooling (that creates or assigns work) is reachable from here.
             primary_items = (
-                nav_link('/parser', '✦ Parser', path)
+                nav_link(url_for("dashboard"), 'My Day', path)
                 + nav_link(cab_href, 'Cab View', path)
                 + nav_link(url_for("inspection_new"), '🔧 Inspection', path)
-                + nav_link(url_for("dashboard"), 'Owner', path)
             )
 
         # ── Overflow "More" items (role-aware) ───────────────────────────
@@ -12533,7 +12534,7 @@ Rules:
 
 
 @app.route("/api/parse", methods=["POST"])
-@login_required
+@roles_required("dispatcher", api=True)
 def api_parse_dispatch():
     import os as _os
 
@@ -15430,7 +15431,7 @@ def api_csrf_token():
 # PASTE ROUTE — PARSE API
 # =========================================================
 @app.route("/api/parse-route-text", methods=["POST"])
-@login_required
+@roles_required("dispatcher", api=True)
 def parse_route_text_api():
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()
@@ -15563,7 +15564,7 @@ def _validate_parser_stops(stops_in):
 
 
 @app.route("/api/dispatch", methods=["POST"])
-@boss_required
+@roles_required("dispatcher", api=True)
 def api_dispatch():
     data = request.get_json(silent=True) or {}
     stops_in = data.get("stops")
@@ -18464,7 +18465,7 @@ def route_view():
     return send_from_directory('static', 'route.html')
 
 @app.route('/parser')
-@login_required
+@roles_required("dispatcher")
 def parser_view():
     route_id_arg = (request.args.get('route_id') or '').strip()
     route_mode_js = "null"
