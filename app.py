@@ -16466,15 +16466,179 @@ _REQUESTS_PAGE_JS = """
 """
 
 
+# Unassigned Work client script. Plain (non-f) string. Assign calls the same
+# PATCH /assign endpoint the two-stage flow uses; on success the card leaves
+# the queue and the nav badge ticks down.
+_UNASSIGNED_PAGE_JS = """
+<script>
+(function(){
+  var CSRF = (document.querySelector('meta[name=csrf-token]')||{}).content || '';
+  function hideForm(id){
+    var f=document.getElementById('assign-form-'+id); if(f) f.hidden=true;
+    var e=document.getElementById('err-'+id); if(e){ e.hidden=true; e.textContent=''; }
+  }
+  window.hideAssign = hideForm;
+  window.showAssign=function(id){ hideForm(id); var f=document.getElementById('assign-form-'+id); if(f) f.hidden=false; };
+  function err(id,msg){ var e=document.getElementById('err-'+id); if(e){ e.textContent=msg; e.hidden=false; } }
+  function removeCard(id){
+    var c=document.getElementById('uw-card-'+id); if(c) c.remove();
+    var list=document.getElementById('uw-list');
+    if(list && !list.querySelector('.bin-card')){
+      var empty=document.getElementById('uw-empty'); if(empty) empty.hidden=false;
+    }
+    var badge=document.getElementById('unassigned-nav-badge');
+    if(badge){ var n=parseInt(badge.textContent||'0',10)-1;
+      if(n>0){ badge.textContent=n; } else { badge.hidden=true; badge.textContent=''; } }
+  }
+  window.submitAssign=function(id){
+    var drv=document.getElementById('drv-'+id).value;
+    var date=document.getElementById('date-'+id).value;
+    if(!drv){ err(id,'Pick a driver.'); return; }
+    fetch('/api/requests/'+id+'/assign', {method:'PATCH',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
+        body:JSON.stringify({driver_id: parseInt(drv,10), scheduled_date: date})})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
+      .then(function(res){ if(res.ok){ removeCard(id); }
+                           else { err(id, (res.j && res.j.error) || 'Something went wrong.'); } })
+      .catch(function(){ err(id, 'Network error — try again.'); });
+  };
+})();
+</script>
+"""
+
+
 @app.route("/unassigned")
 @roles_required("dispatcher")
 def unassigned_work():
-    """Dispatcher/owner: accepted-but-unassigned requests. (Section 3 fills
-    this in; stub keeps the nav's url_for resolvable.)"""
-    return render_template_string(shell_page(
-        "Unassigned Work",
-        '<div class="hero"><h1>Unassigned Work</h1></div>'
-        '<div class="empty-state" style="padding:32px 0;">Loading&hellip;</div>'))
+    """Dispatcher/owner: accepted-but-unassigned jobs, oldest/most-urgent
+    first, each assignable to a driver + date in place."""
+    conn = get_db()
+    reqs = conn.execute(
+        """SELECT r.*,
+                  c.business_name AS customer_business_name,
+                  c.contact_name  AS customer_contact_name,
+                  s.address       AS site_address,
+                  b.size          AS bin_size
+             FROM requests r
+             JOIN customers c ON r.customer_id = c.id
+             JOIN sites     s ON r.site_id     = s.id
+        LEFT JOIN bins      b ON r.bin_id      = b.id
+            WHERE c.company_id = ? AND r.status = 'accepted'""",
+        (cid(),),
+    ).fetchall()
+    drivers = conn.execute(
+        "SELECT id, username FROM users WHERE role='driver' AND company_id=? ORDER BY username",
+        (cid(),),
+    ).fetchall()
+    conn.close()
+
+    today = today_str()
+
+    def eff_date(r):
+        # "asap" is the most urgent — sort it as today so it leads the queue.
+        return today if r["preferred_date"] == "asap" else (r["preferred_date"] or "9999-12-31")
+
+    # Preferred date ascending, then oldest request first.
+    reqs = sorted(reqs, key=lambda r: (eff_date(r), r["created_at"] or "", r["id"]))
+
+    driver_options = '<option value="">Select driver…</option>' + "".join(
+        f'<option value="{d["id"]}">{e(d["username"])}</option>' for d in drivers
+    )
+
+    _TYPE_LABEL = {"PR": "PR · Pull & Return", "P": "P · Pickup",
+                   "D": "D · Drop", "NEW_BIN": "NEW BIN"}
+
+    def age_label(created_at):
+        """Whole days since the request came in, e.g. 'new', '3d old'."""
+        if not created_at:
+            return ""
+        try:
+            then = datetime.strptime(created_at[:10], "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            return ""
+        days = (datetime.strptime(today, "%Y-%m-%d").date() - then).days
+        if days <= 0:
+            return "new today"
+        return f"{days}d old"
+
+    cards = ""
+    for r in reqs:
+        rid  = r["id"]
+        name = e(r["customer_business_name"] or r["customer_contact_name"] or "Customer")
+        addr = e(r["site_address"] or "—")
+        size = r["bin_size"] if r["type"] in ("PR", "P") else r["size_requested"]
+        size_html = (f'<div style="color:var(--slate);font-size:13px;margin-top:2px;">📦 {e(size)}</div>'
+                     if size else "")
+        pref = r["preferred_date"]
+        ed = eff_date(r)
+        if pref == "asap":
+            pref_label, flag = "ASAP", "today"
+        else:
+            pref_label = e(pref)
+            flag = "overdue" if ed < today else ("today" if ed == today else "")
+        if flag == "overdue":
+            flag_html = ('<span style="color:#FF7A7A;font-weight:800;font-size:11px;'
+                         'text-transform:uppercase;letter-spacing:.5px;">Overdue</span>')
+            date_color = "#FF7A7A"
+        elif flag == "today":
+            flag_html = ('<span style="color:var(--cyan);font-weight:800;font-size:11px;'
+                         'text-transform:uppercase;letter-spacing:.5px;">Today</span>')
+            date_color = "var(--cyan)"
+        else:
+            flag_html = ""
+            date_color = "var(--slate)"
+        notes_html = (
+            f'<div style="margin-top:8px;padding:8px 10px;background:rgba(255,255,255,0.03);'
+            f'border-radius:8px;font-size:13px;color:#C9C9C2;">{e(r["notes"])}</div>'
+        ) if r["notes"] else ""
+        default_date = today if pref == "asap" else e(pref)
+        type_badge = (
+            f'<span style="display:inline-block;padding:3px 10px;border-radius:999px;'
+            f'font-size:10px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;'
+            f'background:var(--cyan-dim);color:var(--cyan);border:1px solid var(--border-glow);">'
+            f'{e(_TYPE_LABEL.get(r["type"], r["type"]))}</span>'
+        )
+        age = age_label(r["created_at"])
+        cards += f"""
+        <div class="bin-card" id="uw-card-{rid}" style="padding:16px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
+                {type_badge}
+                <span style="color:{date_color};font-size:12px;white-space:nowrap;">📅 {pref_label} {flag_html}</span>
+            </div>
+            <div style="font-weight:700;font-size:15px;margin-top:8px;">{name}</div>
+            <div style="color:var(--slate);font-size:13px;margin-top:2px;">📍 {addr}</div>
+            {size_html}
+            <div style="color:var(--slate);font-size:12px;margin-top:4px;">🕑 {age}</div>
+            {notes_html}
+            <div style="margin-top:12px;">
+                <button class="btn green" style="width:100%;" onclick="showAssign({rid})">Assign</button>
+            </div>
+            <div id="err-{rid}" hidden style="color:#FF5252;font-size:12px;margin-top:8px;"></div>
+            <div id="assign-form-{rid}" hidden style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
+                <label style="display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Driver</label>
+                <select id="drv-{rid}" style="width:100%;margin-bottom:10px;">{driver_options}</select>
+                <label style="display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Scheduled date</label>
+                <input type="date" id="date-{rid}" value="{default_date}" style="width:100%;margin-bottom:12px;">
+                <div style="display:flex;gap:8px;">
+                    <button class="btn green" style="flex:1;" onclick="submitAssign({rid})">Confirm &amp; schedule</button>
+                    <button class="btn secondary" onclick="hideAssign({rid})">Cancel</button>
+                </div>
+            </div>
+        </div>
+        """
+
+    empty_hidden = "" if not reqs else " hidden"
+    body = f"""
+    <div class="hero">
+        <h1>Unassigned Work</h1>
+        <p>Accepted jobs waiting to be routed. Assign one to a driver and date to schedule it.</p>
+    </div>
+    <div id="uw-empty" class="empty-state" style="padding:32px 0;"{empty_hidden}>No unassigned work — everything's routed.</div>
+    <div id="uw-list" class="bin-list" style="display:grid;gap:12px;max-width:640px;">
+        {cards}
+    </div>
+    """ + _UNASSIGNED_PAGE_JS
+    return render_template_string(shell_page("Unassigned Work", body))
 
 
 @app.route("/customers")
