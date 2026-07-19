@@ -2025,6 +2025,47 @@ def init_db():
         """)
         conn.commit()
 
+    # Phase 7B — add 'S' (Swap) to the requests.type CHECK. SQLite can't ALTER a
+    # CHECK, so rebuild once (guarded: only when 'S' isn't already allowed).
+    # Column-safe copy by intersection, same pattern as the P5 rebuild above.
+    _rq_type_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='requests'"
+    ).fetchone()
+    if _rq_type_row and "'S'" not in (_rq_type_row["sql"] or ""):
+        _old_cols = [r[1] for r in conn.execute("PRAGMA table_info(requests)").fetchall()]
+        _new_cols = ["id", "customer_id", "site_id", "type", "bin_id", "size_requested",
+                     "preferred_date", "notes", "status", "stop_id", "deny_reason",
+                     "customer_note", "created_at", "updated_at"]
+        _copy = [c for c in _new_cols if c in _old_cols]
+        _copy_csv = ", ".join(_copy)
+        conn.executescript(f"""
+            PRAGMA foreign_keys=off;
+            BEGIN;
+            CREATE TABLE requests_p7_new (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                customer_id    INTEGER NOT NULL,
+                site_id        INTEGER NOT NULL,
+                type           TEXT NOT NULL CHECK(type IN ('PR','P','D','NEW_BIN','S')),
+                bin_id         INTEGER,
+                size_requested TEXT,
+                preferred_date TEXT NOT NULL,
+                notes          TEXT,
+                status         TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','accepted','approved','scheduled','in_progress','done','denied')),
+                stop_id        INTEGER,
+                deny_reason    TEXT,
+                customer_note  TEXT,
+                created_at     TEXT NOT NULL,
+                updated_at     TEXT NOT NULL
+            );
+            INSERT INTO requests_p7_new ({_copy_csv}) SELECT {_copy_csv} FROM requests;
+            DROP TABLE requests;
+            ALTER TABLE requests_p7_new RENAME TO requests;
+            COMMIT;
+            PRAGMA foreign_keys=on;
+        """)
+        conn.commit()
+
     # Phase 5 §4 — customers can be deactivated (soft delete). Active by
     # default; deactivating hides them from management lists and kills portal
     # token access without destroying history.
@@ -2034,8 +2075,11 @@ def init_db():
     # never a float. All nullable/additive; existing repair fields untouched.
     safe_add_column(conn, "inspection_items", "cost_cents INTEGER")
     safe_add_column(conn, "inspection_items", "vendor TEXT")
-    # Phase 7B — optional customer-visible bin label ("by the front gate").
+    # Phase 7B — optional customer-visible bin label ("by the front gate"),
+    # plus a "where I left it" drop photo captured by the driver at delivery.
     safe_add_column(conn, "bins", "label TEXT")
+    safe_add_column(conn, "bins", "drop_photo_path TEXT")
+    safe_add_column(conn, "bins", "drop_stop_id INTEGER")
 
     # --- Per-route boss <-> driver messages: minimal thread, one row per
     #     message. "Unread" is derived per-viewer as "not sent by me and
@@ -15850,7 +15894,7 @@ def address_suggestions():
 # creates driver work — the boss approves them in a future phase. All
 # validation is server-side. Errors are {"error": "..."} with the right code.
 # =========================================================
-REQUEST_TYPES     = {"PR", "P", "D", "NEW_BIN"}
+REQUEST_TYPES     = {"PR", "P", "D", "NEW_BIN", "S"}  # S = Swap (Phase 7B)
 REQUEST_SIZES     = ["10yd", "15yd", "20yd", "30yd", "40yd"]
 REQUEST_STATUSES  = {"pending", "accepted", "approved", "scheduled", "in_progress", "done", "denied"}
 REQUEST_OPEN      = ("pending", "accepted", "approved", "scheduled", "in_progress")  # dupe-guard scope
@@ -15969,16 +16013,16 @@ def customer_create_request(token):
     size_requested = data.get("size_requested")
 
     # --- type-specific requirements ---
-    if rtype in ("PR", "P"):
+    if rtype in ("PR", "P", "S"):  # S (Swap) acts on an existing bin, like PR/P
         if not isinstance(bin_id, int):
-            return bad("bin_id is required for PR and P requests")
+            return bad("bin_id is required for PR, P and S requests")
         owned_bin = conn.execute(
             "SELECT id FROM bins WHERE id = ? AND customer_id = ? AND site_id = ?",
             (bin_id, customer["id"], site_id),
         ).fetchone()
         if owned_bin is None:
             return bad("bin_id is not a container at this site")
-        size_requested = None  # not used for PR/P
+        size_requested = None  # not used for PR/P/S
     else:  # D or NEW_BIN
         if not isinstance(size_requested, str) or size_requested not in REQUEST_SIZES:
             return bad("size_requested must be one of " + ", ".join(REQUEST_SIZES))
@@ -16005,9 +16049,9 @@ def customer_create_request(token):
         notes = notes or None
 
     # --- duplicate guard: one open request per (customer, type, bin) for
-    #     PR/P, or per (customer, type, site) for D/NEW_BIN ---
+    #     PR/P/S, or per (customer, type, site) for D/NEW_BIN ---
     open_ph = ",".join("?" for _ in REQUEST_OPEN)
-    if rtype in ("PR", "P"):
+    if rtype in ("PR", "P", "S"):
         dupe = conn.execute(
             f"""SELECT id FROM requests
                  WHERE customer_id = ? AND type = ? AND bin_id = ?
@@ -16425,7 +16469,9 @@ def boss_list_requests():
 
 # Request type -> AI-parser action code -> canonical action label. NEW_BIN is
 # a fresh drop, so it maps to a Delivery like a plain D.
-_REQUEST_TO_PARSER_CODE = {"PR": "PR", "P": "P", "D": "D", "NEW_BIN": "D"}
+# S (Swap) reuses the PR ("Pickup and Return") stop path plus a flagged note,
+# rather than inventing new stop mechanics (per spec).
+_REQUEST_TO_PARSER_CODE = {"PR": "PR", "P": "P", "D": "D", "NEW_BIN": "D", "S": "PR"}
 
 
 def cascade_request_from_stop(conn, stop_id):
@@ -16513,6 +16559,10 @@ def _perform_assignment(conn, req, req_id, data):
         notes = req["notes"] or ""
 
     action_label  = _PARSER_ACTION_MAP[_REQUEST_TO_PARSER_CODE[req["type"]]]
+    # Swap reuses the Pickup-and-Return stop path; flag the note so the driver
+    # knows to bring an empty to replace the one being pulled.
+    if req["type"] == "S":
+        notes = ("[SWAP — empty this one, leave a replacement] " + notes).strip()
     customer_name = req["business_name"] or req["contact_name"] or ""
 
     try:
@@ -16825,7 +16875,7 @@ def unassigned_work():
     )
 
     _TYPE_LABEL = {"PR": "PR · Pull & Return", "P": "P · Pickup",
-                   "D": "D · Drop", "NEW_BIN": "NEW BIN"}
+                   "D": "D · Drop", "NEW_BIN": "NEW BIN", "S": "S · Swap"}
 
     def age_label(created_at):
         """Whole days since the request came in, e.g. 'new', '3d old'."""
@@ -17219,7 +17269,7 @@ def customer_detail_page(customer_id):
                 + "?&body=" + urllib.parse.quote(sms_body))
 
     _TYPE_LABEL = {"PR": "PR · Pull & Return", "P": "P · Pickup",
-                   "D": "D · Drop", "NEW_BIN": "NEW BIN"}
+                   "D": "D · Drop", "NEW_BIN": "NEW BIN", "S": "S · Swap"}
     _STATUS_LABEL = {"pending": "Pending", "accepted": "Accepted",
                      "approved": "Approved", "scheduled": "Scheduled",
                      "in_progress": "In progress", "done": "Done", "denied": "Denied"}
@@ -19154,7 +19204,7 @@ def requests_page():
     can_assign = has_role("dispatcher")
 
     _TYPE_LABEL = {"PR": "PR · Pull & Return", "P": "P · Pickup",
-                   "D": "D · Drop", "NEW_BIN": "NEW BIN"}
+                   "D": "D · Drop", "NEW_BIN": "NEW BIN", "S": "S · Swap"}
 
     cards = ""
     for r in reqs:
