@@ -1748,6 +1748,24 @@ def init_db():
     safe_add_column(conn, "users", "phone TEXT")
     safe_add_column(conn, "users", "company_id INTEGER")
     safe_add_column(conn, "users", "is_superadmin INTEGER NOT NULL DEFAULT 0")
+    # Phase 5 — management sub-roles (additive flags layered on the existing
+    # role column). A management user stays role='boss' (so every existing
+    # @boss_required check keeps working) and carries one or more of these
+    # flags. 'owner' implies both other management permissions. Drivers keep
+    # role='driver' and no flags. Existing bosses are migrated to owner below.
+    safe_add_column(conn, "users", "role_owner INTEGER NOT NULL DEFAULT 0")
+    safe_add_column(conn, "users", "role_customer_manager INTEGER NOT NULL DEFAULT 0")
+    safe_add_column(conn, "users", "role_dispatcher INTEGER NOT NULL DEFAULT 0")
+    # Every pre-Phase-5 boss becomes an owner (full access) so nothing breaks.
+    # Guard on "no role flags yet" so this stays a one-time promotion: it must
+    # NOT re-run on every init_db and clobber a later cm-only / dispatcher-only
+    # user (role='boss' with a single flag) back into an owner.
+    conn.execute(
+        """UPDATE users SET role_owner=1
+            WHERE role='boss' AND role_owner=0
+              AND role_customer_manager=0 AND role_dispatcher=0"""
+    )
+    conn.commit()
     safe_add_column(conn, "routes", "started_at TEXT")
     safe_add_column(conn, "routes", "company_id INTEGER")
     safe_add_column(conn, "orders", "email TEXT")
@@ -2119,6 +2137,86 @@ def superadmin_required(fn):
             return redirect(url_for("dashboard"))
         return fn(*args, **kwargs)
     return wrapper
+
+
+# =========================================================
+# PHASE 5 — ROLES (owner / customer_manager / dispatcher / driver)
+#
+# Management sub-roles are additive flags on top of the legacy role column.
+# 'owner' expands to hold every management permission. These helpers are the
+# single source of truth for "what can this user do", used by both the
+# server-side guards (roles_required) and the nav (shell_page).
+# =========================================================
+MGMT_ROLES = ("owner", "customer_manager", "dispatcher")
+
+
+def user_role_set(user_row):
+    """Return the set of role strings a user holds. Owner expands to include
+    customer_manager + dispatcher so downstream checks are simple membership
+    tests. A driver account contributes 'driver'."""
+    if user_row is None:
+        return set()
+    roles = set()
+    # sqlite3.Row supports mapping access; use dict() for safe .get semantics
+    u = dict(user_row)
+    if u.get("role") == "driver":
+        roles.add("driver")
+    if u.get("role_owner"):
+        roles.update(("owner", "customer_manager", "dispatcher"))
+    if u.get("role_customer_manager"):
+        roles.add("customer_manager")
+    if u.get("role_dispatcher"):
+        roles.add("dispatcher")
+    return roles
+
+
+def session_roles():
+    """The current session's role set (stored at login), as a set."""
+    return set(session.get("roles") or [])
+
+
+def has_role(*needed):
+    """True if the session holds any of `needed` (superadmin always passes)."""
+    if session.get("is_superadmin"):
+        return True
+    return bool(session_roles().intersection(needed))
+
+
+def role_landing_endpoint():
+    """Where to send a user after login / on an access redirect, by role:
+    customer_manager (without dispatcher/owner) -> Requests; dispatcher/owner
+    -> Route Board; driver -> driver dashboard; fallback -> Owner dashboard."""
+    r = session_roles()
+    if "dispatcher" in r or "owner" in r:
+        return "routes_page"
+    if "customer_manager" in r:
+        return "requests_page"
+    if "driver" in r:
+        return "driver_dashboard"
+    return "dashboard"
+
+
+def roles_required(*needed, api=False):
+    """Guard a route by management role. Owner satisfies everything (its set
+    already contains cm+dispatcher). On failure: API routes get a 403 JSON,
+    pages flash + redirect to the user's own landing view. UI hiding is never
+    the security boundary — this is."""
+    def deco(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            if "user_id" not in session:
+                if api:
+                    return jsonify({"error": "login required"}), 401
+                flash("Login required.", "error")
+                return redirect(url_for("login"))
+            if not has_role(*needed):
+                if api:
+                    return jsonify({"error": "forbidden"}), 403
+                flash("You don't have access to that.", "error")
+                return redirect(url_for(role_landing_endpoint()))
+            return fn(*args, **kwargs)
+        return wrapper
+    return deco
 
 
 def get_current_user():
@@ -3835,10 +3933,10 @@ def nav_link(href, label, current_path):
 _REQ_BADGE_POLLER_JS = """
 <script>
 (function(){
-  var badge = document.getElementById('req-nav-badge');
-  if (!badge) return;
-  function refresh(){
-    fetch('/api/requests?status=pending', {headers:{'X-Requested-With':'XMLHttpRequest'}})
+  function poll(badgeId, status){
+    var badge = document.getElementById(badgeId);
+    if (!badge) return;
+    fetch('/api/requests?status=' + status, {headers:{'X-Requested-With':'XMLHttpRequest'}})
       .then(function(r){ return r.ok ? r.json() : null; })
       .then(function(list){
         if (!Array.isArray(list)) return;
@@ -3847,6 +3945,8 @@ _REQ_BADGE_POLLER_JS = """
       })
       .catch(function(){ /* offline/transient — retry next cycle */ });
   }
+  function refresh(){ poll('req-nav-badge','pending'); poll('unassigned-nav-badge','accepted'); }
+  refresh();
   setInterval(refresh, 45000);
 })();
 </script>
@@ -3863,29 +3963,53 @@ def shell_page(title, body, extra_head=""):
 
         # ── Primary top-nav items (role-aware) ──────────────────────────
         if user["role"] == "boss":
+            _rset   = user_role_set(user)
+            is_disp = "dispatcher" in _rset
+            is_cm   = "customer_manager" in _rset
+            is_own  = "owner" in _rset
+
+            def _nav_badge(bid, n):
+                return (
+                    '<span id="%s" style="display:inline-block;min-width:16px;padding:1px 6px;'
+                    'margin-left:6px;border-radius:999px;background:var(--cyan);color:#121212;'
+                    'font-size:10px;font-weight:800;line-height:16px;text-align:center;'
+                    'vertical-align:middle;"%s>%s</span>'
+                    % (bid, "" if n else " hidden", n or "")
+                )
+
             _rc = get_db()
             _pending_reqs = _rc.execute(
                 """SELECT COUNT(*) AS n FROM requests r
                      JOIN customers c ON r.customer_id = c.id
                     WHERE c.company_id = ? AND r.status = 'pending'""",
                 (session.get("company_id"),),
-            ).fetchone()["n"]
+            ).fetchone()["n"] if is_cm else 0
+            _unassigned = _rc.execute(
+                """SELECT COUNT(*) AS n FROM requests r
+                     JOIN customers c ON r.customer_id = c.id
+                    WHERE c.company_id = ? AND r.status = 'accepted'""",
+                (session.get("company_id"),),
+            ).fetchone()["n"] if is_disp else 0
             _rc.close()
-            _req_badge = (
-                '<span id="req-nav-badge" '
-                'style="display:inline-block;min-width:16px;padding:1px 6px;margin-left:6px;'
-                'border-radius:999px;background:var(--cyan);color:#121212;font-size:10px;'
-                'font-weight:800;line-height:16px;text-align:center;vertical-align:middle;"'
-                + ("" if _pending_reqs else " hidden") + ">"
-                + (str(_pending_reqs) if _pending_reqs else "") + "</span>"
-            )
-            primary_items = (
-                nav_link('/parser', '✦ Parser', path)
-                + nav_link(url_for("routes_page"), 'Route Board', path)
-                + nav_link(url_for("requests_page"), '✉ Requests' + _req_badge, path)
-                + nav_link(url_for("bin_tracker"), 'Bin Tracker', path)
-                + nav_link(url_for("dashboard"), 'Owner', path)
-            )
+
+            _parts = []
+            if is_disp:
+                _parts.append(nav_link('/parser', '✦ Parser', path))
+                _parts.append(nav_link(url_for("routes_page"), 'Route Board', path))
+                _parts.append(nav_link(url_for("unassigned_work"),
+                              '📋 Unassigned' + _nav_badge('unassigned-nav-badge', _unassigned), path))
+            if is_cm:
+                _parts.append(nav_link(url_for("requests_page"),
+                              '✉ Requests' + _nav_badge('req-nav-badge', _pending_reqs), path))
+                _parts.append(nav_link(url_for("customers_page"), '👤 Customers', path))
+            if is_disp:
+                _parts.append(nav_link(url_for("bin_tracker"), 'Bin Tracker', path))
+            if is_own:
+                _parts.append(nav_link(url_for("dashboard"), 'Owner', path))
+            primary_items = "".join(_parts)
+            # NOTE: unassigned_work + customers_page routes are defined in the
+            # same module (sections 3 & 4); url_for resolves them at request
+            # time, so ordering within the file doesn't matter.
         else:
             _cab_conn = get_db()
             _active_route_id = driver_active_route_id(_cab_conn, user["id"])
@@ -3903,11 +4027,13 @@ def shell_page(title, body, extra_head=""):
         # lives per-row on Team, and Boss Panel / Orders / Live Dispatch keep
         # working at their old URLs but no longer have a nav entry (see PR notes).
         if user["role"] == "boss":
-            more_items = (
-                nav_link(url_for("team_page"), "👥 Team", path)
-                + nav_link(url_for("yard_setup_page"), "🏗 Yard Setup", path)
-                + nav_link(url_for("settings_page"), "⚙ Settings", path)
-            )
+            _mparts = []
+            if is_disp:
+                _mparts.append(nav_link(url_for("team_page"), "👥 Team", path))
+            if is_own:
+                _mparts.append(nav_link(url_for("yard_setup_page"), "🏗 Yard Setup", path))
+                _mparts.append(nav_link(url_for("settings_page"), "⚙ Settings", path))
+            more_items = "".join(_mparts)
         else:
             more_items = (
                 nav_link(url_for("driver_dashboard"), "◈ My Routes", path)
@@ -5847,6 +5973,7 @@ def login():
             session["user_id"]       = user["id"]
             session["username"]      = user["username"]
             session["role"]          = user["role"]
+            session["roles"]         = sorted(user_role_set(user))
             session["company_id"]    = user["company_id"]
             session["is_superadmin"] = bool(user["is_superadmin"])
             _co_conn = get_db()
@@ -5863,7 +5990,9 @@ def login():
             if user["role"] == "driver":
                 return redirect(url_for("driver_dashboard"))
 
-            return redirect(url_for("dashboard"))
+            # Land management users on the view their roles grant:
+            # customer_manager -> Requests, dispatcher/owner -> Route Board.
+            return redirect(url_for(role_landing_endpoint()))
 
         # Wrong username or wrong password both land here, with the same
         # message — never reveal which one was wrong.
@@ -8379,7 +8508,7 @@ def route_board_partial():
 
 
 @app.route("/routes")
-@login_required
+@roles_required("dispatcher")
 def routes_page():
     user = get_current_user()
     q = request.args.get("q", "").strip()
@@ -16216,10 +16345,32 @@ _REQUESTS_PAGE_JS = """
 """
 
 
+@app.route("/unassigned")
+@roles_required("dispatcher")
+def unassigned_work():
+    """Dispatcher/owner: accepted-but-unassigned requests. (Section 3 fills
+    this in; stub keeps the nav's url_for resolvable.)"""
+    return render_template_string(shell_page(
+        "Unassigned Work",
+        '<div class="hero"><h1>Unassigned Work</h1></div>'
+        '<div class="empty-state" style="padding:32px 0;">Loading&hellip;</div>'))
+
+
+@app.route("/customers")
+@roles_required("customer_manager")
+def customers_page():
+    """Customer_manager/owner: customer list + management. (Section 4 fills
+    this in; stub keeps the nav's url_for resolvable.)"""
+    return render_template_string(shell_page(
+        "Customers",
+        '<div class="hero"><h1>Customers</h1></div>'
+        '<div class="empty-state" style="padding:32px 0;">Loading&hellip;</div>'))
+
+
 @app.route("/requests")
-@boss_required
+@roles_required("customer_manager")
 def requests_page():
-    """Boss UI: pending customer requests as approve/deny cards."""
+    """Customer_manager/owner: pending customer requests as accept/deny cards."""
     conn = get_db()
     reqs = conn.execute(
         """SELECT r.*,
