@@ -1748,6 +1748,24 @@ def init_db():
     safe_add_column(conn, "users", "phone TEXT")
     safe_add_column(conn, "users", "company_id INTEGER")
     safe_add_column(conn, "users", "is_superadmin INTEGER NOT NULL DEFAULT 0")
+    # Phase 5 — management sub-roles (additive flags layered on the existing
+    # role column). A management user stays role='boss' (so every existing
+    # @boss_required check keeps working) and carries one or more of these
+    # flags. 'owner' implies both other management permissions. Drivers keep
+    # role='driver' and no flags. Existing bosses are migrated to owner below.
+    safe_add_column(conn, "users", "role_owner INTEGER NOT NULL DEFAULT 0")
+    safe_add_column(conn, "users", "role_customer_manager INTEGER NOT NULL DEFAULT 0")
+    safe_add_column(conn, "users", "role_dispatcher INTEGER NOT NULL DEFAULT 0")
+    # Every pre-Phase-5 boss becomes an owner (full access) so nothing breaks.
+    # Guard on "no role flags yet" so this stays a one-time promotion: it must
+    # NOT re-run on every init_db and clobber a later cm-only / dispatcher-only
+    # user (role='boss' with a single flag) back into an owner.
+    conn.execute(
+        """UPDATE users SET role_owner=1
+            WHERE role='boss' AND role_owner=0
+              AND role_customer_manager=0 AND role_dispatcher=0"""
+    )
+    conn.commit()
     safe_add_column(conn, "routes", "started_at TEXT")
     safe_add_column(conn, "routes", "company_id INTEGER")
     safe_add_column(conn, "orders", "email TEXT")
@@ -1886,6 +1904,54 @@ def init_db():
     safe_add_column(conn, "stops", "customer_id INTEGER")
     # Customer Request System (Phase 3): boss's reason when denying a request.
     safe_add_column(conn, "requests", "deny_reason TEXT")
+    # Phase 5 — two-stage workflow adds the 'accepted' status and a manager's
+    # note-to-customer. The status CHECK from Phase 1 forbids 'accepted', and
+    # SQLite can't ALTER a CHECK, so rebuild the table once (dropping the
+    # status CHECK — transitions are validated in code) when 'accepted' isn't
+    # yet allowed. Column-safe: copies by the intersection of old/new columns.
+    safe_add_column(conn, "requests", "customer_note TEXT")
+    _rq_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='requests'"
+    ).fetchone()
+    if _rq_sql_row and "'accepted'" not in (_rq_sql_row["sql"] or ""):
+        _old_cols = [r[1] for r in conn.execute("PRAGMA table_info(requests)").fetchall()]
+        _new_cols = ["id", "customer_id", "site_id", "type", "bin_id", "size_requested",
+                     "preferred_date", "notes", "status", "stop_id", "deny_reason",
+                     "customer_note", "created_at", "updated_at"]
+        _copy = [c for c in _new_cols if c in _old_cols]
+        _copy_csv = ", ".join(_copy)
+        conn.executescript(f"""
+            PRAGMA foreign_keys=off;
+            BEGIN;
+            CREATE TABLE requests_p5_new (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                customer_id    INTEGER NOT NULL,
+                site_id        INTEGER NOT NULL,
+                type           TEXT NOT NULL CHECK(type IN ('PR','P','D','NEW_BIN')),
+                bin_id         INTEGER,
+                size_requested TEXT,
+                preferred_date TEXT NOT NULL,
+                notes          TEXT,
+                status         TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','accepted','approved','scheduled','in_progress','done','denied')),
+                stop_id        INTEGER,
+                deny_reason    TEXT,
+                customer_note  TEXT,
+                created_at     TEXT NOT NULL,
+                updated_at     TEXT NOT NULL
+            );
+            INSERT INTO requests_p5_new ({_copy_csv}) SELECT {_copy_csv} FROM requests;
+            DROP TABLE requests;
+            ALTER TABLE requests_p5_new RENAME TO requests;
+            COMMIT;
+            PRAGMA foreign_keys=on;
+        """)
+        conn.commit()
+
+    # Phase 5 §4 — customers can be deactivated (soft delete). Active by
+    # default; deactivating hides them from management lists and kills portal
+    # token access without destroying history.
+    safe_add_column(conn, "customers", "is_active INTEGER NOT NULL DEFAULT 1")
 
     # --- Per-route boss <-> driver messages: minimal thread, one row per
     #     message. "Unread" is derived per-viewer as "not sent by me and
@@ -1984,6 +2050,7 @@ def init_db():
         contact_name  TEXT,
         phone         TEXT,
         portal_token  TEXT NOT NULL UNIQUE,
+        is_active     INTEGER NOT NULL DEFAULT 1,
         created_at    TEXT NOT NULL,
         FOREIGN KEY (company_id) REFERENCES companies(id)
     )
@@ -2025,8 +2092,10 @@ def init_db():
         preferred_date TEXT NOT NULL,
         notes          TEXT,
         status         TEXT NOT NULL DEFAULT 'pending'
-            CHECK(status IN ('pending','approved','scheduled','in_progress','done','denied')),
+            CHECK(status IN ('pending','accepted','approved','scheduled','in_progress','done','denied')),
         stop_id        INTEGER,
+        deny_reason    TEXT,
+        customer_note  TEXT,
         created_at     TEXT NOT NULL,
         updated_at     TEXT NOT NULL,
         FOREIGN KEY (customer_id) REFERENCES customers(id),
@@ -2119,6 +2188,95 @@ def superadmin_required(fn):
             return redirect(url_for("dashboard"))
         return fn(*args, **kwargs)
     return wrapper
+
+
+# =========================================================
+# PHASE 5 — ROLES (owner / customer_manager / dispatcher / driver)
+#
+# Management sub-roles are additive flags on top of the legacy role column.
+# 'owner' expands to hold every management permission. These helpers are the
+# single source of truth for "what can this user do", used by both the
+# server-side guards (roles_required) and the nav (shell_page).
+# =========================================================
+MGMT_ROLES = ("owner", "customer_manager", "dispatcher")
+
+
+def user_role_set(user_row):
+    """Return the set of role strings a user holds. Owner expands to include
+    customer_manager + dispatcher so downstream checks are simple membership
+    tests. A driver account contributes 'driver'."""
+    if user_row is None:
+        return set()
+    roles = set()
+    # sqlite3.Row supports mapping access; use dict() for safe .get semantics
+    u = dict(user_row)
+    if u.get("role") == "driver":
+        roles.add("driver")
+    if u.get("role_owner"):
+        roles.update(("owner", "customer_manager", "dispatcher"))
+    if u.get("role_customer_manager"):
+        roles.add("customer_manager")
+    if u.get("role_dispatcher"):
+        roles.add("dispatcher")
+    # Backward-compat / safety net: a plain "boss" carrying none of the Phase 5
+    # flags is a full-access owner (the pre-Phase-5 meaning of "boss"). This
+    # covers a freshly-registered company owner and any "boss" created on the
+    # team page before init_db's one-time promotion runs, so nobody is ever
+    # locked out of the management UI between deploy and the next restart.
+    if u.get("role") == "boss" and not (
+        u.get("role_owner") or u.get("role_customer_manager") or u.get("role_dispatcher")
+    ):
+        roles.update(("owner", "customer_manager", "dispatcher"))
+    return roles
+
+
+def session_roles():
+    """The current session's role set (stored at login), as a set."""
+    return set(session.get("roles") or [])
+
+
+def has_role(*needed):
+    """True if the session holds any of `needed` (superadmin always passes)."""
+    if session.get("is_superadmin"):
+        return True
+    return bool(session_roles().intersection(needed))
+
+
+def role_landing_endpoint():
+    """Where to send a user after login / on an access redirect, by role:
+    customer_manager (without dispatcher/owner) -> Requests; dispatcher/owner
+    -> Route Board; driver -> driver dashboard; fallback -> Owner dashboard."""
+    r = session_roles()
+    if "dispatcher" in r or "owner" in r:
+        return "routes_page"
+    if "customer_manager" in r:
+        return "requests_page"
+    if "driver" in r:
+        return "driver_dashboard"
+    return "dashboard"
+
+
+def roles_required(*needed, api=False):
+    """Guard a route by management role. Owner satisfies everything (its set
+    already contains cm+dispatcher). On failure: API routes get a 403 JSON,
+    pages flash + redirect to the user's own landing view. UI hiding is never
+    the security boundary — this is."""
+    def deco(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            if "user_id" not in session:
+                if api:
+                    return jsonify({"error": "login required"}), 401
+                flash("Login required.", "error")
+                return redirect(url_for("login"))
+            if not has_role(*needed):
+                if api:
+                    return jsonify({"error": "forbidden"}), 403
+                flash("You don't have access to that.", "error")
+                return redirect(url_for(role_landing_endpoint()))
+            return fn(*args, **kwargs)
+        return wrapper
+    return deco
 
 
 def get_current_user():
@@ -3835,10 +3993,10 @@ def nav_link(href, label, current_path):
 _REQ_BADGE_POLLER_JS = """
 <script>
 (function(){
-  var badge = document.getElementById('req-nav-badge');
-  if (!badge) return;
-  function refresh(){
-    fetch('/api/requests?status=pending', {headers:{'X-Requested-With':'XMLHttpRequest'}})
+  function poll(badgeId, status){
+    var badge = document.getElementById(badgeId);
+    if (!badge) return;
+    fetch('/api/requests?status=' + status, {headers:{'X-Requested-With':'XMLHttpRequest'}})
       .then(function(r){ return r.ok ? r.json() : null; })
       .then(function(list){
         if (!Array.isArray(list)) return;
@@ -3847,6 +4005,8 @@ _REQ_BADGE_POLLER_JS = """
       })
       .catch(function(){ /* offline/transient — retry next cycle */ });
   }
+  function refresh(){ poll('req-nav-badge','pending'); poll('unassigned-nav-badge','accepted'); }
+  refresh();
   setInterval(refresh, 45000);
 })();
 </script>
@@ -3863,29 +4023,53 @@ def shell_page(title, body, extra_head=""):
 
         # ── Primary top-nav items (role-aware) ──────────────────────────
         if user["role"] == "boss":
+            _rset   = user_role_set(user)
+            is_disp = "dispatcher" in _rset
+            is_cm   = "customer_manager" in _rset
+            is_own  = "owner" in _rset
+
+            def _nav_badge(bid, n):
+                return (
+                    '<span id="%s" style="display:inline-block;min-width:16px;padding:1px 6px;'
+                    'margin-left:6px;border-radius:999px;background:var(--cyan);color:#121212;'
+                    'font-size:10px;font-weight:800;line-height:16px;text-align:center;'
+                    'vertical-align:middle;"%s>%s</span>'
+                    % (bid, "" if n else " hidden", n or "")
+                )
+
             _rc = get_db()
             _pending_reqs = _rc.execute(
                 """SELECT COUNT(*) AS n FROM requests r
                      JOIN customers c ON r.customer_id = c.id
                     WHERE c.company_id = ? AND r.status = 'pending'""",
                 (session.get("company_id"),),
-            ).fetchone()["n"]
+            ).fetchone()["n"] if is_cm else 0
+            _unassigned = _rc.execute(
+                """SELECT COUNT(*) AS n FROM requests r
+                     JOIN customers c ON r.customer_id = c.id
+                    WHERE c.company_id = ? AND r.status = 'accepted'""",
+                (session.get("company_id"),),
+            ).fetchone()["n"] if is_disp else 0
             _rc.close()
-            _req_badge = (
-                '<span id="req-nav-badge" '
-                'style="display:inline-block;min-width:16px;padding:1px 6px;margin-left:6px;'
-                'border-radius:999px;background:var(--cyan);color:#121212;font-size:10px;'
-                'font-weight:800;line-height:16px;text-align:center;vertical-align:middle;"'
-                + ("" if _pending_reqs else " hidden") + ">"
-                + (str(_pending_reqs) if _pending_reqs else "") + "</span>"
-            )
-            primary_items = (
-                nav_link('/parser', '✦ Parser', path)
-                + nav_link(url_for("routes_page"), 'Route Board', path)
-                + nav_link(url_for("requests_page"), '✉ Requests' + _req_badge, path)
-                + nav_link(url_for("bin_tracker"), 'Bin Tracker', path)
-                + nav_link(url_for("dashboard"), 'Owner', path)
-            )
+
+            _parts = []
+            if is_disp:
+                _parts.append(nav_link('/parser', '✦ Parser', path))
+                _parts.append(nav_link(url_for("routes_page"), 'Route Board', path))
+                _parts.append(nav_link(url_for("unassigned_work"),
+                              '📋 Unassigned' + _nav_badge('unassigned-nav-badge', _unassigned), path))
+            if is_cm:
+                _parts.append(nav_link(url_for("requests_page"),
+                              '✉ Requests' + _nav_badge('req-nav-badge', _pending_reqs), path))
+                _parts.append(nav_link(url_for("customers_page"), '👤 Customers', path))
+            if is_disp:
+                _parts.append(nav_link(url_for("bin_tracker"), 'Bin Tracker', path))
+            if is_own:
+                _parts.append(nav_link(url_for("dashboard"), 'Owner', path))
+            primary_items = "".join(_parts)
+            # NOTE: unassigned_work + customers_page routes are defined in the
+            # same module (sections 3 & 4); url_for resolves them at request
+            # time, so ordering within the file doesn't matter.
         else:
             _cab_conn = get_db()
             _active_route_id = driver_active_route_id(_cab_conn, user["id"])
@@ -3903,11 +4087,13 @@ def shell_page(title, body, extra_head=""):
         # lives per-row on Team, and Boss Panel / Orders / Live Dispatch keep
         # working at their old URLs but no longer have a nav entry (see PR notes).
         if user["role"] == "boss":
-            more_items = (
-                nav_link(url_for("team_page"), "👥 Team", path)
-                + nav_link(url_for("yard_setup_page"), "🏗 Yard Setup", path)
-                + nav_link(url_for("settings_page"), "⚙ Settings", path)
-            )
+            _mparts = []
+            if is_disp:
+                _mparts.append(nav_link(url_for("team_page"), "👥 Team", path))
+            if is_own:
+                _mparts.append(nav_link(url_for("yard_setup_page"), "🏗 Yard Setup", path))
+                _mparts.append(nav_link(url_for("settings_page"), "⚙ Settings", path))
+            more_items = "".join(_mparts)
         else:
             more_items = (
                 nav_link(url_for("driver_dashboard"), "◈ My Routes", path)
@@ -5847,6 +6033,7 @@ def login():
             session["user_id"]       = user["id"]
             session["username"]      = user["username"]
             session["role"]          = user["role"]
+            session["roles"]         = sorted(user_role_set(user))
             session["company_id"]    = user["company_id"]
             session["is_superadmin"] = bool(user["is_superadmin"])
             _co_conn = get_db()
@@ -5863,7 +6050,9 @@ def login():
             if user["role"] == "driver":
                 return redirect(url_for("driver_dashboard"))
 
-            return redirect(url_for("dashboard"))
+            # Land management users on the view their roles grant:
+            # customer_manager -> Requests, dispatcher/owner -> Route Board.
+            return redirect(url_for(role_landing_endpoint()))
 
         # Wrong username or wrong password both land here, with the same
         # message — never reveal which one was wrong.
@@ -8379,7 +8568,7 @@ def route_board_partial():
 
 
 @app.route("/routes")
-@login_required
+@roles_required("dispatcher")
 def routes_page():
     user = get_current_user()
     q = request.args.get("q", "").strip()
@@ -12300,8 +12489,9 @@ def company_register():
             company_id = _crow["id"]
 
             conn.execute(
-                """INSERT INTO users (username, password_hash, role, full_name, phone, email,
-                   company_id, created_at) VALUES (?,?,?,?,?,?,?,?)""",
+                """INSERT INTO users (username, password_hash, role, role_owner,
+                   full_name, phone, email, company_id, created_at)
+                   VALUES (?,?,?,1,?,?,?,?,?)""",
                 (username, generate_password_hash(password), "boss",
                  full_name, phone, email or None, company_id, now_ts())
             )
@@ -15400,8 +15590,8 @@ def address_suggestions():
 # =========================================================
 REQUEST_TYPES     = {"PR", "P", "D", "NEW_BIN"}
 REQUEST_SIZES     = ["10yd", "15yd", "20yd", "30yd", "40yd"]
-REQUEST_STATUSES  = {"pending", "approved", "scheduled", "in_progress", "done", "denied"}
-REQUEST_OPEN      = ("pending", "approved", "scheduled", "in_progress")  # dupe-guard scope
+REQUEST_STATUSES  = {"pending", "accepted", "approved", "scheduled", "in_progress", "done", "denied"}
+REQUEST_OPEN      = ("pending", "accepted", "approved", "scheduled", "in_progress")  # dupe-guard scope
 
 
 def _customer_by_token(conn, token):
@@ -15410,7 +15600,7 @@ def _customer_by_token(conn, token):
     if not token:
         return None
     return conn.execute(
-        "SELECT * FROM customers WHERE portal_token = ?", (token,)
+        "SELECT * FROM customers WHERE portal_token = ? AND is_active = 1", (token,)
     ).fetchone()
 
 
@@ -15682,7 +15872,7 @@ _PORTAL_JS = r"""
   var CUES = {'10yd':'Fits a garage cleanout','15yd':'Kitchen remodel','20yd':'Roof tear-off','30yd':'Full house cleanout','40yd':'Construction / commercial'};
   var root  = document.getElementById('portal-root');
   var st = { view:'home', data:null, action:null, when:'asap', date:'', note:'', sending:false, error:'', ok:'' };
-  var OPEN = ['pending','approved','scheduled','in_progress'];
+  var OPEN = ['pending','accepted','approved','scheduled','in_progress'];
 
   function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){
       return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
@@ -15715,6 +15905,7 @@ _PORTAL_JS = r"""
   function chip(r){
     var cls='gray', txt=esc(r.status);
     if(r.status==='pending'){ cls='orange'; txt='Request received &mdash; waiting on confirmation'; }
+    else if(r.status==='accepted'){ cls='green'; txt='Confirmed &mdash; we&rsquo;re scheduling it'; }
     else if(r.status==='scheduled'){ cls='green'; txt='Scheduled &#10003;'+(r.scheduled_date?(' for '+esc(r.scheduled_date)):'')+(r.driver_name?' &middot; driver assigned':''); }
     else if(r.status==='in_progress'){ cls='blue'; txt='Driver is on it today'; }
     else if(r.status==='done'){ cls='green'; txt='Completed &#10003;'; }
@@ -16002,18 +16193,10 @@ def cascade_request_from_stop(conn, stop_id):
     )
 
 
-@app.route("/api/requests/<int:req_id>/approve", methods=["PATCH"])
-@boss_required
-def approve_request(req_id):
-    """Approve a pending request: create the stop and link it, atomically."""
-    data = request.get_json(silent=True) or {}
-    conn = get_db()
-
-    def fail(code, msg):
-        conn.close()
-        return jsonify({"error": msg}), code
-
-    req = conn.execute(
+def _load_request_for_assignment(conn, req_id):
+    """Fetch a request joined with the fields assignment needs, company-scoped.
+    None if not found / not this company."""
+    return conn.execute(
         """SELECT r.*, c.business_name, c.contact_name,
                   s.address AS site_address, b.size AS bin_size
              FROM requests r
@@ -16023,24 +16206,29 @@ def approve_request(req_id):
             WHERE r.id = ? AND c.company_id = ?""",
         (req_id, cid()),
     ).fetchone()
-    if req is None:
-        return fail(404, "not found")
-    if req["status"] != "pending":
-        return fail(409, "request is not pending")
 
+
+def _perform_assignment(conn, req, req_id, data):
+    """Shared core for one-click approve (Accept & Assign) and the two-stage
+    assign: validate driver + date + optional overrides, create the stop via
+    the same route/stop shape api_dispatch uses, link it, and set the request
+    to 'scheduled' — atomically. Returns (payload, None) on success or
+    (None, (http_code, message)) on failure. Caller owns conn + the status
+    precondition. Identical stop-creation to the original approve so the Route
+    Board / driver side see it exactly as before."""
     # --- driver: required, must exist and be a driver in this company ---
     driver_id_raw = data.get("driver_id")
     if not (isinstance(driver_id_raw, int) or (isinstance(driver_id_raw, str) and driver_id_raw.isdigit())):
-        return fail(400, "driver_id is required")
+        return None, (400, "driver_id is required")
     driver_id = int(driver_id_raw)
     driver = conn.execute(
         "SELECT id, username FROM users WHERE id=? AND company_id=? AND role='driver'",
         (driver_id, cid()),
     ).fetchone()
     if not driver:
-        return fail(400, "selected driver not found")
+        return None, (400, "selected driver not found")
 
-    # --- scheduled_date: boss's choice wins; default from preferred_date
+    # --- scheduled_date: dispatcher's choice wins; default from preferred_date
     #     ("asap" -> today). Must be a valid ISO date, today or later. ---
     scheduled_date = (data.get("scheduled_date") or "").strip()
     if not scheduled_date:
@@ -16048,14 +16236,14 @@ def approve_request(req_id):
     try:
         sd = datetime.strptime(scheduled_date, "%Y-%m-%d").date()
     except (ValueError, TypeError):
-        return fail(400, "scheduled_date must be an ISO date (YYYY-MM-DD)")
+        return None, (400, "scheduled_date must be an ISO date (YYYY-MM-DD)")
     if sd < datetime.strptime(today_str(), "%Y-%m-%d").date():
-        return fail(400, "scheduled_date cannot be in the past")
+        return None, (400, "scheduled_date cannot be in the past")
 
     # --- optional overrides (address / size / notes) ---
     address = (str(data.get("address") or "").strip()) or (req["site_address"] or "")
     if not address:
-        return fail(400, "no address on the site — provide an address override")
+        return None, (400, "no address on the site — provide an address override")
     size = (str(data.get("size") or "").strip()) or (req["size_requested"] or req["bin_size"] or "")
     if "notes" in data and data.get("notes") is not None:
         notes = str(data.get("notes")).strip()[:500]
@@ -16065,8 +16253,6 @@ def approve_request(req_id):
     action_label  = _PARSER_ACTION_MAP[_REQUEST_TO_PARSER_CODE[req["type"]]]
     customer_name = req["business_name"] or req["contact_name"] or ""
 
-    # --- create stop (find-or-create the driver's route for that date), link
-    #     the request, all in one transaction ---
     try:
         cur = conn.cursor()
         route = conn.execute(
@@ -16110,26 +16296,101 @@ def approve_request(req_id):
         conn.commit()
     except Exception as exc:
         conn.rollback()
-        conn.close()
-        app.logger.warning("approve_request %s failed: %s", req_id, exc)
-        return jsonify({"error": "could not approve request"}), 500
+        app.logger.warning("assign request %s failed: %s", req_id, exc)
+        return None, (500, "could not assign request")
 
     # Best-effort, same as api_dispatch — a can-flow hiccup must not undo the
-    # approval that already committed above.
+    # assignment that already committed above.
     try:
         compute_can_flow(conn, route_id)
         conn.commit()
     except Exception as exc:
-        app.logger.warning("approve_request: compute_can_flow error: %s", exc)
-    conn.close()
+        app.logger.warning("assign request: compute_can_flow error: %s", exc)
 
-    return jsonify({
-        "success":    True,
-        "request_id": req_id,
-        "stop_id":    stop_id,
-        "route_id":   route_id,
-        "status":     "scheduled",
-    })
+    return {"success": True, "request_id": req_id, "stop_id": stop_id,
+            "route_id": route_id, "status": "scheduled"}, None
+
+
+@app.route("/api/requests/<int:req_id>/approve", methods=["PATCH"])
+@login_required
+def approve_request(req_id):
+    """Accept & Assign in ONE click — the solo-operator path, unchanged from
+    Phase 3/4. Requires holding BOTH management roles (owner holds both). A
+    pending request goes straight to 'scheduled', creating the stop now."""
+    if not (has_role("customer_manager") and has_role("dispatcher")):
+        return jsonify({"error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    conn = get_db()
+    req = _load_request_for_assignment(conn, req_id)
+    if req is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if req["status"] != "pending":
+        conn.close()
+        return jsonify({"error": "request is not pending"}), 409
+    payload, err = _perform_assignment(conn, req, req_id, data)
+    conn.close()
+    if err:
+        return jsonify({"error": err[1]}), err[0]
+    return jsonify(payload)
+
+
+@app.route("/api/requests/<int:req_id>/accept", methods=["PATCH"])
+@login_required
+def accept_request(req_id):
+    """Stage 1 (customer_manager/owner): confirm a pending request WITHOUT
+    scheduling it — no driver, no date, no stop. It becomes 'accepted' and
+    drops into Unassigned Work. Optional note-to-customer stored for the
+    portal."""
+    if not has_role("customer_manager"):
+        return jsonify({"error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    note = data.get("note")
+    if note is not None:
+        note = str(note).strip()[:500] or None
+    conn = get_db()
+    req = conn.execute(
+        """SELECT r.id, r.status FROM requests r
+             JOIN customers c ON r.customer_id = c.id
+            WHERE r.id = ? AND c.company_id = ?""",
+        (req_id, cid()),
+    ).fetchone()
+    if req is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if req["status"] != "pending":
+        conn.close()
+        return jsonify({"error": "request is not pending"}), 409
+    conn.execute(
+        "UPDATE requests SET status='accepted', customer_note=?, updated_at=? WHERE id=?",
+        (note, now_ts(), req_id),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "request_id": req_id, "status": "accepted"})
+
+
+@app.route("/api/requests/<int:req_id>/assign", methods=["PATCH"])
+@login_required
+def assign_request(req_id):
+    """Stage 2 (dispatcher/owner): assign an accepted request to a driver +
+    date, creating the stop via the exact shared approve path."""
+    if not has_role("dispatcher"):
+        return jsonify({"error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    conn = get_db()
+    req = _load_request_for_assignment(conn, req_id)
+    if req is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if req["status"] != "accepted":
+        conn.close()
+        return jsonify({"error": "request is not awaiting assignment"}), 409
+    payload, err = _perform_assignment(conn, req, req_id, data)
+    conn.close()
+    if err:
+        return jsonify({"error": err[1]}), err[0]
+    return jsonify(payload)
 
 
 @app.route("/api/requests/<int:req_id>/deny", methods=["PATCH"])
@@ -16175,11 +16436,13 @@ _REQUESTS_PAGE_JS = """
 (function(){
   var CSRF = (document.querySelector('meta[name=csrf-token]')||{}).content || '';
   function hideForms(id){
+    var ac=document.getElementById('accept-form-'+id); if(ac) ac.hidden=true;
     var a=document.getElementById('approve-form-'+id); if(a) a.hidden=true;
     var d=document.getElementById('deny-form-'+id); if(d) d.hidden=true;
     var e=document.getElementById('err-'+id); if(e){ e.hidden=true; e.textContent=''; }
   }
   window.hideReqForms = hideForms;
+  window.showAccept=function(id){ hideForms(id); var ac=document.getElementById('accept-form-'+id); if(ac) ac.hidden=false; };
   window.showApprove=function(id){ hideForms(id); var a=document.getElementById('approve-form-'+id); if(a) a.hidden=false; };
   window.showDeny=function(id){ hideForms(id); var d=document.getElementById('deny-form-'+id); if(d) d.hidden=false; };
   function err(id,msg){ var e=document.getElementById('err-'+id); if(e){ e.textContent=msg; e.hidden=false; } }
@@ -16201,6 +16464,10 @@ _REQUESTS_PAGE_JS = """
                            else { err(id, (res.j && res.j.error) || 'Something went wrong.'); } })
       .catch(function(){ err(id, 'Network error — try again.'); });
   }
+  window.submitAccept=function(id){
+    var note=(document.getElementById('note-'+id)||{value:''}).value || '';
+    patch('/api/requests/'+id+'/accept', {note: note}, id);
+  };
   window.submitApprove=function(id){
     var drv=document.getElementById('drv-'+id).value;
     var date=document.getElementById('date-'+id).value;
@@ -16216,10 +16483,649 @@ _REQUESTS_PAGE_JS = """
 """
 
 
+# Unassigned Work client script. Plain (non-f) string. Assign calls the same
+# PATCH /assign endpoint the two-stage flow uses; on success the card leaves
+# the queue and the nav badge ticks down.
+_UNASSIGNED_PAGE_JS = """
+<script>
+(function(){
+  var CSRF = (document.querySelector('meta[name=csrf-token]')||{}).content || '';
+  function hideForm(id){
+    var f=document.getElementById('assign-form-'+id); if(f) f.hidden=true;
+    var e=document.getElementById('err-'+id); if(e){ e.hidden=true; e.textContent=''; }
+  }
+  window.hideAssign = hideForm;
+  window.showAssign=function(id){ hideForm(id); var f=document.getElementById('assign-form-'+id); if(f) f.hidden=false; };
+  function err(id,msg){ var e=document.getElementById('err-'+id); if(e){ e.textContent=msg; e.hidden=false; } }
+  function removeCard(id){
+    var c=document.getElementById('uw-card-'+id); if(c) c.remove();
+    var list=document.getElementById('uw-list');
+    if(list && !list.querySelector('.bin-card')){
+      var empty=document.getElementById('uw-empty'); if(empty) empty.hidden=false;
+    }
+    var badge=document.getElementById('unassigned-nav-badge');
+    if(badge){ var n=parseInt(badge.textContent||'0',10)-1;
+      if(n>0){ badge.textContent=n; } else { badge.hidden=true; badge.textContent=''; } }
+  }
+  window.submitAssign=function(id){
+    var drv=document.getElementById('drv-'+id).value;
+    var date=document.getElementById('date-'+id).value;
+    if(!drv){ err(id,'Pick a driver.'); return; }
+    fetch('/api/requests/'+id+'/assign', {method:'PATCH',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
+        body:JSON.stringify({driver_id: parseInt(drv,10), scheduled_date: date})})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
+      .then(function(res){ if(res.ok){ removeCard(id); }
+                           else { err(id, (res.j && res.j.error) || 'Something went wrong.'); } })
+      .catch(function(){ err(id, 'Network error — try again.'); });
+  };
+})();
+</script>
+"""
+
+
+@app.route("/unassigned")
+@roles_required("dispatcher")
+def unassigned_work():
+    """Dispatcher/owner: accepted-but-unassigned jobs, oldest/most-urgent
+    first, each assignable to a driver + date in place."""
+    conn = get_db()
+    reqs = conn.execute(
+        """SELECT r.*,
+                  c.business_name AS customer_business_name,
+                  c.contact_name  AS customer_contact_name,
+                  s.address       AS site_address,
+                  b.size          AS bin_size
+             FROM requests r
+             JOIN customers c ON r.customer_id = c.id
+             JOIN sites     s ON r.site_id     = s.id
+        LEFT JOIN bins      b ON r.bin_id      = b.id
+            WHERE c.company_id = ? AND r.status = 'accepted'""",
+        (cid(),),
+    ).fetchall()
+    drivers = conn.execute(
+        "SELECT id, username FROM users WHERE role='driver' AND company_id=? ORDER BY username",
+        (cid(),),
+    ).fetchall()
+    conn.close()
+
+    today = today_str()
+
+    def eff_date(r):
+        # "asap" is the most urgent — sort it as today so it leads the queue.
+        return today if r["preferred_date"] == "asap" else (r["preferred_date"] or "9999-12-31")
+
+    # Preferred date ascending, then oldest request first.
+    reqs = sorted(reqs, key=lambda r: (eff_date(r), r["created_at"] or "", r["id"]))
+
+    driver_options = '<option value="">Select driver…</option>' + "".join(
+        f'<option value="{d["id"]}">{e(d["username"])}</option>' for d in drivers
+    )
+
+    _TYPE_LABEL = {"PR": "PR · Pull & Return", "P": "P · Pickup",
+                   "D": "D · Drop", "NEW_BIN": "NEW BIN"}
+
+    def age_label(created_at):
+        """Whole days since the request came in, e.g. 'new', '3d old'."""
+        if not created_at:
+            return ""
+        try:
+            then = datetime.strptime(created_at[:10], "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            return ""
+        days = (datetime.strptime(today, "%Y-%m-%d").date() - then).days
+        if days <= 0:
+            return "new today"
+        return f"{days}d old"
+
+    cards = ""
+    for r in reqs:
+        rid  = r["id"]
+        name = e(r["customer_business_name"] or r["customer_contact_name"] or "Customer")
+        addr = e(r["site_address"] or "—")
+        size = r["bin_size"] if r["type"] in ("PR", "P") else r["size_requested"]
+        size_html = (f'<div style="color:var(--slate);font-size:13px;margin-top:2px;">📦 {e(size)}</div>'
+                     if size else "")
+        pref = r["preferred_date"]
+        ed = eff_date(r)
+        if pref == "asap":
+            pref_label, flag = "ASAP", "today"
+        else:
+            pref_label = e(pref)
+            flag = "overdue" if ed < today else ("today" if ed == today else "")
+        if flag == "overdue":
+            flag_html = ('<span style="color:#FF7A7A;font-weight:800;font-size:11px;'
+                         'text-transform:uppercase;letter-spacing:.5px;">Overdue</span>')
+            date_color = "#FF7A7A"
+        elif flag == "today":
+            flag_html = ('<span style="color:var(--cyan);font-weight:800;font-size:11px;'
+                         'text-transform:uppercase;letter-spacing:.5px;">Today</span>')
+            date_color = "var(--cyan)"
+        else:
+            flag_html = ""
+            date_color = "var(--slate)"
+        notes_html = (
+            f'<div style="margin-top:8px;padding:8px 10px;background:rgba(255,255,255,0.03);'
+            f'border-radius:8px;font-size:13px;color:#C9C9C2;">{e(r["notes"])}</div>'
+        ) if r["notes"] else ""
+        default_date = today if pref == "asap" else e(pref)
+        type_badge = (
+            f'<span style="display:inline-block;padding:3px 10px;border-radius:999px;'
+            f'font-size:10px;font-weight:800;letter-spacing:.6px;text-transform:uppercase;'
+            f'background:var(--cyan-dim);color:var(--cyan);border:1px solid var(--border-glow);">'
+            f'{e(_TYPE_LABEL.get(r["type"], r["type"]))}</span>'
+        )
+        age = age_label(r["created_at"])
+        cards += f"""
+        <div class="bin-card" id="uw-card-{rid}" style="padding:16px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
+                {type_badge}
+                <span style="color:{date_color};font-size:12px;white-space:nowrap;">📅 {pref_label} {flag_html}</span>
+            </div>
+            <div style="font-weight:700;font-size:15px;margin-top:8px;">{name}</div>
+            <div style="color:var(--slate);font-size:13px;margin-top:2px;">📍 {addr}</div>
+            {size_html}
+            <div style="color:var(--slate);font-size:12px;margin-top:4px;">🕑 {age}</div>
+            {notes_html}
+            <div style="margin-top:12px;">
+                <button class="btn green" style="width:100%;" onclick="showAssign({rid})">Assign</button>
+            </div>
+            <div id="err-{rid}" hidden style="color:#FF5252;font-size:12px;margin-top:8px;"></div>
+            <div id="assign-form-{rid}" hidden style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
+                <label style="display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Driver</label>
+                <select id="drv-{rid}" style="width:100%;margin-bottom:10px;">{driver_options}</select>
+                <label style="display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Scheduled date</label>
+                <input type="date" id="date-{rid}" value="{default_date}" style="width:100%;margin-bottom:12px;">
+                <div style="display:flex;gap:8px;">
+                    <button class="btn green" style="flex:1;" onclick="submitAssign({rid})">Confirm &amp; schedule</button>
+                    <button class="btn secondary" onclick="hideAssign({rid})">Cancel</button>
+                </div>
+            </div>
+        </div>
+        """
+
+    empty_hidden = "" if not reqs else " hidden"
+    body = f"""
+    <div class="hero">
+        <h1>Unassigned Work</h1>
+        <p>Accepted jobs waiting to be routed. Assign one to a driver and date to schedule it.</p>
+    </div>
+    <div id="uw-empty" class="empty-state" style="padding:32px 0;"{empty_hidden}>No unassigned work — everything's routed.</div>
+    <div id="uw-list" class="bin-list" style="display:grid;gap:12px;max-width:640px;">
+        {cards}
+    </div>
+    """ + _UNASSIGNED_PAGE_JS
+    return render_template_string(shell_page("Unassigned Work", body))
+
+
+def _new_portal_token(conn):
+    """A URL-safe token guaranteed unique across customers."""
+    for _ in range(8):
+        tok = secrets.token_urlsafe(32)
+        if not conn.execute(
+            "SELECT 1 FROM customers WHERE portal_token=?", (tok,)
+        ).fetchone():
+            return tok
+    return secrets.token_urlsafe(48)  # astronomically unlikely fallback
+
+
+def _portal_url(token):
+    return url_for("customer_portal", token=token, _external=True)
+
+
+def _load_customer_scoped(conn, customer_id):
+    """An active customer in the session's company, or None."""
+    return conn.execute(
+        "SELECT * FROM customers WHERE id=? AND company_id=? AND is_active=1",
+        (customer_id, cid()),
+    ).fetchone()
+
+
+@app.route("/customers")
+@roles_required("customer_manager")
+def customers_page():
+    """Customer_manager/owner: active customers with at-a-glance counts, plus
+    an Add Customer form."""
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT c.id, c.business_name, c.contact_name, c.phone,
+                  (SELECT COUNT(*) FROM bins b WHERE b.customer_id = c.id) AS bin_count,
+                  (SELECT COUNT(*) FROM requests r
+                     WHERE r.customer_id = c.id
+                       AND r.status IN ('pending','accepted','approved','scheduled','in_progress')
+                  ) AS open_count
+             FROM customers c
+            WHERE c.company_id = ? AND c.is_active = 1
+            ORDER BY LOWER(COALESCE(c.business_name, c.contact_name, '')), c.id""",
+        (cid(),),
+    ).fetchall()
+    conn.close()
+
+    size_opts = "".join(f'<option value="{s}">{s}</option>' for s in REQUEST_SIZES)
+
+    cards = ""
+    for c in rows:
+        name = e(c["business_name"] or c["contact_name"] or "Customer")
+        contact = e(c["contact_name"] or "")
+        phone = e(c["phone"] or "")
+        meta_bits = " · ".join(b for b in [contact, phone] if b)
+        meta_html = (f'<div style="color:var(--slate);font-size:13px;margin-top:2px;">{meta_bits}</div>'
+                     if meta_bits else "")
+        open_badge = (
+            f'<span style="display:inline-block;padding:2px 9px;border-radius:999px;'
+            f'font-size:11px;font-weight:800;background:var(--cyan-dim);color:var(--cyan);'
+            f'border:1px solid var(--border-glow);">{c["open_count"]} open</span>'
+        ) if c["open_count"] else ""
+        cards += f"""
+        <a class="bin-card" href="{url_for('customer_detail_page', customer_id=c['id'])}"
+           style="padding:16px;display:block;text-decoration:none;color:inherit;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
+                <div style="font-weight:700;font-size:15px;">{name}</div>
+                {open_badge}
+            </div>
+            {meta_html}
+            <div style="color:var(--slate);font-size:12px;margin-top:6px;">
+                🗑️ {c["bin_count"]} active bin{"" if c["bin_count"]==1 else "s"}
+            </div>
+        </a>
+        """
+
+    empty_hidden = "" if not rows else " hidden"
+    body = f"""
+    <div class="hero">
+        <h1>Customers</h1>
+        <p>Everyone you serve. Add a customer to generate their self-service portal link.</p>
+    </div>
+    <div style="max-width:640px;margin-bottom:16px;">
+        <button class="btn green" id="add-cust-toggle" onclick="toggleAdd()">+ Add Customer</button>
+        <div id="add-cust-form" hidden class="bin-card" style="padding:16px;margin-top:12px;">
+            <div id="add-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
+            <label class="uw-lbl">Business name</label>
+            <input id="ac-business" style="width:100%;margin-bottom:10px;" placeholder="ABC Demolition">
+            <label class="uw-lbl">Contact name</label>
+            <input id="ac-contact" style="width:100%;margin-bottom:10px;" placeholder="Sam Rivera">
+            <label class="uw-lbl">Phone</label>
+            <input id="ac-phone" style="width:100%;margin-bottom:10px;" placeholder="757-555-0142">
+            <label class="uw-lbl">Site address</label>
+            <input id="ac-address" style="width:100%;margin-bottom:10px;" placeholder="1200 Industrial Blvd, Norfolk, VA">
+            <label class="uw-lbl">Initial bin size (optional)</label>
+            <select id="ac-size" style="width:100%;margin-bottom:12px;"><option value="">None yet</option>{size_opts}</select>
+            <div style="display:flex;gap:8px;">
+                <button class="btn green" style="flex:1;" onclick="submitAdd()">Create customer</button>
+                <button class="btn secondary" onclick="toggleAdd()">Cancel</button>
+            </div>
+        </div>
+    </div>
+    <div id="cust-empty" class="empty-state" style="padding:32px 0;"{empty_hidden}>No customers yet — add your first one above.</div>
+    <div class="bin-list" style="display:grid;gap:12px;max-width:640px;">
+        {cards}
+    </div>
+    <style>.uw-lbl{{display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;}}</style>
+    """ + _CUSTOMERS_PAGE_JS
+    return render_template_string(shell_page("Customers", body))
+
+
+_CUSTOMERS_PAGE_JS = """
+<script>
+(function(){
+  var CSRF = (document.querySelector('meta[name=csrf-token]')||{}).content || '';
+  window.toggleAdd=function(){
+    var f=document.getElementById('add-cust-form');
+    if(f) f.hidden=!f.hidden;
+  };
+  function err(msg){ var e=document.getElementById('add-err'); if(e){ e.textContent=msg; e.hidden=false; } }
+  window.submitAdd=function(){
+    var body={
+      business_name:(document.getElementById('ac-business')||{}).value||'',
+      contact_name:(document.getElementById('ac-contact')||{}).value||'',
+      phone:(document.getElementById('ac-phone')||{}).value||'',
+      site_address:(document.getElementById('ac-address')||{}).value||'',
+      bin_size:(document.getElementById('ac-size')||{}).value||''
+    };
+    if(!body.business_name.trim() && !body.contact_name.trim()){ err('Enter a business or contact name.'); return; }
+    fetch('/api/customers', {method:'POST',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
+        body:JSON.stringify(body)})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
+      .then(function(res){ if(res.ok && res.j.id){ window.location='/customers/'+res.j.id; }
+                           else { err((res.j && res.j.error) || 'Could not create customer.'); } })
+      .catch(function(){ err('Network error — try again.'); });
+  };
+})();
+</script>
+"""
+
+
+@app.route("/api/customers", methods=["POST"])
+@login_required
+def create_customer():
+    """Create a customer (+ optional first site and bin) and mint a portal
+    token. customer_manager/owner only."""
+    if not has_role("customer_manager"):
+        return jsonify({"error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    business = str(data.get("business_name") or "").strip()[:200]
+    contact  = str(data.get("contact_name") or "").strip()[:200]
+    phone    = str(data.get("phone") or "").strip()[:50]
+    address  = str(data.get("site_address") or "").strip()[:300]
+    bin_size = str(data.get("bin_size") or "").strip()
+    if not business and not contact:
+        return jsonify({"error": "a business or contact name is required"}), 400
+    if bin_size and bin_size not in REQUEST_SIZES:
+        return jsonify({"error": "invalid bin size"}), 400
+    if bin_size and not address:
+        return jsonify({"error": "a site address is required to add a bin"}), 400
+
+    conn = get_db()
+    try:
+        token = _new_portal_token(conn)
+        ts = now_ts()
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO customers (company_id, business_name, contact_name, phone,
+                                      portal_token, is_active, created_at)
+               VALUES (?, ?, ?, ?, ?, 1, ?)""",
+            (cid(), business or None, contact or None, phone or None, token, ts),
+        )
+        customer_id = cur.lastrowid
+        if address:
+            cur.execute(
+                "INSERT INTO sites (customer_id, address, created_at) VALUES (?, ?, ?)",
+                (customer_id, address, ts),
+            )
+            site_id = cur.lastrowid
+            if bin_size:
+                cur.execute(
+                    "INSERT INTO bins (customer_id, site_id, size, dropped_at) VALUES (?, ?, ?, ?)",
+                    (customer_id, site_id, bin_size, today_str()),
+                )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        app.logger.warning("create customer failed: %s", exc)
+        return jsonify({"error": "could not create customer"}), 500
+    conn.close()
+    return jsonify({"success": True, "id": customer_id, "portal_token": token})
+
+
+@app.route("/api/customers/<int:customer_id>", methods=["PATCH"])
+@login_required
+def update_customer(customer_id):
+    """Edit a customer's business name / contact / phone. cm/owner only."""
+    if not has_role("customer_manager"):
+        return jsonify({"error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    conn = get_db()
+    cust = _load_customer_scoped(conn, customer_id)
+    if cust is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    business = str(data.get("business_name") or "").strip()[:200]
+    contact  = str(data.get("contact_name") or "").strip()[:200]
+    phone    = str(data.get("phone") or "").strip()[:50]
+    if not business and not contact:
+        conn.close()
+        return jsonify({"error": "a business or contact name is required"}), 400
+    conn.execute(
+        "UPDATE customers SET business_name=?, contact_name=?, phone=? WHERE id=?",
+        (business or None, contact or None, phone or None, customer_id),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/customers/<int:customer_id>/regenerate-token", methods=["POST"])
+@login_required
+def regenerate_customer_token(customer_id):
+    """Mint a fresh portal token, invalidating the old link. cm/owner only."""
+    if not has_role("customer_manager"):
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    cust = _load_customer_scoped(conn, customer_id)
+    if cust is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    token = _new_portal_token(conn)
+    conn.execute("UPDATE customers SET portal_token=? WHERE id=?", (token, customer_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "portal_token": token, "portal_url": _portal_url(token)})
+
+
+@app.route("/api/customers/<int:customer_id>/deactivate", methods=["POST"])
+@login_required
+def deactivate_customer(customer_id):
+    """Soft-delete: hide from lists and kill portal access. History is kept.
+    cm/owner only."""
+    if not has_role("customer_manager"):
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    cust = _load_customer_scoped(conn, customer_id)
+    if cust is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    conn.execute("UPDATE customers SET is_active=0 WHERE id=?", (customer_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/customers/<int:customer_id>")
+@roles_required("customer_manager")
+def customer_detail_page(customer_id):
+    """One customer: info, sites, bins, request history, and the portal link
+    with copy / text / regenerate controls."""
+    conn = get_db()
+    cust = _load_customer_scoped(conn, customer_id)
+    if cust is None:
+        conn.close()
+        flash("Customer not found.", "error")
+        return redirect(url_for("customers_page"))
+
+    sites = conn.execute(
+        "SELECT id, address, notes FROM sites WHERE customer_id=? ORDER BY id",
+        (customer_id,),
+    ).fetchall()
+    bins = conn.execute(
+        """SELECT b.id, b.size, b.dropped_at, s.address AS site_address
+             FROM bins b LEFT JOIN sites s ON b.site_id = s.id
+            WHERE b.customer_id=? ORDER BY b.id""",
+        (customer_id,),
+    ).fetchall()
+    reqs = conn.execute(
+        """SELECT r.id, r.type, r.status, r.preferred_date, r.created_at,
+                  ro.route_date AS scheduled_date
+             FROM requests r
+        LEFT JOIN stops st ON r.stop_id = st.id
+        LEFT JOIN routes ro ON st.route_id = ro.id
+            WHERE r.customer_id=? ORDER BY r.created_at DESC, r.id DESC""",
+        (customer_id,),
+    ).fetchall()
+    conn.close()
+
+    portal_url = _portal_url(cust["portal_token"])
+    company_name = session.get("company_name") or "HAULTRA"
+    name = e(cust["business_name"] or cust["contact_name"] or "Customer")
+    contact = cust["contact_name"] or ""
+    # SMS body: greeting uses contact if we have one.
+    greet = f"Hi {contact}, " if contact else "Hi, "
+    sms_body = (f"{greet}here's your {company_name} service portal — request pickups, "
+                f"swaps, or extra bins anytime: {portal_url}")
+    sms_href = ("sms:" + (e(cust["phone"]) if cust["phone"] else "")
+                + "?&body=" + urllib.parse.quote(sms_body))
+
+    _TYPE_LABEL = {"PR": "PR · Pull & Return", "P": "P · Pickup",
+                   "D": "D · Drop", "NEW_BIN": "NEW BIN"}
+    _STATUS_LABEL = {"pending": "Pending", "accepted": "Accepted",
+                     "approved": "Approved", "scheduled": "Scheduled",
+                     "in_progress": "In progress", "done": "Done", "denied": "Denied"}
+
+    _site_rows = []
+    for s in sites:
+        note = (f'<div style="color:var(--slate);font-size:12px;margin-top:2px;">{e(s["notes"])}</div>'
+                if s["notes"] else "")
+        _site_rows.append(
+            f'<div style="padding:8px 0;border-bottom:1px solid var(--border);">'
+            f'📍 {e(s["address"] or "—")}{note}</div>'
+        )
+    sites_html = "".join(_site_rows) or '<div style="color:var(--slate);font-size:13px;">No sites yet.</div>'
+
+    _bin_rows = []
+    for b in bins:
+        dropped = f' · dropped {e(b["dropped_at"])}' if b["dropped_at"] else ""
+        _bin_rows.append(
+            f'<div style="padding:8px 0;border-bottom:1px solid var(--border);">'
+            f'🗑️ {e(b["size"] or "Dumpster")} '
+            f'<span style="color:var(--slate);font-size:12px;">at {e(b["site_address"] or "—")}{dropped}</span></div>'
+        )
+    bins_html = "".join(_bin_rows) or '<div style="color:var(--slate);font-size:13px;">No active bins.</div>'
+
+    def _status_chip(st):
+        color = {"denied": "#FF7A7A", "done": "#3DDC84", "pending": "#FF8A3D"}.get(st, "var(--cyan)")
+        return (f'<span style="color:{color};font-weight:700;font-size:12px;">'
+                f'{e(_STATUS_LABEL.get(st, st))}</span>')
+
+    reqs_html = "".join(
+        f'<div style="display:flex;justify-content:space-between;gap:10px;padding:8px 0;border-bottom:1px solid var(--border);">'
+        f'<span style="font-size:13px;">{e(_TYPE_LABEL.get(r["type"], r["type"]))}'
+        f'<span style="color:var(--slate);"> · {e((r["created_at"] or "")[:10])}</span></span>'
+        f'{_status_chip(r["status"])}</div>'
+        for r in reqs
+    ) or '<div style="color:var(--slate);font-size:13px;">No requests yet.</div>'
+
+    body = f"""
+    <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+        <div>
+            <h1 style="margin-bottom:4px;">{name}</h1>
+            <p style="margin:0;">Customer details &amp; portal link.</p>
+        </div>
+        <a class="btn secondary" href="{url_for('customers_page')}" style="white-space:nowrap;">← All customers</a>
+    </div>
+
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+            <h2 style="font-size:15px;margin:0;">Info</h2>
+            <button class="btn secondary" onclick="toggleEdit()" style="padding:4px 12px;font-size:12px;">Edit</button>
+        </div>
+        <div id="cust-view" style="margin-top:10px;">
+            <div style="font-size:14px;">👤 {e(contact) or "—"}</div>
+            <div style="font-size:14px;color:var(--slate);margin-top:4px;">📞 {e(cust["phone"] or "—")}</div>
+        </div>
+        <div id="cust-edit" hidden style="margin-top:10px;">
+            <div id="edit-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
+            <label class="uw-lbl">Business name</label>
+            <input id="ed-business" style="width:100%;margin-bottom:10px;" value="{e(cust["business_name"] or "")}">
+            <label class="uw-lbl">Contact name</label>
+            <input id="ed-contact" style="width:100%;margin-bottom:10px;" value="{e(cust["contact_name"] or "")}">
+            <label class="uw-lbl">Phone</label>
+            <input id="ed-phone" style="width:100%;margin-bottom:12px;" value="{e(cust["phone"] or "")}">
+            <div style="display:flex;gap:8px;">
+                <button class="btn green" style="flex:1;" onclick="submitEdit()">Save</button>
+                <button class="btn secondary" onclick="toggleEdit()">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+        <h2 style="font-size:15px;margin:0 0 10px;">Portal link</h2>
+        <div id="portal-url-box" style="word-break:break-all;font-size:13px;color:var(--cyan);
+             background:rgba(255,255,255,0.03);border-radius:8px;padding:10px;">{e(portal_url)}</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">
+            <button class="btn secondary" onclick="copyLink()" style="flex:1;min-width:110px;">Copy link</button>
+            <a class="btn secondary" href="{sms_href}" style="flex:1;min-width:110px;text-align:center;">Text link</a>
+            <button class="btn secondary" onclick="regen()" style="flex:1;min-width:110px;">Regenerate</button>
+        </div>
+        <div id="portal-msg" hidden style="font-size:12px;margin-top:8px;color:var(--slate);"></div>
+    </div>
+
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+        <h2 style="font-size:15px;margin:0 0 6px;">Sites</h2>
+        {sites_html}
+    </div>
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+        <h2 style="font-size:15px;margin:0 0 6px;">Bins</h2>
+        {bins_html}
+    </div>
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+        <h2 style="font-size:15px;margin:0 0 6px;">Request history</h2>
+        {reqs_html}
+    </div>
+    <div style="max-width:640px;margin-bottom:24px;">
+        <button class="btn red" onclick="deactivate()" style="width:100%;">Deactivate customer</button>
+        <div style="color:var(--slate);font-size:12px;margin-top:6px;text-align:center;">
+            Hides them from lists and disables their portal link. History is kept.
+        </div>
+    </div>
+    <style>.uw-lbl{{display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;}}</style>
+    {_customer_detail_js(customer_id)}
+    """
+    return render_template_string(shell_page("Customer", body))
+
+
+def _customer_detail_js(customer_id):
+    """Per-customer detail script. f-string only interpolates the id and the
+    customers list URL; all JS braces are doubled."""
+    list_url = url_for("customers_page")
+    return f"""
+<script>
+(function(){{
+  var CSRF = (document.querySelector('meta[name=csrf-token]')||{{}}).content || '';
+  var CID = {customer_id};
+  function msg(t){{ var m=document.getElementById('portal-msg'); if(m){{ m.textContent=t; m.hidden=false; }} }}
+  window.toggleEdit=function(){{
+    var v=document.getElementById('cust-view'), ed=document.getElementById('cust-edit');
+    if(v&&ed){{ var show=ed.hidden; ed.hidden=!show; v.hidden=show; }}
+  }};
+  window.submitEdit=function(){{
+    var body={{business_name:(document.getElementById('ed-business')||{{}}).value||'',
+              contact_name:(document.getElementById('ed-contact')||{{}}).value||'',
+              phone:(document.getElementById('ed-phone')||{{}}).value||''}};
+    fetch('/api/customers/'+CID, {{method:'PATCH',
+        headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},
+        body:JSON.stringify(body)}})
+      .then(function(r){{ return r.json().then(function(j){{ return {{ok:r.ok,j:j}}; }}); }})
+      .then(function(res){{ if(res.ok){{ window.location.reload(); }}
+        else {{ var e=document.getElementById('edit-err'); if(e){{ e.textContent=(res.j&&res.j.error)||'Could not save.'; e.hidden=false; }} }} }})
+      .catch(function(){{ var e=document.getElementById('edit-err'); if(e){{ e.textContent='Network error.'; e.hidden=false; }} }});
+  }};
+  window.copyLink=function(){{
+    var url=(document.getElementById('portal-url-box')||{{}}).textContent||'';
+    if(navigator.clipboard&&navigator.clipboard.writeText){{
+      navigator.clipboard.writeText(url).then(function(){{ msg('Link copied.'); }},
+        function(){{ msg('Copy failed — select and copy manually.'); }});
+    }} else {{ msg('Copy not supported — select the link manually.'); }}
+  }};
+  window.regen=function(){{
+    if(!confirm('Regenerate the portal link? The current link will stop working immediately.')) return;
+    fetch('/api/customers/'+CID+'/regenerate-token', {{method:'POST',
+        headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}}}})
+      .then(function(r){{ return r.json().then(function(j){{ return {{ok:r.ok,j:j}}; }}); }})
+      .then(function(res){{ if(res.ok&&res.j.portal_url){{
+          var box=document.getElementById('portal-url-box'); if(box) box.textContent=res.j.portal_url;
+          msg('New link generated — the old one no longer works.');
+        }} else {{ msg((res.j&&res.j.error)||'Could not regenerate.'); }} }})
+      .catch(function(){{ msg('Network error — try again.'); }});
+  }};
+  window.deactivate=function(){{
+    if(!confirm('Deactivate this customer? They disappear from your lists and their portal link stops working. History is kept.')) return;
+    fetch('/api/customers/'+CID+'/deactivate', {{method:'POST',
+        headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}}}})
+      .then(function(r){{ return r.json().then(function(j){{ return {{ok:r.ok,j:j}}; }}); }})
+      .then(function(res){{ if(res.ok){{ window.location='{list_url}'; }}
+        else {{ msg((res.j&&res.j.error)||'Could not deactivate.'); }} }})
+      .catch(function(){{ msg('Network error — try again.'); }});
+  }};
+}})();
+</script>
+"""
+
+
 @app.route("/requests")
-@boss_required
+@roles_required("customer_manager")
 def requests_page():
-    """Boss UI: pending customer requests as approve/deny cards."""
+    """Customer_manager/owner: pending customer requests as accept/deny cards."""
     conn = get_db()
     reqs = conn.execute(
         """SELECT r.*,
@@ -16245,6 +17151,11 @@ def requests_page():
         f'<option value="{d["id"]}">{e(d["username"])}</option>' for d in drivers
     )
 
+    # Only a user who also holds the dispatcher role (owner, or someone with
+    # both roles) can schedule in one click — the solo-operator path. A
+    # customer-manager-only user accepts, and a dispatcher assigns later.
+    can_assign = has_role("dispatcher")
+
     _TYPE_LABEL = {"PR": "PR · Pull & Return", "P": "P · Pickup",
                    "D": "D · Drop", "NEW_BIN": "NEW BIN"}
 
@@ -16268,6 +17179,10 @@ def requests_page():
             f'background:var(--cyan-dim);color:var(--cyan);border:1px solid var(--border-glow);">'
             f'{e(_TYPE_LABEL.get(r["type"], r["type"]))}</span>'
         )
+        assign_btn = (
+            f'<button class="btn green" style="flex:1;min-width:120px;" '
+            f'onclick="showApprove({rid})">Accept &amp; Assign</button>'
+        ) if can_assign else ""
         cards += f"""
         <div class="bin-card" id="req-card-{rid}" style="padding:16px;">
             <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
@@ -16278,18 +17193,28 @@ def requests_page():
             <div style="color:var(--slate);font-size:13px;margin-top:2px;">📍 {addr}</div>
             {size_html}
             {notes_html}
-            <div style="display:flex;gap:8px;margin-top:12px;">
-                <button class="btn green" style="flex:1;" onclick="showApprove({rid})">Approve</button>
-                <button class="btn red" style="flex:1;" onclick="showDeny({rid})">Deny</button>
+            <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
+                <button class="btn green" style="flex:1;min-width:90px;" onclick="showAccept({rid})">Accept</button>
+                {assign_btn}
+                <button class="btn red" style="flex:1;min-width:90px;" onclick="showDeny({rid})">Deny</button>
             </div>
             <div id="err-{rid}" hidden style="color:#FF5252;font-size:12px;margin-top:8px;"></div>
+            <div id="accept-form-{rid}" hidden style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
+                <label style="display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Note to customer (optional)</label>
+                <textarea id="note-{rid}" maxlength="500" rows="2" style="width:100%;margin-bottom:6px;" placeholder="e.g. We'll have you scheduled within a day or two."></textarea>
+                <div style="font-size:12px;color:var(--slate);margin-bottom:12px;">Confirms the request without scheduling — it moves to Unassigned Work for a dispatcher to route.</div>
+                <div style="display:flex;gap:8px;">
+                    <button class="btn green" style="flex:1;" onclick="submitAccept({rid})">Confirm accept</button>
+                    <button class="btn secondary" onclick="hideReqForms({rid})">Cancel</button>
+                </div>
+            </div>
             <div id="approve-form-{rid}" hidden style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
                 <label style="display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Driver</label>
                 <select id="drv-{rid}" style="width:100%;margin-bottom:10px;">{driver_options}</select>
                 <label style="display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Scheduled date</label>
                 <input type="date" id="date-{rid}" value="{default_date}" style="width:100%;margin-bottom:12px;">
                 <div style="display:flex;gap:8px;">
-                    <button class="btn green" style="flex:1;" onclick="submitApprove({rid})">Confirm approve</button>
+                    <button class="btn green" style="flex:1;" onclick="submitApprove({rid})">Confirm &amp; schedule</button>
                     <button class="btn secondary" onclick="hideReqForms({rid})">Cancel</button>
                 </div>
             </div>
@@ -16304,11 +17229,15 @@ def requests_page():
         </div>
         """
 
+    accept_assign_hint = (
+        "; <strong>Accept &amp; Assign</strong> schedules it to a driver in one step"
+        if can_assign else ""
+    )
     empty_hidden = "" if not reqs else " hidden"
     body = f"""
     <div class="hero">
         <h1>Requests</h1>
-        <p>Customer requests awaiting your approval. Approving one schedules a stop on the driver's route.</p>
+        <p>Customer requests awaiting your review. <strong>Accept</strong> confirms the job and sends it to Unassigned Work for scheduling{accept_assign_hint}.</p>
     </div>
     <div id="req-empty" class="empty-state" style="padding:32px 0;"{empty_hidden}>No pending requests.</div>
     <div id="req-list" class="bin-list" style="display:grid;gap:12px;max-width:640px;">
