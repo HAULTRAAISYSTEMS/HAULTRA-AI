@@ -17814,19 +17814,35 @@ def inspection_new():
 
 _INSPECTION_FORM_CSS = """
 <style>
-  .uw-lbl{display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;}
-  .insp-btn{flex:1;padding:16px 8px;border-radius:12px;font-weight:800;font-size:15px;
-    border:1px solid var(--border);background:rgba(255,255,255,0.03);color:var(--slate);cursor:pointer;}
-  .insp-btn.pass.on{background:rgba(61,220,132,0.18);color:#3DDC84;border-color:rgba(61,220,132,0.5);}
-  .insp-btn.defect.on{background:rgba(255,82,82,0.18);color:#FF7A7A;border-color:rgba(255,82,82,0.5);}
-  .insp-btn.na.on{background:rgba(140,160,179,0.22);color:#ADC0D1;border-color:rgba(140,160,179,0.5);}
-  .insp-type,.insp-overall{padding:14px;border-radius:12px;font-weight:800;font-size:15px;
-    border:1px solid var(--border);background:rgba(255,255,255,0.03);color:var(--slate);cursor:pointer;text-align:center;}
-  .insp-type{flex:1;}
-  .insp-type.active{background:var(--cyan-dim);color:var(--cyan);border-color:var(--border-glow);}
-  .insp-overall.safe.on{background:rgba(61,220,132,0.18);color:#3DDC84;border-color:rgba(61,220,132,0.5);}
-  .insp-overall.warn.on{background:rgba(255,138,61,0.18);color:#FF8A3D;border-color:rgba(255,138,61,0.5);}
-  .insp-overall.stop.on{background:rgba(255,82,82,0.2);color:#FF7A7A;border-color:rgba(255,82,82,0.6);}
+  /* Every rule is scoped under #insp-form so its id-level specificity (1,x,0)
+     beats the global button:not(...) rule (0,7,1) that would otherwise force an
+     orange gradient onto these buttons and hide the selected state. No
+     !important needed. appearance:none + explicit background make iOS Safari /
+     standalone PWA render our fill instead of native button chrome, and the
+     selected state is a persistent class (not :hover/:active), so it survives
+     scrolling and taps. */
+  #insp-form .uw-lbl{display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;}
+  #insp-form .insp-btn,
+  #insp-form .insp-type,
+  #insp-form .insp-overall{
+    -webkit-appearance:none;appearance:none;
+    -webkit-tap-highlight-color:transparent;
+    padding:16px 8px;border-radius:12px;font-weight:800;font-size:15px;
+    border:2px solid rgba(255,255,255,0.16);
+    background:rgba(255,255,255,0.04);color:var(--slate);
+    cursor:pointer;text-align:center;transition:none;box-shadow:none;
+  }
+  #insp-form .insp-btn{flex:1;}
+  #insp-form .insp-type{flex:1;padding:14px;}
+  #insp-form .insp-overall{padding:14px;}
+  /* Selected = solid, high-contrast fill with white text. */
+  #insp-form .insp-btn.pass.on{background:#1f9d57;color:#fff;border-color:#1f9d57;}
+  #insp-form .insp-btn.defect.on{background:#e5484d;color:#fff;border-color:#e5484d;}
+  #insp-form .insp-btn.na.on{background:#64748b;color:#fff;border-color:#64748b;}
+  #insp-form .insp-type.active{background:#FF6B1A;color:#1A1000;border-color:#FF6B1A;}
+  #insp-form .insp-overall.safe.on{background:#1f9d57;color:#fff;border-color:#1f9d57;}
+  #insp-form .insp-overall.warn.on{background:#f5842a;color:#1A1000;border-color:#f5842a;}
+  #insp-form .insp-overall.stop.on{background:#e5484d;color:#fff;border-color:#e5484d;}
 </style>
 """
 
