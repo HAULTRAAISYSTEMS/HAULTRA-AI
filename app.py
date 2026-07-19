@@ -17273,9 +17273,12 @@ def customers_page():
 
     empty_hidden = "" if not rows else " hidden"
     body = f"""
-    <div class="hero">
-        <h1>Customers</h1>
-        <p>Everyone you serve. Add a customer to generate their self-service portal link.</p>
+    <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+        <div>
+            <h1>Customers</h1>
+            <p>Everyone you serve. Add a customer to generate their self-service portal link.</p>
+        </div>
+        {_export_link(url_for('export_customers_csv'), "⬇ Export CSV")}
     </div>
     <div style="max-width:640px;margin-bottom:16px;">
         <button class="btn green" id="add-cust-toggle" onclick="toggleAdd()">+ Add Customer</button>
@@ -17674,7 +17677,10 @@ def customer_detail_page(customer_id):
             <h1 style="margin-bottom:4px;">{name}</h1>
             <p style="margin:0;">Customer details &amp; portal link.</p>
         </div>
-        <a class="btn secondary" href="{url_for('customers_page')}" style="white-space:nowrap;">← All customers</a>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end;">
+            {_print_link(url_for('customer_print', customer_id=customer_id))}
+            <a class="btn secondary" href="{url_for('customers_page')}" style="white-space:nowrap;">← All customers</a>
+        </div>
     </div>
 
     <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
@@ -18178,9 +18184,12 @@ def trucks_page():
 
     empty_hidden = "" if not rows else " hidden"
     body = f"""
-    <div class="hero">
-        <h1>Trucks</h1>
-        <p>Your fleet. Drivers run pre/post-trip inspections against these vehicles.</p>
+    <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+        <div>
+            <h1>Trucks</h1>
+            <p>Your fleet. Drivers run pre/post-trip inspections against these vehicles.</p>
+        </div>
+        {_export_link(url_for('export_inspections_csv'), "⬇ Inspections CSV")}
     </div>
     {add_form}
     <div id="truck-empty" class="empty-state" style="padding:32px 0;"{empty_hidden}>No trucks yet{'' if can_action else ' — an owner or dispatcher can add them'}.</div>
@@ -18515,7 +18524,10 @@ def truck_detail_page(truck_id):
     {totals_card}
     {add_maint}
     <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:8px;">
-        <h2 style="font-size:15px;margin:0 0 10px;">Maintenance log</h2>
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px;">
+            <h2 style="font-size:15px;margin:0;">Maintenance log</h2>
+            {_export_link(url_for('export_maintenance_csv') + _filter_qs(truck_id=truck_id, **{"from": _valid_date(date_from) or "", "to": _valid_date(date_to) or "", "cat": cat_filter or ""}))}
+        </div>
         <form method="GET" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:6px;">
             <div><label class="uw-lbl">From</label><input type="date" name="from" value="{e(date_from)}"></div>
             <div><label class="uw-lbl">To</label><input type="date" name="to" value="{e(date_to)}"></div>
@@ -18534,7 +18546,10 @@ def truck_detail_page(truck_id):
             <h1 style="margin-bottom:4px;">🚛 {e(truck["name"])}{_truck_status_badges(truck)}</h1>
             <p style="margin:0;">{sub_bits}</p>
         </div>
-        <a class="btn secondary" href="{url_for('trucks_page')}" style="white-space:nowrap;">← All trucks</a>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end;">
+            {_print_link(url_for('truck_history_print', truck_id=truck_id) + _truck_filter_qs(date_from, date_to, cat_filter), "🖨 Print history")}
+            <a class="btn secondary" href="{url_for('trucks_page')}" style="white-space:nowrap;">← All trucks</a>
+        </div>
     </div>
     {oos_html}
     <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
@@ -18547,7 +18562,10 @@ def truck_detail_page(truck_id):
     {edit_block}
     {maint_section}
     <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:8px;">
-        <h2 style="font-size:15px;margin:0 0 10px;">Inspection history</h2>
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px;">
+            <h2 style="font-size:15px;margin:0;">Inspection history</h2>
+            {_export_link(url_for('export_inspections_csv') + _filter_qs(truck_id=truck_id, **{"from": _valid_date(date_from) or "", "to": _valid_date(date_to) or ""}))}
+        </div>
         <form method="GET" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:6px;">
             <div><label class="uw-lbl">From</label><input type="date" name="from" value="{e(date_from)}"></div>
             <div><label class="uw-lbl">To</label><input type="date" name="to" value="{e(date_to)}"></div>
@@ -19066,7 +19084,10 @@ def inspection_report(inspection_id):
             <h1 style="margin-bottom:4px;">🚛 {e(insp["truck_name"])}{_truck_oos_badge(insp)}{_truck_at_vendor_badge(insp) if is_mgmt else ""}</h1>
             <p style="margin:0;">{e(_INSPECTION_TYPE_LABEL.get(insp["type"], insp["type"]))} inspection · {e((insp["created_at"] or ""))}</p>
         </div>
-        <a class="btn secondary" href="{back}" style="white-space:nowrap;">← Back</a>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end;">
+            {_print_link(url_for("inspection_report_print", inspection_id=inspection_id)) if is_mgmt else ""}
+            <a class="btn secondary" href="{back}" style="white-space:nowrap;">← Back</a>
+        </div>
     </div>
     <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
         <div style="font-weight:800;color:{ov_color};font-size:16px;">{e(_INSPECTION_OVERALL_LABEL.get(insp["overall"], insp["overall"]))}</div>
@@ -19312,10 +19333,16 @@ def maintenance_page():
     empty_hidden = "" if defects else " hidden"
     view_note = "" if can_action else '<p style="color:var(--slate);font-size:13px;">View-only — an owner or dispatcher resolves defects and logs maintenance.</p>'
     body = f"""
-    <div class="hero">
-        <h1>Maintenance</h1>
-        <p>Which truck, which vendor, what, when — and is it back in service. Costs optional.</p>
-        {view_note}
+    <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+        <div>
+            <h1>Maintenance</h1>
+            <p>Which truck, which vendor, what, when — and is it back in service. Costs optional.</p>
+            {view_note}
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;">
+            {_export_link(url_for('export_maintenance_csv'), "⬇ Maintenance CSV")}
+            {_export_link(url_for('export_defects_csv'), "⬇ Defects CSV")}
+        </div>
     </div>
     {totals_table}
     {add_entry_block}
@@ -19899,7 +19926,10 @@ def maintenance_entry_detail(entry_id):
     body = f"""
     <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
         <div><h1 style="margin-bottom:4px;">Maintenance</h1><p style="margin:0;">{truck_link}</p></div>
-        <a class="btn secondary" href="{url_for('truck_detail_page', truck_id=entry['truck_id'])}" style="white-space:nowrap;">← Truck</a>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end;">
+            {_print_link(url_for('maintenance_entry_print', entry_id=entry_id))}
+            <a class="btn secondary" href="{url_for('truck_detail_page', truck_id=entry['truck_id'])}" style="white-space:nowrap;">← Truck</a>
+        </div>
     </div>
     {voided_banner}
     <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
@@ -20091,9 +20121,12 @@ def requests_page():
     )
     empty_hidden = "" if not reqs else " hidden"
     body = f"""
-    <div class="hero">
-        <h1>Requests</h1>
-        <p>Customer requests awaiting your review. <strong>Accept</strong> confirms the job and sends it to Unassigned Work for scheduling{accept_assign_hint}.</p>
+    <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+        <div>
+            <h1>Requests</h1>
+            <p>Customer requests awaiting your review. <strong>Accept</strong> confirms the job and sends it to Unassigned Work for scheduling{accept_assign_hint}.</p>
+        </div>
+        {_export_link(url_for('export_requests_csv'), "⬇ History CSV")}
     </div>
     <div id="req-empty" class="empty-state" style="padding:32px 0;"{empty_hidden}>No pending requests.</div>
     <div id="req-list" class="bin-list" style="display:grid;gap:12px;max-width:640px;">
@@ -20101,6 +20134,667 @@ def requests_page():
     </div>
     """ + _REQUESTS_PAGE_JS
     return render_template_string(shell_page("Requests", body))
+
+
+# =========================================================
+# Phase 8 — PRINT & EXPORT.  Read-only: zero writes, zero schema changes.
+#
+# Product principle: the company's data belongs to the company. Any record
+# management can see, they can get out — as a clean printable document (browser
+# print → the OS "Save as PDF"/printer dialog, no server-side PDF lib) or a CSV
+# file (server-generated, hand-rolled RFC-4180 escaping, UTF-8). Every endpoint
+# is company-scoped and role-checked exactly like the view it exports; drivers
+# and the customer portal get nothing here (management owns exports).
+# =========================================================
+
+# ── small, consistent action affordances (screen-only; top-right of a view) ──
+def _print_link(href, label="🖨 Print"):
+    return (f'<a class="btn secondary" href="{href}" target="_blank" rel="noopener" '
+            f'style="padding:6px 12px;font-size:12px;white-space:nowrap;">{e(label)}</a>')
+
+
+def _export_link(href, label="⬇ CSV"):
+    return (f'<a class="btn secondary" href="{href}" '
+            f'style="padding:6px 12px;font-size:12px;white-space:nowrap;">{e(label)}</a>')
+
+
+def _filter_qs(**kw):
+    """A ?a=b&… query string from the given kwargs, dropping empty values."""
+    parts = {k: v for k, v in kw.items() if v}
+    return ("?" + urllib.parse.urlencode(parts)) if parts else ""
+
+
+def _truck_filter_qs(date_from, date_to, cat=None):
+    """?from=&to=&cat= for a truck-detail print link (valid, non-empty parts)."""
+    return _filter_qs(**{"from": _valid_date(date_from) or "",
+                         "to": _valid_date(date_to) or "", "cat": cat or ""})
+
+
+# ── CSV: hand-rolled so escaping is fully under our control ────────────────
+def _csv_field(v):
+    """One RFC-4180 field. Quote only when the value contains a comma, double
+    quote, CR or LF; escape embedded quotes by doubling them."""
+    s = "" if v is None else str(v)
+    if any(ch in s for ch in (",", '"', "\n", "\r")):
+        return '"' + s.replace('"', '""') + '"'
+    return s
+
+
+def _csv_bytes(header, rows):
+    """UTF-8 CSV bytes with a BOM (so Excel reads it as UTF-8) and CRLF line
+    endings. header: list[str]; rows: iterable of iterables."""
+    out = [",".join(_csv_field(c) for c in header)]
+    for r in rows:
+        out.append(",".join(_csv_field(c) for c in r))
+    return ("﻿" + "\r\n".join(out) + "\r\n").encode("utf-8")
+
+
+def _csv_money(cents):
+    """Integer cents → plain dollars with two decimals ('149.99'); '' when None.
+    No thousands separators — a bare number reopens cleanly in any spreadsheet."""
+    if cents is None:
+        return ""
+    neg = cents < 0
+    cents = abs(int(cents))
+    return f"{'-' if neg else ''}{cents // 100}.{cents % 100:02d}"
+
+
+def _valid_date(s):
+    s = (s or "").strip()
+    return s if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s) else None
+
+
+def _export_filename(report, date_from=None, date_to=None):
+    slug = re.sub(r"[^a-z0-9]+", "-", (session.get("company_name") or "haultra").lower()).strip("-") or "haultra"
+    span = f"{date_from or 'start'}_{date_to or 'today'}" if (date_from or date_to) else today_str()
+    return f"{slug}-{report}-{span}.csv"
+
+
+def _csv_response(report, header, rows, date_from=None, date_to=None):
+    from flask import Response
+    resp = Response(_csv_bytes(header, rows), mimetype="text/csv")
+    resp.headers["Content-Type"] = "text/csv; charset=utf-8"
+    resp.headers["Content-Disposition"] = (
+        f'attachment; filename="{_export_filename(report, date_from, date_to)}"')
+    return resp
+
+
+# ── print document shell (light, nav-less, print-optimized) ────────────────
+_PRINT_CSS = """
+<style>
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; padding:0; }
+  body{ background:#ececec; color:#1a1a1a;
+        font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+        -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+  .np-wrap{ max-width:820px; margin:0 auto; padding:18px 16px 60px; }
+  .np-bar{ display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px; }
+  .np-btn{ display:inline-flex; align-items:center; gap:6px; background:#1a1a1a; color:#fff; border:none;
+           border-radius:6px; padding:9px 16px; font-size:14px; font-weight:600; cursor:pointer; text-decoration:none; }
+  .np-back{ color:#333; text-decoration:none; font-size:14px; }
+  .np-sheet{ background:#fff; border:1px solid #d0d0d0; border-radius:8px; padding:30px 34px; }
+  .np-head{ display:flex; justify-content:space-between; align-items:flex-end; gap:12px;
+            border-bottom:2px solid #1a1a1a; padding-bottom:12px; margin-bottom:18px; }
+  .np-co{ font-size:22px; font-weight:800; letter-spacing:.4px; }
+  .np-doc{ font-size:12px; color:#555; text-transform:uppercase; letter-spacing:1px; font-weight:700; }
+  .np-h1{ font-size:20px; font-weight:800; margin:0 0 4px; }
+  .np-sub{ color:#555; font-size:14px; margin:0; }
+  .np-sec{ margin-top:22px; }
+  .np-sec-t{ font-size:12px; text-transform:uppercase; letter-spacing:1px; color:#555;
+             border-bottom:1px solid #d0d0d0; padding-bottom:4px; margin-bottom:10px; font-weight:700; }
+  .np-kv{ display:flex; gap:10px; font-size:14px; padding:3px 0; }
+  .np-kv b{ min-width:130px; color:#555; font-weight:600; }
+  table.np-tbl{ width:100%; border-collapse:collapse; font-size:13px; }
+  table.np-tbl th{ text-align:left; border-bottom:1.5px solid #1a1a1a; padding:6px 8px;
+                   font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:#555; }
+  table.np-tbl td{ border-bottom:1px solid #e0e0e0; padding:6px 8px; vertical-align:top; }
+  table.np-tbl tfoot td{ border-top:1.5px solid #1a1a1a; border-bottom:none; font-weight:800; }
+  .np-item{ padding:11px 0; border-bottom:1px solid #e0e0e0; page-break-inside:avoid; }
+  .np-item:last-child{ border-bottom:none; }
+  .np-res{ font-weight:800; font-size:12px; letter-spacing:.5px; }
+  .np-note{ font-size:13px; color:#333; margin-top:3px; }
+  .np-photo{ max-width:230px; max-height:230px; border:1px solid #ccc; border-radius:4px; margin:8px 8px 0 0; }
+  .np-foot{ margin-top:28px; padding-top:10px; border-top:1px solid #d0d0d0; font-size:11px; color:#777; }
+  @media print {
+    body{ background:#fff; }
+    .np-wrap{ max-width:none; padding:0; }
+    .np-sheet{ border:none; border-radius:0; padding:0; }
+    .no-print{ display:none !important; }
+    .page-break{ page-break-before:always; }
+    a{ color:#000; text-decoration:none; }
+  }
+  @page{ margin:14mm; }
+</style>
+"""
+
+
+def print_page(doc_label, title, subtitle_html, body_inner, back_url=None):
+    """A standalone printable document — no app nav, light background, @media
+    print rules. subtitle_html and body_inner are pre-escaped HTML the caller
+    builds. Returned as a plain string (NOT through render_template_string) so
+    record data is never evaluated as a Jinja template."""
+    company = e(session.get("company_name") or "HAULTRA")
+    back = (f'<a href="{back_url}" class="np-back">← Back</a>' if back_url else "<span></span>")
+    sub = f'<p class="np-sub">{subtitle_html}</p>' if subtitle_html else ""
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8">
+<title>{e(title)}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{_PRINT_CSS}</head><body>
+<div class="np-wrap">
+  <div class="np-bar no-print">
+    {back}
+    <button class="np-btn" onclick="window.print()">🖨 Print / Save PDF</button>
+  </div>
+  <div class="np-sheet">
+    <div class="np-head">
+      <div class="np-co">{company}</div>
+      <div class="np-doc">{e(doc_label)}</div>
+    </div>
+    <h1 class="np-h1">{e(title)}</h1>
+    {sub}
+    {body_inner}
+    <div class="np-foot">Generated {e(now_ts())} · {company} · immutable record printed for your files</div>
+  </div>
+</div>
+</body></html>"""
+
+
+# ── 1. PRINT VIEWS (single records) ────────────────────────────────────────
+@app.route("/inspection/<int:inspection_id>/print")
+@login_required
+def inspection_report_print(inspection_id):
+    """DOT-auditor DVIR document for one inspection. Management only — the
+    official record view (mirrors inspection_report's company scope)."""
+    if not _is_management():
+        abort(403)
+    conn = get_db()
+    insp = conn.execute(
+        """SELECT i.*, t.name AS truck_name, t.make_model, t.plate,
+                  COALESCE(u.full_name, u.username, '—') AS driver_name
+             FROM inspections i
+             JOIN trucks t ON i.truck_id=t.id
+        LEFT JOIN users  u ON i.driver_id=u.id
+            WHERE i.id=? AND i.company_id=?""",
+        (inspection_id, cid()),
+    ).fetchone()
+    if insp is None:
+        conn.close()
+        abort(404)
+    items = conn.execute(
+        "SELECT * FROM inspection_items WHERE inspection_id=? ORDER BY id",
+        (inspection_id,),
+    ).fetchall()
+    conn.close()
+
+    _RES = {"pass": ("PASS", "#137a2e"), "defect": ("DEFECT", "#b3261e"), "na": ("N/A", "#555")}
+    _DEF = {"open": "Open", "repaired": "Repaired", "deferred": "Deferred"}
+    items_html = ""
+    for it in items:
+        label_txt, color = _RES.get(it["result"], (it["result"], "#555"))
+        note = f'<div class="np-note">{e(it["note"])}</div>' if it["note"] else ""
+        photo = ""
+        if it["photo_path"]:
+            purl = url_for("serve_inspection_photo", item_id=it["id"])
+            photo = f'<div><img class="np-photo" src="{purl}"></div>'
+        defstat = ""
+        if it["result"] == "defect" and it["defect_status"]:
+            res_note = f' — {e(it["resolution_note"])}' if it["resolution_note"] else ""
+            defstat = (f'<div class="np-note"><b>Defect status:</b> '
+                       f'{e(_DEF.get(it["defect_status"], it["defect_status"]))}{res_note}</div>')
+        items_html += f"""
+        <div class="np-item">
+            <div style="display:flex;justify-content:space-between;gap:12px;">
+                <span style="font-weight:700;font-size:14px;">{e(it["label"])}</span>
+                <span class="np-res" style="color:{color};">{label_txt}</span>
+            </div>
+            {note}{defstat}{photo}
+        </div>"""
+    if not items:
+        items_html = '<div class="np-note">No checklist items recorded.</div>'
+
+    tsub = " · ".join(b for b in [e(insp["make_model"] or ""), e(insp["plate"] or "")] if b)
+    subtitle = (f'{e(_INSPECTION_TYPE_LABEL.get(insp["type"], insp["type"]))} inspection'
+                f' &middot; {e((insp["created_at"] or ""))}')
+    body_inner = f"""
+    <div class="np-sec">
+        <div class="np-kv"><b>Truck</b><span>{e(insp["truck_name"])}{(" · " + tsub) if tsub else ""}</span></div>
+        <div class="np-kv"><b>Driver</b><span>{e(insp["driver_name"])}</span></div>
+        <div class="np-kv"><b>Type</b><span>{e(_INSPECTION_TYPE_LABEL.get(insp["type"], insp["type"]))}</span></div>
+        <div class="np-kv"><b>Date / time</b><span>{e(insp["created_at"] or "")}</span></div>
+        <div class="np-kv"><b>Overall judgment</b><span style="font-weight:800;">{e(_INSPECTION_OVERALL_LABEL.get(insp["overall"], insp["overall"]))}</span></div>
+    </div>
+    <div class="np-sec">
+        <div class="np-sec-t">Checklist</div>
+        {items_html}
+    </div>
+    <div class="np-sec">
+        <div class="np-sec-t">Signature</div>
+        <div class="np-kv"><b>Signed by</b><span style="font-weight:700;">{e(insp["signature_name"])}</span></div>
+        <div class="np-kv"><b>Timestamp</b><span>{e(insp["created_at"] or "")}</span></div>
+    </div>"""
+    return print_page("Driver Vehicle Inspection Report", f'DVIR — {insp["truck_name"]}',
+                      subtitle, body_inner,
+                      back_url=url_for("inspection_report", inspection_id=inspection_id))
+
+
+@app.route("/maintenance/entry/<int:entry_id>/print")
+@roles_required("owner", "customer_manager", "dispatcher")
+def maintenance_entry_print(entry_id):
+    """Printable repair/maintenance record for one manual entry — cost, vendor,
+    receipts, status trail. Management only (mirrors maintenance_entry_detail)."""
+    conn = get_db()
+    entry = _load_manual_entry(conn, entry_id)
+    if entry is None:
+        conn.close()
+        abort(404)
+    truck = conn.execute("SELECT name, make_model, plate, at_vendor FROM trucks WHERE id=? AND company_id=?",
+                         (entry["truck_id"], cid())).fetchone()
+    receipts = _maintenance_receipts(conn, manual_entry_id=entry_id)
+    creator = conn.execute("SELECT COALESCE(full_name, username) AS n FROM users WHERE id=?",
+                           (entry["created_by"],)).fetchone()
+    vmap = _vendor_map(conn)
+    conn.close()
+
+    ed = dict(entry)
+    vendor_name = vmap.get(ed.get("vendor_id")) or "In-house / none"
+    if entry["voided"]:
+        status = "Voided"
+    elif ed.get("at_vendor"):
+        status = f"At vendor ({e(vmap.get(ed.get('vendor_id')) or 'vendor')})"
+    else:
+        status = "Logged"
+    photos_html = ""
+    if receipts:
+        imgs = "".join(f'<img class="np-photo" src="{url_for("serve_maintenance_photo", photo_id=r["id"])}">'
+                       for r in receipts)
+        photos_html = f'<div class="np-sec"><div class="np-sec-t">Receipts</div>{imgs}</div>'
+    voided_html = ""
+    if entry["voided"]:
+        voided_html = (f'<div class="np-sec"><div class="np-sec-t">Voided</div>'
+                       f'<div class="np-note">{e(entry["void_note"] or "")} · {e(entry["voided_at"] or "")}</div></div>')
+    tsub = " · ".join(b for b in [e(truck["make_model"] or ""), e(truck["plate"] or "")] if truck and b)
+    body_inner = f"""
+    <div class="np-sec">
+        <div class="np-kv"><b>Truck</b><span>{e(truck["name"]) if truck else "—"}{(" · " + tsub) if tsub else ""}</span></div>
+        <div class="np-kv"><b>Date</b><span>{e(entry["entry_date"])}</span></div>
+        <div class="np-kv"><b>Category</b><span>{e(entry["category"])}</span></div>
+        <div class="np-kv"><b>Description</b><span>{e(entry["description"])}</span></div>
+        <div class="np-kv"><b>Vendor</b><span>{e(vendor_name)}</span></div>
+        <div class="np-kv"><b>Cost</b><span>{e(format_cents(entry["cost_cents"]))}</span></div>
+        <div class="np-kv"><b>Source</b><span>Manual entry</span></div>
+        <div class="np-kv"><b>Status</b><span>{status}</span></div>
+        <div class="np-kv"><b>Logged by</b><span>{e(creator["n"] if creator else "—")} · {e(entry["created_at"] or "")}</span></div>
+    </div>
+    {voided_html}
+    {photos_html}"""
+    return print_page("Maintenance / Repair Record",
+                      f'Maintenance — {truck["name"] if truck else "Truck"}',
+                      f'{e(entry["entry_date"])} &middot; {e(entry["category"])}',
+                      body_inner, back_url=url_for("maintenance_entry_detail", entry_id=entry_id))
+
+
+@app.route("/trucks/<int:truck_id>/print")
+@roles_required("owner", "customer_manager", "dispatcher")
+def truck_history_print(truck_id):
+    """Full chronological maintenance history for one truck over a date range,
+    with per-category subtotals (spend when costs exist, else event counts)."""
+    conn = get_db()
+    truck = _load_truck_scoped(conn, truck_id)
+    if truck is None:
+        conn.close()
+        abort(404)
+    df = _valid_date(request.args.get("from"))
+    dt = _valid_date(request.args.get("to"))
+    cat = (request.args.get("cat") or "").strip()
+    if cat not in MAINTENANCE_CATEGORIES:
+        cat = ""
+    mlog = _truck_maintenance_log(conn, truck_id, date_from=df, date_to=dt, category=(cat or None))
+    has_costs = _company_has_costs(conn)
+    conn.close()
+
+    rows_html = ""
+    cat_totals = {}   # category -> (count, cents)
+    for r in mlog:
+        cost = "" if r["cost_cents"] is None else format_cents(r["cost_cents"])
+        src = "Inspection defect" if r["source"] == "defect" else "Manual"
+        flags = []
+        if r["voided"]:
+            flags.append("VOID")
+        if r.get("at_vendor") and not r["voided"]:
+            flags.append("At vendor")
+        flag_txt = f' <span style="color:#b3261e;font-weight:700;">{e(" · ".join(flags))}</span>' if flags else ""
+        rows_html += f"""<tr>
+            <td>{e(r["date"])}</td>
+            <td>{e(r["category"])}</td>
+            <td>{e(r["description"])}{flag_txt}</td>
+            <td>{e(r["vendor"] or "")}</td>
+            <td>{e(src)}</td>
+            <td style="text-align:right;white-space:nowrap;">{e(cost)}</td>
+        </tr>"""
+        # subtotals exclude voided rows
+        if not r["voided"]:
+            c, cents = cat_totals.get(r["category"], (0, 0))
+            cat_totals[r["category"]] = (c + 1, cents + (r["cost_cents"] or 0))
+    if not mlog:
+        rows_html = '<tr><td colspan="6" style="color:#777;">No maintenance in this range.</td></tr>'
+
+    # Per-category subtotals: spend if any cost recorded company-wide, else counts.
+    sub_rows = ""
+    tot_count = tot_cents = 0
+    for c in sorted(cat_totals):
+        cnt, cents = cat_totals[c]
+        tot_count += cnt
+        tot_cents += cents
+        metric = format_cents(cents) if has_costs else f"{cnt} event{'' if cnt == 1 else 's'}"
+        sub_rows += (f'<tr><td>{e(c)}</td>'
+                     f'<td style="text-align:right;white-space:nowrap;">{e(metric)}</td></tr>')
+    total_metric = format_cents(tot_cents) if has_costs else f"{tot_count} event{'' if tot_count == 1 else 's'}"
+    subtotals_html = ""
+    if cat_totals:
+        subtotals_html = f"""
+        <div class="np-sec">
+            <div class="np-sec-t">{'Subtotals by category' if has_costs else 'Event counts by category'}</div>
+            <table class="np-tbl"><tbody>{sub_rows}</tbody>
+            <tfoot><tr><td>Total</td><td style="text-align:right;">{e(total_metric)}</td></tr></tfoot></table>
+        </div>"""
+
+    span = (f'{df or "start"} → {dt or "today"}' if (df or dt) else "All time")
+    if cat:
+        span += f' &middot; {e(cat)}'
+    tsub = " · ".join(b for b in [e(truck["make_model"] or ""), e(truck["plate"] or "")] if b)
+    body_inner = f"""
+    <div class="np-sec">
+        <div class="np-kv"><b>Truck</b><span>{e(truck["name"])}{(" · " + tsub) if tsub else ""}</span></div>
+        <div class="np-kv"><b>Range</b><span>{span}</span></div>
+    </div>
+    <div class="np-sec">
+        <div class="np-sec-t">Maintenance log</div>
+        <table class="np-tbl">
+            <thead><tr><th>Date</th><th>Category</th><th>Description</th><th>Vendor</th><th>Source</th><th style="text-align:right;">Cost</th></tr></thead>
+            <tbody>{rows_html}</tbody>
+        </table>
+    </div>
+    {subtotals_html}"""
+    return print_page("Truck Maintenance History", f'Maintenance history — {truck["name"]}',
+                      span, body_inner, back_url=url_for("truck_detail_page", truck_id=truck_id))
+
+
+@app.route("/customers/<int:customer_id>/print")
+@roles_required("customer_manager")
+def customer_print(customer_id):
+    """Printable customer record: info, sites, bins (with labels), request
+    history summary. Management (customer_manager/owner)."""
+    conn = get_db()
+    cust = _load_customer_scoped(conn, customer_id)
+    if cust is None:
+        conn.close()
+        abort(404)
+    sites = conn.execute("SELECT address, notes FROM sites WHERE customer_id=? ORDER BY id",
+                         (customer_id,)).fetchall()
+    bins = conn.execute(
+        """SELECT b.size, b.label, b.dropped_at, s.address AS site_address
+             FROM bins b LEFT JOIN sites s ON b.site_id=s.id
+            WHERE b.customer_id=? ORDER BY b.id""",
+        (customer_id,)).fetchall()
+    reqs = conn.execute(
+        """SELECT r.type, r.status, r.created_at, ro.route_date AS scheduled_date
+             FROM requests r
+        LEFT JOIN stops st ON r.stop_id=st.id
+        LEFT JOIN routes ro ON st.route_id=ro.id
+            WHERE r.customer_id=? ORDER BY r.created_at DESC, r.id DESC""",
+        (customer_id,)).fetchall()
+    conn.close()
+
+    _TYPE = {"PR": "PR · Pull & Return", "P": "P · Pickup", "D": "D · Drop",
+             "NEW_BIN": "New bin", "S": "S · Swap"}
+    _STAT = {"pending": "Pending", "accepted": "Accepted", "approved": "Approved",
+             "scheduled": "Scheduled", "in_progress": "In progress", "done": "Done", "denied": "Denied"}
+
+    sites_html = "".join(
+        f'<div class="np-item">📍 {e(s["address"] or "—")}'
+        f'{("<div class=np-note>" + e(s["notes"]) + "</div>") if s["notes"] else ""}</div>'
+        for s in sites) or '<div class="np-note">No sites.</div>'
+
+    bin_rows = ""
+    for b in bins:
+        lbl = f' — {e(b["label"])}' if b["label"] else ""
+        dropped = f' · dropped {e(b["dropped_at"])}' if b["dropped_at"] else ""
+        bin_rows += (f'<tr><td>{e(b["size"] or "Dumpster")}{lbl}</td>'
+                     f'<td>{e(b["site_address"] or "—")}{dropped}</td></tr>')
+    if not bins:
+        bin_rows = '<tr><td colspan="2" style="color:#777;">No active bins.</td></tr>'
+
+    req_rows = ""
+    for r in reqs:
+        req_rows += (f'<tr><td>{e((r["created_at"] or "")[:10])}</td>'
+                     f'<td>{e(_TYPE.get(r["type"], r["type"]))}</td>'
+                     f'<td>{e(_STAT.get(r["status"], r["status"]))}</td>'
+                     f'<td>{e(r["scheduled_date"] or "")}</td></tr>')
+    if not reqs:
+        req_rows = '<tr><td colspan="4" style="color:#777;">No requests yet.</td></tr>'
+
+    name = cust["business_name"] or cust["contact_name"] or "Customer"
+    contact_bits = " · ".join(b for b in [e(cust["contact_name"] or ""), e(cust["phone"] or "")] if b) or "—"
+    body_inner = f"""
+    <div class="np-sec">
+        <div class="np-kv"><b>Contact</b><span>{contact_bits}</span></div>
+        <div class="np-kv"><b>Active bins</b><span>{len(bins)}</span></div>
+        <div class="np-kv"><b>Sites</b><span>{len(sites)}</span></div>
+    </div>
+    <div class="np-sec">
+        <div class="np-sec-t">Sites</div>
+        {sites_html}
+    </div>
+    <div class="np-sec">
+        <div class="np-sec-t">Bins</div>
+        <table class="np-tbl"><thead><tr><th>Bin</th><th>Location</th></tr></thead><tbody>{bin_rows}</tbody></table>
+    </div>
+    <div class="np-sec">
+        <div class="np-sec-t">Request history</div>
+        <table class="np-tbl"><thead><tr><th>Requested</th><th>Type</th><th>Status</th><th>Scheduled</th></tr></thead><tbody>{req_rows}</tbody></table>
+    </div>"""
+    return print_page("Customer Record", e(name), contact_bits, body_inner,
+                      back_url=url_for("customer_detail_page", customer_id=customer_id))
+
+
+# ── 2. CSV EXPORTS (lists) ─────────────────────────────────────────────────
+@app.route("/export/inspections.csv")
+@roles_required("owner", "customer_manager", "dispatcher", api=True)
+def export_inspections_csv():
+    """Inspections list — optional ?truck_id, ?from, ?to. Same scope/roles as
+    the truck-detail inspection history."""
+    df = _valid_date(request.args.get("from"))
+    dt = _valid_date(request.args.get("to"))
+    where = ["i.company_id=?"]
+    params = [cid()]
+    truck_id = (request.args.get("truck_id") or "").strip()
+    if truck_id.isdigit():
+        where.append("i.truck_id=?")
+        params.append(int(truck_id))
+    if df:
+        where.append("substr(i.created_at,1,10) >= ?")
+        params.append(df)
+    if dt:
+        where.append("substr(i.created_at,1,10) <= ?")
+        params.append(dt)
+    conn = get_db()
+    rows = conn.execute(
+        f"""SELECT i.created_at, t.name AS truck, COALESCE(u.full_name,u.username,'—') AS driver,
+                   i.type, i.overall,
+                   (SELECT COUNT(*) FROM inspection_items ii
+                     WHERE ii.inspection_id=i.id AND ii.result='defect') AS defects
+              FROM inspections i
+              JOIN trucks t ON i.truck_id=t.id
+         LEFT JOIN users u ON i.driver_id=u.id
+             WHERE {' AND '.join(where)}
+             ORDER BY i.created_at DESC, i.id DESC""",
+        params,
+    ).fetchall()
+    conn.close()
+    header = ["Date", "Truck", "Driver", "Type", "Result", "Defect count"]
+    out = [[
+        r["created_at"] or "", r["truck"], r["driver"],
+        _INSPECTION_TYPE_LABEL.get(r["type"], r["type"]),
+        _INSPECTION_OVERALL_LABEL.get(r["overall"], r["overall"]),
+        r["defects"],
+    ] for r in rows]
+    return _csv_response("inspections", header, out, df, dt)
+
+
+@app.route("/export/maintenance.csv")
+@roles_required("owner", "customer_manager", "dispatcher", api=True)
+def export_maintenance_csv():
+    """Maintenance log — repaired defects + manual entries, per-truck (?truck_id)
+    or fleet. Optional ?from, ?to, ?cat."""
+    df = _valid_date(request.args.get("from"))
+    dt = _valid_date(request.args.get("to"))
+    cat = (request.args.get("cat") or "").strip()
+    if cat not in MAINTENANCE_CATEGORIES:
+        cat = ""
+    truck_id = (request.args.get("truck_id") or "").strip()
+    conn = get_db()
+    if truck_id.isdigit():
+        trucks = conn.execute("SELECT id, name FROM trucks WHERE id=? AND company_id=?",
+                              (int(truck_id), cid())).fetchall()
+    else:
+        trucks = conn.execute("SELECT id, name FROM trucks WHERE company_id=? ORDER BY LOWER(name), id",
+                              (cid(),)).fetchall()
+    merged = []
+    for t in trucks:
+        for r in _truck_maintenance_log(conn, t["id"], date_from=df, date_to=dt, category=(cat or None)):
+            merged.append((t["name"], r))
+    conn.close()
+    merged.sort(key=lambda tr: tr[1]["sort_key"], reverse=True)
+
+    def _status(r):
+        if r["voided"]:
+            return "Voided"
+        if r["source"] == "defect":
+            return "Repaired"
+        if r.get("at_vendor"):
+            return "At vendor"
+        return "Logged"
+    header = ["Date", "Truck", "Category", "Description", "Vendor", "Cost", "Status", "Source"]
+    out = [[
+        r["date"], tname, r["category"], r["description"], r["vendor"] or "",
+        _csv_money(r["cost_cents"]), _status(r),
+        "Inspection defect" if r["source"] == "defect" else "Manual",
+    ] for tname, r in merged]
+    return _csv_response("maintenance", header, out, df, dt)
+
+
+@app.route("/export/defects.csv")
+@roles_required("owner", "customer_manager", "dispatcher", api=True)
+def export_defects_csv():
+    """Defects — open + closed (repaired/deferred). Optional ?status=open|closed,
+    ?truck_id."""
+    where = ["i.company_id=?", "ii.result='defect'"]
+    params = [cid()]
+    st = (request.args.get("status") or "").strip().lower()
+    if st == "open":
+        where.append("ii.defect_status='open'")
+    elif st == "closed":
+        where.append("ii.defect_status IN ('repaired','deferred')")
+    truck_id = (request.args.get("truck_id") or "").strip()
+    if truck_id.isdigit():
+        where.append("i.truck_id=?")
+        params.append(int(truck_id))
+    conn = get_db()
+    rows = conn.execute(
+        f"""SELECT ii.label, ii.defect_status, ii.resolution_note, ii.resolved_at,
+                   i.created_at AS reported_at, t.name AS truck
+              FROM inspection_items ii
+              JOIN inspections i ON ii.inspection_id=i.id
+              JOIN trucks t ON i.truck_id=t.id
+             WHERE {' AND '.join(where)}
+             ORDER BY (ii.defect_status='open') DESC, i.created_at DESC, ii.id DESC""",
+        params,
+    ).fetchall()
+    conn.close()
+    _DEF = {"open": "Open", "repaired": "Repaired", "deferred": "Deferred"}
+    header = ["Status", "Truck", "Item", "Reported date", "Resolved date", "Resolution"]
+    out = [[
+        _DEF.get(r["defect_status"], r["defect_status"] or "Open"), r["truck"], r["label"],
+        (r["reported_at"] or "")[:10], (r["resolved_at"] or "")[:10] if r["resolved_at"] else "",
+        r["resolution_note"] or "",
+    ] for r in rows]
+    return _csv_response("defects", header, out)
+
+
+@app.route("/export/customers.csv")
+@roles_required("customer_manager", api=True)
+def export_customers_csv():
+    """Customers — business, contact, phone, sites, active bins, open requests.
+    Same roles as the customers list."""
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT c.business_name, c.contact_name, c.phone,
+                  (SELECT COUNT(*) FROM sites s WHERE s.customer_id=c.id) AS sites,
+                  (SELECT COUNT(*) FROM bins b WHERE b.customer_id=c.id) AS bins,
+                  (SELECT COUNT(*) FROM requests r
+                     WHERE r.customer_id=c.id
+                       AND r.status IN ('pending','accepted','approved','scheduled','in_progress')) AS open_reqs
+             FROM customers c
+            WHERE c.company_id=? AND c.is_active=1
+            ORDER BY LOWER(COALESCE(c.business_name, c.contact_name, '')), c.id""",
+        (cid(),),
+    ).fetchall()
+    conn.close()
+    header = ["Business", "Contact", "Phone", "Sites", "Active bins", "Open requests"]
+    out = [[r["business_name"] or "", r["contact_name"] or "", r["phone"] or "",
+            r["sites"], r["bins"], r["open_reqs"]] for r in rows]
+    return _csv_response("customers", header, out)
+
+
+@app.route("/export/requests.csv")
+@roles_required("customer_manager", api=True)
+def export_requests_csv():
+    """Requests history — every request for the company. Optional ?status,
+    ?from, ?to (on the created date)."""
+    df = _valid_date(request.args.get("from"))
+    dt = _valid_date(request.args.get("to"))
+    where = ["c.company_id=?"]
+    params = [cid()]
+    st = (request.args.get("status") or "").strip()
+    if st in REQUEST_STATUSES:
+        where.append("r.status=?")
+        params.append(st)
+    if df:
+        where.append("substr(r.created_at,1,10) >= ?")
+        params.append(df)
+    if dt:
+        where.append("substr(r.created_at,1,10) <= ?")
+        params.append(dt)
+    conn = get_db()
+    rows = conn.execute(
+        f"""SELECT r.created_at, r.type, r.status, r.updated_at,
+                   c.business_name, c.contact_name, s.address AS site,
+                   ro.route_date AS scheduled_date
+              FROM requests r
+              JOIN customers c ON r.customer_id=c.id
+              JOIN sites s ON r.site_id=s.id
+         LEFT JOIN stops st ON r.stop_id=st.id
+         LEFT JOIN routes ro ON st.route_id=ro.id
+             WHERE {' AND '.join(where)}
+             ORDER BY r.created_at DESC, r.id DESC""",
+        params,
+    ).fetchall()
+    conn.close()
+    _TYPE = {"PR": "PR · Pull & Return", "P": "P · Pickup", "D": "D · Drop",
+             "NEW_BIN": "New bin", "S": "S · Swap"}
+    _STAT = {"pending": "Pending", "accepted": "Accepted", "approved": "Approved",
+             "scheduled": "Scheduled", "in_progress": "In progress", "done": "Done", "denied": "Denied"}
+    header = ["Date", "Customer", "Type", "Status", "Site", "Scheduled date", "Completed date"]
+    out = [[
+        (r["created_at"] or "")[:10],
+        r["business_name"] or r["contact_name"] or "Customer",
+        _TYPE.get(r["type"], r["type"]), _STAT.get(r["status"], r["status"]),
+        r["site"] or "",
+        r["scheduled_date"] or "",
+        (r["updated_at"] or "")[:10] if r["status"] == "done" else "",
+    ] for r in rows]
+    return _csv_response("requests", header, out, df, dt)
 
 
 # =========================================================
