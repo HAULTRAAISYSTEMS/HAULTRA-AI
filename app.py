@@ -1602,6 +1602,52 @@ _INSPECTION_OVERALL_LABEL = {
     "out_of_service": "OUT OF SERVICE (unsafe)",
 }
 
+# Phase 7A — data-driven maintenance category pick list (validated server-side).
+# Repaired inspection defects are surfaced in the log under "Repair".
+MAINTENANCE_CATEGORIES = [
+    "Oil/Fluids", "Tires", "Brakes", "Hydraulics/Hoist",
+    "Electrical", "PM Service", "Repair", "Other",
+]
+# How long after creation a manual maintenance entry stays editable (then locked).
+MAINTENANCE_EDIT_WINDOW_SECONDS = 24 * 3600
+
+
+def parse_cost_cents(raw):
+    """Parse a user-entered dollar amount into INTEGER CENTS without ever
+    touching a float (float cents are lossy). Accepts '', '12', '12.5',
+    '$1,250.00'. Returns (cents:int|None, error:str|None). Empty → (None, None)
+    since cost is optional. Negative or >~$1M rejected."""
+    if raw is None:
+        return None, None
+    s = str(raw).strip().replace("$", "").replace(",", "")
+    if s == "":
+        return None, None
+    neg = s.startswith("-")
+    if neg:
+        return None, "cost cannot be negative"
+    if "." in s:
+        whole, _, frac = s.partition(".")
+    else:
+        whole, frac = s, ""
+    whole = whole or "0"
+    if not whole.isdigit() or (frac and not frac.isdigit()):
+        return None, "cost must be a number like 149.99"
+    frac = (frac + "00")[:2]  # pad/truncate to exactly 2 decimals, integer-only
+    cents = int(whole) * 100 + int(frac)
+    if cents > 100_000_000:  # $1,000,000 sanity ceiling
+        return None, "cost is too large"
+    return cents, None
+
+
+def format_cents(cents):
+    """Integer cents → '$1,250.00'. None → '—'."""
+    if cents is None:
+        return "—"
+    neg = cents < 0
+    cents = abs(int(cents))
+    dollars, rem = divmod(cents, 100)
+    return f"{'-' if neg else ''}${dollars:,}.{rem:02d}"
+
 
 def init_db():
     conn = get_db()
@@ -1984,6 +2030,13 @@ def init_db():
     # token access without destroying history.
     safe_add_column(conn, "customers", "is_active INTEGER NOT NULL DEFAULT 1")
 
+    # Phase 7A — costs on repaired defects. Money is stored as INTEGER CENTS,
+    # never a float. All nullable/additive; existing repair fields untouched.
+    safe_add_column(conn, "inspection_items", "cost_cents INTEGER")
+    safe_add_column(conn, "inspection_items", "vendor TEXT")
+    # Phase 7B — optional customer-visible bin label ("by the front gate").
+    safe_add_column(conn, "bins", "label TEXT")
+
     # --- Per-route boss <-> driver messages: minimal thread, one row per
     #     message. "Unread" is derived per-viewer as "not sent by me and
     #     read_at IS NULL" rather than tracked per-recipient, since a route
@@ -2228,6 +2281,49 @@ def init_db():
             [(lbl, hint, i, _ts) for i, (lbl, hint) in enumerate(DEFAULT_CHECKLIST)],
         )
         conn.commit()
+
+    # Phase 7A — manual (non-inspection) maintenance entries. Money is stored as
+    # INTEGER CENTS (cost_cents), never a float. Editable by owner/dispatcher for
+    # EDIT_WINDOW after creation, then locked; never deleted — a `voided` flag +
+    # required note preserves the record.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS maintenance_entries (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id  INTEGER NOT NULL,
+        truck_id    INTEGER NOT NULL,
+        entry_date  TEXT NOT NULL,
+        category    TEXT NOT NULL,
+        description TEXT NOT NULL,
+        cost_cents  INTEGER,
+        vendor      TEXT,
+        created_by  INTEGER NOT NULL,
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT,
+        voided      INTEGER NOT NULL DEFAULT 0,
+        void_note   TEXT,
+        voided_by   INTEGER,
+        voided_at   TEXT,
+        FOREIGN KEY (company_id) REFERENCES companies(id),
+        FOREIGN KEY (truck_id)   REFERENCES trucks(id)
+    )
+    """)
+
+    # Receipt photos for maintenance — attaches to EITHER a repaired defect
+    # (inspection_items.id) or a manual entry (maintenance_entries.id). Exactly
+    # one of the two link columns is set. Multiple rows per record = multiple
+    # receipts. Cost data → management-only serving.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS maintenance_photos (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id     INTEGER NOT NULL,
+        defect_item_id INTEGER,
+        manual_entry_id INTEGER,
+        file_path      TEXT NOT NULL,
+        uploaded_at    TEXT NOT NULL,
+        uploaded_by    INTEGER,
+        FOREIGN KEY (company_id) REFERENCES companies(id)
+    )
+    """)
 
     # --- default company bootstrap ---
     default_co = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()
@@ -17336,6 +17432,139 @@ def _open_defect_count(conn):
     ).fetchone()["n"]
 
 
+# ── Phase 7A maintenance-log helpers ──────────────────────────────────────
+def _save_maintenance_receipts(conn, files, defect_item_id=None, manual_entry_id=None):
+    """Persist any uploaded receipt photos (reuses the stop-photo pipeline:
+    filesystem + web-relative path row). Returns count saved. Skips silently on
+    a disk error so a receipt hiccup never rolls back the maintenance write."""
+    saved = 0
+    for f in files or []:
+        if not f or not f.filename or not allowed_file(f.filename):
+            continue
+        try:
+            fname = f"mnt_{secrets.token_hex(8)}_{secure_filename(f.filename)}"
+            f.save(os.path.join(app.config["UPLOAD_FOLDER"], fname))
+            conn.execute(
+                """INSERT INTO maintenance_photos (company_id, defect_item_id,
+                       manual_entry_id, file_path, uploaded_at, uploaded_by)
+                   VALUES (?,?,?,?,?,?)""",
+                (cid(), defect_item_id, manual_entry_id,
+                 os.path.join("static", "uploads", fname), now_ts(), session.get("user_id")),
+            )
+            saved += 1
+        except OSError as exc:
+            app.logger.warning("maintenance receipt save failed: %s", exc)
+    return saved
+
+
+def _maintenance_receipts(conn, defect_item_id=None, manual_entry_id=None):
+    """Rows of receipt photos for one record (company-scoped)."""
+    if defect_item_id is not None:
+        return conn.execute(
+            "SELECT * FROM maintenance_photos WHERE company_id=? AND defect_item_id=? ORDER BY id",
+            (cid(), defect_item_id)).fetchall()
+    return conn.execute(
+        "SELECT * FROM maintenance_photos WHERE company_id=? AND manual_entry_id=? ORDER BY id",
+        (cid(), manual_entry_id)).fetchall()
+
+
+def _receipt_thumbs_html(rows):
+    """Small thumbnail gallery for receipt photos (management views only)."""
+    if not rows:
+        return ""
+    imgs = "".join(
+        f'<a href="{url_for("serve_maintenance_photo", photo_id=r["id"])}" target="_blank">'
+        f'<img src="{url_for("serve_maintenance_photo", photo_id=r["id"])}" loading="lazy" '
+        f'style="width:54px;height:54px;object-fit:cover;border-radius:8px;border:1px solid var(--border);"></a>'
+        for r in rows
+    )
+    return f'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;">{imgs}</div>'
+
+
+def _truck_maintenance_log(conn, truck_id, date_from=None, date_to=None, category=None):
+    """Merged chronological maintenance log for one truck: repaired inspection
+    defects + manual entries. Returns a list of uniform dicts (newest first).
+    cost_cents is None when not recorded. Voided manual entries are included but
+    flagged (and excluded from spend totals by the caller)."""
+    # Repaired defects — dated by resolved_at.
+    defects = conn.execute(
+        """SELECT ii.id AS ref_id, ii.label, ii.resolution_note, ii.cost_cents,
+                  ii.vendor, ii.resolved_at, i.truck_id, i.id AS inspection_id
+             FROM inspection_items ii
+             JOIN inspections i ON ii.inspection_id = i.id
+            WHERE i.company_id=? AND i.truck_id=? AND ii.result='defect'
+              AND ii.defect_status='repaired'""",
+        (cid(), truck_id),
+    ).fetchall()
+    manuals = conn.execute(
+        "SELECT * FROM maintenance_entries WHERE company_id=? AND truck_id=?",
+        (cid(), truck_id),
+    ).fetchall()
+
+    rows = []
+    for d in defects:
+        rows.append({
+            "source": "defect", "ref_id": d["ref_id"], "inspection_id": d["inspection_id"],
+            "date": (d["resolved_at"] or "")[:10],
+            "sort_key": d["resolved_at"] or "",
+            "category": "Repair",
+            "description": d["label"] + (f" — {d['resolution_note']}" if d["resolution_note"] else ""),
+            "cost_cents": d["cost_cents"], "vendor": d["vendor"],
+            "voided": 0,
+        })
+    for m in manuals:
+        rows.append({
+            "source": "manual", "ref_id": m["id"],
+            "date": m["entry_date"] or "",
+            "sort_key": (m["entry_date"] or "") + " " + (m["created_at"] or ""),
+            "category": m["category"],
+            "description": m["description"],
+            "cost_cents": m["cost_cents"], "vendor": m["vendor"],
+            "voided": m["voided"],
+        })
+
+    def _keep(r):
+        if date_from and r["date"] and r["date"] < date_from:
+            return False
+        if date_to and r["date"] and r["date"] > date_to:
+            return False
+        if category and r["category"] != category:
+            return False
+        return True
+
+    rows = [r for r in rows if _keep(r)]
+    rows.sort(key=lambda r: r["sort_key"], reverse=True)
+    return rows
+
+
+def _truck_spend(conn, truck_id):
+    """(month, year, lifetime) spend in cents for a truck across repaired
+    defects + non-voided manual entries. Voided entries never count."""
+    today = today_str()
+    month_prefix = today[:7]   # YYYY-MM
+    year_prefix = today[:4]    # YYYY
+    d_rows = conn.execute(
+        """SELECT ii.cost_cents AS c, substr(ii.resolved_at,1,10) AS dt
+             FROM inspection_items ii JOIN inspections i ON ii.inspection_id=i.id
+            WHERE i.company_id=? AND i.truck_id=? AND ii.result='defect'
+              AND ii.defect_status='repaired' AND ii.cost_cents IS NOT NULL""",
+        (cid(), truck_id)).fetchall()
+    m_rows = conn.execute(
+        """SELECT cost_cents AS c, entry_date AS dt FROM maintenance_entries
+            WHERE company_id=? AND truck_id=? AND voided=0 AND cost_cents IS NOT NULL""",
+        (cid(), truck_id)).fetchall()
+    month = year = life = 0
+    for r in list(d_rows) + list(m_rows):
+        c = r["c"] or 0
+        dt = r["dt"] or ""
+        life += c
+        if dt[:4] == year_prefix:
+            year += c
+        if dt[:7] == month_prefix:
+            month += c
+    return month, year, life
+
+
 @app.route("/trucks")
 @roles_required("owner", "customer_manager", "dispatcher")
 def trucks_page():
@@ -17563,6 +17792,22 @@ def truck_detail_page(truck_id):
              ORDER BY i.created_at DESC, i.id DESC""",
         params,
     ).fetchall()
+
+    # Phase 7A — spend totals + merged maintenance log (same from/to filter,
+    # plus a category filter).
+    cat_filter = (request.args.get("cat") or "").strip()
+    if cat_filter not in MAINTENANCE_CATEGORIES:
+        cat_filter = ""
+    _df = date_from if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_from) else None
+    _dt = date_to if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_to) else None
+    mlog = _truck_maintenance_log(conn, truck_id, date_from=_df, date_to=_dt, category=(cat_filter or None))
+    # receipt thumbs per log row
+    mlog_thumbs = {}
+    for r in mlog:
+        rc = (_maintenance_receipts(conn, defect_item_id=r["ref_id"]) if r["source"] == "defect"
+              else _maintenance_receipts(conn, manual_entry_id=r["ref_id"]))
+        mlog_thumbs[(r["source"], r["ref_id"])] = rc
+    spend_month, spend_year, spend_life = _truck_spend(conn, truck_id)
     conn.close()
     can_action = _can_action_fleet()
 
@@ -17624,6 +17869,95 @@ def truck_detail_page(truck_id):
     edit_toggle = ('<button class="btn secondary" onclick="toggleEditTruck()" style="padding:4px 12px;font-size:12px;">Edit</button>'
                    if can_action else "")
     sub_bits = " · ".join(b for b in [e(truck["make_model"] or ""), e(truck["plate"] or "")] if b) or "—"
+
+    # ── Phase 7A: spend totals card ──
+    totals_card = f"""
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+        <h2 style="font-size:15px;margin:0 0 10px;">Maintenance spend</h2>
+        <div style="display:flex;gap:10px;text-align:center;">
+            <div style="flex:1;"><div style="color:var(--slate);font-size:11px;text-transform:uppercase;letter-spacing:.5px;">This month</div><div style="font-weight:800;font-size:18px;margin-top:2px;">{e(format_cents(spend_month))}</div></div>
+            <div style="flex:1;"><div style="color:var(--slate);font-size:11px;text-transform:uppercase;letter-spacing:.5px;">This year</div><div style="font-weight:800;font-size:18px;margin-top:2px;">{e(format_cents(spend_year))}</div></div>
+            <div style="flex:1;"><div style="color:var(--slate);font-size:11px;text-transform:uppercase;letter-spacing:.5px;">Lifetime</div><div style="font-weight:800;font-size:18px;margin-top:2px;">{e(format_cents(spend_life))}</div></div>
+        </div>
+    </div>"""
+
+    # ── Phase 7A: add manual maintenance (owner/dispatcher) ──
+    add_maint = ""
+    if can_action:
+        cat_opts = "".join(f'<option value="{e(c)}">{e(c)}</option>' for c in MAINTENANCE_CATEGORIES)
+        add_maint = f"""
+        <div style="max-width:640px;margin-bottom:12px;">
+            <button class="btn green" onclick="toggleAddMaint()">+ Log maintenance</button>
+            <div id="add-maint-form" hidden class="bin-card" style="padding:16px;margin-top:12px;">
+                <div id="add-maint-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
+                <div style="display:flex;gap:8px;">
+                    <div style="flex:1;"><label class="uw-lbl">Date</label><input id="tm-date" type="date" value="{today_str()}" style="width:100%;"></div>
+                    <div style="flex:1;"><label class="uw-lbl">Category</label><select id="tm-cat" style="width:100%;">{cat_opts}</select></div>
+                </div>
+                <label class="uw-lbl" style="margin-top:10px;">Description</label>
+                <textarea id="tm-desc" rows="2" style="width:100%;margin-bottom:8px;" placeholder="e.g. Oil change + filter"></textarea>
+                <div style="display:flex;gap:8px;">
+                    <div style="flex:1;"><label class="uw-lbl">Cost (optional)</label><input id="tm-cost" inputmode="decimal" placeholder="89.00" style="width:100%;"></div>
+                    <div style="flex:1;"><label class="uw-lbl">Vendor (optional)</label><input id="tm-vendor" placeholder="Shop" style="width:100%;"></div>
+                </div>
+                <label class="uw-lbl" style="margin-top:8px;">Receipt photo(s) (optional)</label>
+                <input id="tm-receipts" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple capture="environment" style="width:100%;margin-bottom:10px;">
+                <div style="display:flex;gap:8px;">
+                    <button class="btn green" style="flex:1;" onclick="submitMaint({truck_id})">Save</button>
+                    <button class="btn secondary" onclick="toggleAddMaint()">Cancel</button>
+                </div>
+            </div>
+        </div>"""
+
+    # ── Phase 7A: merged maintenance log ──
+    _SRC_BADGE = {
+        "defect": ('<span style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:10px;'
+                   'font-weight:800;background:var(--cyan-dim);color:var(--cyan);border:1px solid var(--border-glow);">From inspection</span>'),
+        "manual": ('<span style="display:inline-block;padding:2px 8px;border-radius:999px;font-size:10px;'
+                   'font-weight:800;background:rgba(140,160,179,0.16);color:#ADC0D1;border:1px solid rgba(140,160,179,0.4);">Manual</span>'),
+    }
+    mlog_rows = ""
+    for r in mlog:
+        thumbs = _receipt_thumbs_html(mlog_thumbs.get((r["source"], r["ref_id"])))
+        cost = format_cents(r["cost_cents"]) if r["cost_cents"] is not None else "—"
+        vendor = f' · {e(r["vendor"])}' if r["vendor"] else ""
+        voided_tag = (' <span style="color:#FF7A7A;font-weight:800;font-size:11px;">VOID</span>'
+                      if r["voided"] else "")
+        href = (url_for("inspection_report", inspection_id=r["inspection_id"]) if r["source"] == "defect"
+                else url_for("maintenance_entry_detail", entry_id=r["ref_id"]))
+        desc_style = "text-decoration:line-through;opacity:.6;" if r["voided"] else ""
+        mlog_rows += f"""
+        <a class="bin-card" href="{href}" style="padding:14px;display:block;text-decoration:none;color:inherit;">
+            <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;">
+                <span style="font-weight:700;font-size:14px;{desc_style}">{e(r["date"])} · {e(r["category"])}{voided_tag}</span>
+                <span style="font-weight:800;font-size:14px;">{e(cost)}</span>
+            </div>
+            <div style="color:#C9C9C2;font-size:13px;margin-top:4px;{desc_style}">{e(r["description"])}{vendor}</div>
+            <div style="margin-top:6px;">{_SRC_BADGE.get(r["source"], "")}</div>
+            {thumbs}
+        </a>"""
+    if not mlog:
+        mlog_rows = '<div class="empty-state" style="padding:24px 0;">No maintenance in this range.</div>'
+
+    cat_filter_opts = '<option value="">All categories</option>' + "".join(
+        f'<option value="{e(c)}"{" selected" if c==cat_filter else ""}>{e(c)}</option>' for c in MAINTENANCE_CATEGORIES)
+    maint_section = f"""
+    {totals_card}
+    {add_maint}
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:8px;">
+        <h2 style="font-size:15px;margin:0 0 10px;">Maintenance log</h2>
+        <form method="GET" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:6px;">
+            <div><label class="uw-lbl">From</label><input type="date" name="from" value="{e(date_from)}"></div>
+            <div><label class="uw-lbl">To</label><input type="date" name="to" value="{e(date_to)}"></div>
+            <div><label class="uw-lbl">Category</label><select name="cat">{cat_filter_opts}</select></div>
+            <button class="btn secondary" type="submit" style="padding:8px 14px;">Filter</button>
+            <a class="btn secondary" href="{url_for('truck_detail_page', truck_id=truck_id)}" style="padding:8px 14px;">Reset</a>
+        </form>
+    </div>
+    <div class="bin-list" style="display:grid;gap:10px;max-width:640px;margin-bottom:16px;">
+        {mlog_rows}
+    </div>"""
+
     body = f"""
     <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
         <div>
@@ -17641,6 +17975,7 @@ def truck_detail_page(truck_id):
         <div id="truck-view" style="margin-top:10px;color:var(--slate);font-size:14px;">{sub_bits}</div>
     </div>
     {edit_block}
+    {maint_section}
     <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:8px;">
         <h2 style="font-size:15px;margin:0 0 10px;">Inspection history</h2>
         <form method="GET" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:6px;">
@@ -17694,6 +18029,26 @@ def _truck_detail_js(truck_id):
       .then(function(r){{return r.json().then(function(j){{return {{ok:r.ok,j:j}};}});}})
       .then(function(res){{ if(res.ok){{ window.location.reload(); }} else {{ msg((res.j&&res.j.error)||'Could not clear.'); }} }})
       .catch(function(){{ msg('Network error — try again.'); }});
+  }};
+  window.toggleAddMaint=function(){{ var f=document.getElementById('add-maint-form'); if(f) f.hidden=!f.hidden; }};
+  window.submitMaint=function(tid){{
+    var desc=(document.getElementById('tm-desc')||{{}}).value||'';
+    var eb=document.getElementById('add-maint-err');
+    if(!desc.trim()){{ if(eb){{eb.textContent='A description is required.';eb.hidden=false;}} return; }}
+    var fd=new FormData();
+    fd.append('_csrf_token', CSRF);
+    fd.append('truck_id',tid);
+    fd.append('entry_date',(document.getElementById('tm-date')||{{}}).value||'');
+    fd.append('category',(document.getElementById('tm-cat')||{{}}).value||'');
+    fd.append('description',desc);
+    fd.append('cost',(document.getElementById('tm-cost')||{{}}).value||'');
+    fd.append('vendor',(document.getElementById('tm-vendor')||{{}}).value||'');
+    var files=(document.getElementById('tm-receipts')||{{}}).files||[];
+    for(var i=0;i<files.length;i++){{ fd.append('receipts', files[i]); }}
+    fetch('/api/maintenance/entries',{{method:'POST',headers:{{'X-CSRF-Token':CSRF}},body:fd}})
+      .then(function(r){{return r.json().then(function(j){{return {{ok:r.ok,j:j}};}});}})
+      .then(function(res){{ if(res.ok){{ window.location.reload(); }} else {{ if(eb){{eb.textContent=(res.j&&res.j.error)||'Could not save.';eb.hidden=false;}} }} }})
+      .catch(function(){{ if(eb){{eb.textContent='Network error — try again.';eb.hidden=false;}} }});
   }};
 }})();
 </script>
@@ -18069,6 +18424,16 @@ def inspection_report(inspection_id):
         "SELECT * FROM inspection_items WHERE inspection_id=? ORDER BY id",
         (inspection_id,),
     ).fetchall()
+    # Cost data (cost/vendor/receipts) is MANAGEMENT-ONLY — a driver viewing
+    # their own report never sees it.
+    is_mgmt = _is_management()
+    receipts_by_item = {}
+    if is_mgmt:
+        for it in items:
+            if it["result"] == "defect":
+                rc = _maintenance_receipts(conn, defect_item_id=it["id"])
+                if rc:
+                    receipts_by_item[it["id"]] = rc
     conn.close()
 
     _RES = {
@@ -18093,13 +18458,23 @@ def inspection_report(inspection_id):
             res_note = f' — {e(it["resolution_note"])}' if it["resolution_note"] else ""
             defstat = (f'<div style="font-size:12px;margin-top:4px;color:{dcolor};font-weight:700;">'
                        f'{dlabel}{res_note}</div>')
+        cost_block = ""
+        if is_mgmt and it["result"] == "defect" and (it["cost_cents"] is not None or it["vendor"]):
+            _bits = []
+            if it["cost_cents"] is not None:
+                _bits.append(f'💵 {e(format_cents(it["cost_cents"]))}')
+            if it["vendor"]:
+                _bits.append(e(it["vendor"]))
+            cost_block = (f'<div style="font-size:12px;margin-top:4px;color:var(--slate);">'
+                          f'{" · ".join(_bits)}</div>')
+        receipts_block = _receipt_thumbs_html(receipts_by_item.get(it["id"])) if is_mgmt else ""
         rows_html += f"""
         <div style="border-top:1px solid var(--border);padding:12px 0;">
             <div style="display:flex;justify-content:space-between;gap:10px;">
                 <span style="font-weight:700;font-size:14px;">{e(it["label"])}</span>
                 <span style="color:{color};font-weight:800;font-size:12px;">{label_txt}</span>
             </div>
-            {note}{photo}{defstat}
+            {note}{photo}{defstat}{cost_block}{receipts_block}
         </div>"""
 
     _OVR_COLOR = {"safe": "#3DDC84", "defects_safe": "#FF8A3D", "out_of_service": "#FF7A7A"}
@@ -18187,6 +18562,18 @@ def maintenance_page():
             ORDER BY t.out_of_service DESC, i.created_at ASC, ii.id ASC""",
         (cid(),),
     ).fetchall()
+    # Per-truck spend table (A4) — month/year, plus fleet total.
+    trucks = conn.execute(
+        "SELECT id, name, out_of_service FROM trucks WHERE company_id=? AND is_active=1 ORDER BY LOWER(name), id",
+        (cid(),),
+    ).fetchall()
+    spend_rows = []
+    fleet_month = fleet_year = 0
+    for t in trucks:
+        m, y, _ = _truck_spend(conn, t["id"])
+        fleet_month += m
+        fleet_year += y
+        spend_rows.append((t, m, y))
     conn.close()
     can_action = _can_action_fleet()
 
@@ -18198,12 +18585,28 @@ def maintenance_page():
             thumb = (f'<a href="{purl}" target="_blank"><img src="{purl}" loading="lazy" '
                      f'style="width:64px;height:64px;object-fit:cover;border-radius:8px;border:1px solid var(--border);"></a>')
         note = f'<div style="font-size:13px;color:#C9C9C2;margin-top:4px;">{e(d["note"])}</div>' if d["note"] else ""
+        repair_form = ""
         actions = ""
         if can_action:
             actions = f"""
             <div style="display:flex;gap:8px;margin-top:10px;">
-                <button class="btn green" style="flex:1;" onclick="resolveDefect({d['item_id']},'repaired')">Repaired</button>
-                <button class="btn secondary" style="flex:1;" onclick="resolveDefect({d['item_id']},'deferred')">Defer</button>
+                <button class="btn green" style="flex:1;" onclick="showRepair({d['item_id']})">Repaired</button>
+                <button class="btn secondary" style="flex:1;" onclick="deferDefect({d['item_id']})">Defer</button>
+            </div>"""
+            repair_form = f"""
+            <div id="repair-form-{d['item_id']}" hidden style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
+                <label class="uw-lbl">What was done (required)</label>
+                <textarea id="rp-note-{d['item_id']}" rows="2" style="width:100%;margin-bottom:8px;" placeholder="e.g. Replaced front brake pads"></textarea>
+                <div style="display:flex;gap:8px;">
+                    <div style="flex:1;"><label class="uw-lbl">Cost (optional)</label><input id="rp-cost-{d['item_id']}" inputmode="decimal" placeholder="149.99" style="width:100%;"></div>
+                    <div style="flex:1;"><label class="uw-lbl">Vendor (optional)</label><input id="rp-vendor-{d['item_id']}" placeholder="Shop name" style="width:100%;"></div>
+                </div>
+                <label class="uw-lbl" style="margin-top:8px;">Receipt photo(s) (optional)</label>
+                <input id="rp-receipts-{d['item_id']}" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple capture="environment" style="width:100%;margin-bottom:10px;">
+                <div style="display:flex;gap:8px;">
+                    <button class="btn green" style="flex:1;" onclick="submitRepair({d['item_id']})">Save repair</button>
+                    <button class="btn secondary" onclick="hideRepair({d['item_id']})">Cancel</button>
+                </div>
             </div>"""
         cards += f"""
         <div class="bin-card" id="defect-{d['item_id']}" style="padding:16px;">
@@ -18221,21 +18624,83 @@ def maintenance_page():
                 </div>
             </div>
             <div id="defect-err-{d['item_id']}" hidden style="color:#FF5252;font-size:12px;margin-top:8px;"></div>
-            {actions}
+            {actions}{repair_form}
+        </div>"""
+
+    # Spend table HTML
+    spend_html = ""
+    for t, m, y in spend_rows:
+        spend_html += f"""
+        <tr style="border-top:1px solid var(--border);">
+            <td style="padding:8px 6px;"><a href="{url_for('truck_detail_page', truck_id=t['id'])}" style="color:inherit;">🚛 {e(t['name'])}{_truck_oos_badge(t)}</a></td>
+            <td style="padding:8px 6px;text-align:right;">{e(format_cents(m))}</td>
+            <td style="padding:8px 6px;text-align:right;">{e(format_cents(y))}</td>
+        </tr>"""
+    if not spend_rows:
+        spend_html = '<tr><td colspan="3" style="padding:12px 6px;color:var(--slate);">No trucks yet.</td></tr>'
+    spend_table = f"""
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:16px;">
+        <h2 style="font-size:15px;margin:0 0 6px;">Spend</h2>
+        <table style="width:100%;border-collapse:collapse;font-size:13px;">
+            <thead><tr style="color:var(--slate);text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px;">
+                <th style="padding:4px 6px;">Truck</th><th style="padding:4px 6px;text-align:right;">This month</th><th style="padding:4px 6px;text-align:right;">This year</th>
+            </tr></thead>
+            <tbody>{spend_html}</tbody>
+            <tfoot><tr style="border-top:2px solid var(--border-glow);font-weight:800;">
+                <td style="padding:8px 6px;">Fleet total</td>
+                <td style="padding:8px 6px;text-align:right;">{e(format_cents(fleet_month))}</td>
+                <td style="padding:8px 6px;text-align:right;">{e(format_cents(fleet_year))}</td>
+            </tr></tfoot>
+        </table>
+    </div>"""
+
+    # Add-manual-entry form (owner/dispatcher)
+    add_entry_block = ""
+    if can_action:
+        truck_opts = "".join(f'<option value="{t["id"]}">{e(t["name"])}</option>' for t in trucks)
+        cat_opts = "".join(f'<option value="{e(c)}">{e(c)}</option>' for c in MAINTENANCE_CATEGORIES)
+        add_entry_block = f"""
+        <div style="max-width:640px;margin-bottom:16px;">
+            <button class="btn green" onclick="toggleAddEntry()">+ Log maintenance</button>
+            <div id="add-entry-form" hidden class="bin-card" style="padding:16px;margin-top:12px;">
+                <div id="add-entry-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
+                <label class="uw-lbl">Truck</label>
+                <select id="me-truck" style="width:100%;margin-bottom:10px;">{truck_opts}</select>
+                <div style="display:flex;gap:8px;">
+                    <div style="flex:1;"><label class="uw-lbl">Date</label><input id="me-date" type="date" value="{today_str()}" style="width:100%;"></div>
+                    <div style="flex:1;"><label class="uw-lbl">Category</label><select id="me-cat" style="width:100%;">{cat_opts}</select></div>
+                </div>
+                <label class="uw-lbl" style="margin-top:10px;">Description</label>
+                <textarea id="me-desc" rows="2" style="width:100%;margin-bottom:8px;" placeholder="e.g. Oil change + filter"></textarea>
+                <div style="display:flex;gap:8px;">
+                    <div style="flex:1;"><label class="uw-lbl">Cost (optional)</label><input id="me-cost" inputmode="decimal" placeholder="89.00" style="width:100%;"></div>
+                    <div style="flex:1;"><label class="uw-lbl">Vendor (optional)</label><input id="me-vendor" placeholder="Shop name" style="width:100%;"></div>
+                </div>
+                <label class="uw-lbl" style="margin-top:8px;">Receipt photo(s) (optional)</label>
+                <input id="me-receipts" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple capture="environment" style="width:100%;margin-bottom:10px;">
+                <div style="display:flex;gap:8px;">
+                    <button class="btn green" style="flex:1;" onclick="submitEntry()">Save</button>
+                    <button class="btn secondary" onclick="toggleAddEntry()">Cancel</button>
+                </div>
+            </div>
         </div>"""
 
     empty_hidden = "" if defects else " hidden"
-    view_note = "" if can_action else '<p style="color:var(--slate);font-size:13px;">View-only — an owner or dispatcher resolves defects.</p>'
+    view_note = "" if can_action else '<p style="color:var(--slate);font-size:13px;">View-only — an owner or dispatcher resolves defects and logs maintenance.</p>'
     body = f"""
     <div class="hero">
         <h1>Maintenance</h1>
-        <p>Open defects reported on inspections. Repaired closes a defect; Defer postpones it.</p>
+        <p>Fleet spend, open defects, and manual maintenance. Repaired closes a defect; Defer postpones it.</p>
         {view_note}
     </div>
-    <div id="maint-empty" class="empty-state" style="padding:32px 0;"{empty_hidden}>No open defects — the fleet's clean. 🛠️</div>
+    {spend_table}
+    {add_entry_block}
+    <h2 style="font-size:15px;margin:0 0 8px;max-width:640px;">Open defects</h2>
+    <div id="maint-empty" class="empty-state" style="padding:24px 0;"{empty_hidden}>No open defects — the fleet's clean. 🛠️</div>
     <div id="maint-list" class="bin-list" style="display:grid;gap:12px;max-width:640px;">
         {cards}
     </div>
+    <style>.uw-lbl{{display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;}}</style>
     {_MAINTENANCE_PAGE_JS}
     """
     return render_template_string(shell_page("Maintenance", body))
@@ -18246,24 +18711,62 @@ _MAINTENANCE_PAGE_JS = """
 (function(){
   var CSRF=(document.querySelector('meta[name=csrf-token]')||{}).content||'';
   function err(id,m){ var e=document.getElementById('defect-err-'+id); if(e){ e.textContent=m; e.hidden=false; } }
-  window.resolveDefect=function(id,action){
-    var verb = action==='repaired' ? 'Mark this defect repaired' : 'Defer this defect';
-    var note=prompt(verb+'. Add a note (what was done / why):');
+  function bump(){ var badge=document.getElementById('maint-nav-badge');
+    if(badge){ var n=parseInt(badge.textContent||'0',10)-1;
+      if(n>0){ badge.textContent=n; } else { badge.hidden=true; badge.textContent=''; } } }
+  function removeCard(id){
+    var c=document.getElementById('defect-'+id); if(c) c.remove();
+    var list=document.getElementById('maint-list');
+    if(list && !list.querySelector('.bin-card')){ var em=document.getElementById('maint-empty'); if(em) em.hidden=false; }
+    bump();
+  }
+  window.showRepair=function(id){ var f=document.getElementById('repair-form-'+id); if(f) f.hidden=false; };
+  window.hideRepair=function(id){ var f=document.getElementById('repair-form-'+id); if(f) f.hidden=true; };
+  window.submitRepair=function(id){
+    var note=(document.getElementById('rp-note-'+id)||{}).value||'';
+    if(!note.trim()){ err(id,'A note is required.'); return; }
+    var fd=new FormData();
+    fd.append('_csrf_token', CSRF);
+    fd.append('action','repaired'); fd.append('note',note);
+    fd.append('cost',(document.getElementById('rp-cost-'+id)||{}).value||'');
+    fd.append('vendor',(document.getElementById('rp-vendor-'+id)||{}).value||'');
+    var files=(document.getElementById('rp-receipts-'+id)||{}).files||[];
+    for(var i=0;i<files.length;i++){ fd.append('receipts', files[i]); }
+    fetch('/api/defects/'+id+'/resolve',{method:'POST',headers:{'X-CSRF-Token':CSRF},body:fd})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
+      .then(function(res){ if(res.ok){ removeCard(id); } else { err(id,(res.j&&res.j.error)||'Could not save.'); } })
+      .catch(function(){ err(id,'Network error — try again.'); });
+  };
+  window.deferDefect=function(id){
+    var note=prompt('Defer this defect. Add a note (why):');
     if(note===null) return;
     if(!note.trim()){ err(id,'A note is required.'); return; }
     fetch('/api/defects/'+id+'/resolve',{method:'POST',
         headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
-        body:JSON.stringify({action:action, note:note})})
+        body:JSON.stringify({action:'deferred', note:note})})
       .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
-      .then(function(res){ if(res.ok){
-            var c=document.getElementById('defect-'+id); if(c) c.remove();
-            var list=document.getElementById('maint-list');
-            if(list && !list.querySelector('.bin-card')){ var em=document.getElementById('maint-empty'); if(em) em.hidden=false; }
-            var badge=document.getElementById('maint-nav-badge');
-            if(badge){ var n=parseInt(badge.textContent||'0',10)-1;
-              if(n>0){ badge.textContent=n; } else { badge.hidden=true; badge.textContent=''; } }
-          } else { err(id,(res.j&&res.j.error)||'Could not update.'); } })
+      .then(function(res){ if(res.ok){ removeCard(id); } else { err(id,(res.j&&res.j.error)||'Could not update.'); } })
       .catch(function(){ err(id,'Network error — try again.'); });
+  };
+  window.toggleAddEntry=function(){ var f=document.getElementById('add-entry-form'); if(f) f.hidden=!f.hidden; };
+  function eerr(m){ var e=document.getElementById('add-entry-err'); if(e){ e.textContent=m; e.hidden=false; } }
+  window.submitEntry=function(){
+    var desc=(document.getElementById('me-desc')||{}).value||'';
+    if(!desc.trim()){ eerr('A description is required.'); return; }
+    var fd=new FormData();
+    fd.append('_csrf_token', CSRF);
+    fd.append('truck_id',(document.getElementById('me-truck')||{}).value||'');
+    fd.append('entry_date',(document.getElementById('me-date')||{}).value||'');
+    fd.append('category',(document.getElementById('me-cat')||{}).value||'');
+    fd.append('description',desc);
+    fd.append('cost',(document.getElementById('me-cost')||{}).value||'');
+    fd.append('vendor',(document.getElementById('me-vendor')||{}).value||'');
+    var files=(document.getElementById('me-receipts')||{}).files||[];
+    for(var i=0;i<files.length;i++){ fd.append('receipts', files[i]); }
+    fetch('/api/maintenance/entries',{method:'POST',headers:{'X-CSRF-Token':CSRF},body:fd})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
+      .then(function(res){ if(res.ok){ window.location.reload(); } else { eerr((res.j&&res.j.error)||'Could not save.'); } })
+      .catch(function(){ eerr('Network error — try again.'); });
   };
 })();
 </script>
@@ -18274,17 +18777,28 @@ _MAINTENANCE_PAGE_JS = """
 @login_required
 def resolve_defect(item_id):
     """Owner/dispatcher marks a defect Repaired (closes) or Deferred, with a
-    required note. Only the defect lifecycle fields change — the inspection
-    report itself stays immutable."""
+    required note. Repaired accepts optional cost (integer cents), vendor, and
+    receipt photos (multipart). Only the defect lifecycle + cost fields change —
+    the driver's inspection report content stays immutable, and cost data is
+    never shown to the driver (see inspection_report / serve_maintenance_photo).
+    Accepts multipart (with receipts) or JSON."""
     if not _can_action_fleet():
         return jsonify({"error": "forbidden"}), 403
-    data = request.get_json(silent=True) or {}
-    action = data.get("action")
-    note = str(data.get("note") or "").strip()[:500]
+    # Read from form (multipart) first, else JSON.
+    src = request.form if request.form else (request.get_json(silent=True) or {})
+    action = src.get("action")
+    note = str(src.get("note") or "").strip()[:500]
     if action not in ("repaired", "deferred"):
         return jsonify({"error": "invalid action"}), 400
     if not note:
         return jsonify({"error": "a note is required"}), 400
+    cost_cents = None
+    vendor = None
+    if action == "repaired":
+        cost_cents, cost_err = parse_cost_cents(src.get("cost"))
+        if cost_err:
+            return jsonify({"error": cost_err}), 400
+        vendor = (str(src.get("vendor") or "").strip()[:120]) or None
     conn = get_db()
     row = conn.execute(
         """SELECT ii.id, ii.defect_status
@@ -18301,12 +18815,308 @@ def resolve_defect(item_id):
         return jsonify({"error": "defect is not open"}), 409
     conn.execute(
         """UPDATE inspection_items SET defect_status=?, resolution_note=?,
-                                       resolved_by=?, resolved_at=? WHERE id=?""",
-        (action, note, session["user_id"], now_ts(), item_id),
+                   resolved_by=?, resolved_at=?, cost_cents=?, vendor=? WHERE id=?""",
+        (action, note, session["user_id"], now_ts(), cost_cents, vendor, item_id),
     )
+    if action == "repaired":
+        _save_maintenance_receipts(conn, request.files.getlist("receipts"),
+                                   defect_item_id=item_id)
     conn.commit()
     conn.close()
     return jsonify({"success": True, "status": action})
+
+
+@app.route("/maintenance-photo/<int:photo_id>")
+@login_required
+def serve_maintenance_photo(photo_id):
+    """Serve a receipt photo — MANAGEMENT ONLY (cost data). Drivers get 403
+    even for their own inspection's defect receipts."""
+    if not _is_management():
+        abort(403)
+    conn = get_db()
+    row = conn.execute(
+        "SELECT file_path FROM maintenance_photos WHERE id=? AND company_id=?",
+        (photo_id, cid()),
+    ).fetchone()
+    conn.close()
+    if not row:
+        abort(404)
+    full = os.path.join(app.root_path, row["file_path"])
+    if not os.path.isfile(full):
+        abort(404)
+    return send_file(full)
+
+
+@app.route("/api/maintenance/entries", methods=["POST"])
+@login_required
+def create_maintenance_entry():
+    """Owner/dispatcher logs a manual (non-inspection) maintenance record.
+    Multipart: truck_id, entry_date, category, description, cost, vendor,
+    receipts[]. cost/vendor/receipts optional."""
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    src = request.form if request.form else (request.get_json(silent=True) or {})
+    truck_id_raw = str(src.get("truck_id") or "")
+    if not truck_id_raw.isdigit():
+        return jsonify({"error": "truck is required"}), 400
+    conn = get_db()
+    truck = _load_truck_scoped(conn, int(truck_id_raw), active_only=True)
+    if truck is None:
+        conn.close()
+        return jsonify({"error": "truck not found"}), 404
+    entry_date = (str(src.get("entry_date") or "").strip()) or today_str()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", entry_date):
+        conn.close()
+        return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+    category = str(src.get("category") or "").strip()
+    if category not in MAINTENANCE_CATEGORIES:
+        conn.close()
+        return jsonify({"error": "invalid category"}), 400
+    description = str(src.get("description") or "").strip()[:1000]
+    if not description:
+        conn.close()
+        return jsonify({"error": "a description is required"}), 400
+    cost_cents, cost_err = parse_cost_cents(src.get("cost"))
+    if cost_err:
+        conn.close()
+        return jsonify({"error": cost_err}), 400
+    vendor = (str(src.get("vendor") or "").strip()[:120]) or None
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO maintenance_entries (company_id, truck_id, entry_date, category,
+               description, cost_cents, vendor, created_by, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (cid(), truck["id"], entry_date, category, description, cost_cents, vendor,
+         session["user_id"], now_ts()),
+    )
+    entry_id = cur.lastrowid
+    _save_maintenance_receipts(conn, request.files.getlist("receipts"), manual_entry_id=entry_id)
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "id": entry_id})
+
+
+def _load_manual_entry(conn, entry_id):
+    return conn.execute(
+        "SELECT * FROM maintenance_entries WHERE id=? AND company_id=?",
+        (entry_id, cid()),
+    ).fetchone()
+
+
+def _entry_editable(entry):
+    """A manual entry is editable by owner/dispatcher only within the edit
+    window after creation, and never once voided."""
+    if entry["voided"]:
+        return False
+    try:
+        created = datetime.strptime(entry["created_at"], "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return False
+    now = datetime.strptime(now_ts(), "%Y-%m-%d %H:%M:%S")
+    return (now - created).total_seconds() <= MAINTENANCE_EDIT_WINDOW_SECONDS
+
+
+@app.route("/api/maintenance/entries/<int:entry_id>/edit", methods=["POST"])
+@login_required
+def edit_maintenance_entry(entry_id):
+    """Edit a manual entry — owner/dispatcher, only within the edit window."""
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    entry = _load_manual_entry(conn, entry_id)
+    if entry is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if not _entry_editable(entry):
+        conn.close()
+        return jsonify({"error": "this entry is locked (edit window has passed or it is voided)"}), 409
+    src = request.form if request.form else (request.get_json(silent=True) or {})
+    entry_date = (str(src.get("entry_date") or "").strip()) or entry["entry_date"]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", entry_date):
+        conn.close()
+        return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+    category = str(src.get("category") or "").strip()
+    if category not in MAINTENANCE_CATEGORIES:
+        conn.close()
+        return jsonify({"error": "invalid category"}), 400
+    description = str(src.get("description") or "").strip()[:1000]
+    if not description:
+        conn.close()
+        return jsonify({"error": "a description is required"}), 400
+    cost_cents, cost_err = parse_cost_cents(src.get("cost"))
+    if cost_err:
+        conn.close()
+        return jsonify({"error": cost_err}), 400
+    vendor = (str(src.get("vendor") or "").strip()[:120]) or None
+    conn.execute(
+        """UPDATE maintenance_entries SET entry_date=?, category=?, description=?,
+               cost_cents=?, vendor=?, updated_at=? WHERE id=?""",
+        (entry_date, category, description, cost_cents, vendor, now_ts(), entry_id),
+    )
+    _save_maintenance_receipts(conn, request.files.getlist("receipts"), manual_entry_id=entry_id)
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/maintenance/entries/<int:entry_id>/void", methods=["POST"])
+@login_required
+def void_maintenance_entry(entry_id):
+    """Void (never delete) a manual entry — owner/dispatcher, required note.
+    Voided entries drop out of spend totals and are flagged in the log."""
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    src = request.form if request.form else (request.get_json(silent=True) or {})
+    note = str(src.get("note") or "").strip()[:500]
+    if not note:
+        return jsonify({"error": "a note is required to void"}), 400
+    conn = get_db()
+    entry = _load_manual_entry(conn, entry_id)
+    if entry is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if entry["voided"]:
+        conn.close()
+        return jsonify({"error": "already voided"}), 409
+    conn.execute(
+        "UPDATE maintenance_entries SET voided=1, void_note=?, voided_by=?, voided_at=? WHERE id=?",
+        (note, session["user_id"], now_ts(), entry_id),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/maintenance/entry/<int:entry_id>")
+@roles_required("owner", "customer_manager", "dispatcher")
+def maintenance_entry_detail(entry_id):
+    """Full detail of a manual maintenance entry. Any management role views;
+    owner/dispatcher can edit (within the window) or void."""
+    conn = get_db()
+    entry = _load_manual_entry(conn, entry_id)
+    if entry is None:
+        conn.close()
+        flash("Maintenance entry not found.", "error")
+        return redirect(url_for("maintenance_page"))
+    truck = conn.execute("SELECT id, name, out_of_service FROM trucks WHERE id=? AND company_id=?",
+                         (entry["truck_id"], cid())).fetchone()
+    receipts = _maintenance_receipts(conn, manual_entry_id=entry_id)
+    creator = conn.execute("SELECT COALESCE(full_name, username) AS n FROM users WHERE id=?",
+                           (entry["created_by"],)).fetchone()
+    conn.close()
+
+    can_action = _can_action_fleet()
+    editable = can_action and _entry_editable(entry)
+    truck_link = (f'<a href="{url_for("truck_detail_page", truck_id=truck["id"])}" style="color:inherit;">🚛 {e(truck["name"])}</a>'
+                  if truck else "—")
+    voided_banner = ""
+    if entry["voided"]:
+        voided_banner = f"""
+        <div class="bin-card" style="padding:14px;max-width:640px;margin-bottom:12px;border:1px solid rgba(255,82,82,0.45);">
+            <div style="color:#FF7A7A;font-weight:800;">VOIDED</div>
+            <div style="font-size:13px;color:#C9C9C2;margin-top:4px;">{e(entry["void_note"] or "")}</div>
+            <div style="font-size:12px;color:var(--slate);margin-top:4px;">{e(entry["voided_at"] or "")}</div>
+        </div>"""
+
+    edit_ui = ""
+    if editable:
+        cat_opts = "".join(
+            f'<option value="{e(c)}"{" selected" if c==entry["category"] else ""}>{e(c)}</option>'
+            for c in MAINTENANCE_CATEGORIES)
+        cost_val = "" if entry["cost_cents"] is None else f'{entry["cost_cents"]//100}.{entry["cost_cents"]%100:02d}'
+        edit_ui = f"""
+        <div style="max-width:640px;margin-bottom:12px;display:flex;gap:8px;">
+            <button class="btn secondary" style="flex:1;" onclick="toggleEdit()">Edit</button>
+            <button class="btn red" style="flex:1;" onclick="voidEntry()">Void</button>
+        </div>
+        <div id="edit-form" hidden class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+            <div id="edit-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
+            <div style="display:flex;gap:8px;">
+                <div style="flex:1;"><label class="uw-lbl">Date</label><input id="ed-date" type="date" value="{e(entry["entry_date"])}" style="width:100%;"></div>
+                <div style="flex:1;"><label class="uw-lbl">Category</label><select id="ed-cat" style="width:100%;">{cat_opts}</select></div>
+            </div>
+            <label class="uw-lbl" style="margin-top:10px;">Description</label>
+            <textarea id="ed-desc" rows="2" style="width:100%;margin-bottom:8px;">{e(entry["description"])}</textarea>
+            <div style="display:flex;gap:8px;">
+                <div style="flex:1;"><label class="uw-lbl">Cost</label><input id="ed-cost" inputmode="decimal" value="{cost_val}" style="width:100%;"></div>
+                <div style="flex:1;"><label class="uw-lbl">Vendor</label><input id="ed-vendor" value="{e(entry["vendor"] or "")}" style="width:100%;"></div>
+            </div>
+            <label class="uw-lbl" style="margin-top:8px;">Add receipt photo(s)</label>
+            <input id="ed-receipts" type="file" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple capture="environment" style="width:100%;margin-bottom:10px;">
+            <div style="display:flex;gap:8px;">
+                <button class="btn green" style="flex:1;" onclick="submitEdit()">Save</button>
+                <button class="btn secondary" onclick="toggleEdit()">Cancel</button>
+            </div>
+        </div>"""
+    elif can_action and not entry["voided"]:
+        edit_ui = ('<div style="max-width:640px;margin-bottom:12px;">'
+                   '<div style="color:var(--slate);font-size:12px;margin-bottom:8px;">Edit window has passed — this entry is locked. It can still be voided.</div>'
+                   '<button class="btn red" style="width:100%;" onclick="voidEntry()">Void</button></div>')
+
+    body = f"""
+    <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+        <div><h1 style="margin-bottom:4px;">Maintenance</h1><p style="margin:0;">{truck_link}</p></div>
+        <a class="btn secondary" href="{url_for('truck_detail_page', truck_id=entry['truck_id'])}" style="white-space:nowrap;">← Truck</a>
+    </div>
+    {voided_banner}
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+        <div style="display:flex;justify-content:space-between;gap:10px;">
+            <span style="font-weight:800;font-size:16px;">{e(entry["entry_date"])} · {e(entry["category"])}</span>
+            <span style="font-weight:800;font-size:16px;">{e(format_cents(entry["cost_cents"]))}</span>
+        </div>
+        <div style="color:#C9C9C2;font-size:14px;margin-top:8px;">{e(entry["description"])}</div>
+        <div style="color:var(--slate);font-size:13px;margin-top:8px;">
+            {('Vendor: ' + e(entry["vendor"]) + '<br>') if entry["vendor"] else ''}
+            Logged by {e(creator["n"] if creator else "—")} · {e(entry["created_at"])}
+        </div>
+        {_receipt_thumbs_html(receipts)}
+    </div>
+    {edit_ui}
+    <style>.uw-lbl{{display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;}}</style>
+    {_maintenance_entry_js(entry_id, entry["truck_id"])}
+    """
+    return render_template_string(shell_page("Maintenance", body))
+
+
+def _maintenance_entry_js(entry_id, truck_id):
+    truck_url = url_for("truck_detail_page", truck_id=truck_id)
+    return f"""
+<script>
+(function(){{
+  var CSRF=(document.querySelector('meta[name=csrf-token]')||{{}}).content||'';
+  var EID={entry_id};
+  window.toggleEdit=function(){{ var f=document.getElementById('edit-form'); if(f) f.hidden=!f.hidden; }};
+  function eerr(m){{ var e=document.getElementById('edit-err'); if(e){{ e.textContent=m; e.hidden=false; }} }}
+  window.submitEdit=function(){{
+    var desc=(document.getElementById('ed-desc')||{{}}).value||'';
+    if(!desc.trim()){{ eerr('A description is required.'); return; }}
+    var fd=new FormData();
+    fd.append('_csrf_token', CSRF);
+    fd.append('entry_date',(document.getElementById('ed-date')||{{}}).value||'');
+    fd.append('category',(document.getElementById('ed-cat')||{{}}).value||'');
+    fd.append('description',desc);
+    fd.append('cost',(document.getElementById('ed-cost')||{{}}).value||'');
+    fd.append('vendor',(document.getElementById('ed-vendor')||{{}}).value||'');
+    var files=(document.getElementById('ed-receipts')||{{}}).files||[];
+    for(var i=0;i<files.length;i++){{ fd.append('receipts', files[i]); }}
+    fetch('/api/maintenance/entries/'+EID+'/edit',{{method:'POST',headers:{{'X-CSRF-Token':CSRF}},body:fd}})
+      .then(function(r){{return r.json().then(function(j){{return {{ok:r.ok,j:j}};}});}})
+      .then(function(res){{ if(res.ok){{ window.location.reload(); }} else {{ eerr((res.j&&res.j.error)||'Could not save.'); }} }})
+      .catch(function(){{ eerr('Network error — try again.'); }});
+  }};
+  window.voidEntry=function(){{
+    var note=prompt('Void this entry? Add a note (required):');
+    if(note===null) return;
+    if(!note.trim()){{ alert('A note is required.'); return; }}
+    fetch('/api/maintenance/entries/'+EID+'/void',{{method:'POST',
+        headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},body:JSON.stringify({{note:note}})}})
+      .then(function(r){{return r.json().then(function(j){{return {{ok:r.ok,j:j}};}});}})
+      .then(function(res){{ if(res.ok){{ window.location.reload(); }} else {{ alert((res.j&&res.j.error)||'Could not void.'); }} }})
+      .catch(function(){{ alert('Network error — try again.'); }});
+  }};
+}})();
+</script>
+"""
 
 
 @app.route("/requests")
