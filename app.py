@@ -1630,7 +1630,10 @@ def parse_cost_cents(raw):
     else:
         whole, frac = s, ""
     whole = whole or "0"
-    if not whole.isdigit() or (frac and not frac.isdigit()):
+    # ASCII-only digit check: str.isdigit() also accepts unicode digits like "²"
+    # that int() then rejects with ValueError. Require plain 0-9.
+    _ascii_digits = lambda x: x.isascii() and x.isdigit()
+    if not _ascii_digits(whole) or (frac and not _ascii_digits(frac)):
         return None, "cost must be a number like 149.99"
     frac = (frac + "00")[:2]  # pad/truncate to exactly 2 decimals, integer-only
     cents = int(whole) * 100 + int(frac)
@@ -2208,7 +2211,7 @@ def init_db():
         id             INTEGER PRIMARY KEY AUTOINCREMENT,
         customer_id    INTEGER NOT NULL,
         site_id        INTEGER NOT NULL,
-        type           TEXT NOT NULL CHECK(type IN ('PR','P','D','NEW_BIN')),
+        type           TEXT NOT NULL CHECK(type IN ('PR','P','D','NEW_BIN','S')),
         bin_id         INTEGER,
         size_requested TEXT,
         preferred_date TEXT NOT NULL,
@@ -18802,7 +18805,7 @@ def my_inspections():
         <a class="bin-card" href="{url_for('inspection_report', inspection_id=i['id'])}"
            style="padding:14px;display:block;text-decoration:none;color:inherit;">
             <div style="display:flex;justify-content:space-between;gap:10px;">
-                <span style="font-weight:700;">🚛 {e(i["truck_name"])}{_truck_status_badges(i)}</span>
+                <span style="font-weight:700;">🚛 {e(i["truck_name"])}{_truck_oos_badge(i)}</span>
                 <span style="color:{color};font-weight:800;font-size:12px;">{e(_INSPECTION_OVERALL_LABEL.get(i["overall"], i["overall"]))}</span>
             </div>
             <div style="color:var(--slate);font-size:13px;margin-top:4px;">
@@ -18912,7 +18915,7 @@ def inspection_report(inspection_id):
     body = f"""
     <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
         <div>
-            <h1 style="margin-bottom:4px;">🚛 {e(insp["truck_name"])}{_truck_status_badges(insp)}</h1>
+            <h1 style="margin-bottom:4px;">🚛 {e(insp["truck_name"])}{_truck_oos_badge(insp)}{_truck_at_vendor_badge(insp) if is_mgmt else ""}</h1>
             <p style="margin:0;">{e(_INSPECTION_TYPE_LABEL.get(insp["type"], insp["type"]))} inspection · {e((insp["created_at"] or ""))}</p>
         </div>
         <a class="btn secondary" href="{back}" style="white-space:nowrap;">← Back</a>
