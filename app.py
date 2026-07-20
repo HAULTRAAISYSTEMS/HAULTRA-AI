@@ -2424,16 +2424,27 @@ def init_db():
 
     existing_boss = cur.execute("SELECT id FROM users WHERE role='boss' LIMIT 1").fetchone()
     if not existing_boss:
+        bootstrap_password = secrets.token_urlsafe(16)
         cur.execute(
             """INSERT INTO users (username, password_hash, role, full_name, phone,
                company_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            ("boss", generate_password_hash("boss123"), "boss", "Boss", "", default_co_id, now_ts())
+            ("boss", generate_password_hash(bootstrap_password), "boss", "Boss", "", default_co_id, now_ts())
         )
         conn.commit()
         # make the default boss the company owner
         boss_id = cur.lastrowid
         conn.execute("UPDATE companies SET owner_id=? WHERE id=?", (boss_id, default_co_id))
         conn.commit()
+        print(
+            "=== BOOTSTRAP: no boss account existed, created one ===\n"
+            "  username: boss\n"
+            f"  password: {bootstrap_password}\n"
+            "  This is logged ONCE, here, and nowhere else — copy it now.\n"
+            "  There is no in-app 'change password' field: log in, go to\n"
+            "  Settings and add an email to this account, then use\n"
+            "  'Forgot password' to set your own password.",
+            flush=True
+        )
 
     conn.close()
 
