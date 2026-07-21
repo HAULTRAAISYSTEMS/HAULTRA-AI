@@ -773,7 +773,7 @@ _SUBSCRIPTION_EXEMPT = {
     "login", "logout", "company_register", "static",
     "subscription_blocked", "subscription_success", "billing",
     "company_subscription", "company_settings", "settings_page", "stripe_webhook",
-    "privacy_policy", "terms_of_service", "account_deletion_info",
+    "privacy_policy", "terms_of_service", "account_deletion_info", "delete_account_request",
 }
 
 _SUB_CACHE_TTL = 60  # seconds between DB re-checks per company
@@ -5689,7 +5689,7 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
                 <div class="footer-note">
                     <div class="footer-trust">
                         <span class="footer-badge">&#128274; SSL Encrypted</span>
-                        <span class="footer-badge">&#9989; SOC 2 Ready</span>
+                        <span class="footer-badge">&#128737; Security-Focused Architecture</span>
                         <span class="footer-badge">&#128100; Role-Based Access</span>
                         <span class="footer-badge">&#127968; US-Based Data</span>
                     </div>
@@ -14131,11 +14131,13 @@ def superadmin_edit_company(company_id):
 # =========================================================
 @app.route("/privacy")
 def privacy_policy():
-    today = datetime.now().strftime("%B %d, %Y")
+    # Fixed, not datetime.now() — an effective date must only change when
+    # the policy content actually changes, not on every page load.
+    effective_date = "July 20, 2026"
     body = f"""
     <div class="hero">
         <h1>Privacy Policy</h1>
-        <p class="muted small">Effective date: <strong style="color:#F5F5F0;">{today}</strong>
+        <p class="muted small">Effective date: <strong style="color:#F5F5F0;">{effective_date}</strong>
         &nbsp;&middot;&nbsp; HAULTRA AI SYSTEMS &nbsp;&middot;&nbsp; Virginia, USA</p>
     </div>
 
@@ -14199,7 +14201,7 @@ def privacy_policy():
         </ul>
 
         <h2>5. Billing and Subscription Data</h2>
-        <p>When you select a paid subscription plan (Starter, Pro, or Enterprise), we record your
+        <p>When you select a paid subscription plan (Starter, Pro, or Fleet), we record your
         plan type, activation date, and plan change history in our systems. This information is
         used to enforce access controls and maintain an audit trail for your account. Billing
         inquiries and disputes should be directed to
@@ -14247,7 +14249,12 @@ def privacy_policy():
         <h2>9. Third-Party Services</h2>
         <p>We use Nominatim (OpenStreetMap) for address geocoding. Stop addresses submitted for
         route optimization are sent to this service. No account credentials or driver names are
-        included. We do not sell or rent your data to any third party for marketing purposes.</p>
+        included.</p>
+        <p>We use the Anthropic Claude API to parse dispatch messages into structured routes.
+        Message content submitted for parsing may include addresses, customer names, and job
+        details. This data is processed under Anthropic's commercial API data policies and is not
+        used to train AI models. We do not sell or rent your data to any third party for marketing
+        purposes.</p>
 
         <h2>10. Data Retention</h2>
         <p>Your operational data (routes, stops, photos) is retained for as long as your account
@@ -14265,9 +14272,9 @@ def privacy_policy():
         time by contacting <a href="mailto:info@haultraai.com">info@haultraai.com</a>. We will
         respond within 30 days. Residents of California (CCPA) and the EEA/UK (GDPR) have
         additional rights including portability and the right to object to processing — contact
-        us to exercise these rights. To delete your account specifically, see
-        <a href="{url_for('account_deletion_info')}">Account Deletion</a>, which covers both the
-        in-app self-service option and this email-based process.</p>
+        us to exercise these rights. You may also request account deletion at any time via our
+        account deletion page at
+        <a href="{url_for('delete_account_request', _external=True)}">{url_for('delete_account_request', _external=True)}</a>.</p>
 
         <h2>13. Changes to This Policy</h2>
         <p>We will post updates to this page with a revised effective date. For material changes,
@@ -14296,18 +14303,52 @@ def privacy_policy():
 # account-deletion requirements point to a stable URL here, separate from
 # the in-app self-service flow at /account/delete and /company/close).
 # =========================================================
+
+# Legacy URL — redirect to the canonical page below.
 @app.route("/account-deletion")
 def account_deletion_info():
+    return redirect(url_for("delete_account_request"))
+
+
+@app.route("/delete-account", methods=["GET", "POST"])
+def delete_account_request():
+    submitted = False
+    email_sent = False
+
+    if request.method == "POST":
+        company_name  = request.form.get("company_name", "").strip()
+        account_email = request.form.get("account_email", "").strip()
+        confirmed     = request.form.get("confirm", "") == "yes"
+
+        if not company_name or not account_email or not confirmed:
+            flash("Fill in your company name and account email, and check the confirmation box.", "error")
+        else:
+            submitted = True
+            email_sent = send_email(
+                "info@haultraai.com",
+                f"Account deletion request — {company_name}",
+                f"""
+                <p>A company account deletion request was submitted via the public
+                account deletion page.</p>
+                <p><strong>Company name:</strong> {e(company_name)}<br>
+                <strong>Account email:</strong> {e(account_email)}<br>
+                <strong>Submitted:</strong> {now_ts()}</p>
+                """
+            )
+
     body = f"""
     <div class="hero">
-        <h1>Account Deletion</h1>
-        <p class="muted small">How to delete your HAULTRA account and data.</p>
+        <h1>Delete Your HAULTRA Account</h1>
+        <p class="muted small">Request full deletion of your company account and its data.</p>
     </div>
 
     <div class="card" style="max-width:820px;line-height:1.8;">
 
-        <h2>If you can log in</h2>
-        <p>Delete your own account directly in the app — no need to contact us:</p>
+        <p>Account owners can request full deletion of their company account and all associated
+        data — routes, stops, customer addresses, photos, and account records.</p>
+
+        <h2>Faster: delete it yourself in the app</h2>
+        <p>If you can log in, this is quicker than submitting a request below:</p>
         <ul>
             <li><strong>Drivers</strong> — open Cab View, tap the gear icon, and choose
             <strong>Delete My Account</strong>.</li>
@@ -14316,28 +14357,54 @@ def account_deletion_info():
             add another Boss on the Team page first, or use <strong>Close Company</strong> instead,
             which deletes every account on the company at once.</li>
         </ul>
-        <p>Either way, your account is deactivated immediately — you're logged out and can no
-        longer sign in. Your remaining data (routes, stops, photos, and any other account data)
-        is then permanently removed within 30 days.</p>
 
-        <h2>If you can't log in</h2>
-        <p>Email <a href="mailto:info@haultraai.com">info@haultraai.com</a> from the address on
-        the account (or with enough detail to identify it — company name and username) and ask us
-        to delete it. We'll confirm and complete the deletion within 30 days.</p>
+        <h2>Or request deletion here</h2>
+        {"" if submitted else '''
+        <form method="POST">
+            <label>Company name</label>
+            <input name="company_name" required>
+            <label>Account email</label>
+            <input type="email" name="account_email" required>
+            <label style="display:flex;align-items:flex-start;gap:10px;margin:14px 0;font-size:13.5px;color:#D8D8D0;font-weight:400;">
+                <input type="checkbox" name="confirm" value="yes" required style="margin-top:3px;width:auto;">
+                I confirm I'm authorized to request deletion of this company's HAULTRA account
+                and understand this cannot be undone.
+            </label>
+            <div style="margin-top:14px;">
+                <button type="submit" class="btn orange" style="width:100%;font-size:16px;padding:14px;">
+                    Submit Deletion Request
+                </button>
+            </div>
+        </form>
+        '''}
 
-        <h2>What gets deleted</h2>
+        {f'''
+        <div style="background:rgba(61,220,132,0.08);border:1px solid rgba(61,220,132,0.25);
+                    border-radius:10px;padding:14px 18px;margin-top:8px;">
+            <strong style="color:#3DDC84;">Request received.</strong> We'll confirm and complete
+            the deletion within 30 days.
+        </div>
+        ''' if submitted and email_sent else ""}
+
+        {f'''
+        <div style="background:rgba(255,107,26,0.08);border:1px solid rgba(255,107,26,0.20);
+                    border-radius:10px;padding:14px 18px;margin-top:8px;">
+            <strong>We couldn't send that automatically.</strong> Please email
+            <a href="mailto:info@haultraai.com">info@haultraai.com</a> directly with your company
+            name and account email, and ask us to delete your account. We'll confirm and complete
+            the deletion within 30 days.
+        </div>
+        ''' if submitted and not email_sent else ""}
+
+        <h2>What gets deleted, and when</h2>
         <p>Account data (name, username, phone, email), operational data (routes, stops, customer
         addresses), photos (job-site and vehicle inspection), and location data captured at stop
-        completion. Billing/subscription history is retained for 7 years for accounting and legal
+        completion are deleted from production systems, with backups purged within 90 days.
+        Billing and subscription history is retained for 7 years for accounting and legal
         compliance, as described in our <a href="{url_for('privacy_policy')}">Privacy Policy</a>.</p>
-
-        <p class="muted small" style="margin-top:20px;">
-            See the <a href="{url_for('privacy_policy')}">Privacy Policy</a> for the full detail
-            on what we collect and how long we keep it.
-        </p>
     </div>
     """
-    return render_template_string(shell_page("Account Deletion", body))
+    return render_template_string(shell_page("Delete Your Account", body))
 
 
 # =========================================================
