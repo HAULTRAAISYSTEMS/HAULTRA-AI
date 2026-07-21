@@ -6870,6 +6870,7 @@ a {{ color: inherit; }}
 .haul-road {{ position: relative; height: 128px; margin-top: 8px; overflow: hidden; }}
 .haul-road::after {{ content: ''; position: absolute; left: 0; right: 0; bottom: 6px; height: 2px; background: repeating-linear-gradient(90deg, rgba(255,107,26,0.3) 0 18px, transparent 18px 34px); }}
 .haul-truck {{ position: absolute; bottom: 10px; left: 50%; width: clamp(160px, 46vw, 230px); margin-left: clamp(-115px, -23vw, -80px); animation: haul-truck-move 10s infinite; }}
+.haul-truck-bounce {{ animation: haul-idle-bounce 1.6s ease-in-out infinite; }}
 .haul-truck svg {{ display: block; width: 100%; height: auto; overflow: visible; }}
 .haul-wheel {{ transform-origin: center; transform-box: fill-box; animation: haul-wheel-spin 10s infinite linear; }}
 .haul-container {{ transform-origin: 15% 100%; transform-box: fill-box; animation: haul-container-tip 10s infinite; }}
@@ -6901,6 +6902,10 @@ a {{ color: inherit; }}
   68%  {{ transform: translateX(30%); }}
   74%  {{ transform: translateX(160%); }}
   100% {{ transform: translateX(160%); }}
+}}
+@keyframes haul-idle-bounce {{
+  0%, 100% {{ transform: translateY(0); }}
+  50%      {{ transform: translateY(-3px); }}
 }}
 @keyframes haul-wheel-spin {{
   0%   {{ transform: rotate(0deg); }}
@@ -7045,46 +7050,60 @@ a {{ color: inherit; }}
 
         <div class="haul-road">
             <div class="haul-truck">
-                <svg viewBox="0 0 240 120" xmlns="http://www.w3.org/2000/svg">
-                    <circle class="haul-puff" cx="61" cy="16" r="3" fill="#FF9D5C"/>
-                    <circle class="haul-puff" cx="63" cy="12" r="2.5" fill="#FF9D5C"/>
-                    <circle class="haul-puff" cx="65" cy="9" r="2" fill="#FF9D5C"/>
+              <div class="haul-truck-bounce">
+                <svg viewBox="0 0 240 122" xmlns="http://www.w3.org/2000/svg">
+                    <circle class="haul-puff" cx="69" cy="14" r="3" fill="#FF9D5C"/>
+                    <circle class="haul-puff" cx="72" cy="10" r="2.5" fill="#FF9D5C"/>
+                    <circle class="haul-puff" cx="75" cy="7" r="2" fill="#FF9D5C"/>
 
-                    <rect x="58" y="20" width="6" height="24" rx="1.5" fill="#3A3A3A"/>
+                    <circle cx="69.5" cy="16" r="4" fill="#3A3A3A"/>
+                    <rect x="66" y="16" width="7" height="26" rx="3.5" fill="#3A3A3A"/>
 
                     <g class="haul-container">
-                        <rect x="72" y="28" width="128" height="52" rx="3" fill="#FF6B1A"/>
-                        <rect x="72" y="28" width="128" height="9" rx="3" fill="#FF9D5C"/>
-                        <rect x="72" y="71" width="128" height="9" fill="#C4530E"/>
-                        <line x1="94" y1="37" x2="94" y2="71" stroke="#C4530E" stroke-width="1.5" opacity=".45"/>
-                        <line x1="116" y1="37" x2="116" y2="71" stroke="#C4530E" stroke-width="1.5" opacity=".45"/>
-                        <line x1="138" y1="37" x2="138" y2="71" stroke="#C4530E" stroke-width="1.5" opacity=".45"/>
-                        <line x1="160" y1="37" x2="160" y2="71" stroke="#C4530E" stroke-width="1.5" opacity=".45"/>
-                        <line x1="182" y1="37" x2="182" y2="71" stroke="#C4530E" stroke-width="1.5" opacity=".45"/>
+                        <rect x="80" y="34" width="118" height="46" rx="12" fill="#FF6B1A"/>
+                        <rect x="80" y="34" width="118" height="11" rx="12" fill="#FF9D5C"/>
+                        <rect x="80" y="69" width="118" height="11" rx="6" fill="#C4530E"/>
+                        <line x1="98"  y1="45" x2="98"  y2="69" stroke="#C4530E" stroke-width="1.5" opacity=".4"/>
+                        <line x1="118" y1="45" x2="118" y2="69" stroke="#C4530E" stroke-width="1.5" opacity=".4"/>
+                        <line x1="138" y1="45" x2="138" y2="69" stroke="#C4530E" stroke-width="1.5" opacity=".4"/>
+                        <line x1="158" y1="45" x2="158" y2="69" stroke="#C4530E" stroke-width="1.5" opacity=".4"/>
+                        <line x1="178" y1="45" x2="178" y2="69" stroke="#C4530E" stroke-width="1.5" opacity=".4"/>
                     </g>
 
-                    <rect x="68" y="78" width="132" height="7" fill="#202020"/>
+                    <rect x="76" y="84" width="124" height="8" rx="4" fill="#202020"/>
 
-                    <path d="M25,90 L25,55 L40,42 L68,42 L68,90 Z" fill="#1A1A1A" stroke="rgba(255,255,255,0.08)"/>
-                    <path d="M29,54 L40,46 L64,46 L64,58 L29,58 Z" fill="#262626"/>
-                    <rect x="25" y="86" width="43" height="4" fill="#161616"/>
+                    <path d="M14,98 L14,60 Q14,40 34,40 L58,40 Q76,40 76,58 L76,98 Q76,102 72,102 L18,102 Q14,102 14,98 Z"
+                          fill="#1A1A1A" stroke="rgba(255,255,255,0.08)"/>
 
-                    <circle class="haul-eye" cx="33" cy="76" r="4.2" fill="#FFE3C2"/>
-                    <circle class="haul-eye" cx="46" cy="76" r="4.2" fill="#FFE3C2"/>
+                    <rect x="22" y="48" width="46" height="28" rx="13" fill="#262626"/>
+
+                    <g class="haul-eye">
+                        <circle cx="33" cy="62" r="8" fill="#F5F5F0"/>
+                        <circle cx="34.5" cy="63.5" r="4" fill="#161616"/>
+                        <circle cx="36" cy="61" r="1.3" fill="#F5F5F0"/>
+                    </g>
+                    <g class="haul-eye">
+                        <circle cx="57" cy="62" r="8" fill="#F5F5F0"/>
+                        <circle cx="58.5" cy="63.5" r="4" fill="#161616"/>
+                        <circle cx="60" cy="61" r="1.3" fill="#F5F5F0"/>
+                    </g>
+
+                    <path d="M27,90 Q45,97 63,90" stroke="#3A3A3A" stroke-width="3" stroke-linecap="round" fill="none"/>
 
                     <g class="haul-wheel">
-                        <circle cx="48" cy="93" r="13" fill="#141414" stroke="#050505"/>
-                        <circle cx="48" cy="93" r="5" fill="#3A3A3A"/>
+                        <circle cx="42" cy="100" r="15" fill="#141414" stroke="#050505"/>
+                        <circle cx="42" cy="100" r="6" fill="#3A3A3A"/>
                     </g>
                     <g class="haul-wheel">
-                        <circle cx="155" cy="93" r="13" fill="#141414" stroke="#050505"/>
-                        <circle cx="155" cy="93" r="5" fill="#3A3A3A"/>
+                        <circle cx="150" cy="100" r="15" fill="#141414" stroke="#050505"/>
+                        <circle cx="150" cy="100" r="6" fill="#3A3A3A"/>
                     </g>
                     <g class="haul-wheel">
-                        <circle cx="180" cy="93" r="13" fill="#141414" stroke="#050505"/>
-                        <circle cx="180" cy="93" r="5" fill="#3A3A3A"/>
+                        <circle cx="178" cy="100" r="15" fill="#141414" stroke="#050505"/>
+                        <circle cx="178" cy="100" r="6" fill="#3A3A3A"/>
                     </g>
                 </svg>
+              </div>
             </div>
         </div>
 
