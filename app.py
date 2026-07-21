@@ -62,6 +62,11 @@ STRIPE_PRICE_IDS = {
 STRIPE_PLAN_LIMITS       = {"starter": 10, "pro": 30}
 STRIPE_PURCHASABLE_PLANS = {"starter", "pro"}
 
+# Android package identity — same value used in the Digital Asset Links
+# file (.well-known/assetlinks.json) and for detecting a Google Play TWA
+# launch server-side (see is_native_app()).
+ANDROID_PACKAGE_NAME = "com.rockkstaar.haultra"
+
 # ----------------------------------------------------------
 app = Flask(__name__)
 _secret_key = os.environ.get("SECRET_KEY", "")
@@ -2611,12 +2616,26 @@ def cid():
 
 
 def is_native_app():
-    """True when the request comes from the Capacitor iOS/Android shell,
-    not a browser. Detected via the appendUserAgent marker set in
-    capacitor.config.json — takes effect once the native projects are
-    generated/synced with that config. Used to hide pricing/checkout UI:
-    Apple counts any path to an external payment flow as steering."""
-    return "HaultraNativeApp" in request.headers.get("User-Agent", "")
+    """True when the request comes from either native wrapper, not a
+    plain browser:
+
+    - The Capacitor iOS/Android shell — detected via the appendUserAgent
+      marker set in capacitor.config.json (takes effect once the native
+      projects are generated/synced with that config).
+    - A Google Play TWA (Trusted Web Activity) — detected via the
+      X-Requested-With header. Android's CustomTabsService sets this to
+      the launching app's package name for a Trusted Web Activity launch;
+      it's the standard server-visible TWA signal (the tooling Google
+      recommends, e.g. Bubblewrap, wires this up automatically) — a TWA
+      does NOT send a distinguishing User-Agent, so the Capacitor check
+      alone never catches it.
+
+    Used to hide pricing/checkout UI: both app stores count any in-app
+    path to an external payment flow as steering.
+    """
+    ua = request.headers.get("User-Agent", "")
+    requested_with = request.headers.get("X-Requested-With", "")
+    return "HaultraNativeApp" in ua or requested_with == ANDROID_PACKAGE_NAME
 
 
 def driver_active_route_id(conn, user_id):
@@ -15738,30 +15757,44 @@ const OFFLINE = '/offline';
 // This is the ONE service worker for the whole origin — FCM handling lives
 // here rather than in a second registered worker to avoid two SWs fighting
 // over the '/' scope.
-importScripts('https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js');
-importScripts('https://www.gstatic.com/firebasejs/10.12.0/firebase-messaging-compat.js');
+//
+// importScripts() is synchronous and throws on failure — if gstatic.com is
+// slow, blocked (ad blocker, corporate firewall, offline first install),
+// or briefly down, an uncaught throw here fails the ENTIRE service worker's
+// script evaluation, which means install/activate/fetch below never get
+// wired up either. Offline caching is the real PWA requirement and must
+// keep working even when FCM can't load, so this is wrapped defensively —
+// losing background push for a session is fine, losing offline support
+// is not.
+try {
+  importScripts('https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js');
+  importScripts('https://www.gstatic.com/firebasejs/10.12.0/firebase-messaging-compat.js');
 
-firebase.initializeApp({
-  apiKey: "AIzaSyBAWm08bVHH5uia21H5VPd1mAW0Ei0MnV4",
-  authDomain: "haultra-dispatch.firebaseapp.com",
-  projectId: "haultra-dispatch",
-  storageBucket: "haultra-dispatch.firebasestorage.app",
-  messagingSenderId: "66096047367",
-  appId: "1:66096047367:web:a7a3da473ba9d0bf5b51a2"
-});
-
-const messaging = firebase.messaging();
-
-messaging.onBackgroundMessage((payload) => {
-  const { title, body, stopId } = payload.data || {};
-  self.registration.showNotification(title || 'New Stop Assigned', {
-    body: body || 'You have a new stop. Tap to view.',
-    icon: '/static/icon-192.png',
-    badge: '/static/icon-192.png',
-    tag: stopId || 'haultra-stop',
-    data: { stopId }
+  firebase.initializeApp({
+    apiKey: "AIzaSyBAWm08bVHH5uia21H5VPd1mAW0Ei0MnV4",
+    authDomain: "haultra-dispatch.firebaseapp.com",
+    projectId: "haultra-dispatch",
+    storageBucket: "haultra-dispatch.firebasestorage.app",
+    messagingSenderId: "66096047367",
+    appId: "1:66096047367:web:a7a3da473ba9d0bf5b51a2"
   });
-});
+
+  const messaging = firebase.messaging();
+
+  messaging.onBackgroundMessage((payload) => {
+    const { title, body, stopId } = payload.data || {};
+    self.registration.showNotification(title || 'New Stop Assigned', {
+      body: body || 'You have a new stop. Tap to view.',
+      icon: '/static/icon-192.png',
+      badge: '/static/icon-192.png',
+      tag: stopId || 'haultra-stop',
+      data: { stopId }
+    });
+  });
+} catch (e) {
+  // FCM unavailable this session (network/CDN issue) — background push
+  // notifications won't fire, but offline caching below still will.
+}
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
@@ -20500,7 +20533,7 @@ def android_asset_links():
             "relation": ["delegate_permission/common.handle_all_urls"],
             "target": {
                 "namespace": "android_app",
-                "package_name": "com.rockkstaar.haultra",
+                "package_name": ANDROID_PACKAGE_NAME,
                 "sha256_cert_fingerprints": ["REPLACE_WITH_ANDROID_SHA256_FINGERPRINT"],
             },
         }
