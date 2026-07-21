@@ -5287,7 +5287,11 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     border-radius: var(--radius-lg);
     border: 1px solid rgba(255,107,26,0.18);
     overflow: hidden;
-    background: #121212;
+    /* Light background so there's no dark flash before the light tile
+       layer loads — the map canvas is intentionally light against the
+       app's dark theme; see .leaflet-* overrides below for why the
+       popups/controls floating on top of it stay dark. */
+    background: #F5F5F0;
 }}
 @media (max-width: 900px) {{ .bin-map {{ height: 300px; }} }}
 .bin-map-note {{
@@ -14736,11 +14740,15 @@ def bin_tracker():
 
             function makeIcon(overdue) {{
                 var color = overdue ? '#FF5252' : '#FF6B1A';
+                // White halo ring (via box-shadow) + a solid dark border keeps
+                // the pin popping against light-tile features of any color —
+                // pale roads, water, parks — not just a plain background.
                 return L.divIcon({{
                     className: 'bin-map-pin',
                     html: '<div style="width:16px;height:16px;border-radius:50% 50% 50% 0;' +
                           'transform:rotate(-45deg);background:' + color + ';' +
-                          'border:2px solid rgba(0,0,0,0.45);box-shadow:0 2px 6px rgba(0,0,0,0.55);"></div>',
+                          'border:2px solid rgba(0,0,0,0.55);' +
+                          'box-shadow:0 0 0 2px rgba(255,255,255,0.9), 0 2px 5px rgba(0,0,0,0.35);"></div>',
                     iconSize: [16, 16],
                     iconAnchor: [8, 16],
                     popupAnchor: [0, -18],
@@ -14765,7 +14773,7 @@ def bin_tracker():
             }}
 
             var map = L.map('bin-map', {{ scrollWheelZoom: true }}).setView(FALLBACK_CENTER, 11);
-            L.tileLayer('https://{{s}}.basemaps.cartocdn.com/dark_all/{{z}}/{{x}}/{{y}}{{r}}.png', {{
+            L.tileLayer('https://{{s}}.basemaps.cartocdn.com/light_all/{{z}}/{{x}}/{{y}}{{r}}.png', {{
                 attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
                 subdomains: 'abcd',
                 maxZoom: 19,
