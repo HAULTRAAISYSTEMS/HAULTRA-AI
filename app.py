@@ -4531,7 +4531,7 @@ def shell_page(title, body, extra_head=""):
    <head>
     <title>{e(title)}</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#121212">
+    <meta name="theme-color" content="#FF6B1A">
     <meta name="csrf-token" content="{csrf_token}">
 
     <link rel="manifest" href="/static/manifest.json">
