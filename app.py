@@ -773,7 +773,7 @@ _SUBSCRIPTION_EXEMPT = {
     "login", "logout", "company_register", "static",
     "subscription_blocked", "subscription_success", "billing",
     "company_subscription", "company_settings", "settings_page", "stripe_webhook",
-    "privacy_policy", "terms_of_service",
+    "privacy_policy", "terms_of_service", "account_deletion_info",
 }
 
 _SUB_CACHE_TTL = 60  # seconds between DB re-checks per company
@@ -14168,12 +14168,14 @@ def privacy_policy():
 
         <h2>3. Information We Collect</h2>
         <ul>
-            <li><strong>Account data</strong> — company name, owner name, username, and password
-            (stored as a bcrypt hash; we never store your plaintext password).</li>
+            <li><strong>Account data</strong> — company name, owner name, username, password
+            (stored as a bcrypt hash; we never store your plaintext password), and, where provided,
+            phone number and email address for the people on your account.</li>
             <li><strong>Operational data</strong> — routes, stops, customer addresses, order notes,
             and driver assignments you enter into the system.</li>
-            <li><strong>Photos</strong> — images uploaded by drivers at job sites, stored on our
-            servers and associated only with your company account.</li>
+            <li><strong>Photos</strong> — images uploaded by drivers at job sites, and vehicle
+            inspection (DVIR) photos submitted during driver safety checks, stored on our servers
+            and associated only with your company account.</li>
             <li><strong>Location data</strong> — GPS coordinates captured at the moment a driver
             marks a stop complete, used to confirm container location for tracking purposes. We
             do not track location continuously or in the background — only at stop completion,
@@ -14263,7 +14265,9 @@ def privacy_policy():
         time by contacting <a href="mailto:info@haultraai.com">info@haultraai.com</a>. We will
         respond within 30 days. Residents of California (CCPA) and the EEA/UK (GDPR) have
         additional rights including portability and the right to object to processing — contact
-        us to exercise these rights.</p>
+        us to exercise these rights. To delete your account specifically, see
+        <a href="{url_for('account_deletion_info')}">Account Deletion</a>, which covers both the
+        in-app self-service option and this email-based process.</p>
 
         <h2>13. Changes to This Policy</h2>
         <p>We will post updates to this page with a revised effective date. For material changes,
@@ -14285,6 +14289,55 @@ def privacy_policy():
     </div>
     """
     return render_template_string(shell_page("Privacy Policy", body))
+
+
+# =========================================================
+# ACCOUNT DELETION — public, reachable without login (Google Play / Apple
+# account-deletion requirements point to a stable URL here, separate from
+# the in-app self-service flow at /account/delete and /company/close).
+# =========================================================
+@app.route("/account-deletion")
+def account_deletion_info():
+    body = f"""
+    <div class="hero">
+        <h1>Account Deletion</h1>
+        <p class="muted small">How to delete your HAULTRA account and data.</p>
+    </div>
+
+    <div class="card" style="max-width:820px;line-height:1.8;">
+
+        <h2>If you can log in</h2>
+        <p>Delete your own account directly in the app — no need to contact us:</p>
+        <ul>
+            <li><strong>Drivers</strong> — open Cab View, tap the gear icon, and choose
+            <strong>Delete My Account</strong>.</li>
+            <li><strong>Bosses / managers</strong> — go to <strong>Settings</strong> and scroll to
+            <strong>Delete Account</strong>. If you're the only manager on your company account,
+            add another Boss on the Team page first, or use <strong>Close Company</strong> instead,
+            which deletes every account on the company at once.</li>
+        </ul>
+        <p>Either way, your account is deactivated immediately — you're logged out and can no
+        longer sign in. Your remaining data (routes, stops, photos, and any other account data)
+        is then permanently removed within 30 days.</p>
+
+        <h2>If you can't log in</h2>
+        <p>Email <a href="mailto:info@haultraai.com">info@haultraai.com</a> from the address on
+        the account (or with enough detail to identify it — company name and username) and ask us
+        to delete it. We'll confirm and complete the deletion within 30 days.</p>
+
+        <h2>What gets deleted</h2>
+        <p>Account data (name, username, phone, email), operational data (routes, stops, customer
+        addresses), photos (job-site and vehicle inspection), and location data captured at stop
+        completion. Billing/subscription history is retained for 7 years for accounting and legal
+        compliance, as described in our <a href="{url_for('privacy_policy')}">Privacy Policy</a>.</p>
+
+        <p class="muted small" style="margin-top:20px;">
+            See the <a href="{url_for('privacy_policy')}">Privacy Policy</a> for the full detail
+            on what we collect and how long we keep it.
+        </p>
+    </div>
+    """
+    return render_template_string(shell_page("Account Deletion", body))
 
 
 # =========================================================
