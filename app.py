@@ -6855,23 +6855,87 @@ a {{ color: inherit; }}
 .lp-hero p {{ color: var(--text-dim); font-size: 17px; line-height: 1.6; max-width: 560px; margin: 0 auto 30px; }}
 .lp-hero-ctas {{ display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }}
 
-/* ── Parser demo ── */
-.lp-demo {{ margin: 44px auto 84px; max-width: 560px; }}
-.lp-demo-frame {{ background: var(--bg-1); border: 1px solid rgba(255,255,255,0.08); border-radius: var(--radius); padding: 22px; min-height: 230px; position: relative; }}
-.lp-demo-label {{ font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-faint); margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }}
-.lp-demo-label .dot {{ width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); }}
-.lp-demo-raw {{ font-family: var(--font-mono); font-size: 14px; line-height: 1.7; color: var(--text-dim); min-height: 96px; transition: opacity .35s ease; }}
-.lp-demo-raw.is-hidden {{ opacity: 0; position: absolute; pointer-events: none; }}
-.lp-demo-raw .cursor {{ display: inline-block; width: 2px; height: 15px; background: var(--orange); margin-left: 1px; vertical-align: -2px; animation: lp-blink 1s step-end infinite; }}
-.lp-demo-cards {{ display: flex; flex-direction: column; gap: 10px; opacity: 0; transform: translateY(10px); pointer-events: none; transition: opacity .4s ease, transform .4s ease; }}
-.lp-demo-cards.is-visible {{ opacity: 1; transform: none; pointer-events: auto; }}
-.lp-demo-card {{ background: var(--bg-2); border: 1px solid var(--teal-border); border-radius: var(--radius-sm); padding: 13px 14px; box-shadow: 0 0 0 rgba(0,229,204,0); transition: box-shadow .4s ease; }}
-.lp-demo-cards.is-visible .lp-demo-card {{ box-shadow: 0 0 18px rgba(0,229,204,0.16); }}
+/* ── Shared parsed-stop-card look (reused by hero scene + AI feature block) ── */
+.lp-demo-card {{ background: var(--bg-2); border: 1px solid var(--teal-border); border-radius: var(--radius-sm); padding: 13px 14px; box-shadow: 0 0 18px rgba(0,229,204,0.12); }}
 .lp-demo-card-top {{ display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }}
 .lp-demo-addr {{ font-weight: 700; font-size: 14px; }}
 .lp-demo-meta {{ color: var(--text-dim); font-size: 12.5px; line-height: 1.5; }}
 .lp-demo-ai-tag {{ margin-left: auto; font-size: 10px; letter-spacing: .5px; color: var(--teal); border: 1px solid var(--teal-border); background: var(--teal-dim); padding: 2px 7px; border-radius: 999px; }}
 @keyframes lp-blink {{ 50% {{ opacity: 0; }} }}
+
+/* ── HAUL mascot hero scene ── */
+.haul-scene {{ margin: 40px auto 90px; max-width: 620px; }}
+.haul-bubble {{ position: relative; z-index: 3; max-width: 380px; margin: 0 auto 4px; background: var(--bg-1); border: 1px solid rgba(255,255,255,0.10); border-radius: var(--radius-sm); padding: 12px 16px; font-family: var(--font-mono); font-size: 13px; line-height: 1.6; color: var(--text-dim); min-height: 64px; animation: haul-bubble-cycle 10s infinite; }}
+.haul-bubble .cursor {{ display: inline-block; width: 2px; height: 13px; background: var(--orange); margin-left: 1px; vertical-align: -2px; animation: lp-blink 1s step-end infinite; }}
+.haul-road {{ position: relative; height: 128px; margin-top: 8px; overflow: hidden; }}
+.haul-road::after {{ content: ''; position: absolute; left: 0; right: 0; bottom: 6px; height: 2px; background: repeating-linear-gradient(90deg, rgba(255,107,26,0.3) 0 18px, transparent 18px 34px); }}
+.haul-truck {{ position: absolute; bottom: 10px; left: 50%; width: clamp(160px, 46vw, 230px); margin-left: clamp(-115px, -23vw, -80px); animation: haul-truck-move 10s infinite; }}
+.haul-truck svg {{ display: block; width: 100%; height: auto; overflow: visible; }}
+.haul-wheel {{ transform-origin: center; transform-box: fill-box; animation: haul-wheel-spin 10s infinite linear; }}
+.haul-container {{ transform-origin: 15% 100%; transform-box: fill-box; animation: haul-container-tip 10s infinite; }}
+.haul-eye {{ transform-origin: center; transform-box: fill-box; animation: haul-blink 10s infinite; }}
+.haul-puff {{ transform-origin: center; transform-box: fill-box; opacity: 0; animation: haul-puff 10s infinite; }}
+.haul-puff:nth-child(2) {{ animation-delay: .12s; }}
+.haul-puff:nth-child(3) {{ animation-delay: .24s; }}
+.haul-cards {{ position: relative; z-index: 2; display: flex; flex-direction: column; gap: 10px; max-width: 420px; margin: 18px auto 0; }}
+.haul-cards .lp-demo-card {{ opacity: 0; transform: translateY(14px); animation: haul-cards-cycle 10s infinite; }}
+.haul-cards .lp-demo-card:nth-child(2) {{ animation-delay: .15s; }}
+
+@keyframes haul-bubble-cycle {{
+  0%   {{ opacity: 0; transform: translateY(6px) scale(.97); }}
+  3%   {{ opacity: 1; transform: translateY(0) scale(1); }}
+  33%  {{ opacity: 1; transform: translateY(0) scale(1); }}
+  38%  {{ opacity: 0; transform: translateY(-6px) scale(.7); }}
+  100% {{ opacity: 0; }}
+}}
+@keyframes haul-truck-move {{
+  0%   {{ transform: translateX(-160%); }}
+  28%  {{ transform: translateX(-160%); }}
+  36%  {{ transform: translateX(4%); }}
+  39%  {{ transform: translateX(0%); }}
+  40%  {{ transform: translateX(-1.5%); }}
+  41%  {{ transform: translateX(1%); }}
+  42%  {{ transform: translateX(-.5%); }}
+  43%  {{ transform: translateX(0%); }}
+  62%  {{ transform: translateX(0%); }}
+  68%  {{ transform: translateX(30%); }}
+  74%  {{ transform: translateX(160%); }}
+  100% {{ transform: translateX(160%); }}
+}}
+@keyframes haul-wheel-spin {{
+  0%   {{ transform: rotate(0deg); }}
+  36%  {{ transform: rotate(760deg); }}
+  43%  {{ transform: rotate(760deg); }}
+  62%  {{ transform: rotate(760deg); }}
+  74%  {{ transform: rotate(1520deg); }}
+  100% {{ transform: rotate(1520deg); }}
+}}
+@keyframes haul-container-tip {{
+  0%, 45% {{ transform: rotate(0deg); }}
+  51% {{ transform: rotate(-10deg); }}
+  59% {{ transform: rotate(-10deg); }}
+  63% {{ transform: rotate(0deg); }}
+  100% {{ transform: rotate(0deg); }}
+}}
+@keyframes haul-puff {{
+  0%, 39% {{ opacity: 0; transform: translate(0,0) scale(.4); }}
+  41% {{ opacity: .8; transform: translate(2px,-5px) scale(.7); }}
+  47% {{ opacity: 0; transform: translate(11px,-18px) scale(1.15); }}
+  100% {{ opacity: 0; }}
+}}
+@keyframes haul-blink {{
+  0%, 13%, 17%, 58%, 59.3%, 60.5%, 61.5%, 100% {{ transform: scaleY(1); }}
+  15%   {{ transform: scaleY(.12); }}
+  59.7% {{ transform: scaleY(.12); }}
+  61%   {{ transform: scaleY(.12); }}
+}}
+@keyframes haul-cards-cycle {{
+  0%, 49% {{ opacity: 0; transform: translateY(14px); }}
+  54% {{ opacity: 1; transform: translateY(0); }}
+  63% {{ opacity: 1; transform: translateY(0); }}
+  67% {{ opacity: 0; transform: translateY(-8px); }}
+  100% {{ opacity: 0; }}
+}}
 
 /* ── Reveal-on-scroll ── */
 .reveal {{ opacity: 0; transform: translateY(26px); transition: opacity .6s ease, transform .6s ease; }}
@@ -6950,9 +7014,10 @@ a {{ color: inherit; }}
 @media (prefers-reduced-motion: reduce) {{
   * {{ animation: none !important; transition: none !important; }}
   .reveal {{ opacity: 1 !important; transform: none !important; }}
-  .lp-demo-cards {{ opacity: 1 !important; transform: none !important; pointer-events: auto !important; }}
-  .lp-demo-raw {{ display: none !important; }}
   .lp-bin-pin {{ opacity: 1 !important; transform: rotate(-45deg) scale(1) !important; }}
+  .haul-bubble {{ display: none !important; }}
+  .haul-truck {{ position: relative !important; left: auto !important; bottom: auto !important; margin: 0 auto !important; }}
+  .haul-cards .lp-demo-card {{ opacity: 1 !important; transform: none !important; }}
 }}
 </style>
 </head>
@@ -6966,35 +7031,79 @@ a {{ color: inherit; }}
 </nav>
 
 <header class="lp-hero lp-wrap">
-    <h1>Dispatch built for<br><span class="accent">roll&#8209;off haulers.</span></h1>
-    <p>Turn a messy text message into an assigned, trackable route in seconds — no more
-    scrolling for addresses, guessing container sizes, or losing track of what's overdue.</p>
+    <h1>Your dispatch texts.<br><span class="accent">Handled.</span></h1>
+    <p>Built by a driver for roll&#8209;off haulers — messy texts become clean, trackable routes.</p>
     <div class="lp-hero-ctas">
         <a class="lp-btn lp-btn--primary" href="{url_for('company_register')}">Get Started</a>
         <a class="lp-secondary-link" href="{url_for('login')}">Log In &rarr;</a>
     </div>
 
-    <div class="lp-demo lp-wrap">
-        <div class="lp-demo-frame">
-            <div class="lp-demo-label"><span class="dot"></span> Incoming dispatch text</div>
-            <div class="lp-demo-raw" id="lp-demo-raw"></div>
-            <div class="lp-demo-cards" id="lp-demo-cards">
-                <div class="lp-demo-card">
-                    <div class="lp-demo-card-top">
-                        <span class="action-badge pickup">PR</span>
-                        <span class="lp-demo-addr">2476 Bayview Ave</span>
-                        <span class="lp-demo-ai-tag">AI&#8209;PARSED</span>
-                    </div>
-                    <div class="lp-demo-meta">Virginia Beach &middot; Froehler &middot; 30&nbsp;YD &middot; Dump: Dominion</div>
+    <div class="haul-scene lp-wrap" aria-hidden="true">
+        <div class="haul-bubble">
+            <span id="haul-bubble-text"></span>
+        </div>
+
+        <div class="haul-road">
+            <div class="haul-truck">
+                <svg viewBox="0 0 240 120" xmlns="http://www.w3.org/2000/svg">
+                    <circle class="haul-puff" cx="61" cy="16" r="3" fill="#FF9D5C"/>
+                    <circle class="haul-puff" cx="63" cy="12" r="2.5" fill="#FF9D5C"/>
+                    <circle class="haul-puff" cx="65" cy="9" r="2" fill="#FF9D5C"/>
+
+                    <rect x="58" y="20" width="6" height="24" rx="1.5" fill="#3A3A3A"/>
+
+                    <g class="haul-container">
+                        <rect x="72" y="28" width="128" height="52" rx="3" fill="#FF6B1A"/>
+                        <rect x="72" y="28" width="128" height="9" rx="3" fill="#FF9D5C"/>
+                        <rect x="72" y="71" width="128" height="9" fill="#C4530E"/>
+                        <line x1="94" y1="37" x2="94" y2="71" stroke="#C4530E" stroke-width="1.5" opacity=".45"/>
+                        <line x1="116" y1="37" x2="116" y2="71" stroke="#C4530E" stroke-width="1.5" opacity=".45"/>
+                        <line x1="138" y1="37" x2="138" y2="71" stroke="#C4530E" stroke-width="1.5" opacity=".45"/>
+                        <line x1="160" y1="37" x2="160" y2="71" stroke="#C4530E" stroke-width="1.5" opacity=".45"/>
+                        <line x1="182" y1="37" x2="182" y2="71" stroke="#C4530E" stroke-width="1.5" opacity=".45"/>
+                    </g>
+
+                    <rect x="68" y="78" width="132" height="7" fill="#202020"/>
+
+                    <path d="M25,90 L25,55 L40,42 L68,42 L68,90 Z" fill="#1A1A1A" stroke="rgba(255,255,255,0.08)"/>
+                    <path d="M29,54 L40,46 L64,46 L64,58 L29,58 Z" fill="#262626"/>
+                    <rect x="25" y="86" width="43" height="4" fill="#161616"/>
+
+                    <circle class="haul-eye" cx="33" cy="76" r="4.2" fill="#FFE3C2"/>
+                    <circle class="haul-eye" cx="46" cy="76" r="4.2" fill="#FFE3C2"/>
+
+                    <g class="haul-wheel">
+                        <circle cx="48" cy="93" r="13" fill="#141414" stroke="#050505"/>
+                        <circle cx="48" cy="93" r="5" fill="#3A3A3A"/>
+                    </g>
+                    <g class="haul-wheel">
+                        <circle cx="155" cy="93" r="13" fill="#141414" stroke="#050505"/>
+                        <circle cx="155" cy="93" r="5" fill="#3A3A3A"/>
+                    </g>
+                    <g class="haul-wheel">
+                        <circle cx="180" cy="93" r="13" fill="#141414" stroke="#050505"/>
+                        <circle cx="180" cy="93" r="5" fill="#3A3A3A"/>
+                    </g>
+                </svg>
+            </div>
+        </div>
+
+        <div class="haul-cards">
+            <div class="lp-demo-card">
+                <div class="lp-demo-card-top">
+                    <span class="action-badge pickup">PR</span>
+                    <span class="lp-demo-addr">2476 Bayview Ave</span>
+                    <span class="lp-demo-ai-tag">AI&#8209;PARSED</span>
                 </div>
-                <div class="lp-demo-card">
-                    <div class="lp-demo-card-top">
-                        <span class="action-badge dropswap">S</span>
-                        <span class="lp-demo-addr">1013 Paragon Way</span>
-                        <span class="lp-demo-ai-tag">AI&#8209;PARSED</span>
-                    </div>
-                    <div class="lp-demo-meta">Swap out &middot; before returning to previous stop</div>
+                <div class="lp-demo-meta">Virginia Beach &middot; Froehler &middot; 30&nbsp;YD &middot; Dump: Dominion</div>
+            </div>
+            <div class="lp-demo-card">
+                <div class="lp-demo-card-top">
+                    <span class="action-badge dropswap">S</span>
+                    <span class="lp-demo-addr">1013 Paragon Way</span>
+                    <span class="lp-demo-ai-tag">AI&#8209;PARSED</span>
                 </div>
+                <div class="lp-demo-meta">Swap out &middot; before returning to previous stop</div>
             </div>
         </div>
     </div>
@@ -7145,32 +7254,32 @@ a {{ color: inherit; }}
         revealEls.forEach(function(el) {{ el.classList.add('is-visible'); }});
     }}
 
-    /* ── Parser typewriter demo ── */
-    var rawEl   = document.getElementById('lp-demo-raw');
-    var cardsEl = document.getElementById('lp-demo-cards');
-    var demoText = {demo_text!r};
+    /* ── HAUL mascot: type the bubble text in sync with the truck's CSS loop.
+         The truck's position/wheels/container-tip/eyes/cards are all pure CSS
+         keyframe animations sharing one 10s timeline — this only drives the
+         bubble's dynamic text, re-triggered every time that timeline loops. ── */
+    var bubbleTextEl = document.getElementById('haul-bubble-text');
+    var truckEl      = document.querySelector('.haul-truck');
+    var demoText     = {demo_text!r};
 
-    if (reduceMotion) {{
-        cardsEl.classList.add('is-visible');
-    }} else if (rawEl && cardsEl) {{
-        (function loop() {{
-            rawEl.classList.remove('is-hidden');
-            cardsEl.classList.remove('is-visible');
-            rawEl.innerHTML = '<span class="cursor"></span>';
-            var i = 0;
-            var typing = setInterval(function() {{
-                i++;
-                rawEl.innerHTML = demoText.slice(0, i) + '<span class="cursor"></span>';
-                if (i >= demoText.length) {{
-                    clearInterval(typing);
-                    setTimeout(function() {{
-                        rawEl.classList.add('is-hidden');
-                        cardsEl.classList.add('is-visible');
-                        setTimeout(loop, 3600);
-                    }}, 550);
-                }}
-            }}, 27);
-        }})();
+    if (bubbleTextEl) {{
+        if (reduceMotion) {{
+            bubbleTextEl.textContent = demoText;
+        }} else if (truckEl) {{
+            var typeBubble = function() {{
+                var i = 0;
+                bubbleTextEl.innerHTML = '<span class="cursor"></span>';
+                var typing = setInterval(function() {{
+                    i++;
+                    bubbleTextEl.innerHTML = demoText.slice(0, i) + '<span class="cursor"></span>';
+                    if (i >= demoText.length) clearInterval(typing);
+                }}, 26);
+            }};
+            typeBubble();
+            truckEl.addEventListener('animationiteration', function(e) {{
+                if (e.animationName === 'haul-truck-move') typeBubble();
+            }});
+        }}
     }}
 
     /* ── Bin Tracker rental-clock count-up demo ── */
