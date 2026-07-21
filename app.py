@@ -1958,6 +1958,14 @@ def init_db():
     #     apple | waze | device_default ---
     safe_add_column(conn, "users", "nav_preference TEXT")
 
+    # --- In-app account deletion (Apple 5.1.1(v)). is_active=0 blocks login
+    #     immediately; pending_deletion_at records the date operational data
+    #     is eligible for permanent removal (30 days out, matching the
+    #     retention window already documented in the privacy policy). ---
+    safe_add_column(conn, "users", "is_active INTEGER NOT NULL DEFAULT 1")
+    safe_add_column(conn, "users", "pending_deletion_at TEXT")
+    safe_add_column(conn, "companies", "closed_at TEXT")
+
     # --- Geocoded coordinates for a stop's own address, used by the Bin
     #     Tracker map. NULL until geocoded (or if geocoding failed/was never
     #     attempted) — compute_containers_out() and the map degrade to
@@ -2600,6 +2608,15 @@ def get_current_user():
 def cid():
     """Return the current session's company_id (None if not logged in)."""
     return session.get("company_id")
+
+
+def is_native_app():
+    """True when the request comes from the Capacitor iOS/Android shell,
+    not a browser. Detected via the appendUserAgent marker set in
+    capacitor.config.json — takes effect once the native projects are
+    generated/synced with that config. Used to hide pricing/checkout UI:
+    Apple counts any path to an external payment flow as steering."""
+    return "HaultraNativeApp" in request.headers.get("User-Agent", "")
 
 
 def driver_active_route_id(conn, user_id):
@@ -6370,6 +6387,10 @@ def login():
             flash("Something went wrong on our end — please try again in a moment.", "error")
             return redirect(url_for("login"))
 
+        if user and check_password_hash(user["password_hash"], password) and not user["is_active"]:
+            flash("This account has been deactivated.", "error")
+            return redirect(url_for("login"))
+
         if user and check_password_hash(user["password_hash"], password):
             session.clear()
             session["user_id"]       = user["id"]
@@ -7279,16 +7300,11 @@ def delete_user(user_id):
         flash("User not found.", "error")
         return redirect(url_for("team_page"))
 
-    # Cannot delete yourself
-    if user_id == session["user_id"]:
-        conn.close()
-        flash("You cannot delete your own account.", "error")
-        return redirect(url_for("team_page"))
-
-    # Cannot delete the last boss
+    # Cannot delete the last boss (also protects a boss deleting themselves
+    # through this route — see /account/delete for the self-service flow)
     if target["role"] == "boss":
         boss_count = conn.execute(
-            "SELECT COUNT(*) n FROM users WHERE role='boss' AND company_id=?", (cid(),)
+            "SELECT COUNT(*) n FROM users WHERE role='boss' AND company_id=? AND is_active=1", (cid(),)
         ).fetchone()["n"]
         if boss_count <= 1:
             conn.close()
@@ -7308,6 +7324,90 @@ def delete_user(user_id):
 
     flash(f"User '{target['username']}' has been deleted.", "success")
     return redirect(url_for("team_page"))
+
+
+@app.route("/account/delete", methods=["POST"])
+@login_required
+def delete_own_account():
+    """Self-service account deletion (Apple 5.1.1(v)). Drivers can always
+    delete themselves immediately. A boss can too, UNLESS they're the last
+    active boss on the company — in that case they must add another boss
+    first (via Team) or close the whole company via /company/close."""
+    conn = get_db()
+    me = conn.execute("SELECT * FROM users WHERE id=?", (session["user_id"],)).fetchone()
+    if not me:
+        conn.close()
+        return redirect(url_for("logout"))
+
+    if me["role"] == "boss":
+        other_active_bosses = conn.execute(
+            "SELECT COUNT(*) n FROM users WHERE role='boss' AND company_id=? AND id!=? AND is_active=1",
+            (cid(), me["id"])
+        ).fetchone()["n"]
+        if other_active_bosses == 0:
+            conn.close()
+            flash(
+                "You're the only manager on this account. Add another Boss on "
+                "the Team page first, or close the company entirely below.",
+                "error"
+            )
+            return redirect(url_for("settings_page") + "#delete-account")
+
+    removal_date = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+    conn.execute(
+        "UPDATE users SET is_active=0, pending_deletion_at=? WHERE id=?",
+        (removal_date, me["id"])
+    )
+    if me["role"] == "driver":
+        conn.execute(
+            "UPDATE routes SET assigned_to=NULL WHERE assigned_to=? AND company_id=?",
+            (me["id"], cid())
+        )
+    conn.commit()
+    conn.close()
+
+    username = me["username"]
+    session.clear()
+    flash(
+        f"Account '{username}' has been deactivated. Remaining data will be "
+        f"permanently removed by {removal_date}.",
+        "success"
+    )
+    return redirect(url_for("login"))
+
+
+@app.route("/company/close", methods=["POST"])
+@boss_required
+def close_company():
+    """Closes the whole company: deactivates every account (all bosses and
+    drivers), cancels the subscription, and schedules data removal. This is
+    the path a company's last remaining boss uses to delete their own
+    account, since there's no one else to hand it off to."""
+    if request.form.get("confirm_close", "").strip().upper() != "CLOSE":
+        flash("Type CLOSE to confirm closing the company.", "error")
+        return redirect(url_for("settings_page") + "#delete-account")
+
+    conn = get_db()
+    removal_date = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+    conn.execute(
+        "UPDATE users SET is_active=0, pending_deletion_at=? WHERE company_id=? AND is_active=1",
+        (removal_date, cid())
+    )
+    conn.execute(
+        "UPDATE companies SET subscription_status='cancelled', closed_at=? WHERE id=?",
+        (now_ts(), cid())
+    )
+    conn.execute("UPDATE routes SET assigned_to=NULL WHERE company_id=?", (cid(),))
+    conn.commit()
+    conn.close()
+
+    session.clear()
+    flash(
+        f"Company closed. All accounts have been deactivated; remaining data "
+        f"will be permanently removed by {removal_date}.",
+        "success"
+    )
+    return redirect(url_for("login"))
 
 
 _NAV_PREFERENCES = {"google", "apple", "waze", "device_default"}
@@ -7516,7 +7616,10 @@ def register():
                 ).fetchone()["n"]
                 if current_drivers >= co["max_drivers"]:
                     conn.close()
-                    flash(f"Driver limit reached ({co['max_drivers']}). Upgrade your plan to add more.", "error")
+                    limit_msg = f"Driver limit reached ({co['max_drivers']})."
+                    if not is_native_app():
+                        limit_msg += " Upgrade your plan to add more."
+                    flash(limit_msg, "error")
                     return redirect(url_for("register"))
 
         # Case-insensitive duplicate check — the DB's UNIQUE constraint on
@@ -9295,6 +9398,19 @@ def driver_route_detail(route_id):
         <button type="button" id="gps-enable-btn" class="btn secondary" style="width:100%;min-height:48px;">
             Enable Location
         </button>
+
+        <div class="no-photo-confirm-title" style="font-size:15px;margin:22px 0 8px;color:#f87171;">Delete Account</div>
+        <div class="no-photo-confirm-body" style="margin-bottom:12px;">
+            Deactivates your account immediately and permanently removes your data within 30 days.
+        </div>
+        <form method="POST" action="{url_for('delete_own_account')}"
+              onsubmit="return confirm('Delete your account? This cannot be undone.');">
+            <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+            <button type="submit" class="btn" style="width:100%;min-height:48px;background:#f8717122;
+                    color:#f87171;border:1px solid #f8717155;">
+                Delete My Account
+            </button>
+        </form>
     </div>
     """
 
@@ -13250,6 +13366,8 @@ def settings_page():
     sub_status = _co.get("subscription_status") or "active"
     trial_ends_at = _co.get("trial_ends_at")
 
+    native = is_native_app()
+
     trial_banner = ""
     if plan == "trial" and trial_ends_at:
         try:
@@ -13259,14 +13377,19 @@ def settings_page():
                 trial_banner = (
                     f'<div style="background:rgba(251,191,36,0.15);border:1px solid rgba(251,191,36,0.4);'
                     f'border-radius:10px;padding:14px 18px;margin-bottom:18px;">'
-                    f'&#9888; Your free trial ends in <strong>{days_left} day{"s" if days_left != 1 else ""}</strong>. '
-                    f'Contact <a href="mailto:info@haultraai.com">info@haultraai.com</a> to upgrade.</div>'
+                    f'&#9888; Your free trial ends in <strong>{days_left} day{"s" if days_left != 1 else ""}</strong>.'
+                    + ('' if native else
+                       f' Contact <a href="mailto:info@haultraai.com">info@haultraai.com</a> to upgrade.')
+                    + '</div>'
                 )
             elif sub_status == "active":
                 trial_banner = (
                     '<div style="background:rgba(248,113,113,0.15);border:1px solid rgba(248,113,113,0.4);'
                     'border-radius:10px;padding:14px 18px;margin-bottom:18px;">'
-                    '&#128274; Your trial has expired. Upgrade to restore full access.</div>'
+                    '&#128274; Your trial has expired.'
+                    + (' Manage your plan on the web to restore full access.' if native
+                       else ' Upgrade to restore full access.')
+                    + '</div>'
                 )
         except ValueError:
             pass
@@ -13291,7 +13414,7 @@ def settings_page():
     else:
         exp_display = "—" if sub_status == "active" else "Subscription ended"
 
-    show_upgrade = plan in ("trial", "starter", "pro")
+    show_upgrade = plan in ("trial", "starter", "pro") and not native
     upgrade_btn = (
         '<button onclick="haultraCheckout(\'starter\',this)" '
         'class="btn" style="background:linear-gradient(135deg,#FF9D5C,#3DDC84);'
@@ -13307,7 +13430,7 @@ def settings_page():
         badge  = (f'<span class="badge" style="background:{color}30;color:{color};'
                   f'font-size:11px;margin-left:8px;">&#10003; Current</span>') if active else ""
         upgrade_card_btn = ""
-        if not active and key in ("starter", "pro"):
+        if not active and key in ("starter", "pro") and not native:
             upgrade_card_btn = (
                 f'<div style="margin-top:12px;">'
                 f'<button onclick="haultraCheckout(\'{key}\',this)" '
@@ -13355,6 +13478,29 @@ def settings_page():
     plan_color_map = {"trial": "#fbbf24", "starter": "#FF9D5C", "pro": "#3DDC84", "enterprise": "#c084fc"}
     pc = plan_color_map.get(plan, "#D8D8D0")
 
+    if native:
+        available_plans_block = """
+        <div class="stat" style="margin-top:22px;padding:16px 18px;">
+            <div class="muted small">Manage your plan on the web.</div>
+        </div>
+        """
+        checkout_form_block = ""
+    else:
+        available_plans_block = f"""
+        <h3 style="margin:22px 0 12px;font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:#B8B8AE;">Available Plans</h3>
+        <div class="grid">{plan_cards}</div>
+        <p class="muted small" style="margin-top:14px;">
+            Secure checkout powered by Stripe. Cancel anytime.
+        </p>
+        """
+        checkout_form_block = f"""
+    <!-- Hidden form used by JS to POST to /create-checkout-session -->
+    <form id="checkout-form" method="POST" action="{url_for('create_checkout_session')}" style="display:none;">
+        <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+        <input type="hidden" name="plan" id="checkout-plan" value="">
+    </form>
+        """
+
     subscription_body = f"""
     <div class="card" id="subscription" style="margin-top:8px;">
         <h2 style="margin:0 0 4px;">Subscription &amp; Billing</h2>
@@ -13385,11 +13531,7 @@ def settings_page():
             </div>
         </div>
 
-        <h3 style="margin:22px 0 12px;font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:#B8B8AE;">Available Plans</h3>
-        <div class="grid">{plan_cards}</div>
-        <p class="muted small" style="margin-top:14px;">
-            Secure checkout powered by Stripe. Cancel anytime.
-        </p>
+        {available_plans_block}
 
         <h3 style="margin:22px 0 12px;font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:#B8B8AE;">Subscription History</h3>
         <div class="table-wrap">
@@ -13400,11 +13542,7 @@ def settings_page():
         </div>
     </div>
 
-    <!-- Hidden form used by JS to POST to /create-checkout-session -->
-    <form id="checkout-form" method="POST" action="{url_for('create_checkout_session')}" style="display:none;">
-        <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
-        <input type="hidden" name="plan" id="checkout-plan" value="">
-    </form>
+    {checkout_form_block}
 
     <script>
     window.haultraCheckout = function(plan, btn) {{
@@ -13415,6 +13553,56 @@ def settings_page():
     </script>
     """
 
+    conn4 = get_db()
+    other_active_bosses = conn4.execute(
+        "SELECT COUNT(*) n FROM users WHERE role='boss' AND company_id=? AND id!=? AND is_active=1",
+        (cid(), session["user_id"])
+    ).fetchone()["n"]
+    conn4.close()
+
+    if other_active_bosses > 0:
+        delete_account_body = f"""
+        <div class="card" id="delete-account" style="margin-top:20px;">
+            <h2 style="margin:0 0 4px;">Delete Account</h2>
+            <p class="muted small" style="margin-bottom:16px;">
+                This deactivates your account immediately and permanently removes your
+                data within 30 days. This cannot be undone.
+            </p>
+            <form method="POST" action="{url_for('delete_own_account')}"
+                  onsubmit="return confirm('Delete your account? This cannot be undone.');">
+                <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+                <button type="submit" class="btn" style="background:#f8717122;color:#f87171;
+                        border:1px solid #f8717155;padding:10px 22px;border-radius:8px;cursor:pointer;">
+                    Delete My Account
+                </button>
+            </form>
+        </div>
+        """
+    else:
+        delete_account_body = f"""
+        <div class="card" id="delete-account" style="margin-top:20px;">
+            <h2 style="margin:0 0 4px;">Delete Account</h2>
+            <p class="muted small" style="margin-bottom:16px;">
+                You're the only manager on this company account, so deleting just your
+                own account isn't possible — it would leave the company with no one to
+                run it. Add another Boss on the <a href="{url_for('team_page')}">Team page</a>
+                first (once they're active, you can delete your own account above), or
+                close the company entirely below.
+            </p>
+            <form method="POST" action="{url_for('close_company')}"
+                  onsubmit="return confirm('Close the company? This deactivates every account — all managers and drivers — and cannot be undone.');"
+                  style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+                <input type="text" name="confirm_close" placeholder="Type CLOSE to confirm" required
+                       style="flex:1;min-width:200px;">
+                <button type="submit" class="btn" style="background:#f8717122;color:#f87171;
+                        border:1px solid #f8717155;padding:10px 22px;border-radius:8px;cursor:pointer;">
+                    Close Company
+                </button>
+            </form>
+        </div>
+        """
+
     body = f"""
     <div class="hero">
         <h1>Settings</h1>
@@ -13422,6 +13610,7 @@ def settings_page():
     </div>
     {settings_body}
     {subscription_body}
+    {delete_account_body}
     """
     return render_template_string(shell_page("Settings", body))
 
@@ -13558,6 +13747,14 @@ def _stripe_suspend_by_sub(sub_id):
 @app.route("/create-checkout-session", methods=["POST"])
 @boss_required
 def create_checkout_session():
+    if is_native_app():
+        # Belt-and-suspenders: the UI never renders a path to this endpoint
+        # inside the native shell, but block it server-side too in case
+        # anything ever links here directly. Apple counts any in-app path
+        # to an external payment flow as steering.
+        flash("Manage your plan on the web.", "error")
+        return redirect(url_for("settings_page") + "#subscription")
+
     if not STRIPE_ENABLED or not stripe_configured:
         print("STRIPE NOT CONFIGURED — STRIPE_ENABLED={} stripe_configured={}".format(
             STRIPE_ENABLED, stripe_configured))
@@ -13764,18 +13961,20 @@ def subscription_blocked():
     status = co["subscription_status"] if co else "suspended"
     name   = co["name"] if co else ""
 
+    native = is_native_app()
+
     if status == "suspended" and plan == "trial":
         reason = "Your 14-day free trial has ended."
-        action = "Upgrade to a paid plan to restore access."
+        action = "Manage your plan on the web to restore access." if native else "Upgrade to a paid plan to restore access."
     elif status == "suspended":
         reason = "Your account has been suspended."
-        action  = "Please contact support or upgrade your plan."
+        action = "Please contact support." if native else "Please contact support or upgrade your plan."
     else:
         reason = "Your account has been cancelled."
         action  = "Contact support to reactivate."
 
     sub_link = ""
-    if session.get("role") == "boss":
+    if session.get("role") == "boss" and not native:
         sub_link = f'<a class="btn green" href="{url_for("settings_page")}#subscription" style="margin-top:16px;display:inline-block;font-size:16px;padding:14px 28px;">View Plans &amp; Upgrade</a>'
 
     body = f"""
@@ -13952,6 +14151,10 @@ def privacy_policy():
             and driver assignments you enter into the system.</li>
             <li><strong>Photos</strong> — images uploaded by drivers at job sites, stored on our
             servers and associated only with your company account.</li>
+            <li><strong>Location data</strong> — GPS coordinates captured at the moment a driver
+            marks a stop complete, used to confirm container location for tracking purposes. We
+            do not track location continuously or in the background — only at stop completion,
+            and only with your device's location permission granted.</li>
             <li><strong>Billing data</strong> — subscription plan selections and plan change history.
             We do not currently store credit card numbers directly; payment processing is handled
             by contracted processors under their own privacy policies.</li>

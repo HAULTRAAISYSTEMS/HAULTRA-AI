@@ -135,7 +135,7 @@ a connected device and automatic signing).
 - You'll need an [App Store Connect](https://appstoreconnect.apple.com)
   listing created first (App Store Connect → My Apps → +) with the same
   bundle ID, screenshots, description, privacy policy URL (you already have
-  one at `/privacy-policy`), and a completed **App Privacy** questionnaire —
+  one at `/privacy`), and a completed **App Privacy** questionnaire —
   this app requests Camera and Location, both must be declared there, and
   the `NSCameraUsageDescription` / `NSLocationWhenInUseUsageDescription`
   strings Capacitor's Camera/Geolocation plugins add to `Info.plist` should
