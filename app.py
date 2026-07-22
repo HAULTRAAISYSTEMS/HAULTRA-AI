@@ -16012,8 +16012,99 @@ def team_hours_page():
         '<span style="font-size:15px;color:var(--text-dim);"> HRS</span></div>'
         '</div>'
         '</div>'
+
+        # ── Export CSV (this week's breakdown, payroll-ready) ────────────
+        '<div style="max-width:460px;margin:14px auto 0;">'
+        '<a href="' + url_for("team_hours_export") + ('?w=%d' % w) + '" '
+        'style="display:flex;align-items:center;justify-content:center;gap:8px;'
+        'min-height:48px;border-radius:10px;text-decoration:none;font-weight:700;'
+        'font-size:14px;border:1px solid var(--orange-border);'
+        'background:var(--orange-dim);color:var(--orange);">'
+        '&#8681;&nbsp;Export CSV</a></div>'
     )
     return render_template_string(shell_page("Team Hours", body))
+
+
+# =========================================================
+# TEAM HOURS CSV EXPORT  — payroll-ready weekly breakdown
+# Reuses get_driver_week_summary() so the file matches the on-screen
+# numbers exactly. Same `w` week offset as the Team Hours view.
+# =========================================================
+@app.route("/boss/team-hours.csv")
+@app.route("/boss/team-hours/export")
+@boss_required
+def team_hours_export():
+    conn = get_db()
+    company = conn.execute("SELECT * FROM companies WHERE id=?", (cid(),)).fetchone()
+    co_settings = {k: company[k] for k in company.keys()} if company else {}
+
+    try:
+        w = request.args.get("w", default=0, type=int) or 0
+    except Exception:
+        w = 0
+    if w > 0:
+        w = 0
+
+    now_local = _company_local_now(co_settings)
+    monday    = week_monday_for(now_local) + timedelta(days=7 * w)
+    sunday    = monday + timedelta(days=6)
+
+    drivers = conn.execute(
+        "SELECT id, username FROM users WHERE company_id=? AND role='driver' "
+        "ORDER BY username",
+        (cid(),)
+    ).fetchall()
+    drivers = [dict(d) for d in drivers]
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Week", "%s to %s" % (monday.isoformat(), sunday.isoformat())])
+    writer.writerow([])
+    writer.writerow(["Driver", "Date", "Day", "Clock In", "Clock Out",
+                     "Hours", "Status"])
+
+    grand_total = 0.0
+    for d in drivers:
+        summ = get_driver_week_summary(
+            conn, d["id"], monday, co_settings, now_local)
+        for day in summ["days"]:
+            ci = _fmt_12h(day["start"]) if day["start"] else ""
+            co = _fmt_12h(day["end"]) if day["end"] else ""
+            if day["missing_out"]:
+                status = "MISSING CLOCK-OUT (not counted)"
+                hours_cell = ""
+            elif day["live"]:
+                status = "Clocked in (live)"
+                hours_cell = "%.1f" % day["hours"] if day["hours"] is not None else ""
+            elif day["hours"] is not None:
+                status = ""
+                hours_cell = "%.1f" % day["hours"]
+            else:
+                status = ""
+                hours_cell = ""
+            writer.writerow([
+                d["username"], day["date"], day["weekday"],
+                ci, co, hours_cell, status,
+            ])
+        # Per-driver weekly total row
+        writer.writerow([d["username"], "", "", "", "WEEK TOTAL",
+                         "%.1f" % summ["total"],
+                         ("%d missing clock-out" % summ["missing_days"])
+                         if summ["missing_days"] else ""])
+        writer.writerow([])
+        grand_total += summ["total"]
+
+    writer.writerow(["ALL DRIVERS", "", "", "", "TEAM TOTAL",
+                     "%.1f" % round(grand_total, 1), ""])
+    conn.close()
+
+    output.seek(0)
+    return send_file(
+        io.BytesIO(output.read().encode()),
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name="haultra-team-hours-%s.csv" % monday.isoformat(),
+    )
 
 
 # =========================================================
