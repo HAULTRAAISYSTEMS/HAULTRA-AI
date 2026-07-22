@@ -1573,24 +1573,41 @@ def _company_local_now(company_settings):
             return datetime.now()
 
 
-def week_monday_for(d):
-    """Return the Monday (date) of the ISO week containing date/datetime d."""
+_WEEKDAY_INDEX = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+
+
+def company_week_start_for(company_settings, d):
+    """Return the date the company's work week starts, for the week containing
+    date/datetime d.
+
+    Driven by the company's "Workweek Starts On" setting (workweek_start_day),
+    so a Friday→Thursday shop gets Friday-start weeks and a Monday→Sunday shop
+    gets Monday-start weeks. Falls back to Monday when the setting is unset.
+    The weekly-hours views run from this day for 7 days.
+    """
     if isinstance(d, datetime):
         d = d.date()
-    return d - timedelta(days=d.weekday())
+    name = (company_settings.get("workweek_start_day") or "monday").strip().lower()
+    start_wd = _WEEKDAY_INDEX.get(name, 0)
+    return d - timedelta(days=(d.weekday() - start_wd) % 7)
 
 
-def get_driver_week_summary(conn, driver_id, monday_date, company_settings, now_local=None):
+def get_driver_week_summary(conn, driver_id, week_start, company_settings, now_local=None):
     """
-    Build a Mon→Sun hours summary for one driver and one week.
+    Build a 7-day hours summary for one driver and one week.
 
-    monday_date : date — the Monday that starts the week (Mon 00:00 local).
+    week_start  : date — the day the company's work week starts (00:00 local).
+                  Compute it with company_week_start_for() so it honours the
+                  "Workweek Starts On" setting (e.g. Friday→Thursday).
     now_local   : aware/naive datetime in company-local time (for the live
                   count-up on a day still in progress). Defaults to now.
 
     Returns a dict:
       {
-        'monday'      : date,
+        'week_start'  : date,
         'days'        : [ {date, weekday, start, end, hours, live, missing_out}, ... ] (7),
         'total'       : float rounded to 1 decimal (live day included),
         'live_hours'  : float — hours already accrued on the live day at render,
@@ -1618,7 +1635,7 @@ def get_driver_week_summary(conn, driver_id, monday_date, company_settings, now_
     missing_days = 0
 
     for i in range(7):
-        d  = monday_date + timedelta(days=i)
+        d  = week_start + timedelta(days=i)
         ds = d.isoformat()
         start_ts, end_ts = resolve_driver_day_punches(
             conn, driver_id, ds, company_settings)
@@ -1665,7 +1682,7 @@ def get_driver_week_summary(conn, driver_id, monday_date, company_settings, now_
         })
 
     return {
-        "monday": monday_date,
+        "week_start": week_start,
         "days": days,
         "total": round(total, 1),
         "live_hours": round(live_hours, 1),
@@ -1692,13 +1709,13 @@ def render_week_hours_card(summary, nav_base_url, w, extra_qs="", heading="This 
                    'driver_id=5&'), already ending in '&' if non-empty.
     heading      : card heading text.
     """
-    monday = summary["monday"]
-    sunday = monday + timedelta(days=6)
+    week_start = summary["week_start"]
+    week_end   = week_start + timedelta(days=6)
 
-    # Week label, e.g. "Mon Jul 20 – Sun Jul 26"
+    # Week label, e.g. "Jul 18 – Jul 24" (spans whatever the company's work week is)
     week_lbl = "%s &ndash; %s" % (
-        monday.strftime("%b %-d") if hasattr(monday, "strftime") else str(monday),
-        sunday.strftime("%b %-d"),
+        week_start.strftime("%b %-d") if hasattr(week_start, "strftime") else str(week_start),
+        week_end.strftime("%b %-d"),
     )
 
     # ── ‹ › arrows (min 48px targets). Forward hidden at current week. ──
@@ -16290,7 +16307,7 @@ def team_hours_page():
         w = 0
 
     now_local = _company_local_now(co_settings)
-    monday    = week_monday_for(now_local) + timedelta(days=7 * w)
+    monday    = company_week_start_for(co_settings, now_local) + timedelta(days=7 * w)
     sunday    = monday + timedelta(days=6)
     week_lbl  = "%s &ndash; %s" % (monday.strftime("%b %-d"), sunday.strftime("%b %-d"))
 
@@ -16464,7 +16481,7 @@ def team_hours_export():
         w = 0
 
     now_local = _company_local_now(co_settings)
-    monday    = week_monday_for(now_local) + timedelta(days=7 * w)
+    monday    = company_week_start_for(co_settings, now_local) + timedelta(days=7 * w)
     sunday    = monday + timedelta(days=6)
 
     drivers = conn.execute(
@@ -16690,7 +16707,7 @@ def driver_clock():
     if _w > 0:
         _w = 0
     _now_local   = _company_local_now(co_settings)
-    _week_monday = week_monday_for(_now_local) + timedelta(days=7 * _w)
+    _week_monday = company_week_start_for(co_settings, _now_local) + timedelta(days=7 * _w)
     week_summary = get_driver_week_summary(
         conn, driver_id, _week_monday, co_settings, _now_local)
     week_card_html = render_week_hours_card(
