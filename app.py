@@ -5662,6 +5662,21 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .cab-gear-btn:hover {{ background: rgba(255,107,26,0.14); border-color: rgba(255,107,26,0.3); }}
 .cab-online-dot {{ width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 6px var(--green); }}
 
+/* Driver route map (Cab View toggle) */
+#cab-map-panel {{ margin-bottom: 16px; }}
+.cab-map-bar {{
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    margin-bottom: 10px;
+}}
+.cab-map-bar-title {{
+    font-family: var(--font-head); font-size: 20px; letter-spacing: 1px; color: #F5F5F0;
+}}
+#cab-route-map {{
+    height: 68vh; min-height: 380px; width: 100%;
+    border-radius: 14px; overflow: hidden;
+    border: 1px solid rgba(255,107,26,0.22);
+}}
+
 .cab-progress-label {{ font-size: 12px; font-weight: 700; letter-spacing: 1px; color: var(--text-muted); text-transform: uppercase; margin-bottom: 6px; }}
 .cab-progress-track {{ height: 8px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; margin-bottom: 22px; }}
 .cab-progress-fill {{ height: 100%; background: linear-gradient(90deg, #FF8A42, #FF6B1A); border-radius: 4px; transition: width .4s; }}
@@ -9926,6 +9941,159 @@ def driver_route_detail(route_id):
     </div>
     """
 
+    # ══════════════════════════════════════════════════════════
+    # DRIVER ROUTE MAP — read-only toggle showing this driver's whole
+    # route as numbered pins (stop order). The route query above is already
+    # filtered to assigned_to == current user, so every stop here is theirs.
+    # ══════════════════════════════════════════════════════════
+    _route_map_points = []
+    for _i, _st in enumerate(stops, start=1):
+        _mlat = _st["lat"] if _st["lat"] is not None else _st["gps_lat"]
+        _mlng = _st["lng"] if _st["lng"] is not None else _st["gps_lng"]
+        if _mlat is None or _mlng is None:
+            continue
+        _mfa = " ".join(filter(None, [
+            _st["address"] or "", _st["city"] or "", _st["state"] or "", _st["zip_code"] or "",
+        ])).strip()
+        _route_map_points.append({
+            "num":     _i,
+            "lat":     _mlat,
+            "lng":     _mlng,
+            "address": _mfa,
+            "action":  _st["action"] or "",
+            "size":    _st["container_size"] or "",
+            "done":    _st["status"] == "completed",
+            "current": _st["id"] == stop_id,
+        })
+
+    if _route_map_points:
+        cab_map_head = (
+            '<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" '
+            'integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />'
+        )
+        cab_map_toggle_btn = (
+            '<button type="button" id="cab-map-toggle" class="cab-gear-btn" '
+            'onclick="toggleCabMap()" aria-label="Toggle route map" '
+            'title="Route map">&#128506;</button>'
+        )
+        cab_map_panel = """
+    <div id="cab-map-panel" hidden>
+        <div class="cab-map-bar">
+            <button type="button" class="btn secondary" onclick="toggleCabMap()"
+                    style="min-height:48px;">&#8249; List</button>
+            <div class="cab-map-bar-title">ROUTE MAP</div>
+            <span style="min-width:64px;"></span>
+        </div>
+        <div id="cab-route-map"></div>
+    </div>
+        """
+        cab_map_script = f"""
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script>
+(function() {{
+    var POINTS   = {json.dumps(_route_map_points)};
+    var NAV_PREF = {json.dumps(_nav_pref)};
+    var inited   = false;
+    var map;
+
+    function escHtml(s) {{
+        return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {{
+            return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c];
+        }});
+    }}
+
+    // Numbered pin. Current = highlighted orange (bigger + glow), done =
+    // green & dimmed, upcoming = neutral slate. Number stays legible on all.
+    function makeNumIcon(p) {{
+        var bg = '#8CA0B3', size = 30, extra = '', op = '1';
+        if (p.current) {{ bg = '#FF6B1A'; size = 38;
+            extra = 'box-shadow:0 0 0 3px rgba(255,107,26,0.35),0 2px 6px rgba(0,0,0,0.5);'; }}
+        else if (p.done) {{ bg = '#3DDC84'; op = '0.6'; }}
+        var half = size / 2;
+        return L.divIcon({{
+            className: 'cab-num-pin',
+            html: '<div style="width:' + size + 'px;height:' + size + 'px;border-radius:50%;' +
+                  'background:' + bg + ';opacity:' + op + ';color:#0d0d0d;font-weight:800;' +
+                  'font-size:' + (p.current ? 15 : 13) + 'px;display:flex;align-items:center;' +
+                  'justify-content:center;border:2px solid rgba(255,255,255,0.92);' + extra + '">' +
+                  p.num + '</div>',
+            iconSize: [size, size],
+            iconAnchor: [half, half],
+            popupAnchor: [0, -half],
+        }});
+    }}
+
+    function popupHtml(p) {{
+        var status = p.current ? '<span style="color:#FF6B1A;font-weight:700;">Current stop</span>'
+                   : p.done ? '<span style="color:#3DDC84;font-weight:700;">Done</span>'
+                   : '<span style="color:#8CA0B3;">Upcoming</span>';
+        var meta = [];
+        if (p.action) meta.push(escHtml(p.action));
+        if (p.size)   meta.push(escHtml(p.size));
+        var navBtn = p.address
+            ? '<a href="#" data-addr="' + escHtml(p.address) + '" onclick="return cabNavTo(this, event)" ' +
+              'style="display:flex;align-items:center;justify-content:center;margin-top:10px;' +
+              'min-height:48px;border-radius:8px;text-decoration:none;font-weight:700;font-size:14px;' +
+              'background:rgba(255,107,26,0.16);border:1px solid rgba(255,107,26,0.45);color:#FF6B1A;">' +
+              '&#128205; Navigate</a>'
+            : '';
+        return '<div style="font-family:var(--font-body,inherit);min-width:190px;">' +
+            '<div style="font-size:11px;letter-spacing:.04em;text-transform:uppercase;margin-bottom:4px;">' +
+            'Stop ' + p.num + ' &middot; ' + status + '</div>' +
+            '<strong>' + escHtml(p.address || 'No address on file') + '</strong>' +
+            (meta.length ? '<div style="color:#A6A69E;font-size:12px;margin-top:4px;">' + meta.join(' &middot; ') + '</div>' : '') +
+            navBtn +
+            '</div>';
+    }}
+
+    // Reuses the page's existing openNavStop() (same deep-link + nav-app
+    // preference logic as the single-stop "Tap to Navigate" button).
+    window.cabNavTo = function(btn, ev) {{
+        ev = ev || window.event;
+        if (typeof window.openNavStop === 'function')
+            return window.openNavStop(ev, NAV_PREF, btn.getAttribute('data-addr'));
+        return true;
+    }};
+
+    function initCabMap() {{
+        if (inited) {{ setTimeout(function() {{ map.invalidateSize(); }}, 60); return; }}
+        if (typeof L === 'undefined') return;   // Leaflet not loaded yet
+        map = L.map('cab-route-map', {{ scrollWheelZoom: true }}).setView([36.85, -76.28], 11);
+        L.tileLayer('https://{{s}}.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}{{r}}.png', {{
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
+            subdomains: 'abcd',
+            maxZoom: 20,
+        }}).addTo(map);
+
+        var latLngs = [];
+        POINTS.forEach(function(p) {{
+            var m = L.marker([p.lat, p.lng], {{ icon: makeNumIcon(p), zIndexOffset: p.current ? 1000 : 0 }}).addTo(map);
+            m.bindPopup(popupHtml(p));
+            latLngs.push([p.lat, p.lng]);
+        }});
+        if (latLngs.length > 1) map.fitBounds(latLngs, {{ padding: [40, 40], maxZoom: 16 }});
+        else if (latLngs.length === 1) map.setView(latLngs[0], 15);
+        inited = true;
+        setTimeout(function() {{ map.invalidateSize(); }}, 60);
+    }}
+
+    // Toggle between the default list view and the read-only route map.
+    window.toggleCabMap = function() {{
+        var panel = document.getElementById('cab-map-panel');
+        var wrap  = document.querySelector('.cab-wrap');
+        var show  = panel.hidden;          // currently hidden → we're showing it
+        panel.hidden = !show;
+        if (wrap) wrap.style.display = show ? 'none' : '';
+        if (show) initCabMap();
+        window.scrollTo(0, 0);
+    }};
+}})();
+</script>
+        """
+    else:
+        cab_map_head = cab_map_toggle_btn = cab_map_panel = cab_map_script = ""
+
     meta_bits = []
     if s["container_size"]:
         meta_bits.append(e(s["container_size"]))
@@ -9940,6 +10108,7 @@ def driver_route_detail(route_id):
     <div class="cab-header">
         <div class="cab-title">MY ROUTE</div>
         <div style="display:flex;align-items:center;gap:10px;">
+            {cab_map_toggle_btn}
             {gear_button_html}
             <span class="cab-online-badge" id="online-badge"><span class="cab-online-dot"></span>ONLINE</span>
         </div>
@@ -9999,6 +10168,7 @@ def driver_route_detail(route_id):
         <a class="btn secondary" href="{url_for('driver_dashboard')}">&#8592; My Routes</a>
     </div>
 </div>
+{cab_map_panel}
 
 {_message_thread_modal_html(show_quick_taps=True)}
 
@@ -10325,8 +10495,9 @@ def driver_route_detail(route_id):
 }})();
 {_message_thread_js()}
 </script>
+{cab_map_script}
 """
-    return render_template_string(shell_page("Cab View", body))
+    return render_template_string(shell_page("Cab View", body, extra_head=cab_map_head))
 
 
 # =========================================================
@@ -15440,21 +15611,60 @@ def bin_tracker():
                 var sourceNote = p.is_gps
                     ? '<div style="color:#3DDC84;font-size:11px;font-weight:700;margin-top:6px;">&#10003; GPS</div>'
                     : '<div style="color:#78786F;font-size:11px;margin-top:6px;">address estimate</div>';
-                return '<div style="font-family:var(--font-body,inherit);min-width:170px;">' +
-                    '<strong>' + escHtml(p.address) + (p.city ? ', ' + escHtml(p.city) : '') + '</strong>' +
+                var fullAddr = escHtml(p.address) + (p.city ? ', ' + escHtml(p.city) : '');
+                // data-addr holds the plain (unescaped-for-HTML) address; the
+                // copy handler reads it via dataset so quotes/apostrophes in the
+                // address can't break the onclick attribute.
+                var copyBtn = p.address
+                    ? '<button type="button" class="bin-copy-btn" data-addr="' + escHtml(p.address + (p.city ? ', ' + p.city : '')) + '" ' +
+                      'onclick="binCopyAddr(this)" style="margin-top:10px;width:100%;min-height:44px;' +
+                      'border-radius:8px;border:1px solid rgba(255,107,26,0.40);cursor:pointer;' +
+                      'background:rgba(255,107,26,0.14);color:#FF6B1A;font-weight:700;font-size:13px;">' +
+                      '&#128203; Copy address</button>'
+                    : '';
+                return '<div style="font-family:var(--font-body,inherit);min-width:180px;">' +
+                    '<strong>' + fullAddr + '</strong>' +
                     (p.customer ? '<div style="margin-top:2px;">' + escHtml(p.customer) + '</div>' : '') +
                     (p.size ? '<div style="color:#A6A69E;font-size:12px;margin-top:2px;">' + escHtml(p.size) + '</div>' : '') +
                     '<div style="font-size:12px;margin-top:4px;">' + escHtml(p.days_label) + '</div>' +
                     overdueBadge +
                     sourceNote +
+                    copyBtn +
                     '</div>';
             }}
 
+            // Copy the container's full address so the boss can text it to
+            // anyone. Brief "Copied ✓" confirmation, with a clipboard fallback
+            // for older / non-secure-context browsers.
+            window.binCopyAddr = function(btn) {{
+                var text = btn.getAttribute('data-addr') || '';
+                var original = btn.innerHTML;
+                function flash() {{
+                    btn.innerHTML = 'Copied &#10003;';
+                    setTimeout(function() {{ btn.innerHTML = original; }}, 1800);
+                }}
+                if (navigator.clipboard && navigator.clipboard.writeText) {{
+                    navigator.clipboard.writeText(text).then(flash, fallbackCopy);
+                }} else {{
+                    fallbackCopy();
+                }}
+                function fallbackCopy() {{
+                    var ta = document.createElement('textarea');
+                    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+                    document.body.appendChild(ta); ta.focus(); ta.select();
+                    try {{ document.execCommand('copy'); flash(); }}
+                    catch (e) {{ alert('Could not copy — long-press the address to copy it.'); }}
+                    document.body.removeChild(ta);
+                }}
+            }};
+
             var map = L.map('bin-map', {{ scrollWheelZoom: true }}).setView(FALLBACK_CENTER, 11);
-            L.tileLayer('https://{{s}}.basemaps.cartocdn.com/light_all/{{z}}/{{x}}/{{y}}{{r}}.png', {{
+            // Carto Voyager: labelled street basemap — full street names stay
+            // readable at neighbourhood zoom so the boss can eyeball location.
+            L.tileLayer('https://{{s}}.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}{{r}}.png', {{
                 attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
                 subdomains: 'abcd',
-                maxZoom: 19,
+                maxZoom: 20,
             }}).addTo(map);
 
             var markersByStopId = {{}};
