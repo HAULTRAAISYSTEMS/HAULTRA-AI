@@ -12384,8 +12384,17 @@ def dump_ticket(stop_id):
         conn.close()
         flash("Dump ticket saved.", "success")
         if session.get("role") == "driver":
-            return redirect(url_for("driver_route_detail", route_id=route_id))
-        return redirect(url_for("view_route", route_id=route_id))
+            redir = url_for("driver_route_detail", route_id=route_id)
+        else:
+            redir = url_for("view_route", route_id=route_id)
+        # The save form posts via fetch() (see the page script) so it can
+        # compress the photo, show honest saving/error states, and time out on
+        # weak signal. For those requests return JSON with the redirect target
+        # instead of a 302 — the browser then navigates via GET, which shows
+        # the "Dump ticket saved." flash (a followed 302 would consume it).
+        if request.headers.get("X-Requested-With") == "fetch":
+            return jsonify({"ok": True, "redirect": redir})
+        return redirect(redir)
 
     # GET: show form
     ticket    = conn.execute("SELECT * FROM dump_tickets WHERE stop_id=?", (stop_id,)).fetchone()
@@ -12411,6 +12420,13 @@ def dump_ticket(stop_id):
             return e(str(ticket[field]))
         return ""
 
+    # Where the page navigates after a successful fetch()-based save (fallback
+    # if the JSON response is missing a redirect for any reason).
+    if session.get("role") == "driver":
+        _fallback_redirect = url_for("driver_route_detail", route_id=route_id)
+    else:
+        _fallback_redirect = url_for("view_route", route_id=route_id)
+
     _cur_site = _fv("dump_site") or e(default_site)
     site_opts = "".join(
         f'<option value="{e(d["name"])}" {"selected" if e(d["name"]) == _cur_site else ""}>'
@@ -12426,19 +12442,19 @@ def dump_ticket(stop_id):
         <a class="btn secondary" href="javascript:history.back()" style="margin-top:10px;display:inline-block;">&#8592; Back</a>
     </div>
     <div class="card">
-        <form method="POST" enctype="multipart/form-data">
+        <form method="POST" enctype="multipart/form-data" id="dt-form">
             <input type="hidden" name="_csrf_token" value="{csrf_tok}">
             <div class="grid">
                 <div>
                     <label>Dump Site</label>
-                    <select name="dump_site">
+                    <select name="dump_site" id="f-site">
                         <option value="">&#8212; Select &#8212;</option>
                         {site_opts}
                     </select>
                 </div>
                 <div>
                     <label>Can / Box Number</label>
-                    <input name="can_number" value="{_fv("can_number")}" placeholder="e.g. 1042">
+                    <input name="can_number" id="f-can" value="{_fv("can_number")}" placeholder="e.g. 1042">
                 </div>
                 <div>
                     <label>Arrival Time</label>
@@ -12465,25 +12481,38 @@ def dump_ticket(stop_id):
                 </div>
                 <div>
                     <label>Ticket Number</label>
-                    <input name="ticket_number" value="{_fv("ticket_number")}" placeholder="Landfill ticket #">
+                    <input name="ticket_number" id="f-ticket" value="{_fv("ticket_number")}" placeholder="Landfill ticket #">
                 </div>
             </div>
             <label>Notes</label>
             <textarea name="notes" placeholder="Issues, observations, gate info...">{_fv("notes")}</textarea>
             <label>Ticket Photo / Scan</label>
-            <input type="file" name="ticket_photo" accept=".png,.jpg,.jpeg,.webp,.pdf"
-                   style="margin-bottom:16px;">
+            <input type="file" name="ticket_photo" id="f-photo" accept=".png,.jpg,.jpeg,.webp,.pdf"
+                   style="margin-bottom:6px;">
+            <div id="dt-photo-note" class="muted" style="font-size:12px;margin-bottom:16px;min-height:16px;"></div>
+            <div id="dt-error" role="alert" style="display:none;margin-bottom:12px;padding:12px 14px;
+                 border-radius:10px;background:var(--red-dim);border:1px solid rgba(255,82,82,0.40);
+                 color:var(--red);font-size:14px;font-weight:600;"></div>
             <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px;">
-                <button class="btn green" type="submit" style="flex:1;min-width:160px;">
-                    &#128190; Save Dump Ticket
+                <button class="btn green" type="submit" id="dt-save"
+                        style="flex:1;min-width:160px;min-height:48px;">
+                    <span id="dt-save-label">&#128190; Save Dump Ticket</span>
                 </button>
                 <a class="btn secondary" href="javascript:history.back()"
-                   style="flex:1;min-width:120px;text-align:center;padding:12px 16px;">
+                   style="flex:1;min-width:120px;text-align:center;padding:12px 16px;min-height:48px;">
                     &#8592; Back
                 </a>
             </div>
         </form>
     </div>
+    <style>
+    #dt-save[disabled] {{ opacity:.85; cursor:progress; }}
+    .dt-spin {{ display:inline-block;width:16px;height:16px;vertical-align:-3px;
+                margin-right:8px;border:2px solid rgba(255,255,255,0.45);
+                border-top-color:#fff;border-radius:50%;animation:dtspin .7s linear infinite; }}
+    @keyframes dtspin {{ to {{ transform:rotate(360deg); }} }}
+    .dt-invalid {{ outline:2px solid var(--red) !important; outline-offset:1px; }}
+    </style>
     <script>
     (function() {{
         var sin  = document.getElementById('f-sin');
@@ -12496,6 +12525,185 @@ def dump_ticket(stop_id):
         }}
         if (sin)  sin.addEventListener('input', calcNet);
         if (sout) sout.addEventListener('input', calcNet);
+
+        var form   = document.getElementById('dt-form');
+        var btn    = document.getElementById('dt-save');
+        var label  = document.getElementById('dt-save-label');
+        var errBox = document.getElementById('dt-error');
+        var photoInput = document.getElementById('f-photo');
+        var photoNote  = document.getElementById('dt-photo-note');
+        var fallbackRedirect = {_fallback_redirect!r};
+        var SAVE_TIMEOUT_MS = 20000;
+        var COMPRESS_MAX_EDGE = 1200;
+        var COMPRESS_TARGET   = 300 * 1024;   // ~300 KB
+
+        // ── Inline validation ────────────────────────────────────────────
+        // Required: dump site, net tons, ticket number. Scale-in / scale-out
+        // are OPTIONAL — they only exist to auto-calculate net tons, so once
+        // net tons has a value (typed or calculated) they are never required.
+        function clearInvalid() {{
+            [document.getElementById('f-site'),
+             document.getElementById('f-net'),
+             document.getElementById('f-ticket')].forEach(function(el) {{
+                if (el) el.classList.remove('dt-invalid');
+            }});
+        }}
+        function validate() {{
+            var site   = document.getElementById('f-site');
+            var ticket = document.getElementById('f-ticket');
+            if (site && !site.value.trim())
+                return {{ el: site, msg: 'Select a dump site before saving.' }};
+            if (net && !net.value.trim())
+                return {{ el: net,
+                    msg: 'Enter net tons (or fill scale-in and scale-out to auto-calculate it).' }};
+            if (ticket && !ticket.value.trim())
+                return {{ el: ticket, msg: 'Enter the landfill ticket number.' }};
+            return null;
+        }}
+
+        function showError(msg) {{
+            errBox.textContent = msg;
+            errBox.style.display = 'block';
+            errBox.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+        }}
+        function clearError() {{ errBox.style.display = 'none'; errBox.textContent = ''; }}
+
+        function setSaving(on) {{
+            btn.disabled = on;
+            label.innerHTML = on
+                ? '<span class="dt-spin"></span>Saving…'
+                : '💾 Save Dump Ticket';
+        }}
+
+        // ── Client-side photo compression (canvas) ───────────────────────
+        // Downscale to <=1200px long edge, JPEG, step quality down until the
+        // blob is under ~300 KB. PDFs and non-images pass through untouched.
+        function readFile(file) {{
+            return new Promise(function(res, rej) {{
+                var r = new FileReader();
+                r.onload = function() {{ res(r.result); }};
+                r.onerror = rej;
+                r.readAsDataURL(file);
+            }});
+        }}
+        function loadImage(url) {{
+            return new Promise(function(res, rej) {{
+                var im = new Image();
+                im.onload = function() {{ res(im); }};
+                im.onerror = rej;
+                im.src = url;
+            }});
+        }}
+        function canvasToBlob(canvas, q) {{
+            return new Promise(function(res) {{ canvas.toBlob(res, 'image/jpeg', q); }});
+        }}
+        async function compressPhoto(file) {{
+            if (!file) return null;
+            if (!/^image\\//.test(file.type)) return file;   // PDF / unknown → as-is
+            try {{
+                var img = await loadImage(await readFile(file));
+                var w = img.naturalWidth || img.width;
+                var h = img.naturalHeight || img.height;
+                if (!w || !h) return file;
+                var scale = Math.min(1, COMPRESS_MAX_EDGE / Math.max(w, h));
+                var cw = Math.round(w * scale), ch = Math.round(h * scale);
+                var canvas = document.createElement('canvas');
+                canvas.width = cw; canvas.height = ch;
+                canvas.getContext('2d').drawImage(img, 0, 0, cw, ch);
+                var qualities = [0.7, 0.6, 0.5, 0.4];
+                var blob = null;
+                for (var i = 0; i < qualities.length; i++) {{
+                    blob = await canvasToBlob(canvas, qualities[i]);
+                    if (blob && (blob.size <= COMPRESS_TARGET || i === qualities.length - 1)) break;
+                }}
+                // If compression didn't help (already-small image), keep original.
+                if (!blob || blob.size >= file.size) return file;
+                var base = (file.name || 'ticket').replace(/\\.[^.]+$/, '') || 'ticket';
+                return new File([blob], base + '.jpg', {{ type: 'image/jpeg' }});
+            }} catch (e) {{
+                return file;   // any failure → send the original
+            }}
+        }}
+
+        if (photoInput) {{
+            photoInput.addEventListener('change', function() {{
+                var f = photoInput.files && photoInput.files[0];
+                photoNote.textContent = f
+                    ? ('Selected: ' + f.name + ' (' + Math.round(f.size / 1024) + ' KB) — will be compressed before upload')
+                    : '';
+            }});
+        }}
+
+        var submitting = false;
+        form.addEventListener('submit', async function(ev) {{
+            ev.preventDefault();
+            if (submitting) return;              // guard against double-taps
+            clearError(); clearInvalid();
+
+            var problem = validate();
+            if (problem) {{
+                if (problem.el) {{
+                    problem.el.classList.add('dt-invalid');
+                    problem.el.focus();
+                }}
+                showError(problem.msg);
+                return;
+            }}
+
+            submitting = true;
+            setSaving(true);
+            try {{
+                var fd = new FormData(form);
+                var raw = photoInput && photoInput.files && photoInput.files[0];
+                if (raw) {{
+                    var compressed = await compressPhoto(raw);
+                    if (compressed) fd.set('ticket_photo', compressed, compressed.name);
+                }}
+
+                var ctrl = new AbortController();
+                var timer = setTimeout(function() {{ ctrl.abort(); }}, SAVE_TIMEOUT_MS);
+                var resp;
+                try {{
+                    resp = await fetch(window.location.href, {{
+                        method: 'POST',
+                        body: fd,
+                        signal: ctrl.signal,
+                        redirect: 'follow',
+                        headers: {{ 'X-Requested-With': 'fetch' }}
+                    }});
+                }} finally {{
+                    clearTimeout(timer);
+                }}
+
+                if (resp.ok) {{
+                    var dest = fallbackRedirect;
+                    try {{
+                        var ct = resp.headers.get('content-type') || '';
+                        if (ct.indexOf('application/json') !== -1) {{
+                            var data = await resp.json();
+                            if (data && data.redirect) dest = data.redirect;
+                        }} else if (resp.redirected && resp.url) {{
+                            dest = resp.url;
+                        }}
+                    }} catch (e) {{ /* fall back to fallbackRedirect */ }}
+                    window.location.assign(dest);
+                    return;                       // keep the saving state through navigation
+                }}
+                showError('Couldn\\u2019t save (server error ' + resp.status +
+                          '). Your ticket is kept on this page \\u2014 try again.');
+            }} catch (err) {{
+                if (err && err.name === 'AbortError') {{
+                    showError('Couldn\\u2019t save \\u2014 weak signal. Your ticket is kept on ' +
+                              'this page, try again.');
+                }} else {{
+                    showError('Couldn\\u2019t save \\u2014 connection problem. Your ticket is kept ' +
+                              'on this page, try again.');
+                }}
+            }} finally {{
+                submitting = false;
+                setSaving(false);                 // form is never cleared on failure
+            }}
+        }});
     }})();
     </script>
     """
