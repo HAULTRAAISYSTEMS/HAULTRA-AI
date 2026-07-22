@@ -1454,71 +1454,92 @@ def get_pay_period_bounds(company_settings, as_of_date_str=None):
     return period_start.isoformat(), period_end.isoformat()
 
 
+def resolve_driver_day_punches(conn, driver_id, date_str, company_settings):
+    """
+    Resolve the raw (start_ts, end_ts) for a driver on a calendar date.
+
+    Manual clock entries always override auto (stop-based) times for any date
+    on which they exist, regardless of the configured start/end rules. Either
+    value may be None — in particular start_ts can be set while end_ts is None
+    (still clocked in, or a forgotten clock-out). Callers decide how to treat
+    that; this function does not compute hours.
+
+    This is the single source of truth for start/end resolution so the driver
+    "THIS WEEK" card, the boss Team Hours view, and the pay-period report can
+    never disagree.
+
+    company_settings: dict with driver_day_start_rule / driver_day_end_rule.
+    date_str: 'YYYY-MM-DD' in the company's local time.
+    """
+    start_rule = (company_settings.get("driver_day_start_rule") or "first_action").lower()
+    end_rule   = (company_settings.get("driver_day_end_rule")   or "last_action").lower()
+
+    # Manual entry takes priority over any auto (stop-based) time
+    manual_ci = manual_co = None
+    try:
+        mrow = conn.execute(
+            "SELECT clock_in_at, clock_out_at FROM driver_clock_entries "
+            "WHERE driver_id=? AND date=?",
+            (driver_id, date_str)
+        ).fetchone()
+        if mrow:
+            manual_ci = mrow["clock_in_at"] or None
+            manual_co = mrow["clock_out_at"] or None
+    except Exception:
+        pass
+
+    # ── start timestamp ──────────────────────────────────────────────────
+    if manual_ci:
+        start_ts = manual_ci                         # manual always wins
+    elif start_rule == "first_action":
+        row = conn.execute(
+            """SELECT MIN(COALESCE(arrived_at, completed_at)) AS t
+               FROM stops s
+               JOIN routes r ON s.route_id = r.id
+               WHERE r.assigned_to = ?
+                 AND COALESCE(arrived_at, completed_at) >= ?
+                 AND COALESCE(arrived_at, completed_at) < date(?, '+1 day')
+                 AND s.status = 'completed'""",
+            (driver_id, date_str, date_str)
+        ).fetchone()
+        start_ts = row["t"] if row else None
+    else:
+        start_ts = None                              # manual rule, no entry yet
+
+    # ── end timestamp ────────────────────────────────────────────────────
+    if manual_co:
+        end_ts = manual_co                           # manual always wins
+    elif end_rule == "last_action":
+        row = conn.execute(
+            """SELECT MAX(completed_at) AS t
+               FROM stops s
+               JOIN routes r ON s.route_id = r.id
+               WHERE r.assigned_to = ?
+                 AND s.completed_at >= ?
+                 AND s.completed_at < date(?, '+1 day')
+                 AND s.status = 'completed'""",
+            (driver_id, date_str, date_str)
+        ).fetchone()
+        end_ts = row["t"] if row else None
+    else:
+        end_ts = None                                # manual rule, no entry yet
+
+    return start_ts, end_ts
+
+
 def get_driver_day_hours(conn, driver_id, date_str, company_settings):
     """
     Return (start_ts, end_ts, hours_float) for a driver on a given calendar date.
 
-    Manual clock entries always override auto (stop-based) times for any date
-    on which they exist, regardless of the configured start/end rules.
-
-    company_settings: dict with driver_day_start_rule / driver_day_end_rule.
-    date_str: 'YYYY-MM-DD' in the company's local time.
-    Returns (None, None, None) if insufficient data or any query fails.
+    Manual clock entries always override auto (stop-based) times. Returns
+    (None, None, None) if either bound is missing or any query fails — a day
+    with a start but no end (still open / forgotten clock-out) is treated as
+    "no complete data" here. Use get_driver_week_summary() when you need to
+    surface the open / missing-clock-out state instead of hiding it.
     """
     try:
-        start_rule = (company_settings.get("driver_day_start_rule") or "first_action").lower()
-        end_rule   = (company_settings.get("driver_day_end_rule")   or "last_action").lower()
-
-        # Manual entry takes priority over any auto (stop-based) time
-        manual_ci = manual_co = None
-        try:
-            mrow = conn.execute(
-                "SELECT clock_in_at, clock_out_at FROM driver_clock_entries "
-                "WHERE driver_id=? AND date=?",
-                (driver_id, date_str)
-            ).fetchone()
-            if mrow:
-                manual_ci = mrow["clock_in_at"] or None
-                manual_co = mrow["clock_out_at"] or None
-        except Exception:
-            pass
-
-        # ── start timestamp ──────────────────────────────────────────────────
-        if manual_ci:
-            start_ts = manual_ci                         # manual always wins
-        elif start_rule == "first_action":
-            row = conn.execute(
-                """SELECT MIN(COALESCE(arrived_at, completed_at)) AS t
-                   FROM stops s
-                   JOIN routes r ON s.route_id = r.id
-                   WHERE r.assigned_to = ?
-                     AND COALESCE(arrived_at, completed_at) >= ?
-                     AND COALESCE(arrived_at, completed_at) < date(?, '+1 day')
-                     AND s.status = 'completed'""",
-                (driver_id, date_str, date_str)
-            ).fetchone()
-            start_ts = row["t"] if row else None
-        else:
-            start_ts = None                              # manual rule, no entry yet
-
-        # ── end timestamp ────────────────────────────────────────────────────
-        if manual_co:
-            end_ts = manual_co                           # manual always wins
-        elif end_rule == "last_action":
-            row = conn.execute(
-                """SELECT MAX(completed_at) AS t
-                   FROM stops s
-                   JOIN routes r ON s.route_id = r.id
-                   WHERE r.assigned_to = ?
-                     AND s.completed_at >= ?
-                     AND s.completed_at < date(?, '+1 day')
-                     AND s.status = 'completed'""",
-                (driver_id, date_str, date_str)
-            ).fetchone()
-            end_ts = row["t"] if row else None
-        else:
-            end_ts = None                                # manual rule, no entry yet
-
+        start_ts, end_ts = resolve_driver_day_punches(
+            conn, driver_id, date_str, company_settings)
         if not start_ts or not end_ts:
             return None, None, None
 
@@ -1531,6 +1552,264 @@ def get_driver_day_hours(conn, driver_id, date_str, company_settings):
 
     except Exception:
         return None, None, None
+
+
+# =========================================================
+# WEEKLY HOURS  — shared summary + renderer (feat/weekly-hours)
+# Week runs Mon 00:00 → Sun 23:59 in company-local time. Hours to 1 decimal.
+# Both the driver "THIS WEEK" card and the boss Team Hours drill-down call
+# get_driver_week_summary() so the two views can never disagree.
+# =========================================================
+def _company_local_now(company_settings):
+    """Current datetime in the company's local timezone (naive-safe fallback)."""
+    tz_name = (company_settings.get("timezone") or "America/New_York").strip()
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(tz_name))
+    except Exception:
+        try:
+            return datetime.now(_EASTERN) if _EASTERN else datetime.now()
+        except Exception:
+            return datetime.now()
+
+
+def week_monday_for(d):
+    """Return the Monday (date) of the ISO week containing date/datetime d."""
+    if isinstance(d, datetime):
+        d = d.date()
+    return d - timedelta(days=d.weekday())
+
+
+def get_driver_week_summary(conn, driver_id, monday_date, company_settings, now_local=None):
+    """
+    Build a Mon→Sun hours summary for one driver and one week.
+
+    monday_date : date — the Monday that starts the week (Mon 00:00 local).
+    now_local   : aware/naive datetime in company-local time (for the live
+                  count-up on a day still in progress). Defaults to now.
+
+    Returns a dict:
+      {
+        'monday'      : date,
+        'days'        : [ {date, weekday, start, end, hours, live, missing_out}, ... ] (7),
+        'total'       : float rounded to 1 decimal (live day included),
+        'live_hours'  : float — hours already accrued on the live day at render,
+        'has_live'    : bool  — a day is currently ticking,
+        'missing_days': int   — count of days flagged ⚠ no clock-out,
+      }
+
+    Rules:
+      • start + end present            → hours = end - start.
+      • start, no end, day == today    → live: count up to now_local, included in total.
+      • start, no end, past day        → missing_out flag, NOT counted (never 24 hrs).
+      • no start                       → empty day.
+    """
+    from datetime import datetime as _dt
+    fmt = "%Y-%m-%d %H:%M:%S"
+    if now_local is None:
+        now_local = _company_local_now(company_settings)
+    today_s = now_local.strftime("%Y-%m-%d")
+    now_naive = now_local.strftime(fmt)
+
+    days = []
+    total = 0.0
+    live_hours = 0.0
+    has_live = False
+    missing_days = 0
+
+    for i in range(7):
+        d  = monday_date + timedelta(days=i)
+        ds = d.isoformat()
+        start_ts, end_ts = resolve_driver_day_punches(
+            conn, driver_id, ds, company_settings)
+
+        hours = None
+        live = False
+        missing_out = False
+
+        if start_ts and end_ts:
+            try:
+                s  = _dt.strptime(start_ts[:19], fmt)
+                e_ = _dt.strptime(end_ts[:19], fmt)
+                hours = max(0.0, (e_ - s).total_seconds() / 3600)
+            except Exception:
+                hours = None
+        elif start_ts and not end_ts:
+            if ds == today_s:
+                # Still clocked in — count up to the current moment.
+                live = True
+                has_live = True
+                try:
+                    s  = _dt.strptime(start_ts[:19], fmt)
+                    e_ = _dt.strptime(now_naive[:19], fmt)
+                    hours = max(0.0, (e_ - s).total_seconds() / 3600)
+                    live_hours = hours
+                except Exception:
+                    hours = None
+            else:
+                # Forgot to clock out on a past day — flag, do not count.
+                missing_out = True
+                missing_days += 1
+
+        if hours is not None:
+            total += hours
+
+        days.append({
+            "date": ds,
+            "weekday": d.strftime("%a"),
+            "start": start_ts,
+            "end": end_ts,
+            "hours": hours,
+            "live": live,
+            "missing_out": missing_out,
+        })
+
+    return {
+        "monday": monday_date,
+        "days": days,
+        "total": round(total, 1),
+        "live_hours": round(live_hours, 1),
+        "has_live": has_live,
+        "missing_days": missing_days,
+    }
+
+
+def _fmt_hours_1(h):
+    """Format an hours float to 1 decimal, or an em-dash for None."""
+    return ("%.1f" % h) if h is not None else "&mdash;"
+
+
+def render_week_hours_card(summary, nav_base_url, w, extra_qs="", heading="This Week"):
+    """
+    Render the shared weekly-hours card (one row per Mon→Sun day + big total,
+    with ‹ › week arrows). Used verbatim by the driver clock page and the boss
+    Team Hours drill-down so both render identically.
+
+    summary      : dict from get_driver_week_summary().
+    nav_base_url : path the ‹ › arrows link to (e.g. url_for('driver_clock')).
+    w            : current week offset (0 = current week, negative = past).
+    extra_qs     : extra query-string fragment to preserve on nav (e.g.
+                   'driver_id=5&'), already ending in '&' if non-empty.
+    heading      : card heading text.
+    """
+    monday = summary["monday"]
+    sunday = monday + timedelta(days=6)
+
+    # Week label, e.g. "Mon Jul 20 – Sun Jul 26"
+    week_lbl = "%s &ndash; %s" % (
+        monday.strftime("%b %-d") if hasattr(monday, "strftime") else str(monday),
+        sunday.strftime("%b %-d"),
+    )
+
+    # ── ‹ › arrows (min 48px targets). Forward hidden at current week. ──
+    ARROW = ("display:inline-flex;align-items:center;justify-content:center;"
+             "min-width:48px;min-height:48px;border-radius:10px;"
+             "border:1px solid var(--orange-border);background:var(--orange-dim);"
+             "color:var(--orange);font-size:22px;font-weight:800;text-decoration:none;")
+    ARROW_OFF = ("display:inline-flex;align-items:center;justify-content:center;"
+                 "min-width:48px;min-height:48px;border-radius:10px;"
+                 "border:1px solid rgba(255,255,255,0.06);background:transparent;"
+                 "color:var(--text-faint);font-size:22px;font-weight:800;opacity:.35;")
+    prev_url = "%s?%sw=%d" % (nav_base_url, extra_qs, w - 1)
+    next_url = "%s?%sw=%d" % (nav_base_url, extra_qs, w + 1)
+    prev_arrow = '<a href="%s" style="%s" aria-label="Previous week">&#8249;</a>' % (prev_url, ARROW)
+    if w >= 0:
+        next_arrow = '<span style="%s" aria-label="Current week">&#8250;</span>' % ARROW_OFF
+    else:
+        next_arrow = '<a href="%s" style="%s" aria-label="Next week">&#8250;</a>' % (next_url, ARROW)
+
+    # ── day rows ──────────────────────────────────────────────────────────
+    rows = []
+    for day in summary["days"]:
+        wd = day["weekday"]
+        if day["missing_out"]:
+            detail = ('<span style="color:var(--red);font-weight:600;">'
+                      '&#9888; no clock-out</span>')
+            hrs_cell = '<span style="color:var(--red);font-weight:700;">&mdash;</span>'
+        elif day["start"] and day["hours"] is not None:
+            ci = _fmt_12h(day["start"])
+            co = _fmt_12h(day["end"]) if day["end"] else "now"
+            detail = '%s &ndash; %s' % (e(ci), e(co))
+            if day["live"]:
+                hrs_cell = ('<span data-live-hours style="color:var(--green);font-weight:800;">'
+                            '%.1f</span>' % day["hours"])
+                detail += ' <span style="color:var(--green);font-weight:700;">&#9679; live</span>'
+            else:
+                hrs_cell = '<span style="font-weight:800;">%.1f</span>' % day["hours"]
+        else:
+            detail = '<span style="color:var(--text-faint);">&mdash;</span>'
+            hrs_cell = '<span style="color:var(--text-faint);">&mdash;</span>'
+
+        day_color = "var(--green)" if day["live"] else "var(--text)"
+        rows.append(
+            '<div style="display:flex;align-items:center;gap:12px;min-height:48px;'
+            'padding:10px 4px;border-top:1px solid rgba(255,255,255,0.05);">'
+            '<div style="width:42px;flex:none;font-weight:800;font-size:14px;'
+            'text-transform:uppercase;color:%s;">%s</div>'
+            '<div style="flex:1;font-size:14px;color:var(--text-dim);">%s</div>'
+            '<div style="flex:none;font-size:15px;text-align:right;min-width:52px;">'
+            '%s<span style="color:var(--text-faint);font-size:12px;"> hrs</span></div>'
+            '</div>' % (day_color, e(wd), detail, hrs_cell)
+        )
+    rows_html = "".join(rows)
+
+    # ── missing-clock-out banner ─────────────────────────────────────────
+    warn_html = ""
+    if summary["missing_days"]:
+        warn_html = (
+            '<div style="margin-top:12px;padding:10px 14px;border-radius:10px;'
+            'background:var(--red-dim);border:1px solid rgba(255,82,82,0.35);'
+            'color:var(--red);font-size:13px;font-weight:600;">'
+            '&#9888; %d day%s missing a clock-out &mdash; not counted in the total.'
+            '</div>' % (summary["missing_days"], "" if summary["missing_days"] == 1 else "s")
+        )
+
+    total_attr = ' data-live-total="%.4f"' % summary["total"] if summary["has_live"] else ""
+
+    return (
+        '<div class="card" style="max-width:460px;margin:0 auto 16px;">'
+        # header row: heading + arrows
+        '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:4px;">'
+        '<div style="font-size:12px;font-weight:800;letter-spacing:.10em;text-transform:uppercase;'
+        'color:var(--orange);">' + e(heading) + '</div>'
+        '<div style="display:flex;gap:8px;">' + prev_arrow + next_arrow + '</div>'
+        '</div>'
+        '<div style="font-size:13px;color:var(--text-dim);margin-bottom:6px;">' + week_lbl + '</div>'
+        + rows_html
+        # big total
+        + '<div style="display:flex;align-items:baseline;justify-content:space-between;'
+        'margin-top:14px;padding-top:14px;border-top:2px solid var(--orange-border);">'
+        '<div style="font-size:13px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;'
+        'color:var(--text-dim);">Week Total</div>'
+        '<div style="font-family:var(--font-head);font-size:34px;line-height:1;color:var(--orange);">'
+        '<span' + total_attr + '>' + ("%.1f" % summary["total"]) + '</span>'
+        '<span style="font-size:16px;color:var(--text-dim);"> HRS</span></div>'
+        '</div>'
+        + warn_html +
+        '</div>'
+    )
+
+
+# Live-tick JS: recomputes the in-progress day + week total each second from
+# page-load, so a clocked-in driver sees the numbers climb without a refresh.
+_WEEK_LIVE_TICK_JS = """
+<script>
+(function(){
+  var liveEl  = document.querySelector('[data-live-hours]');
+  var totalEl = document.querySelector('[data-live-total]');
+  if(!liveEl && !totalEl) return;
+  var baseLive  = liveEl  ? parseFloat(liveEl.textContent) || 0 : 0;
+  var baseTotal = totalEl ? parseFloat(totalEl.getAttribute('data-live-total')) || 0 : 0;
+  var t0 = Date.now();
+  function tick(){
+    var add = (Date.now() - t0) / 3600000;  // ms → hours since load
+    if(liveEl)  liveEl.textContent  = (baseLive  + add).toFixed(1);
+    if(totalEl) totalEl.textContent = (baseTotal + add).toFixed(1);
+  }
+  setInterval(tick, 1000);
+})();
+</script>
+"""
 
 
 def load_stop_photos(conn, stop_ids):
@@ -4465,6 +4744,7 @@ def shell_page(title, body, extra_head=""):
             # server-side to owner/dispatcher).
             _mparts.append(nav_link(url_for("trucks_page"), "🚛 Trucks", path))
             _mparts.append(nav_link(url_for("vendors_page"), "🔧 Vendors", path))
+            _mparts.append(nav_link(url_for("team_hours_page"), "🕐 Team Hours", path))
             if is_disp:
                 _mparts.append(nav_link(url_for("team_page"), "👥 Team", path))
             if is_own:
@@ -15570,6 +15850,173 @@ def delete_clock_entry():
 
 
 # =========================================================
+# TEAM HOURS  — boss weekly-hours view (feat/weekly-hours)
+# List of drivers w/ weekly totals → tap a driver for the same Mon→Sun
+# breakdown the driver sees on their own clock page. Same shared summary
+# (get_driver_week_summary) so the two views can never disagree.
+# =========================================================
+@app.route("/boss/team-hours")
+@boss_required
+def team_hours_page():
+    conn = get_db()
+    company = conn.execute("SELECT * FROM companies WHERE id=?", (cid(),)).fetchone()
+    co_settings = {k: company[k] for k in company.keys()} if company else {}
+
+    # Week offset: 0 = current week, negative = past. Clamp forward so the
+    # boss can't page into empty future weeks.
+    try:
+        w = request.args.get("w", default=0, type=int) or 0
+    except Exception:
+        w = 0
+    if w > 0:
+        w = 0
+
+    now_local = _company_local_now(co_settings)
+    monday    = week_monday_for(now_local) + timedelta(days=7 * w)
+    sunday    = monday + timedelta(days=6)
+    week_lbl  = "%s &ndash; %s" % (monday.strftime("%b %-d"), sunday.strftime("%b %-d"))
+
+    drivers = conn.execute(
+        "SELECT id, username FROM users WHERE company_id=? AND role='driver' "
+        "ORDER BY username",
+        (cid(),)
+    ).fetchall()
+    drivers = [dict(d) for d in drivers]
+    allowed = {d["id"] for d in drivers}
+
+    selected_driver_id = request.args.get("driver_id", type=int)
+
+    # ── Drill-down: one driver's daily breakdown (identical renderer) ─────
+    if selected_driver_id and selected_driver_id in allowed:
+        name = next((d["username"] for d in drivers
+                     if d["id"] == selected_driver_id), "")
+        summary = get_driver_week_summary(
+            conn, selected_driver_id, monday, co_settings, now_local)
+        conn.close()
+        card = render_week_hours_card(
+            summary, url_for("team_hours_page"), w,
+            extra_qs="driver_id=%d&" % selected_driver_id,
+            heading=name + " · Hours")
+        tick = _WEEK_LIVE_TICK_JS if (summary["has_live"] and w == 0) else ""
+        body = (
+            '<div class="hero"><h1>&#128100; ' + e(name) + '</h1>'
+            '<p>Weekly hours breakdown</p></div>'
+            '<div style="max-width:460px;margin:0 auto 12px;">'
+            '<a href="' + url_for("team_hours_page") + ('?w=%d' % w) + '" '
+            'style="display:inline-flex;align-items:center;min-height:48px;'
+            'color:var(--orange);text-decoration:none;font-weight:700;font-size:14px;">'
+            '&#8249;&nbsp;All drivers</a></div>'
+            + card + tick
+        )
+        return render_template_string(shell_page("Team Hours", body))
+
+    # ── List view: one row per driver, name + weekly total ───────────────
+    if not drivers:
+        conn.close()
+        body = (
+            '<div class="hero"><h1>&#128337; Team Hours</h1></div>'
+            '<div class="card"><p class="muted">No drivers found. Add drivers '
+            'under <a href="' + url_for("team_page") + '">Team</a> to see '
+            'weekly hours here.</p></div>'
+        )
+        return render_template_string(shell_page("Team Hours", body))
+
+    driver_rows = []
+    total_all   = 0.0
+    missing_all = 0
+    for d in drivers:
+        summ = get_driver_week_summary(
+            conn, d["id"], monday, co_settings, now_local)
+        total_all   += summ["total"]
+        missing_all += summ["missing_days"]
+        driver_rows.append((d, summ))
+    conn.close()
+
+    # Sort highest hours first so the boss sees the busiest drivers on top.
+    driver_rows.sort(key=lambda r: r[1]["total"], reverse=True)
+
+    # ── ‹ › week arrows (min 48px). Forward hidden at current week. ──────
+    ARROW = ("display:inline-flex;align-items:center;justify-content:center;"
+             "min-width:48px;min-height:48px;border-radius:10px;"
+             "border:1px solid var(--orange-border);background:var(--orange-dim);"
+             "color:var(--orange);font-size:22px;font-weight:800;text-decoration:none;")
+    ARROW_OFF = ("display:inline-flex;align-items:center;justify-content:center;"
+                 "min-width:48px;min-height:48px;border-radius:10px;"
+                 "border:1px solid rgba(255,255,255,0.06);background:transparent;"
+                 "color:var(--text-faint);font-size:22px;font-weight:800;opacity:.35;")
+    prev_arrow = ('<a href="%s?w=%d" style="%s" aria-label="Previous week">&#8249;</a>'
+                  % (url_for("team_hours_page"), w - 1, ARROW))
+    if w >= 0:
+        next_arrow = '<span style="%s" aria-label="Current week">&#8250;</span>' % ARROW_OFF
+    else:
+        next_arrow = ('<a href="%s?w=%d" style="%s" aria-label="Next week">&#8250;</a>'
+                      % (url_for("team_hours_page"), w + 1, ARROW))
+
+    rows_html = ""
+    for d, summ in driver_rows:
+        miss = summ["missing_days"]
+        warn = ''
+        if miss:
+            warn = ('<span style="margin-left:8px;padding:2px 8px;border-radius:999px;'
+                    'background:var(--red-dim);color:var(--red);font-size:11px;'
+                    'font-weight:700;white-space:nowrap;">&#9888; %d</span>' % miss)
+        href = "%s?w=%d&driver_id=%d" % (url_for("team_hours_page"), w, d["id"])
+        rows_html += (
+            '<a href="' + href + '" '
+            'style="display:flex;align-items:center;gap:12px;min-height:56px;'
+            'padding:12px 14px;text-decoration:none;color:var(--text);'
+            'border-top:1px solid rgba(255,255,255,0.05);">'
+            '<div style="flex:1;font-weight:700;font-size:15px;">'
+            + e(d["username"]) + warn + '</div>'
+            '<div style="flex:none;text-align:right;">'
+            '<span style="font-family:var(--font-head);font-size:24px;line-height:1;'
+            'color:var(--orange);">' + ("%.1f" % summ["total"]) + '</span>'
+            '<span style="color:var(--text-dim);font-size:12px;"> hrs</span></div>'
+            '<div style="flex:none;color:var(--text-faint);font-size:20px;">&#8250;</div>'
+            '</a>'
+        )
+
+    warn_banner = ""
+    if missing_all:
+        warn_banner = (
+            '<div style="max-width:460px;margin:0 auto 16px;padding:10px 14px;'
+            'border-radius:10px;background:var(--red-dim);'
+            'border:1px solid rgba(255,82,82,0.35);color:var(--red);'
+            'font-size:13px;font-weight:600;">'
+            '&#9888; %d missing clock-out%s this week &mdash; chase corrections '
+            'before payroll.</div>' % (missing_all, "" if missing_all == 1 else "s")
+        )
+
+    body = (
+        '<div class="hero"><h1>&#128337; Team Hours</h1>'
+        '<p>Weekly totals &mdash; tap a driver for their daily breakdown</p></div>'
+        + warn_banner +
+        '<div class="card" style="max-width:460px;margin:0 auto;padding:0;overflow:hidden;">'
+        # header: week label + arrows
+        '<div style="display:flex;align-items:center;justify-content:space-between;'
+        'gap:10px;padding:14px 14px 12px;">'
+        '<div><div style="font-size:12px;font-weight:800;letter-spacing:.10em;'
+        'text-transform:uppercase;color:var(--orange);">This Week</div>'
+        '<div style="font-size:13px;color:var(--text-dim);margin-top:2px;">'
+        + week_lbl + '</div></div>'
+        '<div style="display:flex;gap:8px;">' + prev_arrow + next_arrow + '</div>'
+        '</div>'
+        + rows_html +
+        # team total footer
+        '<div style="display:flex;align-items:baseline;justify-content:space-between;'
+        'padding:14px;border-top:2px solid var(--orange-border);">'
+        '<div style="font-size:13px;font-weight:800;letter-spacing:.08em;'
+        'text-transform:uppercase;color:var(--text-dim);">Team Total</div>'
+        '<div style="font-family:var(--font-head);font-size:30px;line-height:1;'
+        'color:var(--orange);">' + ("%.1f" % round(total_all, 1)) +
+        '<span style="font-size:15px;color:var(--text-dim);"> HRS</span></div>'
+        '</div>'
+        '</div>'
+    )
+    return render_template_string(shell_page("Team Hours", body))
+
+
+# =========================================================
 # PHASE 5B — MANUAL CLOCK-IN / CLOCK-OUT  (/driver/clock)
 # =========================================================
 @app.route("/driver/clock", methods=["GET", "POST"])
@@ -15724,6 +16171,23 @@ def driver_clock():
         return redirect(url_for("driver_clock"))
 
     # ── GET: render page ─────────────────────────────────────────────────────
+    # THIS WEEK card — build the Mon→Sun summary while the connection is open.
+    # w = week offset (0 = current, negative = past). Forward past current is
+    # clamped so drivers can't scroll into empty future weeks.
+    try:
+        _w = request.args.get("w", default=0, type=int) or 0
+    except Exception:
+        _w = 0
+    if _w > 0:
+        _w = 0
+    _now_local   = _company_local_now(co_settings)
+    _week_monday = week_monday_for(_now_local) + timedelta(days=7 * _w)
+    week_summary = get_driver_week_summary(
+        conn, driver_id, _week_monday, co_settings, _now_local)
+    week_card_html = render_week_hours_card(
+        week_summary, url_for("driver_clock"), _w, heading="This Week")
+    week_tick_js = _WEEK_LIVE_TICK_JS if (week_summary["has_live"] and _w == 0) else ""
+
     conn.close()
 
     _entry = {k: entry[k] for k in entry.keys()} if entry else {}
@@ -15908,9 +16372,13 @@ def driver_clock():
         + co_display + '</div></div>'
         '</div></div>'
 
-        '<div class="card" style="max-width:460px;margin:0 auto;">'
+        '<div class="card" style="max-width:460px;margin:0 auto 16px;">'
         + actions_html +
         '</div>'
+
+        # ── THIS WEEK summary (below today's status) ─────────────────────
+        + week_card_html
+        + week_tick_js
     )
     return render_template_string(shell_page("Clock In / Out", body))
 
