@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HAULTRA — Your dispatch texts. Handled.</title>
+<meta name="description" content="HAULTRA turns messy dispatch texts into clean, trackable routes — plus DVIR inspections, container tracking, and a customer portal. Built by a hauler, for haulers.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --black:#080809;
+    --panel:#141416;
+    --panel-2:#1B1B1E;
+    --line:rgba(255,255,255,.09);
+    --orange:#FF7A1A;
+    --orange-hot:#FFA149;
+    --orange-deep:#E85D04;
+    --orange-soft:rgba(255,122,26,.14);
+    --teal:#2DD4BF;
+    --teal-soft:rgba(45,212,191,.12);
+    --text:#F5F3F0;
+    --muted:#A3A09B;
+    --dim:#6B6862;
+    --radius:16px;
+    --display:'Barlow Condensed',sans-serif;
+    --body:'Inter',sans-serif;
+    --mono:'IBM Plex Mono',monospace;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{background:var(--black);color:var(--text);font-family:var(--body);font-size:16px;line-height:1.6;overflow-x:hidden}
+  ::selection{background:var(--orange);color:#0A0A0B}
+
+  /* ambient animated mesh */
+  .mesh{position:fixed;inset:0;z-index:-3;overflow:hidden}
+  .mesh::before,.mesh::after{
+    content:"";position:absolute;border-radius:50%;filter:blur(140px);
+  }
+  .mesh::before{
+    width:56vw;height:56vw;top:-24vw;right:-16vw;
+    background:radial-gradient(circle, rgba(255,122,26,.16), transparent 65%);
+    animation:drift1 22s ease-in-out infinite alternate;
+  }
+  .mesh::after{
+    width:44vw;height:44vw;bottom:-20vw;left:-14vw;
+    background:radial-gradient(circle, rgba(45,212,191,.07), transparent 65%);
+    animation:drift2 26s ease-in-out infinite alternate;
+  }
+  @keyframes drift1{from{transform:translate(0,0) scale(1)}to{transform:translate(-8vw,6vh) scale(1.15)}}
+  @keyframes drift2{from{transform:translate(0,0) scale(1)}to{transform:translate(6vw,-5vh) scale(1.1)}}
+
+  /* film grain */
+  .grain{position:fixed;inset:-50%;z-index:-1;pointer-events:none;opacity:.05;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='300'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='300' height='300' filter='url(%23n)'/%3E%3C/svg%3E");
+    animation:grain 8s steps(10) infinite}
+  @keyframes grain{0%,100%{transform:translate(0,0)}10%{transform:translate(-3%,2%)}30%{transform:translate(2%,-3%)}50%{transform:translate(-2%,3%)}70%{transform:translate(3%,-2%)}90%{transform:translate(-1%,1%)}}
+
+  .wrap{max-width:1200px;margin:0 auto;padding:0 24px}
+
+  /* ---------- nav ---------- */
+  nav{position:sticky;top:0;z-index:50;backdrop-filter:blur(16px);background:rgba(8,8,9,.75);border-bottom:1px solid var(--line)}
+  .nav-in{display:flex;align-items:center;justify-content:space-between;height:70px}
+  .logo{display:flex;align-items:center;gap:11px;text-decoration:none}
+  .logo-mark{width:38px;height:38px;flex-shrink:0;filter:drop-shadow(0 0 12px rgba(255,122,26,.5))}
+  .logo-word{font-family:var(--display);font-weight:700;font-size:25px;letter-spacing:.1em;color:var(--text)}
+  .logo-word .a{color:var(--orange)}
+  .logo-word .tm{font-size:10px;vertical-align:super;color:var(--dim);letter-spacing:0}
+  .nav-links{display:flex;gap:30px;align-items:center}
+  .nav-links a{color:var(--muted);text-decoration:none;font-size:14.5px;font-weight:500;transition:color .18s}
+  .nav-links a:hover{color:var(--text)}
+  .btn{position:relative;display:inline-flex;align-items:center;gap:9px;font-family:var(--body);font-weight:700;font-size:15.5px;padding:15px 28px;border-radius:12px;text-decoration:none;transition:transform .16s, box-shadow .16s;cursor:pointer;border:none;overflow:hidden}
+  .btn:focus-visible{outline:2px solid var(--teal);outline-offset:3px}
+  .btn-primary{background:linear-gradient(180deg,var(--orange),var(--orange-deep));color:#0A0A0B;box-shadow:0 6px 30px rgba(255,122,26,.45), 0 0 0 1px rgba(255,161,73,.4) inset}
+  .btn-primary::after{content:"";position:absolute;top:0;left:-80%;width:50%;height:100%;background:linear-gradient(105deg,transparent,rgba(255,255,255,.45),transparent);transform:skewX(-20deg);animation:shine 3.6s ease-in-out infinite}
+  @keyframes shine{0%,60%{left:-80%}100%{left:140%}}
+  .btn-primary:hover{transform:translateY(-2px);box-shadow:0 12px 40px rgba(255,122,26,.6), 0 0 0 1px rgba(255,161,73,.5) inset}
+  .btn-ghost{background:rgba(255,255,255,.03);color:var(--text);border:1px solid var(--line)}
+  .btn-ghost:hover{border-color:var(--orange);background:var(--orange-soft);transform:translateY(-2px)}
+  .btn-sm{padding:10px 20px;font-size:14px}
+
+  /* ---------- hero ---------- */
+  .hero{padding:78px 0 0;position:relative}
+  .hero-grid{display:grid;grid-template-columns:1.02fr .98fr;gap:56px;align-items:center;padding-bottom:64px}
+  .eyebrow{display:inline-flex;align-items:center;gap:9px;font-family:var(--mono);font-size:12.5px;letter-spacing:.08em;color:var(--orange);text-transform:uppercase;padding:8px 16px;border:1px solid rgba(255,122,26,.35);border-radius:999px;background:var(--orange-soft);margin-bottom:28px;box-shadow:0 0 24px rgba(255,122,26,.15)}
+  .beacon{width:7px;height:7px;border-radius:50%;background:var(--orange);box-shadow:0 0 10px var(--orange);animation:pulse 2.2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  h1{font-family:var(--display);font-weight:700;font-size:clamp(60px,8.2vw,108px);line-height:.92;letter-spacing:.005em;text-transform:uppercase}
+  h1 .accent{
+    background:linear-gradient(90deg,var(--orange-deep),var(--orange),var(--orange-hot),var(--orange),var(--orange-deep));
+    background-size:220% 100%;
+    -webkit-background-clip:text;background-clip:text;color:transparent;
+    animation:flame 4.5s linear infinite;
+    filter:drop-shadow(0 0 26px rgba(255,122,26,.45));
+  }
+  @keyframes flame{to{background-position:220% 0}}
+  .hero-sub{color:var(--muted);font-size:19px;max-width:530px;margin:26px 0 36px}
+  .hero-sub strong{color:var(--text);font-weight:600}
+  .hero-ctas{display:flex;gap:14px;flex-wrap:wrap}
+  .hero-note{margin-top:16px;font-size:13.5px;color:var(--dim)}
+
+  /* ---------- parse demo ---------- */
+  .parse{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;box-shadow:0 30px 80px rgba(0,0,0,.65), 0 0 70px rgba(255,122,26,.09);transform:perspective(1200px) rotateY(-4deg) rotateX(1.5deg);transition:transform .5s ease}
+  .parse:hover{transform:perspective(1200px) rotateY(0deg) rotateX(0deg)}
+  .parse-bar{display:flex;align-items:center;gap:8px;padding:13px 16px;border-bottom:1px solid var(--line);background:var(--panel-2)}
+  .dot{width:11px;height:11px;border-radius:50%}
+  .dot.r{background:#FF5F57}.dot.y{background:#FEBC2E}.dot.g{background:#28C840}
+  .parse-title{margin-left:8px;font-family:var(--mono);font-size:12px;color:var(--dim)}
+  .parse-live{margin-left:auto;display:flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11px;color:var(--teal);letter-spacing:.08em}
+  .beacon.t{background:var(--teal);box-shadow:0 0 10px var(--teal)}
+  .parse-body{padding:18px;min-height:340px}
+  .sms{font-family:var(--mono);font-size:13.5px;color:var(--muted);background:rgba(0,0,0,.4);border:1px dashed rgba(255,255,255,.16);border-radius:10px;padding:14px 16px;white-space:pre-wrap;line-height:1.7;min-height:96px}
+  .sms .cursor{display:inline-block;width:8px;height:15px;background:var(--orange);vertical-align:-2px;animation:blink 1s steps(1) infinite}
+  @keyframes blink{50%{opacity:0}}
+  .parse-arrow{display:flex;align-items:center;gap:10px;margin:16px 2px;font-family:var(--mono);font-size:11.5px;color:var(--teal);letter-spacing:.14em;text-transform:uppercase}
+  .parse-arrow .line{flex:1;height:1px;background:linear-gradient(90deg,var(--teal),transparent)}
+  .stops{display:flex;flex-direction:column;gap:9px}
+  .stop{display:flex;align-items:center;gap:12px;background:var(--panel-2);border:1px solid var(--line);border-radius:10px;padding:12px 14px;opacity:0;transform:translateX(-16px);transition:opacity .45s ease, transform .45s cubic-bezier(.2,.9,.3,1.2)}
+  .stop.show{opacity:1;transform:none}
+  .stop-code{font-family:var(--mono);font-weight:500;font-size:12.5px;width:38px;height:30px;display:grid;place-items:center;border-radius:7px;flex-shrink:0;background:var(--orange-soft);color:var(--orange);border:1px solid rgba(255,122,26,.4)}
+  .stop-addr{font-size:14px;font-weight:600}
+  .stop-meta{font-family:var(--mono);font-size:11.5px;color:var(--dim);margin-left:auto;white-space:nowrap}
+  .ai-tag{font-family:var(--mono);font-size:10px;letter-spacing:.08em;color:var(--teal);border:1px solid rgba(45,212,191,.4);background:var(--teal-soft);border-radius:999px;padding:3px 9px;margin-left:8px;white-space:nowrap}
+
+  /* ---------- road ticker ---------- */
+  .road{border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:rgba(255,255,255,.02);overflow:hidden;position:relative;padding:16px 0}
+  .road::before{content:"";position:absolute;left:0;right:0;top:50%;height:2px;background:repeating-linear-gradient(90deg,var(--orange) 0 26px,transparent 26px 54px);opacity:.14}
+  .ticker{display:flex;gap:0;width:max-content;animation:roll 26s linear infinite}
+  .ticker span{font-family:var(--display);font-weight:700;font-size:22px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);padding:0 34px;white-space:nowrap}
+  .ticker span b{color:var(--orange);font-weight:700}
+  @keyframes roll{to{transform:translateX(-50%)}}
+
+  /* ---------- proof ---------- */
+  .proof{padding:56px 0}
+  .proof-in{display:flex;align-items:center;justify-content:center;gap:64px;flex-wrap:wrap}
+  .stat{text-align:center}
+  .stat b{font-family:var(--display);font-weight:700;font-size:64px;color:var(--text);letter-spacing:.02em;display:block;line-height:1;text-shadow:0 0 30px rgba(255,122,26,.25)}
+  .stat b em{font-style:normal;color:var(--orange)}
+  .stat span{font-family:var(--mono);font-size:12px;color:var(--dim);letter-spacing:.12em;text-transform:uppercase}
+  .proof-label{font-size:14px;color:var(--muted);max-width:250px;text-align:left;border-left:3px solid var(--orange);padding-left:18px}
+
+  /* ---------- sections ---------- */
+  section{padding:100px 0}
+  .sec-head{max-width:680px;margin-bottom:56px}
+  .sec-eyebrow{font-family:var(--mono);font-size:12.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--teal);margin-bottom:14px}
+  h2{font-family:var(--display);font-weight:700;font-size:clamp(42px,5.2vw,64px);line-height:.98;text-transform:uppercase;letter-spacing:.005em}
+  h2 .accent{color:var(--orange);text-shadow:0 0 30px rgba(255,122,26,.3)}
+  .sec-sub{color:var(--muted);margin-top:16px;font-size:17px}
+
+  /* scroll reveal */
+  .rv{opacity:0;transform:translateY(26px);transition:opacity .6s ease, transform .6s ease}
+  .rv.in{opacity:1;transform:none}
+  .rv.d1{transition-delay:.08s}.rv.d2{transition-delay:.16s}.rv.d3{transition-delay:.24s}
+
+  .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:22px}
+  .card{background:linear-gradient(165deg,#19191C,#101012);border:1px solid var(--line);border-radius:var(--radius);padding:34px 28px;position:relative;overflow:hidden;transition:transform .25s, border-color .25s, box-shadow .25s}
+  .card::before{content:"";position:absolute;inset:0;background:radial-gradient(500px circle at var(--mx,50%) var(--my,0%), rgba(255,122,26,.1), transparent 45%);opacity:0;transition:opacity .3s}
+  .card:hover{transform:translateY(-6px);border-color:rgba(255,122,26,.5);box-shadow:0 20px 50px rgba(0,0,0,.5), 0 0 40px rgba(255,122,26,.1)}
+  .card:hover::before{opacity:1}
+  .card-icon{width:48px;height:48px;border-radius:12px;display:grid;place-items:center;margin-bottom:22px;background:var(--orange-soft);border:1px solid rgba(255,122,26,.35);box-shadow:0 0 24px rgba(255,122,26,.15)}
+  .card-icon svg{width:23px;height:23px;stroke:var(--orange)}
+  .card h3{font-family:var(--display);font-size:27px;font-weight:700;letter-spacing:.03em;text-transform:uppercase;margin-bottom:11px}
+  .card p{color:var(--muted);font-size:14.5px}
+  .card .tag{position:absolute;top:24px;right:24px;font-family:var(--mono);font-size:10.5px;color:var(--teal);letter-spacing:.1em}
+
+  .minor{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-top:22px}
+  .mini{display:flex;align-items:center;gap:11px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;font-size:13.5px;color:var(--muted);font-weight:500;transition:border-color .2s}
+  .mini:hover{border-color:rgba(255,122,26,.4)}
+  .mini svg{width:16px;height:16px;stroke:var(--orange);flex-shrink:0}
+
+  /* ---------- pricing ---------- */
+  .plans{display:grid;grid-template-columns:repeat(4,1fr);gap:18px;align-items:stretch}
+  .plan{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:32px 24px;display:flex;flex-direction:column;position:relative;transition:transform .22s, border-color .22s}
+  .plan:hover{transform:translateY(-5px);border-color:rgba(255,122,26,.35)}
+  .plan.popular{border-color:rgba(255,122,26,.65);box-shadow:0 0 56px rgba(255,122,26,.16);background:linear-gradient(172deg, rgba(255,122,26,.1), var(--panel) 42%)}
+  .pop-badge{position:absolute;top:-14px;left:50%;transform:translateX(-50%);font-family:var(--mono);font-size:11px;letter-spacing:.1em;background:linear-gradient(180deg,var(--orange),var(--orange-deep));color:#0A0A0B;font-weight:600;padding:6px 16px;border-radius:999px;white-space:nowrap;box-shadow:0 4px 18px rgba(255,122,26,.4)}
+  .plan-name{font-family:var(--display);font-size:21px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+  .plan-price{font-family:var(--display);font-weight:700;font-size:52px;margin:8px 0 2px;line-height:1}
+  .plan-price small{font-family:var(--body);font-size:14px;font-weight:500;color:var(--dim)}
+  .plan-for{font-size:13px;color:var(--dim);margin-bottom:20px;min-height:38px}
+  .plan ul{list-style:none;display:flex;flex-direction:column;gap:10px;margin-bottom:26px;flex:1}
+  .plan li{display:flex;gap:9px;font-size:13.5px;color:var(--muted)}
+  .plan li svg{width:15px;height:15px;stroke:var(--orange);flex-shrink:0;margin-top:2px}
+  .plan .btn{width:100%;justify-content:center;padding:12px 16px;font-size:14px}
+  .pilot-note{margin-top:28px;text-align:center;font-size:14.5px;color:var(--muted)}
+  .pilot-note a{color:var(--teal);text-decoration:none;font-weight:600}
+  .pilot-note a:hover{text-decoration:underline}
+
+  /* ---------- cta ---------- */
+  .cta{position:relative;background:linear-gradient(160deg, rgba(255,122,26,.16), rgba(20,20,22,.75));border:1px solid rgba(255,122,26,.4);border-radius:24px;padding:76px 40px;text-align:center;overflow:hidden;box-shadow:0 0 110px rgba(255,122,26,.1) inset}
+  .cta::before{content:"";position:absolute;left:0;right:0;bottom:26px;height:2px;background:repeating-linear-gradient(90deg,var(--orange) 0 26px,transparent 26px 54px);opacity:.25}
+  .cta h2{margin-bottom:16px}
+  .cta p{color:var(--muted);max-width:560px;margin:0 auto 32px;font-size:17px}
+
+  /* ---------- footer ---------- */
+  footer{border-top:1px solid var(--line);padding:40px 0 48px;margin-top:40px}
+  .foot{display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap}
+  .foot-legal{font-size:12.5px;color:var(--dim);line-height:1.7;text-align:right}
+  .foot-legal .rk{color:var(--orange);font-weight:600}
+  .foot-links{display:flex;gap:22px}
+  .foot-links a{color:var(--dim);font-size:13px;text-decoration:none}
+  .foot-links a:hover{color:var(--muted)}
+
+  @media (max-width:1020px){.plans{grid-template-columns:repeat(2,1fr)}}
+  @media (max-width:960px){
+    .hero-grid{grid-template-columns:1fr;gap:44px}
+    .parse{transform:none}
+    .cards{grid-template-columns:1fr}
+    .minor{grid-template-columns:repeat(2,1fr)}
+    .nav-links a:not(.btn){display:none}
+    .proof-in{gap:36px}
+    .stat b{font-size:48px}
+  }
+  @media (max-width:560px){
+    .plans{grid-template-columns:1fr}
+    .minor{grid-template-columns:1fr}
+    .hero{padding-top:52px}
+    section{padding:68px 0}
+    .foot-legal{text-align:left}
+  }
+  @media (prefers-reduced-motion:reduce){
+    *,*::before,*::after{animation:none!important;transition:none!important}
+    .stop{opacity:1;transform:none}
+    .rv{opacity:1;transform:none}
+    .parse{transform:none}
+  }
+</style>
+</head>
+<body>
+<div class="mesh"></div>
+<div class="grain"></div>
+
+<nav>
+  <div class="wrap nav-in">
+    <a class="logo" href="#top" aria-label="HAULTRA home">
+      <svg class="logo-mark" viewBox="0 0 48 48" fill="none" aria-hidden="true">
+        <path d="M24 4l16 9v9l-6-3.5V16.5L24 11l-10 5.5V22L8 25.5V13l16-9z" fill="#FF7A1A"/>
+        <path d="M8 25.5L14 22v9.5L24 37l10-5.5V22l6 3.5V35l-16 9-16-9v-9.5z" fill="#E85D04"/>
+        <rect x="20" y="20" width="8" height="8" rx="1.5" fill="#0A0A0B" stroke="#FF7A1A" stroke-width="2"/>
+      </svg>
+      <span class="logo-word">H<span class="a">A</span>ULTR<span class="a">A</span><span class="tm">™</span></span>
+    </a>
+    <div class="nav-links">
+      <a href="#platform">Platform</a>
+      <a href="#pricing">Pricing</a>
+      <a href="/login">Log in</a>
+      <a class="btn btn-primary btn-sm" href="#pilot">Get started</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="wrap hero-grid">
+    <div>
+      <span class="eyebrow"><span class="beacon"></span> Built by a hauler. Built for haulers.</span>
+      <h1>Your dispatch texts.<br><span class="accent">Handled.</span></h1>
+      <p class="hero-sub">Paste the same messy texts you already send. HAULTRA turns them into clean, trackable routes — plus DVIR inspections, container tracking, and a customer portal. <strong>Built from the cab of a working roll-off truck, not an office.</strong></p>
+      <div class="hero-ctas">
+        <a class="btn btn-primary" href="#pilot">Get started
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+        </a>
+        <a class="btn btn-ghost" href="/demo">Try the live demo</a>
+      </div>
+      <p class="hero-note">Free 14-day trial · No credit card · Real sample fleet</p>
+    </div>
+
+    <div class="parse" aria-label="Demo of HAULTRA parsing a dispatch text into route stops">
+      <div class="parse-bar">
+        <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+        <span class="parse-title">haultra&nbsp;·&nbsp;ai&nbsp;route&nbsp;building</span>
+        <span class="parse-live"><span class="beacon t"></span>LIVE PARSE</span>
+      </div>
+      <div class="parse-body">
+        <div class="sms" id="sms"><span class="cursor"></span></div>
+        <div class="parse-arrow"><span>Text in → structured route out</span><span class="line"></span></div>
+        <div class="stops" id="stops">
+          <div class="stop"><span class="stop-code">PR</span><span class="stop-addr">2476 Bayview Ave</span><span class="ai-tag">AI-PARSED</span><span class="stop-meta">30YD · Dominion</span></div>
+          <div class="stop"><span class="stop-code">D</span><span class="stop-addr">844 Widgeon Rd</span><span class="ai-tag">AI-PARSED</span><span class="stop-meta">20YD · stop 2</span></div>
+          <div class="stop"><span class="stop-code">S</span><span class="stop-addr">1512 Centerville Tpke</span><span class="ai-tag">AI-PARSED</span><span class="stop-meta">40YD · swap</span></div>
+          <div class="stop"><span class="stop-code">PR</span><span class="stop-addr">3300 Shipps Corner Rd</span><span class="ai-tag">AI-PARSED</span><span class="stop-meta">30YD · stop 4</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- road ticker -->
+  <div class="road" aria-hidden="true">
+    <div class="ticker">
+      <span>PR <b>·</b> PICK UP RETURN</span><span>D <b>·</b> DELIVER</span><span>S <b>·</b> SWAP</span><span>DVIR <b>·</b> INSPECTED</span><span>GPS <b>·</b> CAPTURED</span><span>757 <b>·</b> BORN &amp; BUILT</span>
+      <span>PR <b>·</b> PICK UP RETURN</span><span>D <b>·</b> DELIVER</span><span>S <b>·</b> SWAP</span><span>DVIR <b>·</b> INSPECTED</span><span>GPS <b>·</b> CAPTURED</span><span>757 <b>·</b> BORN &amp; BUILT</span>
+    </div>
+  </div>
+
+  <div class="wrap proof">
+    <div class="proof-in">
+      <div class="stat rv"><b data-count="10">0</b><span>Trucks live</span></div>
+      <div class="stat rv d1"><b><span data-count="500">0</span><em>+</em></b><span>Containers tracked</span></div>
+      <div class="stat rv d2"><b>757</b><span>Born &amp; built</span></div>
+      <p class="proof-label rv d3">Piloted with a working roll-off operation in Virginia Beach — real trucks, real routes, real dispatch.</p>
+    </div>
+  </div>
+</header>
+
+<section id="platform">
+  <div class="wrap">
+    <div class="sec-head rv">
+      <p class="sec-eyebrow">The platform</p>
+      <h2>Your whole operation.<br><span class="accent">Not just a map.</span></h2>
+      <p class="sec-sub">Route apps show you dots on a screen. HAULTRA runs the loop — from the customer's order to the driver's inspection to the export that gets you paid.</p>
+    </div>
+    <div class="cards">
+      <div class="card rv">
+        <span class="tag">AI CORE</span>
+        <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h10M4 18h7"/><path d="M17 15l3 3-3 3"/></svg></div>
+        <h3>AI Route Building</h3>
+        <p>Paste the morning texts exactly how they come in. HAULTRA parses addresses, action codes, container sizes, and dump locations into clean, assignable stops — teal-tagged wherever the AI did the work.</p>
+      </div>
+      <div class="card rv d1">
+        <span class="tag">DOT-READY</span>
+        <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12l2 2 4-5"/><path d="M12 3l7 3v5c0 5-3.5 8.5-7 10-3.5-1.5-7-5-7-10V6l7-3z"/></svg></div>
+        <h3>DVIR Inspections</h3>
+        <p>Pre- and post-trip inspections from the driver's phone, GPS captured at completion. Records lock the moment they're signed — proof of work, audit-ready, every day.</p>
+      </div>
+      <div class="card rv d2">
+        <span class="tag">SELF-SERVE</span>
+        <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M8 21h8M12 18v3"/></svg></div>
+        <h3>Customer Portal</h3>
+        <p>Customers order swaps and pickups from a link — no app install, no phone tag. Container rental days tracked automatically, so bins never sit forgotten on-site.</p>
+      </div>
+    </div>
+    <div class="minor">
+      <div class="mini rv"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg>Route board — every driver's day</div>
+      <div class="mini rv d1"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg>Container &amp; rental-day tracking</div>
+      <div class="mini rv d2"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg>Maintenance &amp; vendor logs</div>
+      <div class="mini rv d3"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg>Print &amp; CSV export</div>
+    </div>
+  </div>
+</section>
+
+<section id="pricing">
+  <div class="wrap">
+    <div class="sec-head rv">
+      <p class="sec-eyebrow">Pricing</p>
+      <h2>Simple, <span class="accent">per-driver</span> pricing.</h2>
+      <p class="sec-sub">Start free. Upgrade when your fleet grows. Cancel anytime.</p>
+    </div>
+    <div class="plans">
+      <div class="plan rv">
+        <p class="plan-name">Free</p>
+        <p class="plan-price">$0</p>
+        <p class="plan-for">14 days · up to 5 drivers</p>
+        <ul>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg>Full platform access</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg>AI route building</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg>No credit card</li>
+        </ul>
+        <a class="btn btn-ghost" href="#pilot">Start free trial</a>
+      </div>
+      <div class="plan rv d1">
+        <p class="plan-name">Starter</p>
+        <p class="plan-price">$49<small>/mo</small></p>
+        <p class="plan-for">Up to 10 drivers</p>
+        <ul>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg>Everything in Free</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg>DVIR inspections</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg>Route print &amp; CSV export</li>
+        </ul>
+        <a class="btn btn-ghost" href="#pilot">Start free trial</a>
+      </div>
+      <div class="plan popular rv d2">
+        <span class="pop-badge">MOST POPULAR</span>
+        <p class="plan-name">Pro</p>
+        <p class="plan-price">$99<small>/mo</small></p>
+        <p class="plan-for">Up to 30 drivers · priority support</p>
+        <ul>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg>Everything in Starter</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg>Customer portal &amp; online orders</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg>Container tracking</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg>Maintenance logs</li>
+        </ul>
+        <a class="btn btn-primary" href="#pilot">Start free trial</a>
+      </div>
+      <div class="plan rv d3">
+        <p class="plan-name">Fleet</p>
+        <p class="plan-price">Custom</p>
+        <p class="plan-for">Unlimited drivers · dedicated support</p>
+        <ul>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg>Everything in Pro</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg>Onboarding with your dispatcher</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg>Dedicated support</li>
+        </ul>
+        <a class="btn btn-ghost" href="mailto:info@haultraai.com">Contact us</a>
+      </div>
+    </div>
+    <p class="pilot-note rv">Running a real fleet and want in early? <a href="#pilot">Ask about the pilot program →</a></p>
+  </div>
+</section>
+
+<section id="demo">
+  <div class="wrap">
+    <div class="cta rv" id="pilot">
+      <h2>Stop running your fleet<br><span class="accent">from your text messages.</span></h2>
+      <p>Try the live demo with a pre-loaded sample fleet — or send us one day of your real dispatch texts and we'll show you your own operation inside HAULTRA.</p>
+      <div class="hero-ctas" style="justify-content:center">
+        <a class="btn btn-primary" href="/demo">Try the live demo</a>
+        <a class="btn btn-ghost" href="mailto:info@haultraai.com">info@haultraai.com</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap foot">
+    <a class="logo" href="#top" aria-label="HAULTRA home">
+      <svg class="logo-mark" style="width:28px;height:28px" viewBox="0 0 48 48" fill="none" aria-hidden="true">
+        <path d="M24 4l16 9v9l-6-3.5V16.5L24 11l-10 5.5V22L8 25.5V13l16-9z" fill="#FF7A1A"/>
+        <path d="M8 25.5L14 22v9.5L24 37l10-5.5V22l6 3.5V35l-16 9-16-9v-9.5z" fill="#E85D04"/>
+        <rect x="20" y="20" width="8" height="8" rx="1.5" fill="#0A0A0B" stroke="#FF7A1A" stroke-width="2"/>
+      </svg>
+      <span class="logo-word" style="font-size:18px">H<span class="a">A</span>ULTR<span class="a">A</span><span class="tm">™</span></span>
+    </a>
+    <div class="foot-links">
+      <a href="#platform">Platform</a>
+      <a href="#pricing">Pricing</a>
+      <a href="/demo">Demo</a>
+      <a href="mailto:info@haultraai.com">Contact</a>
+    </div>
+    <p class="foot-legal">© 2026 HAULTRA AI SYSTEMS LLC · Virginia Beach, VA<br>HAULTRA™ is a trademark of HAULTRA AI SYSTEMS LLC · <span class="rk">A Rockkstaar Enterprise company</span></p>
+  </div>
+</footer>
+
+<script>
+(function(){
+  var reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /* dispatch parse loop */
+  var smsEl = document.getElementById('sms');
+  var stops = document.querySelectorAll('#stops .stop');
+  var message = "PR 2476 Bayview 30yd dump dominion\nD 844 Widgeon 20\nS 1512 Centerville 40yd\nPR 3300 Shipps Corner 30";
+  if (reduced) {
+    smsEl.textContent = message;
+    stops.forEach(function(s){ s.classList.add('show'); });
+  } else {
+    (function run(){
+      smsEl.innerHTML = '<span class="cursor"></span>';
+      stops.forEach(function(s){ s.classList.remove('show'); });
+      var i = 0;
+      var typer = setInterval(function(){
+        i++;
+        smsEl.innerHTML = message.slice(0, i).replace(/\n/g,'<br>') + '<span class="cursor"></span>';
+        if (i >= message.length) {
+          clearInterval(typer);
+          stops.forEach(function(s, idx){
+            setTimeout(function(){ s.classList.add('show'); }, 350 + idx * 260);
+          });
+          setTimeout(run, 7500);
+        }
+      }, 32);
+    })();
+  }
+
+  /* scroll reveals */
+  var obs = new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if (e.isIntersecting){ e.target.classList.add('in'); obs.unobserve(e.target); }
+    });
+  }, {threshold:.15});
+  document.querySelectorAll('.rv').forEach(function(el){ obs.observe(el); });
+
+  /* counting stats */
+  function countUp(el){
+    var target = parseInt(el.getAttribute('data-count'),10);
+    if (reduced){ el.textContent = target; return; }
+    var start = null, dur = 1400;
+    function step(ts){
+      if(!start) start = ts;
+      var p = Math.min((ts-start)/dur, 1);
+      el.textContent = Math.floor(target * (1 - Math.pow(1-p, 3)));
+      if (p < 1) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  }
+  var cObs = new IntersectionObserver(function(entries){
+    entries.forEach(function(e){
+      if (e.isIntersecting){ countUp(e.target); cObs.unobserve(e.target); }
+    });
+  }, {threshold:.6});
+  document.querySelectorAll('[data-count]').forEach(function(el){ cObs.observe(el); });
+
+  /* card cursor glow */
+  document.querySelectorAll('.card').forEach(function(card){
+    card.addEventListener('mousemove', function(ev){
+      var r = card.getBoundingClientRect();
+      card.style.setProperty('--mx', (ev.clientX - r.left) + 'px');
+      card.style.setProperty('--my', (ev.clientY - r.top) + 'px');
+    });
+  });
+})();
+</script>
+</body>
+</html>
