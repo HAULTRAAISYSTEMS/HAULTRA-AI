@@ -6216,6 +6216,13 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     color: #FF9B9B; font-size: 12.5px; font-weight: 700; text-align: center;
 }}
 .cab-canplan-toast[hidden] {{ display: none; }}
+/* One-line "after dump" summary for this stop's own pulled can (shown when a
+   different, carried can is what the selector controls). */
+.cab-afterdump {{
+    margin-top: 10px; padding: 9px 12px; border-radius: 9px;
+    background: rgba(140,160,179,0.12); border: 1px solid rgba(140,160,179,0.35);
+    color: #B8C4D0; font-size: 12.5px; font-weight: 600; text-align: center;
+}}
 .upload-details {{ margin: 10px 0; }}
 .upload-details summary {{
     color: #B8B8AE; font-size: 13px; font-weight: 600; cursor: pointer;
@@ -10778,10 +10785,12 @@ def driver_route_detail(route_id):
     # ── Empty-can leg controls (fix/latency-and-leg-actions) ──────────────
     # "Can on board" context: if the immediately-preceding stop is carrying its
     # empty to this one, surface it so the driver knows a can rode along.
+    _has_carried_can = (prev_stop is not None
+                        and (dict(prev_stop).get("empty_can_plan") or "").strip() == "carry_next")
+    _carried_ref = (dict(prev_stop).get("carry_can_ref") or "").strip() if _has_carried_can else ""
     can_on_board_html = ""
-    if prev_stop is not None and (dict(prev_stop).get("empty_can_plan") or "").strip() == "carry_next":
-        _cob_ref = (dict(prev_stop).get("carry_can_ref") or "").strip()
-        _cob_ref_txt = (" #" + e(_cob_ref)) if _cob_ref else ""
+    if _has_carried_can:
+        _cob_ref_txt = (" #" + e(_carried_ref)) if _carried_ref else ""
         can_on_board_html = (
             f'<div class="cab-can-onboard">&#128666; Can on board{_cob_ref_txt} '
             f'&mdash; carried from the previous stop</div>'
@@ -10794,7 +10803,19 @@ def driver_route_detail(route_id):
     empty_can_picker_html = ""
     if is_pr and not is_swap_pr and driver_status != "completed":
         _cur_plan = (_s.get("empty_can_plan") or "").strip() or "return_here"
-        _plan_opts = [("return_here", "Return here"), ("carry_next", "Carry to next"), ("leave_site", "Leave on site")]
+        # The selector governs a DIFFERENT can depending on context, so its title
+        # and labels change to say which one:
+        #  - a can carried on board from the previous stop → its fate here
+        #  - otherwise → this stop's own pulled can after the dump run.
+        # The underlying plan values (return_here/carry_next/leave_site) are the
+        # same; only the wording differs so it's never ambiguous.
+        if _has_carried_can:
+            _cp_title = ("CARRIED CAN" + (" (#" + e(_carried_ref) + ")" if _carried_ref else "")
+                         + " &mdash; where does it go?")
+            _plan_opts = [("return_here", "Box in here"), ("carry_next", "Keep on truck"), ("leave_site", "Other")]
+        else:
+            _cp_title = "PULLED CAN &mdash; after dump"
+            _plan_opts = [("return_here", "Return here"), ("carry_next", "Carry to next"), ("leave_site", "Leave on site")]
         _url = url_for("set_empty_can_plan", stop_id=stop_id)
         _pill_html = ""
         for _pv, _plabel in _plan_opts:
@@ -10861,11 +10882,20 @@ def driver_route_detail(route_id):
 """
         empty_can_picker_html = (
             f'<div class="cab-canplan-wrap" data-url="{_url}" data-csrf="{_csrf}" data-plan="{_cur_plan}">'
-            '<div class="cab-canplan-lbl">Empty can &mdash; tap if this is wrong</div>'
+            f'<div class="cab-canplan-lbl">{_cp_title}</div>'
             f'<div class="cab-canplan-row">{_pill_html}</div>'
             '<div class="cab-canplan-toast" role="status" hidden></div>'
             '</div>'
             + _picker_js
+        )
+
+    # When a can is carried on board, the selector governs THAT can — so the
+    # pulled can's fate (governed by the leg bar) is spelled out separately as a
+    # one-line summary under Complete Stop, from this stop's parsed return leg.
+    after_dump_summary_html = ""
+    if _has_carried_can and is_pr and not is_swap_pr and _rleg:
+        after_dump_summary_html = (
+            f'<div class="cab-afterdump">&#8617; After dump: return empty to {e(_rleg)}</div>'
         )
 
     # Action badge — vendor visits get a distinct wrench badge.
@@ -10936,6 +10966,7 @@ def driver_route_detail(route_id):
             {empty_can_picker_html}
             {upload_widget}
             {complete_section}
+            {after_dump_summary_html}
         </div>
     </div>
 
