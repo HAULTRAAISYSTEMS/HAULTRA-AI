@@ -230,6 +230,83 @@ def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
+# ── Driver avatars (feat/driver-avatars) ─────────────────────────────────────
+# Uploaded photos live on disk under UPLOAD_FOLDER/avatars (git-ignored); the DB
+# stores only the web-relative path. No photo → a deterministic initials avatar,
+# so an avatar is NEVER broken/empty.
+AVATAR_FOLDER = os.path.join(UPLOAD_FOLDER, "avatars")
+try:
+    os.makedirs(AVATAR_FOLDER, exist_ok=True)
+except Exception:
+    pass
+
+# Theme-friendly palette; a driver's color is stable (hashed from their id).
+_AVATAR_COLORS = ["#FF6B1A", "#00A88F", "#3DDC84", "#8C6BFF", "#F5B43C",
+                  "#E5537B", "#3B9EFF", "#00B3A4", "#C98A33", "#6C8CD5"]
+
+
+def _avatar_color(key):
+    h = 0
+    for ch in str(key or ""):
+        h = (h * 31 + ord(ch)) & 0xFFFFFFFF
+    return _AVATAR_COLORS[h % len(_AVATAR_COLORS)]
+
+
+def _avatar_initials(name, username=""):
+    n = (name or "").strip()
+    if n:
+        parts = [p for p in n.split() if p]
+        if len(parts) >= 2:
+            return (parts[0][0] + parts[1][0]).upper()
+        return parts[0][:2].upper()
+    u = (username or "").strip()
+    return u[:2].upper() if u else "?"
+
+
+def _row_get(row, key, default=None):
+    """Read a key from a sqlite3.Row or a dict, tolerating missing columns."""
+    try:
+        if isinstance(row, dict):
+            return row.get(key, default)
+        return row[key] if key in row.keys() else default
+    except Exception:
+        return default
+
+
+def avatar_html(user, size=32, title=None):
+    """Small circular avatar for a user (sqlite3.Row or dict). Renders the
+    uploaded photo if set, else a deterministic initials circle — never a broken
+    image. `user` should carry id/full_name/username/avatar_path where available."""
+    uid = _row_get(user, "id", "")
+    name = _row_get(user, "full_name") or ""
+    username = _row_get(user, "username") or ""
+    path = (_row_get(user, "avatar_path") or "").strip()
+    s = int(size)
+    _title = e(title if title is not None else (name or username or ""))
+    base = (f'width:{s}px;height:{s}px;min-width:{s}px;border-radius:50%;'
+            f'flex:none;object-fit:cover;display:inline-flex;align-items:center;'
+            f'justify-content:center;vertical-align:middle;')
+    if path:
+        # Cache-bust with the unique filename; the file is already square/resized.
+        return (f'<img class="ha-avatar" src="/{e(path)}" alt="{_title}" title="{_title}" '
+                f'loading="lazy" style="{base}border:1px solid rgba(255,255,255,0.14);"'
+                f' onerror="this.style.display=\'none\';if(this.nextElementSibling)this.nextElementSibling.style.display=\'inline-flex\';">'
+                # Hidden initials sibling so a vanished file still shows something.
+                + _avatar_initials_html(uid, name, username, s, hidden=True))
+    return _avatar_initials_html(uid, name, username, s)
+
+
+def _avatar_initials_html(uid, name, username, s, hidden=False):
+    color = _avatar_color(uid if uid != "" else (name or username))
+    fs = max(10, int(s * 0.42))
+    disp = "none" if hidden else "inline-flex"
+    return (f'<span class="ha-avatar ha-avatar-initials" aria-hidden="true" '
+            f'style="width:{s}px;height:{s}px;min-width:{s}px;border-radius:50%;flex:none;'
+            f'display:{disp};align-items:center;justify-content:center;vertical-align:middle;'
+            f'background:{color};color:#12100c;font-weight:800;font-size:{fs}px;'
+            f'letter-spacing:.3px;line-height:1;">{e(_avatar_initials(name, username))}</span>')
+
+
 # ── Abbreviation expansion ───────────────────────────────────────────────────
 _ABBREV_MAP = {
     "dom":  "Dominion",
@@ -2520,6 +2597,9 @@ def init_db():
     #     retention window already documented in the privacy policy). ---
     safe_add_column(conn, "users", "is_active INTEGER NOT NULL DEFAULT 1")
     safe_add_column(conn, "users", "pending_deletion_at TEXT")
+    # Driver profile photo (feat/driver-avatars): web-relative path to a
+    # 512px square JPEG on disk; NULL → initials fallback avatar.
+    safe_add_column(conn, "users", "avatar_path TEXT")
     safe_add_column(conn, "companies", "closed_at TEXT")
 
     # --- Geocoded coordinates for a stop's own address, used by the Bin
@@ -8239,8 +8319,16 @@ def team_page():
         else:
             nav_cell = '<span class="muted small">&mdash;</span>'
 
+        # Avatar cell: drivers get the boss-managed upload control; others show
+        # just the avatar. The shared upload JS is injected once in the body.
+        if u["role"] == "driver":
+            _av_cell = _avatar_upload_control_html(u, size=40, show_remove=True,
+                                                   include_js=False, compact=True)
+        else:
+            _av_cell = avatar_html(u, 40)
         rows += f"""
         <tr>
+            <td>{_av_cell}</td>
             <td>{e(u['username'])}</td>
             <td>{e(u['full_name'] or '')}</td>
             <td>{e(u['phone'] or '')}</td>
@@ -8267,14 +8355,16 @@ def team_page():
             <table>
                 <thead>
                     <tr>
+                        <th style="width:56px;"></th>
                         <th>Username</th><th>Full Name</th><th>Phone</th><th>Role</th>
                         <th>Driver Activity</th><th>Nav App</th><th>Created</th><th style="width:170px;"></th>
                     </tr>
                 </thead>
-                <tbody>{rows or '<tr><td colspan="8" class="muted">No team members found.</td></tr>'}</tbody>
+                <tbody>{rows or '<tr><td colspan="9" class="muted">No team members found.</td></tr>'}</tbody>
             </table>
         </div>
     </div>
+    {_AVATAR_UPLOAD_JS}
     """
     return render_template_string(shell_page("Team", body))
 
@@ -9774,9 +9864,23 @@ def _message_thread_js():
     function queueFor(routeId) { return loadQueue().filter(function(i) { return i.routeId === routeId; }); }
     function genId() { return 'c' + Date.now() + '-' + Math.random().toString(36).slice(2, 8); }
 
-    function bubbleHtml(sender, body, cls, extra) {
+    function avatarMarkup(av) {
+        if (!av) return '';
+        var base = 'width:22px;height:22px;min-width:22px;border-radius:50%;flex:none;'
+                 + 'object-fit:cover;display:inline-flex;align-items:center;justify-content:center;'
+                 + 'vertical-align:middle;margin-right:6px;';
+        if (av.path) {
+            return '<img src="' + av.path + '" alt="" style="' + base
+                 + 'border:1px solid rgba(255,255,255,0.14);">';
+        }
+        return '<span style="' + base + 'background:' + (av.color || '#8CA0B3')
+             + ';color:#12100c;font-weight:800;font-size:10px;">'
+             + escapeHtml(av.initial || '?') + '</span>';
+    }
+    function bubbleHtml(sender, body, cls, extra, avatar) {
         return '<div class="msg-bubble ' + cls + '">' +
-            '<div class="msg-bubble-meta">' + escapeHtml(sender) + '</div>' +
+            '<div class="msg-bubble-meta" style="display:flex;align-items:center;">'
+              + avatarMarkup(avatar) + escapeHtml(sender) + '</div>' +
             '<div class="msg-bubble-body">' + escapeHtml(body) + '</div>' +
             (extra || '') + '</div>';
     }
@@ -9787,7 +9891,8 @@ def _message_thread_js():
         var html = serverMessages.map(function(m) {
             var isNew = m.id > lastRenderedMax;
             var cls = (m.is_me ? 'msg-me' : 'msg-them') + (isNew && lastRenderedMax ? ' rt-new' : '');
-            return bubbleHtml(m.sender_username, m.body, cls);
+            return bubbleHtml(m.sender_username, m.body, cls, '',
+                { path: m.sender_avatar, initial: m.sender_initial, color: m.sender_color });
         }).join('');
         // Optimistic / queued / failed bubbles for THIS thread, always mine.
         queueFor(currentThreadRouteId).forEach(function(it) {
@@ -9955,7 +10060,8 @@ def _build_route_board_html(user):
     params = [company_id, today]
     sql = """
         SELECT r.id AS route_id, r.route_name, r.assigned_to,
-               u.username AS driver_username,
+               u.username AS driver_username, u.full_name AS driver_full_name,
+               u.avatar_path AS driver_avatar,
                s.id AS stop_id, s.stop_order, s.customer_name, s.address, s.city,
                s.action, s.container_size, s.status AS stop_status, s.driver_status,
                s.completed_at, ii.vendor_status AS vendor_status,
@@ -10011,6 +10117,8 @@ def _build_route_board_html(user):
         lane = lanes.setdefault(driver_key, {
             "driver_username": row["driver_username"],
             "driver_id": row["assigned_to"],
+            "driver_full_name": row["driver_full_name"],
+            "driver_avatar": row["driver_avatar"],
             "route_names": [],
             "route_ids_seen": set(),
             "stops": [],
@@ -10138,11 +10246,18 @@ def _build_route_board_html(user):
                              'background:rgba(255,107,26,0.14);color:#FF9D5C;border:1px solid rgba(255,107,26,0.5);">&#9201; LATE '
                              + e(_late_row["eta"] or "") + '</span>')
 
+        _lane_avatar = ""
+        if lane.get("driver_id"):
+            _lane_avatar = avatar_html({
+                "id": lane["driver_id"], "full_name": lane.get("driver_full_name"),
+                "username": lane.get("driver_username"), "avatar_path": lane.get("driver_avatar"),
+            }, 28)
         lanes_html += f"""
         <div class="lane">
             <div class="lane-driver">
                 <div class="lane-name-row">
                     <span class="lane-status-dot {dot_cls}"></span>
+                    {_lane_avatar}
                     <span class="lane-name">{e(display_name)}</span>
                     {timeoff_chip}
                 </div>
@@ -12817,6 +12932,7 @@ def route_messages(route_id):
 
     rows = conn.execute("""
         SELECT m.id, m.sender_user_id, u.username AS sender_username, u.role AS sender_role,
+               u.full_name AS sender_full_name, u.avatar_path AS sender_avatar,
                m.body, m.created_at
         FROM messages m JOIN users u ON u.id = m.sender_user_id
         WHERE m.route_id=?
@@ -12829,6 +12945,11 @@ def route_messages(route_id):
             "id": r["id"], "sender_username": r["sender_username"], "sender_role": r["sender_role"],
             "body": r["body"], "created_at": r["created_at"],
             "is_me": r["sender_user_id"] == session["user_id"],
+            # Avatar for the sender bubble: photo URL if set, else deterministic
+            # initials + color so the fallback is never broken.
+            "sender_avatar": ("/" + r["sender_avatar"]) if (r["sender_avatar"] or "").strip() else None,
+            "sender_initial": _avatar_initials(r["sender_full_name"], r["sender_username"]),
+            "sender_color": _avatar_color(r["sender_user_id"]),
         }
         for r in rows
     ]})
@@ -18512,7 +18633,7 @@ def team_hours_page():
     week_lbl  = "%s &ndash; %s" % (monday.strftime("%b %-d"), sunday.strftime("%b %-d"))
 
     drivers = conn.execute(
-        "SELECT id, username FROM users WHERE company_id=? AND role='driver' "
+        "SELECT id, username, full_name, avatar_path FROM users WHERE company_id=? AND role='driver' "
         "ORDER BY username",
         (cid(),)
     ).fetchall()
@@ -18601,6 +18722,7 @@ def team_hours_page():
             'style="display:flex;align-items:center;gap:12px;min-height:56px;'
             'padding:12px 14px;text-decoration:none;color:var(--text);'
             'border-top:1px solid rgba(255,255,255,0.05);">'
+            + avatar_html(d, 34) +
             '<div style="flex:1;font-weight:700;font-size:15px;">'
             + e(d["username"]) + warn + '</div>'
             '<div style="flex:none;text-align:right;">'
@@ -18740,6 +18862,170 @@ def team_hours_export():
         as_attachment=True,
         download_name="haultra-team-hours-%s.csv" % monday.isoformat(),
     )
+
+
+# =========================================================
+# DRIVER AVATARS — upload / remove (feat/driver-avatars)
+# A driver sets their own photo; the boss can set/replace any driver's. The
+# client downscales + center-crops to a 512px square JPEG before upload (same
+# canvas approach as dump-ticket photos), so weak-signal uploads stay small.
+# The file lives on disk under AVATAR_FOLDER; the DB keeps only the path.
+# =========================================================
+def _avatar_target_user(conn, user_id):
+    """The user whose avatar the caller may change: themselves, or (boss) any
+    driver in their company. Returns the user row or None."""
+    me = session.get("user_id")
+    role = session.get("role")
+    row = conn.execute(
+        "SELECT id, username, full_name, avatar_path, role FROM users WHERE id=? AND company_id=?",
+        (user_id, cid())
+    ).fetchone()
+    if not row:
+        return None
+    if user_id == me:
+        return row
+    if role == "boss" and row["role"] == "driver":
+        return row
+    return None
+
+
+@app.route("/api/users/<int:user_id>/avatar", methods=["POST"])
+@login_required
+def upload_avatar(user_id):
+    conn = get_db()
+    target = _avatar_target_user(conn, user_id)
+    if not target:
+        conn.close()
+        return jsonify({"error": "not allowed"}), 403
+    photo = request.files.get("photo")
+    if not photo or not photo.filename or not allowed_file(photo.filename):
+        conn.close()
+        return jsonify({"error": "no image"}), 400
+    old = (target["avatar_path"] or "").strip()
+    fname = f"av_{user_id}_{secrets.token_hex(8)}.jpg"
+    try:
+        photo.save(os.path.join(AVATAR_FOLDER, fname))
+    except Exception as exc:
+        conn.close()
+        app.logger.warning("avatar save failed: %s", exc)
+        return jsonify({"error": "could not save"}), 500
+    db_path = os.path.join("static", "uploads", "avatars", fname).replace("\\", "/")
+    conn.execute("UPDATE users SET avatar_path=? WHERE id=? AND company_id=?",
+                 (db_path, user_id, cid()))
+    conn.commit()
+    conn.close()
+    _delete_avatar_file(old)
+    return jsonify({"success": True, "avatar_path": db_path})
+
+
+@app.route("/api/users/<int:user_id>/avatar/remove", methods=["POST"])
+@login_required
+def remove_avatar(user_id):
+    conn = get_db()
+    target = _avatar_target_user(conn, user_id)
+    if not target:
+        conn.close()
+        return jsonify({"error": "not allowed"}), 403
+    old = (target["avatar_path"] or "").strip()
+    conn.execute("UPDATE users SET avatar_path=NULL WHERE id=? AND company_id=?", (user_id, cid()))
+    conn.commit()
+    conn.close()
+    _delete_avatar_file(old)
+    return jsonify({"success": True})
+
+
+def _delete_avatar_file(db_path):
+    """Best-effort removal of a superseded avatar file (never raises)."""
+    p = (db_path or "").strip()
+    if not p or "avatars/" not in p:
+        return
+    try:
+        full = os.path.join(app.root_path, p)
+        if os.path.isfile(full):
+            os.remove(full)
+    except Exception:
+        pass
+
+
+# Reusable client-side avatar picker: camera/library → 512px square center-crop
+# JPEG → upload → reload. Plain (non-f) string so its JS braces are literal.
+_AVATAR_UPLOAD_JS = """
+<script>
+(function(){
+  if (window.__haAvatarInit) return; window.__haAvatarInit = true;
+  var CSRF = (document.querySelector('meta[name=csrf-token]')||{}).content || '';
+  function readFile(file){ return new Promise(function(res,rej){ var r=new FileReader(); r.onload=function(){res(r.result);}; r.onerror=rej; r.readAsDataURL(file); }); }
+  function loadImage(src){ return new Promise(function(res,rej){ var im=new Image(); im.onload=function(){res(im);}; im.onerror=rej; im.src=src; }); }
+  function toBlob(c,q){ return new Promise(function(res){ c.toBlob(res,'image/jpeg',q); }); }
+  function squash(img){
+    var side=Math.min(img.width,img.height);
+    var sx=(img.width-side)/2, sy=(img.height-side)/2;
+    var out=512, cv=document.createElement('canvas'); cv.width=out; cv.height=out;
+    cv.getContext('2d').drawImage(img, sx, sy, side, side, 0, 0, out, out);
+    return cv;
+  }
+  window.haAvatarPick = function(userId){
+    var inp=document.getElementById('ha-av-input-'+userId);
+    if(inp) inp.click();
+  };
+  window.haAvatarChange = function(userId, inp){
+    var file = inp.files && inp.files[0]; if(!file) return;
+    var status=document.getElementById('ha-av-status-'+userId);
+    if(status){ status.textContent='Saving…'; status.hidden=false; }
+    readFile(file).then(loadImage).then(function(img){
+      var cv=squash(img);
+      var q=[0.75,0.6,0.5,0.4], i=0;
+      function step(){
+        return toBlob(cv,q[i]).then(function(b){
+          if(b && (b.size<=150*1024 || i>=q.length-1)){ return b; }
+          i++; return step();
+        });
+      }
+      return step();
+    }).then(function(blob){
+      var fd=new FormData(); fd.append('photo', new File([blob],'avatar.jpg',{type:'image/jpeg'})); fd.append('_csrf_token', CSRF);
+      return fetch('/api/users/'+userId+'/avatar', {method:'POST', headers:{'X-CSRF-Token':CSRF}, body:fd});
+    }).then(function(r){ return r.json().catch(function(){return{};}).then(function(j){return{ok:r.ok,j:j};}); })
+      .then(function(res){ if(res.ok){ location.reload(); } else { if(status){status.textContent=(res.j&&res.j.error)||'Could not save — tap to retry';} } })
+      .catch(function(){ if(status){status.textContent='Network error — tap to retry';} });
+  };
+  window.haAvatarRemove = function(userId){
+    if(!confirm('Remove this photo?')) return;
+    fetch('/api/users/'+userId+'/avatar/remove', {method:'POST', headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF}})
+      .then(function(r){ if(r.ok){ location.reload(); } else { alert('Could not remove.'); } })
+      .catch(function(){ alert('Network error — try again.'); });
+  };
+})();
+</script>
+"""
+
+
+def _avatar_upload_control_html(user, size=64, show_remove=True, include_js=True, compact=False):
+    """A tappable avatar + hidden camera/library input + Add/Change/Remove
+    controls for the given user (self or, for a boss, a driver). Pass
+    include_js=False when the page already injected _AVATAR_UPLOAD_JS once."""
+    uid = _row_get(user, "id")
+    has = bool((_row_get(user, "avatar_path") or "").strip())
+    remove = ""
+    if show_remove and has:
+        remove = (f'<button type="button" onclick="haAvatarRemove({uid})" '
+                  f'style="min-height:36px;padding:4px 10px;border-radius:8px;border:1px solid rgba(255,82,82,0.4);'
+                  f'background:transparent;color:#FF9B9B;font-size:12px;cursor:pointer;">Remove</button>')
+    _btn_label = ("Change" if (compact and has) else ("Change photo" if has else ("Photo" if compact else "Add photo")))
+    ctrl = (
+        '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'
+        f'<span onclick="haAvatarPick({uid})" style="cursor:pointer;">{avatar_html(user, size)}</span>'
+        f'<input id="ha-av-input-{uid}" type="file" accept="image/*" capture="environment" '
+        f'style="display:none;" onchange="haAvatarChange({uid}, this)">'
+        f'<button type="button" onclick="haAvatarPick({uid})" '
+        f'style="min-height:36px;padding:5px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.16);'
+        f'background:rgba(255,255,255,0.04);color:var(--text);font-weight:700;font-size:12.5px;cursor:pointer;">'
+        f'{_btn_label}</button>'
+        f'{remove}'
+        f'<span id="ha-av-status-{uid}" class="muted small" hidden></span>'
+        '</div>'
+    )
+    return ctrl + (_AVATAR_UPLOAD_JS if include_js else "")
 
 
 # =========================================================
@@ -19137,10 +19423,11 @@ def team_time_off_page():
     month_label = first.strftime("%B %Y")
 
     drivers = conn.execute(
-        "SELECT id, username, full_name FROM users WHERE role='driver' AND company_id=? ORDER BY username",
+        "SELECT id, username, full_name, avatar_path FROM users WHERE role='driver' AND company_id=? ORDER BY username",
         (company_id,)
     ).fetchall()
     dname = {d["id"]: (d["full_name"] or d["username"] or "Driver") for d in drivers}
+    davatar = {d["id"]: d for d in drivers}
 
     # Project each driver's off/pending across the visible grid; late only today.
     per_driver = {}
@@ -19266,8 +19553,10 @@ def team_time_off_page():
                 bits.append('<span style="color:#A6A69E;font-weight:700;">PENDING</span>')
             if late:
                 bits.append('<span style="color:#FF9D5C;font-weight:700;">LATE ETA ' + e(late["eta"] or "") + '</span>')
-            items += '<li><b>' + e(dname[d["id"]]) + '</b> — ' + " · ".join(bits) + '</li>'
-        day_detail = ('<div class="card"><h3 style="margin-top:0;">' + e(day_q) + '</h3><ul class="tc-daylist">'
+            items += ('<li style="display:flex;align-items:center;gap:8px;list-style:none;">'
+                      + avatar_html(davatar.get(d["id"], d), 22)
+                      + '<span><b>' + e(dname[d["id"]]) + '</b> — ' + " · ".join(bits) + '</span></li>')
+        day_detail = ('<div class="card"><h3 style="margin-top:0;">' + e(day_q) + '</h3><ul class="tc-daylist" style="padding-left:0;">'
                       + (items or '<li class="muted">Nobody off or late this day.</li>') + '</ul></div>')
 
     conn.close()
@@ -19645,6 +19934,17 @@ def driver_clock():
     # Time Off card (request form + own list + running-late control).
     time_off_card_html = _driver_time_off_card_html(conn, cid(), driver_id, today, co_settings, csrf_tok)
 
+    # Driver's own profile photo + upload control for the page header.
+    _me_row = conn.execute(
+        "SELECT id, username, full_name, avatar_path FROM users WHERE id=?", (driver_id,)
+    ).fetchone()
+    driver_avatar_card = (
+        '<div class="card" style="max-width:460px;margin:0 auto 16px;display:flex;'
+        'align-items:center;gap:14px;flex-wrap:wrap;">'
+        + _avatar_upload_control_html(_me_row, size=56, show_remove=True)
+        + '</div>'
+    ) if _me_row else ""
+
     conn.close()
 
     _entry = {k: entry[k] for k in entry.keys()} if entry else {}
@@ -19808,6 +20108,8 @@ def driver_clock():
         '<h1>&#9201; Clock In / Out</h1>'
         '<p>' + e(day_label) + '</p>'
         '</div>'
+
+        + driver_avatar_card +
 
         '<div class="card" style="max-width:460px;margin:0 auto 16px;">'
         '<div style="font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;'
@@ -22891,6 +23193,7 @@ def truck_detail_page(truck_id):
     insps = conn.execute(
         f"""SELECT i.*,
                    COALESCE(u.username,'—') AS driver_name,
+                   u.id AS driver_uid, u.full_name AS driver_full, u.avatar_path AS driver_avatar,
                    (SELECT COUNT(*) FROM inspection_items ii
                      WHERE ii.inspection_id=i.id AND ii.result='defect' AND ii.deleted_at IS NULL) AS defect_count
               FROM inspections i
@@ -22936,9 +23239,10 @@ def truck_detail_page(truck_id):
                 <span style="font-weight:700;font-size:14px;">{e((i["created_at"] or "")[:16])}</span>
                 <span style="color:{color};font-weight:800;font-size:12px;">{e(_INSPECTION_OVERALL_LABEL.get(i["overall"], i["overall"]))}</span>
             </div>
-            <div style="color:var(--slate);font-size:13px;margin-top:4px;">
-                {e(_INSPECTION_TYPE_LABEL.get(i["type"], i["type"]))} · {e(i["driver_name"])}
-                {(' · ' + str(i["defect_count"]) + ' defect' + ('' if i["defect_count"]==1 else 's')) if i["defect_count"] else ''}
+            <div style="color:var(--slate);font-size:13px;margin-top:4px;display:flex;align-items:center;gap:6px;">
+                <span>{e(_INSPECTION_TYPE_LABEL.get(i["type"], i["type"]))} ·</span>
+                {avatar_html({"id": i["driver_uid"], "full_name": i["driver_full"], "username": i["driver_name"], "avatar_path": i["driver_avatar"]}, 20) if i["driver_uid"] else ""}
+                <span>{e(i["driver_name"])}{(' · ' + str(i["defect_count"]) + ' defect' + ('' if i["defect_count"]==1 else 's')) if i["defect_count"] else ''}</span>
             </div>
         </a>"""
     if not insps:
