@@ -2957,6 +2957,13 @@ def init_db():
     safe_add_column(conn, "stops", "empty_can_plan TEXT")
     safe_add_column(conn, "stops", "carry_can_ref TEXT")
 
+    # --- Multi-tenant parser: dump sites are per-company (fix/parser-multitenant) ---
+    # dump_locations predates multi-tenancy and had no company_id, so one
+    # company's dump sites leaked into every company's parse context. Add the
+    # column here; existing rows are assigned to the bootstrap company in the
+    # orphan-backfill block below.
+    safe_add_column(conn, "dump_locations", "company_id INTEGER")
+
     # --- Self-building address book (feat/address-book) ---
     # norm_key: normalized address (case/spacing/abbrev-insensitive) used to
     #   dedupe a location regardless of how it was typed. Every learned stop
@@ -3015,6 +3022,14 @@ def init_db():
     conn.execute("UPDATE routes SET company_id=? WHERE company_id IS NULL", (default_co_id,))
     conn.execute("UPDATE orders SET company_id=? WHERE company_id IS NULL", (default_co_id,))
     conn.execute("UPDATE load_scores SET company_id=? WHERE company_id IS NULL", (default_co_id,))
+    # Multi-tenant parser: dump_locations was historically a GLOBAL table, which
+    # leaked one company's dump sites into every other company's parse context.
+    # Assign every pre-existing (unscoped) dump site to the bootstrap company so
+    # it stays owned by us; new companies build their own list (empty until they
+    # add sites or run parser onboarding). Same for the region/company-specific
+    # shorthand that was seeded at the global (NULL) tier.
+    conn.execute("UPDATE dump_locations SET company_id=? WHERE company_id IS NULL", (default_co_id,))
+    conn.execute("UPDATE parse_vocab SET company_id=? WHERE company_id IS NULL", (default_co_id,))
     conn.commit()
 
     existing_boss = cur.execute("SELECT id FROM users WHERE role='boss' LIMIT 1").fetchone()
@@ -8884,7 +8899,8 @@ def text_to_route():
         (company_id,)
     ).fetchall()
     dump_locs = conn.execute(
-        "SELECT id, name, city FROM dump_locations WHERE active=1 ORDER BY name"
+        "SELECT id, name, city FROM dump_locations WHERE active=1 AND company_id=? ORDER BY name",
+        (company_id,)
     ).fetchall()
 
     if request.method == "POST":
@@ -10035,7 +10051,8 @@ def new_route():
         (cid(),)
     ).fetchall()
     dump_locs = conn.execute(
-        "SELECT id, name, city FROM dump_locations WHERE active=1 ORDER BY name"
+        "SELECT id, name, city FROM dump_locations WHERE active=1 AND company_id=? ORDER BY name",
+        (cid(),)
     ).fetchall()
 
     if request.method == "POST":
@@ -10227,7 +10244,8 @@ def driver_route_detail(route_id):
 
     # Load all active dump locations keyed by lowercase name for per-stop nav lookup
     _dump_loc_rows = conn.execute(
-        "SELECT name, address, city, state, zip_code FROM dump_locations WHERE active=1"
+        "SELECT name, address, city, state, zip_code FROM dump_locations WHERE active=1 AND company_id=?",
+        (cid(),)
     ).fetchall()
     _dump_loc_by_name = {r["name"].lower(): dict(r) for r in _dump_loc_rows}
 
@@ -12556,7 +12574,8 @@ def view_route(route_id):
     stop_ids = [s["id"] for s in stops]
     photos_by_stop = load_stop_photos(conn, stop_ids)
     dump_locs_for_form = conn.execute(
-        "SELECT name FROM dump_locations WHERE active=1 ORDER BY name"
+        "SELECT name FROM dump_locations WHERE active=1 AND company_id=? ORDER BY name",
+        (cid(),)
     ).fetchall()
     conn.close()
 
@@ -13200,7 +13219,8 @@ def edit_stop(stop_id):
     stop = ownership
     _stop = dict(stop)
     _edit_dump_locs = conn.execute(
-        "SELECT name FROM dump_locations WHERE active=1 ORDER BY name"
+        "SELECT name FROM dump_locations WHERE active=1 AND company_id=? ORDER BY name",
+        (cid(),)
     ).fetchall()
     _sibling_stops = conn.execute(
         "SELECT customer_name, address, action FROM stops WHERE route_id=? AND id!=? ORDER BY stop_order",
@@ -13885,7 +13905,8 @@ def dump_ticket(stop_id):
     # GET: show form
     ticket    = conn.execute("SELECT * FROM dump_tickets WHERE stop_id=?", (stop_id,)).fetchone()
     dump_locs = conn.execute(
-        "SELECT * FROM dump_locations WHERE active=1 ORDER BY name"
+        "SELECT * FROM dump_locations WHERE active=1 AND company_id=? ORDER BY name",
+        (cid(),)
     ).fetchall()
 
     # Pre-select the dump site: the stop's parsed dump-leg (multi-leg jobs) wins,
@@ -13895,12 +13916,13 @@ def dump_ticket(stop_id):
     _leg = (dict(stop).get("dump_location") or "").strip()
     if _leg:
         _match = conn.execute(
-            "SELECT name FROM dump_locations WHERE LOWER(name)=LOWER(?) LIMIT 1", (_leg,)
+            "SELECT name FROM dump_locations WHERE LOWER(name)=LOWER(?) AND company_id=? LIMIT 1",
+            (_leg, cid())
         ).fetchone()
         default_site = _match["name"] if _match else _leg
     if not default_site and stop["dump_location_id"]:
         _dl = conn.execute(
-            "SELECT name FROM dump_locations WHERE id=?", (stop["dump_location_id"],)
+            "SELECT name FROM dump_locations WHERE id=? AND company_id=?", (stop["dump_location_id"], cid())
         ).fetchone()
         if _dl:
             default_site = _dl["name"]
@@ -14427,7 +14449,8 @@ def optimize_route(route_id):
     # 2. Load dump-location geocodes from DB (one query, cached by name)
     # ------------------------------------------------------------------
     dump_rows = conn.execute(
-        "SELECT name, address, city, state, zip_code FROM dump_locations WHERE active=1"
+        "SELECT name, address, city, state, zip_code FROM dump_locations WHERE active=1 AND company_id=?",
+        (cid(),)
     ).fetchall()
     # dict: normalised_name → full address string
     _dump_addr_map = {}
@@ -14929,6 +14952,18 @@ Action codes:
   S  = swap (drop an empty, pull a full — one stop)
   R  = relocate (move a container on-site or between addresses)
 
+UNIVERSAL SYNONYMS (these mean the same across every roll-off company — map them
+to the action code, don't treat them as customer/site names):
+  PR ← "pull and return", "pull & return", "p&r", "p/r", "dump and return", "dump & return", "d&r"
+  P  ← "pull", "pickup", "pick up", "pick-up", "haul", "haul off", "grab"
+  D  ← "drop", "drop off", "drop-off", "deliver", "delivery", "set", "spot", "place", "new bin"
+  S  ← "swap", "exchange", "switch out", "trade out"
+  R  ← "relocate", "move", "reposition", "shift", "slide"
+  Container state words: "MT", "empty", "e" = an EMPTY container; "full", "loaded" = a full one;
+  "LB" = leave behind / leave on site. Use these to disambiguate drop-empty vs pull-full, not as
+  a separate action. Company-specific shorthand beyond this list comes from the KNOWN LOCATIONS &
+  VOCABULARY block below (per company) — never assume one company's shorthand applies to another.
+
 MULTI-LEG STOPS (important): a single job can have up to three legs but is still ONE stop:
   1. the primary action + address (where the container is),
   2. an optional DUMP leg — haul the pulled container to a dump/landfill site,
@@ -14988,7 +15023,8 @@ def _parse_vocab_context(conn, company_id):
     lines = []
     try:
         dumps = conn.execute(
-            "SELECT name, city FROM dump_locations WHERE active=1 ORDER BY name"
+            "SELECT name, city FROM dump_locations WHERE active=1 AND company_id=? ORDER BY name",
+            (company_id,)
         ).fetchall()
         if dumps:
             lines.append("KNOWN DUMP SITES (use as dump_leg): " + ", ".join(
@@ -15137,6 +15173,206 @@ def api_parse_dispatch():
         return jsonify({"error": "Parser returned invalid format — try re-parsing"}), 502
 
     return jsonify({"stops": stops})
+
+
+# =========================================================
+# SELF-CALIBRATING PARSER ONBOARDING
+# New company: paste 5–10 recent dispatch texts, the parser runs them, the boss
+# confirms/corrects each stop, and every confirmation seeds this company's
+# parser vocabulary immediately — dump sites into dump_locations, customers +
+# addresses + smart defaults into the address book. Everything is company_id
+# scoped, so a new tenant builds its own vocabulary from its own real texts.
+# =========================================================
+def _upsert_dump_location(conn, company_id, name, address="", city="", state="", zip_code=""):
+    """Add a dump site for this company if it doesn't already exist (dedup on
+    case-insensitive name within the company). Returns True if a new row was
+    added. Never raises."""
+    nm = (name or "").strip()
+    if not company_id or not nm:
+        return False
+    try:
+        existing = conn.execute(
+            "SELECT id FROM dump_locations WHERE company_id=? AND LOWER(name)=LOWER(?) LIMIT 1",
+            (company_id, nm)
+        ).fetchone()
+        if existing:
+            return False
+        conn.execute(
+            "INSERT INTO dump_locations (company_id, name, address, city, state, zip_code, notes, active, created_at) "
+            "VALUES (?,?,?,?,?,?,?,1,?)",
+            (company_id, nm, address or "", city or "", state or "", zip_code or "",
+             "Added from parser onboarding", now_ts())
+        )
+        return True
+    except Exception as exc:
+        app.logger.warning("_upsert_dump_location failed for %r: %s", nm, exc)
+        return False
+
+
+@app.route("/onboarding/parser/seed", methods=["POST"])
+@roles_required("dispatcher", api=True)
+def onboarding_parser_seed():
+    """Seed this company's parser vocabulary from confirmed onboarding stops.
+    Each stop learns its address/customer/defaults (address book) and, if it has
+    a dump leg, registers that dump site for the company. Idempotent — re-running
+    the same confirmations just re-touches existing entries."""
+    data = request.get_json(silent=True) or {}
+    stops_in = data.get("stops")
+    if not isinstance(stops_in, list) or not stops_in:
+        return jsonify({"error": "No confirmed stops to seed."}), 400
+
+    conn = get_db()
+    company_id = cid()
+    learned = 0
+    dumps_added = 0
+    try:
+        for s in stops_in:
+            if not isinstance(s, dict):
+                continue
+            action_code = (s.get("action") or "").strip().upper()
+            address = expand_abbrev((s.get("address") or "").strip())
+            if action_code not in _PARSER_ACTION_MAP or not address:
+                continue
+            customer = expand_abbrev((s.get("customer") or "").strip())
+            container = expand_abbrev((s.get("container_size") or "").strip())
+            dump_leg = expand_abbrev((s.get("dump_leg") or "").strip())
+            learn_location(
+                conn, company_id, address, customer_name=customer,
+                action=_PARSER_ACTION_MAP[action_code], container_size=container,
+                dump_location=dump_leg)
+            learned += 1
+            if dump_leg and _upsert_dump_location(conn, company_id, dump_leg):
+                dumps_added += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"seeded": learned, "dump_sites_added": dumps_added})
+
+
+@app.route("/onboarding/parser")
+@boss_required
+def onboarding_parser_page():
+    csrf_tok = get_csrf_token()
+    _pc = get_db()
+    try:
+        dump_count = _pc.execute(
+            "SELECT COUNT(*) n FROM dump_locations WHERE company_id=?", (cid(),)
+        ).fetchone()["n"]
+        loc_count = _pc.execute(
+            "SELECT COUNT(*) n FROM saved_addresses WHERE company_id=?", (cid(),)
+        ).fetchone()["n"]
+    finally:
+        _pc.close()
+    body = f"""
+    <div class="hero">
+        <h1>Teach the parser your language</h1>
+        <p>Paste 5&ndash;10 recent dispatch texts you&rsquo;ve actually sent. We&rsquo;ll parse them,
+        you confirm or fix each stop, and every confirmation teaches the parser your dump sites,
+        customers and addresses &mdash; instantly.</p>
+    </div>
+    <div class="card" style="max-width:760px;">
+        <div class="muted small" style="margin-bottom:10px;">
+            You currently have <b>{dump_count}</b> dump site(s) and <b>{loc_count}</b> saved location(s).
+        </div>
+        <label style="font-weight:700;">Recent dispatch texts (one job per line, or blank line between jobs)</label>
+        <textarea id="ob-input" rows="8" style="width:100%;min-height:160px;padding:12px;
+                  background:var(--bg-0,#121212);border:1px solid rgba(255,255,255,0.14);
+                  border-radius:10px;color:var(--text,#f5f5f0);font-family:monospace;font-size:14px;"
+                  placeholder="Pr 7021 harbor view blvd, suff, EW 40yd dump holland&#10;drop empty 88 harbor rd 20yd&#10;swap 770 industrial pkwy 40yd"></textarea>
+        <div style="display:flex;gap:10px;margin-top:12px;">
+            <button id="ob-parse" class="btn" style="min-height:48px;">&#10024; Parse &amp; Preview</button>
+            <a class="btn secondary" href="{url_for('yard_setup_page')}" style="min-height:48px;">Done</a>
+        </div>
+        <div id="ob-error" class="muted small" style="color:#FF7A7A;margin-top:10px;" hidden></div>
+        <div id="ob-results" style="margin-top:16px;"></div>
+        <div id="ob-confirm-wrap" style="margin-top:14px;" hidden>
+            <button id="ob-confirm" class="btn" style="min-height:52px;width:100%;background:linear-gradient(135deg,#00c853,#00e57a);color:#001a0a;font-weight:800;">
+                &#9989; Confirm all &amp; teach the parser
+            </button>
+        </div>
+        <div id="ob-done" class="muted" style="margin-top:12px;color:#3DDC84;font-weight:700;" hidden></div>
+    </div>
+    <script>
+    (function() {{
+      var CSRF = "{csrf_tok}";
+      var input = document.getElementById('ob-input');
+      var parseBtn = document.getElementById('ob-parse');
+      var results = document.getElementById('ob-results');
+      var confirmWrap = document.getElementById('ob-confirm-wrap');
+      var confirmBtn = document.getElementById('ob-confirm');
+      var errEl = document.getElementById('ob-error');
+      var doneEl = document.getElementById('ob-done');
+      var parsed = [];
+
+      function esc(s) {{ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }}
+      function showErr(m) {{ errEl.textContent = m; errEl.hidden = false; }}
+
+      // Split into jobs: blank line separates blocks; otherwise one job per line.
+      function blocks(text) {{
+        var t = text.trim();
+        if (!t) return [];
+        if (/\\n\\s*\\n/.test(t)) return t.split(/\\n\\s*\\n/).map(function(b){{return b.trim();}}).filter(Boolean);
+        return t.split(/\\n/).map(function(b){{return b.trim();}}).filter(Boolean);
+      }}
+
+      parseBtn.addEventListener('click', function() {{
+        errEl.hidden = true; doneEl.hidden = true; confirmWrap.hidden = true; results.innerHTML = '';
+        var jobs = blocks(input.value);
+        if (!jobs.length) {{ showErr('Paste at least one dispatch text first.'); return; }}
+        parseBtn.disabled = true; parseBtn.textContent = 'Parsing…'; parsed = [];
+        Promise.all(jobs.map(function(job) {{
+          return fetch('/api/parse', {{method:'POST',headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},
+            body: JSON.stringify({{text: job}})}})
+            .then(function(r){{ return r.json().then(function(d){{ return {{ok:r.ok, d:d}}; }}); }})
+            .then(function(res){{ return (res.ok && res.d && Array.isArray(res.d.stops)) ? res.d.stops : []; }})
+            .catch(function(){{ return []; }});
+        }})).then(function(all) {{
+          parseBtn.disabled = false; parseBtn.textContent = '\\u2728 Parse & Preview';
+          all.forEach(function(stops){{ (stops||[]).forEach(function(s){{ parsed.push(s); }}); }});
+          if (!parsed.length) {{ showErr('The parser is unavailable or returned nothing. Check that the AI parser is configured, then try again.'); return; }}
+          renderPreview();
+        }});
+      }});
+
+      function renderPreview() {{
+        var rows = parsed.map(function(s, i) {{
+          var flag = (s.confidence === 'low') ? ' <span style="color:#fbbf24;">&#9888; review</span>' : '';
+          var legs = [];
+          if (s.dump_leg) legs.push('dump ' + esc(s.dump_leg));
+          if (s.return_leg) legs.push('return ' + esc(s.return_leg));
+          return '<tr>'
+            + '<td><b>' + esc(s.action||'?') + '</b>' + flag + '</td>'
+            + '<td>' + esc(s.address||'') + (s.customer ? '<div class="muted small">' + esc(s.customer) + '</div>' : '') + '</td>'
+            + '<td class="muted small">' + esc(s.container_size||'') + '</td>'
+            + '<td class="muted small">' + esc(legs.join(' \\u2192 ')) + '</td>'
+            + '</tr>';
+        }}).join('');
+        results.innerHTML = '<div class="muted small" style="margin-bottom:6px;">' + parsed.length
+          + ' stop(s) parsed. Review, then confirm to teach the parser.</div>'
+          + '<div class="table-wrap"><table><thead><tr><th>Action</th><th>Address / customer</th><th>Size</th><th>Legs</th></tr></thead><tbody>'
+          + rows + '</tbody></table></div>';
+        confirmWrap.hidden = false;
+      }}
+
+      confirmBtn.addEventListener('click', function() {{
+        confirmBtn.disabled = true; confirmBtn.textContent = 'Teaching…';
+        fetch("{url_for('onboarding_parser_seed')}", {{
+          method:'POST', headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},
+          body: JSON.stringify({{stops: parsed}})
+        }}).then(function(r){{ return r.json(); }}).then(function(d) {{
+          confirmBtn.disabled = false; confirmBtn.textContent = '\\u2705 Confirm all & teach the parser';
+          if (d && typeof d.seeded === 'number') {{
+            doneEl.textContent = 'Learned ' + d.seeded + ' location(s)'
+              + (d.dump_sites_added ? ' and added ' + d.dump_sites_added + ' dump site(s)' : '') + '. The parser now knows them.';
+            doneEl.hidden = false;
+            confirmWrap.hidden = true;
+          }} else {{ showErr((d && d.error) || 'Could not seed — try again.'); }}
+        }}).catch(function(){{ confirmBtn.disabled = false; confirmBtn.textContent = '\\u2705 Confirm all & teach the parser'; showErr('Network error — try again.'); }});
+      }});
+    }})();
+    </script>
+    """
+    return render_template_string(shell_page("Parser Onboarding", body))
 
 
 # =========================================================
@@ -16706,7 +16942,8 @@ def support_page():
 def _dump_locations_section_html():
     conn = get_db()
     locs = conn.execute(
-        "SELECT * FROM dump_locations ORDER BY active DESC, name ASC"
+        "SELECT * FROM dump_locations WHERE company_id=? ORDER BY active DESC, name ASC",
+        (cid(),)
     ).fetchall()
     conn.close()
 
@@ -16753,9 +16990,14 @@ def _dump_locations_section_html():
     <div class="card" id="dump-locations">
         <div class="row between" style="margin-bottom:16px;">
             <h2 style="margin:0;">&#128465; Dump Locations</h2>
-            <a class="btn" href="{url_for('add_dump_location')}">+ Add Location</a>
+            <div style="display:flex;gap:8px;">
+                <a class="btn secondary" href="{url_for('onboarding_parser_page')}">&#10024; Teach the parser</a>
+                <a class="btn" href="{url_for('add_dump_location')}">+ Add Location</a>
+            </div>
         </div>
-        <p class="muted small" style="margin-bottom:14px;">Disposal sites available for route assignment.</p>
+        <p class="muted small" style="margin-bottom:14px;">Disposal sites available for route assignment.
+        New here? <a href="{url_for('onboarding_parser_page')}">Paste a few recent dispatch texts</a> and the
+        parser learns your dump sites, customers and addresses automatically.</p>
         <div class="table-wrap">
             <table>
                 <thead>
@@ -16787,8 +17029,8 @@ def add_dump_location():
 
         conn = get_db()
         conn.execute(
-            "INSERT INTO dump_locations (name, address, city, state, zip_code, notes, active, created_at) VALUES (?,?,?,?,?,?,1,?)",
-            (name, address, city, state, zip_code, notes, now_ts())
+            "INSERT INTO dump_locations (company_id, name, address, city, state, zip_code, notes, active, created_at) VALUES (?,?,?,?,?,?,?,1,?)",
+            (cid(), name, address, city, state, zip_code, notes, now_ts())
         )
         conn.commit()
         conn.close()
@@ -16824,7 +17066,7 @@ def add_dump_location():
 @boss_required
 def edit_dump_location(loc_id):
     conn = get_db()
-    dl = conn.execute("SELECT * FROM dump_locations WHERE id=?", (loc_id,)).fetchone()
+    dl = conn.execute("SELECT * FROM dump_locations WHERE id=? AND company_id=?", (loc_id, cid())).fetchone()
     if not dl:
         conn.close()
         flash("Location not found.", "error")
@@ -16844,8 +17086,8 @@ def edit_dump_location(loc_id):
             return redirect(url_for("edit_dump_location", loc_id=loc_id))
 
         conn.execute(
-            "UPDATE dump_locations SET name=?, address=?, city=?, state=?, zip_code=?, notes=? WHERE id=?",
-            (name, address, city, state, zip_code, notes, loc_id)
+            "UPDATE dump_locations SET name=?, address=?, city=?, state=?, zip_code=?, notes=? WHERE id=? AND company_id=?",
+            (name, address, city, state, zip_code, notes, loc_id, cid())
         )
         conn.commit()
         conn.close()
@@ -16882,13 +17124,13 @@ def edit_dump_location(loc_id):
 @boss_required
 def toggle_dump_location(loc_id):
     conn = get_db()
-    dl = conn.execute("SELECT active, name FROM dump_locations WHERE id=?", (loc_id,)).fetchone()
+    dl = conn.execute("SELECT active, name FROM dump_locations WHERE id=? AND company_id=?", (loc_id, cid())).fetchone()
     if not dl:
         conn.close()
         flash("Location not found.", "error")
         return redirect(url_for("yard_setup_page"))
     new_active = 0 if dl["active"] else 1
-    conn.execute("UPDATE dump_locations SET active=? WHERE id=?", (new_active, loc_id))
+    conn.execute("UPDATE dump_locations SET active=? WHERE id=? AND company_id=?", (new_active, loc_id, cid()))
     conn.commit()
     conn.close()
     status_word = "activated" if new_active else "deactivated"
@@ -16900,14 +17142,14 @@ def toggle_dump_location(loc_id):
 @boss_required
 def delete_dump_location(loc_id):
     conn = get_db()
-    dl = conn.execute("SELECT name FROM dump_locations WHERE id=?", (loc_id,)).fetchone()
+    dl = conn.execute("SELECT name FROM dump_locations WHERE id=? AND company_id=?", (loc_id, cid())).fetchone()
     if not dl:
         conn.close()
         flash("Location not found.", "error")
         return redirect(url_for("yard_setup_page"))
     # Unlink from any routes that reference this location
     conn.execute("UPDATE routes SET dump_location_id=NULL WHERE dump_location_id=?", (loc_id,))
-    conn.execute("DELETE FROM dump_locations WHERE id=?", (loc_id,))
+    conn.execute("DELETE FROM dump_locations WHERE id=? AND company_id=?", (loc_id, cid()))
     conn.commit()
     conn.close()
     flash(f"'{dl['name']}' deleted.", "success")

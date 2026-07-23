@@ -162,6 +162,10 @@ def _self_test_matchers():
 
 # ── Live parse via the real /api/parse endpoint ──────────────────────────────
 def _make_client():
+    """Boot the app on a fresh temp DB and return a test client logged in as the
+    bootstrap company's boss. The bootstrap company already carries the seeded
+    dump sites + shorthand, mirroring company 1's real parser environment, so the
+    company-1 fixtures parse against the same vocabulary the boss actually has."""
     tmp = tempfile.mkdtemp()
     os.environ.setdefault("DATABASE_PATH", os.path.join(tmp, "parsertest.db"))
     os.environ.setdefault("SECRET_KEY", "parser-test")
@@ -171,17 +175,14 @@ def _make_client():
     app = importlib.import_module("app")
 
     conn = app.get_db()
-    cur = conn.cursor()
-    cur.execute("""INSERT INTO companies (name, slug, subscription_plan, subscription_status,
-                   max_drivers, trial_ends_at, created_at) VALUES (?,?,?,?,?,?,?)""",
-                ("ParserCo", "parserco", "pro", "active", 10, None, app.now_ts()))
-    company_id = cur.lastrowid
-    cur.execute("""INSERT INTO users (username, password_hash, role, full_name, phone,
-                   company_id, created_at) VALUES (?,?,?,?,?,?,?)""",
-                ("pboss", "x", "boss", "Boss", "", company_id, app.now_ts()))
-    boss_id = cur.lastrowid
-    conn.commit()
+    co = conn.execute("SELECT id FROM companies ORDER BY id LIMIT 1").fetchone()
+    company_id = co["id"]
+    boss = conn.execute(
+        "SELECT id FROM users WHERE company_id=? AND role='boss' ORDER BY id LIMIT 1",
+        (company_id,)
+    ).fetchone()
     conn.close()
+    boss_id = boss["id"] if boss else 1
 
     app.app.config["TESTING"] = True
     client = app.app.test_client()
@@ -208,13 +209,22 @@ def _parse(client, text):
 
 
 # ── Runner ───────────────────────────────────────────────────────────────────
+def _load_companies(doc):
+    """Support both the company-keyed schema (preferred) and a legacy flat
+    'fixtures' list, so old fixture files keep working."""
+    if "companies" in doc:
+        return doc["companies"]
+    return [{"company_key": "default", "label": "default", "fixtures": doc.get("fixtures", [])}]
+
+
 def run():
     with open(FIXTURES_PATH, encoding="utf-8") as f:
         doc = json.load(f)
-    fixtures = doc["fixtures"]
+    companies = _load_companies(doc)
+    total = sum(len(c.get("fixtures", [])) for c in companies)
 
     print("Parser real-text regression suite")
-    print(f"  fixtures: {len(fixtures)}  ({FIXTURES_PATH})")
+    print(f"  companies: {len(companies)}   fixtures: {total}   ({FIXTURES_PATH})")
 
     # 1) Always self-test the matcher engine so the harness is trustworthy.
     _self_test_matchers()
@@ -222,7 +232,11 @@ def run():
 
     client = _make_client()
     # Probe once to detect a missing key up front.
-    _, skip = _parse(client, fixtures[0]["text"])
+    first_text = next((fx["text"] for c in companies for fx in c.get("fixtures", [])), None)
+    if first_text is None:
+        print("  no fixtures — nothing to run")
+        return 0
+    _, skip = _parse(client, first_text)
     if skip:
         print(f"\n  {_y('SKIP')} live parse unavailable: {skip}")
         print("  Set ANTHROPIC_API_KEY to run the live assertions. Harness OK.")
@@ -230,29 +244,33 @@ def run():
 
     hard_fail = 0
     adv_warn = 0
-    for fx in fixtures:
-        stops, s = _parse(client, fx["text"])
-        print(f"\n  • {fx['id']}")
-        print(f"    text: {fx['text']!r}")
-        if s is not None or stops is None:
-            hard_fail += 1
-            print(f"    {_r('FAIL')} parser error: {s or 'no stops returned'}")
-            continue
-        hard_ok, adv_ok, lines = _check_fixture(fx, stops)
-        print("    actual: " + json.dumps(stops, ensure_ascii=False))
-        for ln in lines:
-            print(ln)
-        if not hard_ok:
-            hard_fail += 1
-            print(f"    {_r('FAIL')}")
-        else:
-            print(f"    {_g('PASS')}")
-            if not adv_ok:
-                adv_warn += 1
-                print(f"    {_y('(advisory expectations not met — watch, not failing)')}")
+    for comp in companies:
+        fixtures = comp.get("fixtures", [])
+        print(f"\n  ── {comp.get('label', comp.get('company_key', '?'))} "
+              f"({len(fixtures)} fixture(s)) ──")
+        for fx in fixtures:
+            stops, s = _parse(client, fx["text"])
+            print(f"\n  • {fx['id']}")
+            print(f"    text: {fx['text']!r}")
+            if s is not None or stops is None:
+                hard_fail += 1
+                print(f"    {_r('FAIL')} parser error: {s or 'no stops returned'}")
+                continue
+            hard_ok, adv_ok, lines = _check_fixture(fx, stops)
+            print("    actual: " + json.dumps(stops, ensure_ascii=False))
+            for ln in lines:
+                print(ln)
+            if not hard_ok:
+                hard_fail += 1
+                print(f"    {_r('FAIL')}")
+            else:
+                print(f"    {_g('PASS')}")
+                if not adv_ok:
+                    adv_warn += 1
+                    print(f"    {_y('(advisory expectations not met — watch, not failing)')}")
 
     print("\n" + "=" * 60)
-    print(f"  {len(fixtures) - hard_fail}/{len(fixtures)} fixtures passed"
+    print(f"  {total - hard_fail}/{total} fixtures passed"
           + (f", {adv_warn} with advisory warnings" if adv_warn else ""))
     if hard_fail:
         print(f"  {_r('SUITE FAILED')} — {hard_fail} fixture(s) regressed")
