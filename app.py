@@ -841,6 +841,46 @@ def send_email(to_email, subject, html_body):
 _CSRF_EXEMPT_ENDPOINTS = {"stripe_webhook", "customer_create_request", "customer_rename_bin"}
 
 @app.before_request
+def _stamp_request_start():
+    """Record a monotonic start time for every request so after_request can
+    report per-request latency in the Render logs (see _log_request_latency)."""
+    from flask import g
+    g._req_start = time.monotonic()
+
+
+@app.after_request
+def _log_request_latency(response):
+    """Emit request latency to the logs and an X-Response-Time-ms header. Always
+    logs /health (a clean baseline probe), and warns on any request that took
+    ≥1s so latency regressions are visible in Render going forward without
+    drowning the logs in normal fast requests."""
+    try:
+        from flask import g
+        start = getattr(g, "_req_start", None)
+        if start is not None:
+            ms = (time.monotonic() - start) * 1000.0
+            response.headers["X-Response-Time-ms"] = str(int(ms))
+            if request.path == "/health":
+                app.logger.info("latency %s %s -> %s in %.0fms",
+                                request.method, request.path, response.status_code, ms)
+            elif ms >= 1000:
+                app.logger.warning("SLOW %s %s -> %s in %.0fms",
+                                   request.method, request.path, response.status_code, ms)
+    except Exception:
+        pass
+    return response
+
+
+@app.route("/health")
+def health_check():
+    """Lightweight, unauthenticated liveness probe. Its latency (surfaced via
+    the X-Response-Time-ms header and the after_request log line) is the
+    baseline request-handling time to watch in Render logs — if /health itself
+    starts reporting seconds, request workers are starved."""
+    return jsonify({"ok": True, "ts": now_ts()})
+
+
+@app.before_request
 def csrf_protect():
     if request.method == "POST":
         if request.endpoint in _CSRF_EXEMPT_ENDPOINTS:
@@ -858,7 +898,7 @@ def csrf_protect():
 
 # Routes that are always accessible regardless of subscription status
 _SUBSCRIPTION_EXEMPT = {
-    "login", "logout", "company_register", "static",
+    "login", "logout", "company_register", "static", "health_check",
     "subscription_blocked", "subscription_success", "billing",
     "company_subscription", "company_settings", "settings_page", "stripe_webhook",
     "privacy_policy", "terms_of_service", "account_deletion_info", "delete_account_request",
@@ -2905,6 +2945,17 @@ def init_db():
     safe_add_column(conn, "bins", "label TEXT")
     safe_add_column(conn, "bins", "drop_photo_path TEXT")
     safe_add_column(conn, "bins", "drop_stop_id INTEGER")
+
+    # --- Empty-can leg plan (fix/latency-and-leg-actions) ---
+    # empty_can_plan drives what a PR stop's post-dump leg action is, derived
+    # from the parsed plan of THAT stop rather than a default per action-code:
+    #   NULL/'' or 'return_here' → return the empty to this customer (Box In)
+    #   'carry_next'             → carry the empty to the NEXT stop (no Box In)
+    #   'leave_site'             → leave the empty on site
+    # carry_can_ref is the optional can id being carried, shown as
+    # "Can on board: #<ref>" on the next stop's card.
+    safe_add_column(conn, "stops", "empty_can_plan TEXT")
+    safe_add_column(conn, "stops", "carry_can_ref TEXT")
 
     # --- Self-building address book (feat/address-book) ---
     # norm_key: normalized address (case/spacing/abbrev-insensitive) used to
@@ -6133,6 +6184,26 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     background: rgba(38,38,35,0.85);
     border: 1px solid rgba(255,107,26,0.22);
     color: #B8B8AE;
+}}
+/* Empty-can leg: "can on board" banner + driver correction picker */
+.cab-can-onboard {{
+    margin: 8px 0; padding: 10px 12px; border-radius: 10px;
+    background: rgba(61,220,132,0.12); border: 1px solid rgba(61,220,132,0.4);
+    color: #3DDC84; font-weight: 700; font-size: 13px;
+}}
+.cab-canplan-wrap {{ margin: 12px 0; }}
+.cab-canplan-lbl {{
+    font-size: 11px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase;
+    color: #8C8C82; margin-bottom: 6px;
+}}
+.cab-canplan-row {{ display: flex; gap: 8px; }}
+.cab-canplan-pill {{
+    width: 100%; min-height: 48px; padding: 8px 6px; border-radius: 10px;
+    background: rgba(26,26,26,0.85); border: 1px solid rgba(255,255,255,0.12);
+    color: #B8B8AE; font-weight: 700; font-size: 12.5px; cursor: pointer; line-height: 1.2;
+}}
+.cab-canplan-pill.active {{
+    background: rgba(255,107,26,0.16); border-color: rgba(255,107,26,0.6); color: #FF9D5C;
 }}
 .upload-details {{ margin: 10px 0; }}
 .upload-details summary {{
@@ -10375,11 +10446,22 @@ def driver_route_detail(route_id):
             "box_in":      ("going_to_dump", "&#128465;&#65039; Go To Dump",                    "btn-driver btn-driver-dump"),
         }
     elif is_pr:
+        # The post-dump empty-can leg action is derived from THIS stop's parsed
+        # plan, never a blanket default. Only a stop actually planned to return
+        # the empty here shows "Return & Box In"; a carry-over stop shows the
+        # carry action, and neither is assumed when the plan says otherwise.
+        _plan = (_s.get("empty_can_plan") or "").strip()
+        if _plan == "carry_next":
+            _empty_step = ("box_in", "&#128666; Load Empty &mdash; carry to next stop",  "btn-driver btn-driver-complete")
+        elif _plan == "leave_site":
+            _empty_step = ("box_in", "&#128230; Leave Empty On Site",                    "btn-driver btn-driver-complete")
+        else:
+            _empty_step = ("box_in", "&#128260; Return &amp; Box In &mdash; Place Empty Can", "btn-driver btn-driver-complete")
         wf_map = {
             "pending":     ("arrived",       "&#128666; Arrived at Stop",                      "btn-driver btn-driver-complete"),
             "arrived":     ("box_out",       "&#128230; Box Out &mdash; Remove Container",            "btn-driver btn-driver-complete"),
             "box_out":     ("going_to_dump", "&#128465;&#65039; Go To Dump",                           "btn-driver btn-driver-dump"),
-            "need_box_in": ("box_in",        "&#128260; Return &amp; Box In &mdash; Place Empty Can",  "btn-driver btn-driver-complete"),
+            "need_box_in": _empty_step,
         }
     elif is_pull:
         wf_map = {
@@ -10682,6 +10764,43 @@ def driver_route_detail(route_id):
             _parts.append(f'<span class="cab-leg"><span class="cab-leg-lbl">Return</span> {e(_rleg)}</span>')
         legs_html = '<div class="cab-legs">&#8594; ' + ' &#8594; '.join(_parts) + '</div>'
 
+    # ── Empty-can leg controls (fix/latency-and-leg-actions) ──────────────
+    # "Can on board" context: if the immediately-preceding stop is carrying its
+    # empty to this one, surface it so the driver knows a can rode along.
+    can_on_board_html = ""
+    if prev_stop is not None and (dict(prev_stop).get("empty_can_plan") or "").strip() == "carry_next":
+        _cob_ref = (dict(prev_stop).get("carry_can_ref") or "").strip()
+        _cob_ref_txt = (" #" + e(_cob_ref)) if _cob_ref else ""
+        can_on_board_html = (
+            f'<div class="cab-can-onboard">&#128666; Can on board{_cob_ref_txt} '
+            f'&mdash; carried from the previous stop</div>'
+        )
+
+    # Driver correction: on a PR stop still in progress, let the driver fix the
+    # empty-can plan when the card's action doesn't match reality. The choice is
+    # persisted on the stop and noted so the boss sees the change — no silent
+    # mismatch. Swap-PR (empty already boxed in before the dump run) is excluded.
+    empty_can_picker_html = ""
+    if is_pr and not is_swap_pr and driver_status != "completed":
+        _cur_plan = (_s.get("empty_can_plan") or "").strip() or "return_here"
+        _plan_opts = [("return_here", "Return here"), ("carry_next", "Carry to next"), ("leave_site", "Leave on site")]
+        _pill_html = ""
+        for _pv, _plabel in _plan_opts:
+            _pcls = "cab-canplan-pill active" if _cur_plan == _pv else "cab-canplan-pill"
+            _pill_html += (
+                f'<form method="POST" action="{url_for("set_empty_can_plan", stop_id=stop_id)}" style="flex:1;">'
+                f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
+                f'<input type="hidden" name="plan" value="{_pv}">'
+                f'<button type="submit" class="{_pcls}" style="width:100%;">{_plabel}</button>'
+                f'</form>'
+            )
+        empty_can_picker_html = (
+            '<div class="cab-canplan-wrap">'
+            '<div class="cab-canplan-lbl">Empty can &mdash; tap if this is wrong</div>'
+            f'<div class="cab-canplan-row">{_pill_html}</div>'
+            '</div>'
+        )
+
     # Action badge — vendor visits get a distinct wrench badge.
     if is_vendor:
         cab_action_badge = '<div class="cab-action-badge vendor">&#128295; VENDOR</div>'
@@ -10725,6 +10844,7 @@ def driver_route_detail(route_id):
         </div>
 
         <div class="cab-address">{e(full_address or 'No address on file')}</div>
+        {can_on_board_html}
         {legs_html}
         {f'<div class="cab-meta-line">{meta_line}</div>' if meta_line else ''}
         {ticket_line}
@@ -10746,6 +10866,7 @@ def driver_route_detail(route_id):
 
         <div style="margin-top:20px;">
             {workflow_btn_html}
+            {empty_can_picker_html}
             {upload_widget}
             {complete_section}
         </div>
@@ -10796,11 +10917,12 @@ def driver_route_detail(route_id):
         }}
     }} catch (e) {{ /* localStorage unavailable (e.g. private browsing) — skip the hint */ }}
 
-    // Realtime Cab View: a Server-Sent Events stream pushes boss→driver changes
-    // (new messages, inserted/rerouted stops, urgent dispatch) within ~1.5s, so
-    // the driver never has to refresh. A slow poll stays as a fallback for when
-    // EventSource can't connect (old proxy, etc.). The displayed stop is never
-    // swapped out mid-action — only counters/banners update live, except a
+    // Realtime Cab View: a lightweight 4s poll surfaces boss→driver changes
+    // (new messages, inserted/rerouted stops, urgent dispatch) so the driver
+    // never has to refresh. We poll instead of holding a live stream because a
+    // held-open connection per driver starves the small worker pool and makes
+    // every action lag; a short poll keeps the app fast. The displayed stop is
+    // never swapped out mid-action — only counters/banners update live, except a
     // Go-NOW insert that changes the *current* stop triggers a soft reload.
     (function() {{
         var lastKnownTotal  = {total_count};
@@ -10887,45 +11009,36 @@ def driver_route_detail(route_id):
             inited = true;
         }}
 
-        // ── SSE primary channel ──────────────────────────────────────────────
-        var es = null, fallbackTimer = null;
-        function startFallback() {{
-            if (fallbackTimer) return;
-            fallbackTimer = setInterval(function() {{
-                fetch('{url_for("driver_route_status", route_id=route_id)}', {{credentials: 'same-origin'}})
-                    .then(function(r) {{ return r.ok ? r.json() : null; }})
-                    .then(applyStatus).catch(function() {{}});
-            }}, 20000);
+        // ── Realtime channel: lightweight short poll ─────────────────────────
+        // Deliberately a 4s poll, NOT a long-lived SSE stream. On the small
+        // production pool (2 gunicorn workers), a held-open stream per driver
+        // ties up a worker for its whole lifetime; a handful of drivers then
+        // starve the pool and EVERY action (clock, stop complete, message)
+        // queues behind them for ~30s. A short poll to a cheap indexed-read
+        // endpoint returns in milliseconds and never holds a worker, so the app
+        // stays fast regardless of the worker class in production. Reliability
+        // over streaming: a responsive app on polling beats a frozen one on SSE.
+        var pollTimer = null;
+        function pollOnce() {{
+            fetch('{url_for("driver_route_status", route_id=route_id)}', {{credentials: 'same-origin'}})
+                .then(function(r) {{ return r.ok ? r.json() : null; }})
+                .then(applyStatus).catch(function() {{}});
         }}
-        function stopFallback() {{ if (fallbackTimer) {{ clearInterval(fallbackTimer); fallbackTimer = null; }} }}
+        function startPolling() {{
+            if (pollTimer) return;
+            pollOnce();                              // immediate first read
+            pollTimer = setInterval(pollOnce, 4000);
+        }}
+        function stopPolling() {{ if (pollTimer) {{ clearInterval(pollTimer); pollTimer = null; }} }}
+        startPolling();
 
-        function closeSSE() {{
-            if (es) {{ try {{ es.close(); }} catch (e) {{}} es = null; }}
-        }}
-        function connectSSE() {{
-            if (es) return;                         // exactly one stream per page
-            if (typeof EventSource === 'undefined') {{ startFallback(); return; }}
-            try {{ es = new EventSource('{url_for("driver_route_stream", route_id=route_id)}'); }}
-            catch (e) {{ startFallback(); return; }}
-            es.onmessage = function(ev) {{
-                stopFallback();
-                try {{ applyStatus(JSON.parse(ev.data)); }} catch (e) {{}}
-            }};
-            es.onerror = function() {{
-                // Browser auto-reconnects EventSource; run the poll fallback
-                // meanwhile so the driver is never left stale.
-                startFallback();
-            }};
-        }}
-        connectSSE();
-
-        // Release the stream when the tab is hidden/backgrounded so it doesn't
-        // hold a server greenlet while nobody's looking; reopen when visible.
+        // Pause polling when the tab is hidden/backgrounded (saves battery and
+        // server load); resume immediately on return so nothing lags.
         document.addEventListener('visibilitychange', function() {{
-            if (document.hidden) {{ closeSSE(); }}
-            else {{ connectSSE(); }}
+            if (document.hidden) {{ stopPolling(); }}
+            else {{ startPolling(); }}
         }});
-        window.addEventListener('pagehide', closeSSE);
+        window.addEventListener('pagehide', stopPolling);
 
         // On regaining connectivity, kick an immediate status fetch so nothing lags.
         window.addEventListener('online', function() {{
@@ -13341,6 +13454,58 @@ def toggle_stop_complete(stop_id):
 
 
 # =========================================================
+# EMPTY-CAN LEG PLAN  (driver correction: return here / carry to next / leave)
+# =========================================================
+_EMPTY_CAN_PLANS = {
+    "return_here": "return the empty here",
+    "carry_next":  "carry the empty to the next stop",
+    "leave_site":  "leave the empty on site",
+}
+
+
+@app.route("/stop/<int:stop_id>/empty-can-plan", methods=["POST"])
+@login_required
+def set_empty_can_plan(stop_id):
+    """Driver (or boss) corrects a stop's empty-can leg plan when the card's
+    action doesn't match reality. Persists empty_can_plan on the stop and
+    appends a dated note so the boss sees the change — no silent mismatch."""
+    plan = (request.form.get("plan") or "").strip()
+    if plan not in _EMPTY_CAN_PLANS:
+        flash("Unknown empty-can action.", "error")
+        return redirect(url_for("dashboard"))
+
+    conn = get_db()
+    stop = conn.execute(
+        """SELECT s.id, s.notes, s.empty_can_plan, r.assigned_to, r.id AS rid
+             FROM stops s JOIN routes r ON s.route_id = r.id
+            WHERE s.id=? AND r.company_id=?""",
+        (stop_id, cid())
+    ).fetchone()
+    if not stop:
+        conn.close()
+        abort(404)
+    if session.get("role") != "boss" and stop["assigned_to"] != session["user_id"]:
+        conn.close()
+        flash("Access denied.", "error")
+        return redirect(url_for("dashboard"))
+
+    if (stop["empty_can_plan"] or "") != plan:
+        who = "Driver" if session.get("role") == "driver" else "Boss"
+        note_line = f"[{now_ts()}] {who} set empty-can action: {_EMPTY_CAN_PLANS[plan]}."
+        existing = (stop["notes"] or "").strip()
+        new_notes = (existing + ("\n" if existing else "") + note_line)
+        conn.execute(
+            "UPDATE stops SET empty_can_plan=?, notes=? WHERE id=?",
+            (plan, new_notes, stop_id)
+        )
+        conn.commit()
+    conn.close()
+    if session.get("role") != "boss":
+        return redirect(url_for("driver_route_detail", route_id=stop["rid"]))
+    return redirect(url_for("view_route", route_id=stop["rid"]))
+
+
+# =========================================================
 # DRIVER WORKFLOW ACTION  (Arrived / Box In / Box Out / Go To Dump)
 # =========================================================
 @app.route("/stop/<int:stop_id>/driver-action", methods=["POST"])
@@ -14631,6 +14796,7 @@ For every stop extract:
   container_size  e.g. "30yd", or null if not stated
   dump_leg        the dump/landfill SITE NAME to haul to, or null (match KNOWN DUMP SITES)
   return_leg      the yard/site to return the empty container to, or null
+  empty_can_plan  what to do with the EMPTY can after dumping (see rule below), or null
   raw             the original text for this stop, verbatim
   confidence      "low" or "high"
   notes           any extra detail worth surfacing, or ""
@@ -14639,17 +14805,27 @@ Rules:
 - Use the KNOWN LOCATIONS & VOCABULARY to expand shorthand (e.g. "newpt" → "Newport News"),
   to recognize dump sites (put them in dump_leg, not as a separate stop), and to recognize
   yard and customer names.
+- empty_can_plan: set "carry_next" when the text says to KEEP/CARRY the empty to the next stop
+  or NOT return it here (e.g. "don't return the can, use it at the next stop", "carry the empty
+  on"); set "leave_site" when the empty is to be left on site; otherwise null (a normal PR
+  returns the empty to this customer by default — do NOT set "return_here" explicitly).
 - Set confidence "low" ONLY when the action or address is genuinely ambiguous or missing —
   not merely because a dump/return leg or a preamble is present.
 - Respond with ONLY valid JSON — no markdown, no commentary — in exactly this shape:
-  {"stops":[{"action":"","address":"","customer":"","container_size":null,"dump_leg":null,"return_leg":null,"raw":"","confidence":"","notes":""}]}
+  {"stops":[{"action":"","address":"","customer":"","container_size":null,"dump_leg":null,"return_leg":null,"empty_can_plan":null,"raw":"","confidence":"","notes":""}]}
 
 WORKED EXAMPLE
 Input:
   Before you return paragon use it to
   Pr 527 j Clyde Morris blvd,newpt, Serv pro 30yd dump holland then return it to paragon
 Output:
-  {"stops":[{"action":"PR","address":"527 J Clyde Morris Blvd, Newport News","customer":"Serv Pro","container_size":"30yd","dump_leg":"Holland","return_leg":"Paragon","raw":"Pr 527 j Clyde Morris blvd,newpt, Serv pro 30yd dump holland then return it to paragon","confidence":"high","notes":""}]}
+  {"stops":[{"action":"PR","address":"527 J Clyde Morris Blvd, Newport News","customer":"Serv Pro","container_size":"30yd","dump_leg":"Holland","return_leg":"Paragon","empty_can_plan":null,"raw":"Pr 527 j Clyde Morris blvd,newpt, Serv pro 30yd dump holland then return it to paragon","confidence":"high","notes":""}]}
+
+WORKED EXAMPLE (carry the empty to the next stop)
+Input:
+  PR 1013 Paragon Way Napo can 3085 dump holland — don't return the can, carry the empty to the next stop
+Output:
+  {"stops":[{"action":"PR","address":"1013 Paragon Way","customer":"Napo","container_size":null,"dump_leg":"Holland","return_leg":null,"empty_can_plan":"carry_next","carry_can_ref":"3085","raw":"PR 1013 Paragon Way Napo can 3085 dump holland — don't return the can, carry the empty to the next stop","confidence":"high","notes":""}]}
 """
 
 
@@ -18548,6 +18724,11 @@ def _validate_parser_stops(stops_in):
             "return_leg": expand_abbrev((s.get("return_leg") or "").strip()),
             "notes": expand_abbrev((s.get("notes") or "").strip()),
             "insert_before": str(s.get("insert_before") or "end").strip(),
+            # Empty-can leg plan: only accept the known values; anything else
+            # (incl. absent) means "no explicit plan" → default per action-code.
+            "empty_can_plan": (s.get("empty_can_plan") or "").strip()
+                              if (s.get("empty_can_plan") or "").strip() in _EMPTY_CAN_PLANS else "",
+            "carry_can_ref": (str(s.get("carry_can_ref") or "").strip()[:40]),
         })
     return clean_stops, None
 
@@ -18608,11 +18789,12 @@ def api_dispatch():
         next_order += 1
         cur.execute("""
             INSERT INTO stops (route_id, stop_order, customer_name, address, action, container_size,
-                                dump_location, return_destination, notes, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+                                dump_location, return_destination, notes,
+                                empty_can_plan, carry_can_ref, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
         """, (route_id, next_order, s.get("customer") or "", s["address"], s["action"],
               s["container_size"], s.get("dump_leg") or "", s.get("return_leg") or "",
-              s["notes"], now_ts()))
+              s["notes"], s.get("empty_can_plan") or "", s.get("carry_can_ref") or "", now_ts()))
         # Self-building address book: learn every dispatched stop's address.
         learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
                        action=s["action"], container_size=s["container_size"],
@@ -18683,10 +18865,12 @@ def api_insert_stops(route_id):
     for s in clean_stops:
         cur.execute("""
             INSERT INTO stops (route_id, stop_order, customer_name, address, action, container_size,
-                                dump_location, return_destination, notes, status, created_at)
-            VALUES (?, 0, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+                                dump_location, return_destination, notes,
+                                empty_can_plan, carry_can_ref, status, created_at)
+            VALUES (?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
         """, (route_id, s.get("customer") or "", s["address"], s["action"], s["container_size"],
-              s.get("dump_leg") or "", s.get("return_leg") or "", s["notes"], now_ts()))
+              s.get("dump_leg") or "", s.get("return_leg") or "", s["notes"],
+              s.get("empty_can_plan") or "", s.get("carry_can_ref") or "", now_ts()))
         new_stops.append((cur.lastrowid, s["insert_before"]))
         # Self-building address book: learn every inserted stop's address.
         learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
