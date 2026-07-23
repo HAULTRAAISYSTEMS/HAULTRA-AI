@@ -1,0 +1,72 @@
+{
+  "_about": "Permanent parser regression fixtures — REAL dispatch texts the boss actually sends. Append a new object to \"fixtures\" whenever a real text surfaces a case worth guarding. The suite (tests/test_parser_real_texts.py) runs each text through the live /api/parse LLM parser and asserts the structured output. It runs strict assertions when ANTHROPIC_API_KEY is set (locally or in CI with a key) and skips cleanly otherwise. Never delete a fixture — that's the whole point (permanent regression guard).",
+  "_matchers": {
+    "equals_ci": "case-insensitive equality after trim",
+    "contains_ci": "list — every substring must appear (case-insensitive)",
+    "oneof_ci": "list — the value must equal one of these (case-insensitive)",
+    "regex": "case-insensitive re.search over the field value",
+    "empty": "true → field must be empty/absent",
+    "nonempty": "true → field must be non-empty",
+    "_note": "A field's matchers ALL must pass. 'fields' are hard (fail the suite). 'advisory' matchers are reported with a ⚠ but never fail — used for LLM-nuance we want to watch but not gate on yet."
+  },
+  "fixtures": [
+    {
+      "id": "harbor-view-ew-40",
+      "text": "Pr 7021 harbor view blvd,suff,Ew 40yd dump holland",
+      "expect": {
+        "stop_count": 1,
+        "fields": {
+          "action": {"equals_ci": "PR"},
+          "address": {"regex": "7021.*harbou?r\\s+view", "contains_ci": ["suffolk"]},
+          "customer": {"equals_ci": "EW"},
+          "container_size": {"equals_ci": "40yd"},
+          "dump_leg": {"equals_ci": "holland"},
+          "return_leg": {"empty": true},
+          "confidence": {"equals_ci": "high"}
+        }
+      }
+    },
+    {
+      "id": "paragon-napo-after-harborview",
+      "text": "After harbor view\nPr 1013 paragon way,suff, napo 3085 at vista 23 dump holland",
+      "expect": {
+        "stop_count": 1,
+        "fields": {
+          "action": {"equals_ci": "PR"},
+          "address": {"regex": "1013.*paragon\\s+way", "contains_ci": ["suffolk"]},
+          "customer": {"equals_ci": "napo"},
+          "dump_leg": {"equals_ci": "holland"}
+        },
+        "any_field_contains_ci": ["3085"],
+        "advisory": {
+          "any_field_contains_ci": ["vista 23", "harbor view"],
+          "fields": {
+            "notes": {"contains_ci": ["vista 23"]}
+          }
+        }
+      }
+    },
+    {
+      "id": "serv-pro-clyde-morris-carryover",
+      "text": "Before you return paragon use it to\nPr 527 j Clyde Morris blvd,newpt, Serv pro 30yd dump holland then return it to paragon",
+      "expect": {
+        "stop_count": 1,
+        "fields": {
+          "action": {"equals_ci": "PR"},
+          "address": {"regex": "527.*clyde\\s+morris", "contains_ci": ["newport news"]},
+          "customer": {"equals_ci": "serv pro"},
+          "container_size": {"equals_ci": "30yd"},
+          "dump_leg": {"equals_ci": "holland"},
+          "return_leg": {"contains_ci": ["paragon"]},
+          "confidence": {"equals_ci": "high"}
+        },
+        "advisory": {
+          "_why": "The preamble asks to bring the empty from the Paragon pull to this stop. Whether the model encodes that as empty_can_plan is a nuance we watch but don't gate on yet — promote to a hard field once confirmed against a live key.",
+          "fields": {
+            "empty_can_plan": {"nonempty": true}
+          }
+        }
+      }
+    }
+  ]
+}
