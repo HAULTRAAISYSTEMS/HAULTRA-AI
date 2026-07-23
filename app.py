@@ -2978,6 +2978,10 @@ def init_db():
     # init_db pass (inspection_items / maintenance_entries / trucks / bins), so
     # they exist on a fresh DB's very first boot, not only after a restart.
     # Money is INTEGER CENTS, never a float.
+    # Vendor address (feat/vendor-address): a single free-form line (street,
+    # city) so a vendor stop the driver is dispatched to is navigable. Existing
+    # vendors get an empty field the boss can fill in.
+    safe_add_column(conn, "vendors", "address TEXT")
     safe_add_column(conn, "inspection_items", "cost_cents INTEGER")
     safe_add_column(conn, "inspection_items", "vendor TEXT")
     safe_add_column(conn, "inspection_items", "vendor_id INTEGER")
@@ -9322,7 +9326,7 @@ def text_to_route():
     <select name="dump_location_id">{dump_options}</select>
     <label>Route Text</label>
     <textarea name="raw_text" rows="10"
-      placeholder="Paste boss text here..."
+      placeholder="Paste dispatch text here..."
       required
       style="font-family:monospace;font-size:13px;min-height:160px;"></textarea>
     <label>Notes</label>
@@ -10103,7 +10107,7 @@ def routes_page():
         {f'''
         <div class="row" style="margin-bottom:18px;gap:10px;">
             <a class="btn gold" href="{url_for('new_route')}">+ Create Route</a>
-            <a class="btn secondary" href="{url_for('text_to_route')}">⌨ Paste Boss Text</a>
+            <a class="btn secondary" href="{url_for('text_to_route')}">⌨ Paste Dispatch Text</a>
         </div>
         ''' if user['role'] == 'boss' else ''}
         <div class="card">
@@ -15162,6 +15166,20 @@ def _parse_vocab_context(conn, company_id):
             lines.append("KNOWN CUSTOMERS: " + ", ".join(names[:40]))
     except Exception:
         pass
+    # Vendors/shops with a saved address — "take truck 1 to gregorys" resolves
+    # to that shop's full navigable address.
+    try:
+        vends = conn.execute(
+            """SELECT name, address FROM vendors
+                WHERE company_id=? AND is_active=1
+                  AND TRIM(COALESCE(address,'')) != '' ORDER BY LOWER(name) LIMIT 40""",
+            (company_id,)
+        ).fetchall()
+        if vends:
+            lines.append("KNOWN VENDORS/SHOPS (a name here resolves to its address): "
+                         + "; ".join(v["name"] + " — " + v["address"] for v in vends))
+    except Exception:
+        pass
     try:
         vocab = conn.execute(
             """SELECT term, expansion FROM parse_vocab
@@ -19927,7 +19945,7 @@ def add_parsed_stops(route_id):
 # Maps the AI parser's short action codes to the same canonical action
 # labels used everywhere else (is_pull_job, compute_can_flow, Route Board
 # badges), so a dispatched route behaves identically to one created via
-# Create Route / Paste Boss Text.
+# Create Route / Paste Dispatch Text.
 _PARSER_ACTION_MAP = {"PR": "Pickup and Return", "P": "Pull", "D": "Delivery", "S": "Swap", "R": "Relocate"}
 
 
@@ -22294,7 +22312,7 @@ def _truck_spend(conn, truck_id):
 # ── Phase 7A revision: vendors + "at vendor" state ────────────────────────
 def _company_vendors(conn):
     return conn.execute(
-        "SELECT id, name, phone, notes FROM vendors WHERE company_id=? AND is_active=1 ORDER BY LOWER(name), id",
+        "SELECT id, name, phone, notes, address FROM vendors WHERE company_id=? AND is_active=1 ORDER BY LOWER(name), id",
         (cid(),)).fetchall()
 
 
@@ -22303,12 +22321,27 @@ def _vendor_map(conn):
         "SELECT id, name FROM vendors WHERE company_id=?", (cid(),)).fetchall()}
 
 
+def _learn_vendor_location(conn, company_id, vendor_name, address):
+    """Add a vendor's address to the self-building address book so it's
+    quick-addable and resolvable in the parser (tagged as a vendor via the
+    'Vendor' action). No-op without a name+address; never raises."""
+    if not (vendor_name or "").strip() or not (address or "").strip():
+        return
+    try:
+        learn_location(conn, company_id, address, customer_name=vendor_name, action="Vendor")
+    except Exception as exc:
+        app.logger.warning("_learn_vendor_location failed for %r: %s", vendor_name, exc)
+
+
 def _vendor_options_html(vendors, selected_id=None):
-    """<option>s for a vendor picker; leading blank == in-house / none."""
+    """<option>s for a vendor picker; leading blank == in-house / none.
+    Each option carries data-address so the dispatch UI can prompt for a
+    missing address inline."""
     opts = ['<option value="">In-house / none</option>']
     for v in vendors:
         sel = " selected" if selected_id is not None and v["id"] == selected_id else ""
-        opts.append(f'<option value="{v["id"]}"{sel}>{e(v["name"])}</option>')
+        _addr = (v["address"] if "address" in v.keys() else "") or ""
+        opts.append(f'<option value="{v["id"]}"{sel} data-address="{e(_addr)}">{e(v["name"])}</option>')
     return "".join(opts)
 
 
@@ -23572,7 +23605,14 @@ def maintenance_page():
             repair_form = f"""
             <div id="send-form-{d['item_id']}" hidden style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
                 <label class="uw-lbl">Vendor</label>
-                <select id="sd-vendor-{d['item_id']}" style="width:100%;margin-bottom:10px;min-height:48px;">{vendor_opts}</select>
+                <select id="sd-vendor-{d['item_id']}" style="width:100%;margin-bottom:10px;min-height:48px;"
+                        onchange="onVendorPick({d['item_id']})">{vendor_opts}</select>
+                <div id="sd-addr-wrap-{d['item_id']}" hidden style="margin-bottom:10px;padding:10px 12px;
+                     border-radius:10px;background:rgba(255,107,26,0.08);border:1px solid rgba(255,107,26,0.4);">
+                    <label class="uw-lbl" style="color:#FF9D5C;">Add <span id="sd-addr-name-{d['item_id']}">this vendor</span>&rsquo;s address so the driver can navigate</label>
+                    <input id="sd-addr-{d['item_id']}" maxlength="200" placeholder="street, city"
+                           style="width:100%;min-height:48px;">
+                </div>
                 <label class="uw-lbl">Dispatch driver?</label>
                 <select id="sd-dispatch-{d['item_id']}" style="width:100%;margin-bottom:10px;min-height:48px;"
                         onchange="onDispatchChange({d['item_id']})">
@@ -23743,10 +23783,31 @@ _MAINTENANCE_PAGE_JS = """
   window.hideRepair=function(id){ var f=document.getElementById('repair-form-'+id); if(f) f.hidden=true; };
   window.showSend=function(id){ var f=document.getElementById('send-form-'+id); if(f) f.hidden=false; };
   window.hideSend=function(id){ var f=document.getElementById('send-form-'+id); if(f) f.hidden=true; };
+  // Show the "add vendor address" quick-fill when a driver is being dispatched
+  // to a vendor that has no address on file, so the stop is navigable.
+  function refreshAddrPrompt(id){
+    var vsel=document.getElementById('sd-vendor-'+id);
+    var dsel=document.getElementById('sd-dispatch-'+id);
+    var wrap=document.getElementById('sd-addr-wrap-'+id);
+    if(!vsel||!dsel||!wrap) return;
+    var opt=vsel.options[vsel.selectedIndex];
+    var hasVendor=!!vsel.value;
+    var hasAddr=opt && (opt.getAttribute('data-address')||'').trim();
+    var dispatching=dsel.value && dsel.value!=='none';
+    if(hasVendor && !hasAddr && dispatching){
+      var nm=document.getElementById('sd-addr-name-'+id);
+      if(nm && opt) nm.textContent=opt.textContent;
+      wrap.hidden=false;
+    } else {
+      wrap.hidden=true;
+    }
+  }
+  window.onVendorPick=function(id){ refreshAddrPrompt(id); };
   window.onDispatchChange=function(id){
     var sel=document.getElementById('sd-dispatch-'+id);
     var nw=document.getElementById('sd-n-wrap-'+id);
     if(nw){ nw.hidden = !(sel && sel.value==='after_n'); }
+    refreshAddrPrompt(id);
   };
   window.submitSend=function(id){
     var dispatch=(document.getElementById('sd-dispatch-'+id)||{}).value||'none';
@@ -23754,6 +23815,7 @@ _MAINTENANCE_PAGE_JS = """
               vendor_id:(document.getElementById('sd-vendor-'+id)||{}).value||'',
               dispatch:dispatch,
               dispatch_n:(document.getElementById('sd-n-'+id)||{}).value||'',
+              vendor_address:(document.getElementById('sd-addr-'+id)||{}).value||'',
               dispatch_note:(document.getElementById('sd-note-'+id)||{}).value||''};
     fetch('/api/defects/'+id+'/resolve',{method:'POST',
         headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
@@ -23896,9 +23958,15 @@ def _dispatch_driver_to_vendor(conn, defect_row, vendor_id, dispatch, dispatch_n
         timing, after_idx = ("After %d more stop%s" % (n, "" if n == 1 else "s")), n
 
     # Mid-route vendor stop (Go NOW / After N both insert into the route; the
-    # boss can reorder with the existing tools).
+    # boss can reorder with the existing tools). The stop's address is the
+    # vendor's saved address so Navigate deep-links and Copy Address work like
+    # any stop; fall back to the vendor name only when no address is on file.
+    _vrow = conn.execute(
+        "SELECT address FROM vendors WHERE id=? AND company_id=?", (vendor_id, cid())
+    ).fetchone()
+    vaddr = ((_vrow["address"] if _vrow else "") or "").strip() or vname
     stop_id = _insert_vendor_stop(
-        conn, route_id, after_idx, vname, vname,
+        conn, route_id, after_idx, vname, vaddr,
         defect_row["id"], vendor_id, dispatch_note or None)
     try:
         compute_can_flow(conn, route_id)
@@ -23984,6 +24052,15 @@ def resolve_defect(item_id):
                        vendor_id=COALESCE(?, vendor_id) WHERE id=?""",
             (vendor_id, now_ts(), vendor_id, item_id),
         )
+        # Inline "add vendor address" quick-fill: if the boss filled it in the
+        # dispatch step, save it back to the vendor record (and learn it as a
+        # vendor location) so this and future dispatches navigate there.
+        _vaddr = str(src.get("vendor_address") or "").strip()[:200]
+        if vendor_id and _vaddr:
+            conn.execute("UPDATE vendors SET address=? WHERE id=? AND company_id=?",
+                         (_vaddr, vendor_id, cid()))
+            _vname = _vendor_map(conn).get(vendor_id, "")
+            _learn_vendor_location(conn, cid(), _vname, _vaddr)
         # Optional "Dispatch driver?" step — insert a vendor stop + urgent message.
         dispatch = str(src.get("dispatch") or "none").strip().lower()
         dispatch_note = str(src.get("dispatch_note") or "").strip()[:300]
@@ -24351,14 +24428,39 @@ def vendors_page():
     can_action = _can_action_fleet()
     rows = ""
     for v in vendors:
+        _vaddr = (v["address"] if "address" in v.keys() else "") or ""
         sub = " · ".join(b for b in [e(v["phone"] or ""), e(v["notes"] or "")] if b)
-        del_btn = (f'<button class="btn secondary" style="padding:4px 12px;font-size:12px;" '
-                   f'onclick="delVendor({v["id"]})">Remove</button>') if can_action else ""
+        addr_line = (f'<div style="color:var(--text-dim);font-size:13px;">&#128205; {e(_vaddr)}</div>'
+                     if _vaddr else
+                     '<div style="color:#FF9D5C;font-size:12px;">&#9888; No address &mdash; add one so drivers can navigate</div>')
+        btns = ""
+        if can_action:
+            btns = (f'<button class="btn secondary" style="padding:4px 12px;font-size:12px;" '
+                    f'onclick="editVendor({v["id"]})">Edit</button>'
+                    f'<button class="btn secondary" style="padding:4px 12px;font-size:12px;" '
+                    f'onclick="delVendor({v["id"]})">Remove</button>')
         rows += f"""
-        <div class="bin-card" id="vendor-{v['id']}" style="padding:14px;display:flex;justify-content:space-between;align-items:center;gap:10px;">
+        <div class="bin-card" id="vendor-{v['id']}" style="padding:14px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;">
             <div><div style="font-weight:700;">{e(v["name"])}</div>
+                 {addr_line}
                  <div style="color:var(--slate);font-size:13px;">{sub or "—"}</div></div>
-            {del_btn}
+            <div style="display:flex;gap:6px;flex-wrap:wrap;">{btns}</div>
+          </div>
+          <div id="edit-vendor-{v['id']}" hidden style="margin-top:12px;border-top:1px solid rgba(255,255,255,0.08);padding-top:12px;">
+            <label class="uw-lbl">Name</label>
+            <input id="ev-name-{v['id']}" value="{e(v['name'])}" style="width:100%;margin-bottom:8px;">
+            <label class="uw-lbl">Address (street, city)</label>
+            <input id="ev-address-{v['id']}" value="{e(_vaddr)}" placeholder="1400 Repair Rd, Norfolk" style="width:100%;margin-bottom:8px;">
+            <label class="uw-lbl">Phone</label>
+            <input id="ev-phone-{v['id']}" value="{e(v['phone'] or '')}" style="width:100%;margin-bottom:8px;">
+            <label class="uw-lbl">Notes</label>
+            <input id="ev-notes-{v['id']}" value="{e(v['notes'] or '')}" style="width:100%;margin-bottom:10px;">
+            <div style="display:flex;gap:8px;">
+              <button class="btn green" style="flex:1;" onclick="saveVendor({v['id']})">Save</button>
+              <button class="btn secondary" onclick="editVendor({v['id']})">Cancel</button>
+            </div>
+          </div>
         </div>"""
     if not vendors:
         rows = '<div class="empty-state" style="padding:24px 0;">No vendors yet.</div>'
@@ -24371,6 +24473,8 @@ def vendors_page():
                 <div id="add-vendor-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
                 <label class="uw-lbl">Name</label>
                 <input id="vn-name" style="width:100%;margin-bottom:10px;" placeholder="Bob's Truck Repair">
+                <label class="uw-lbl">Address (street, city)</label>
+                <input id="vn-address" style="width:100%;margin-bottom:10px;" placeholder="1400 Repair Rd, Norfolk">
                 <label class="uw-lbl">Phone (optional)</label>
                 <input id="vn-phone" style="width:100%;margin-bottom:10px;" placeholder="757-555-0100">
                 <label class="uw-lbl">Notes (optional)</label>
@@ -24404,10 +24508,20 @@ _VENDORS_PAGE_JS = """
     var name=(document.getElementById('vn-name')||{}).value||'';
     if(!name.trim()){ verr('A name is required.'); return; }
     fetch('/api/vendors',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
-        body:JSON.stringify({name:name,phone:(document.getElementById('vn-phone')||{}).value||'',notes:(document.getElementById('vn-notes')||{}).value||''})})
+        body:JSON.stringify({name:name,address:(document.getElementById('vn-address')||{}).value||'',phone:(document.getElementById('vn-phone')||{}).value||'',notes:(document.getElementById('vn-notes')||{}).value||''})})
       .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
       .then(function(res){ if(res.ok){ window.location.reload(); } else { verr((res.j&&res.j.error)||'Could not save.'); } })
       .catch(function(){ verr('Network error — try again.'); });
+  };
+  window.editVendor=function(id){ var f=document.getElementById('edit-vendor-'+id); if(f) f.hidden=!f.hidden; };
+  window.saveVendor=function(id){
+    var g=function(k){ return (document.getElementById('ev-'+k+'-'+id)||{}).value||''; };
+    if(!g('name').trim()){ alert('A name is required.'); return; }
+    fetch('/api/vendors/'+id+'/update',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
+        body:JSON.stringify({name:g('name'),address:g('address'),phone:g('phone'),notes:g('notes')})})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
+      .then(function(res){ if(res.ok){ window.location.reload(); } else { alert((res.j&&res.j.error)||'Could not save.'); } })
+      .catch(function(){ alert('Network error — try again.'); });
   };
   window.delVendor=function(id){
     if(!confirm('Remove this vendor? Past records keep its name.')) return;
@@ -24430,17 +24544,46 @@ def create_vendor():
     name = str(data.get("name") or "").strip()[:120]
     if not name:
         return jsonify({"error": "a name is required"}), 400
+    address = str(data.get("address") or "").strip()[:200]
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO vendors (company_id, name, phone, notes, is_active, created_at) VALUES (?,?,?,?,1,?)",
+        "INSERT INTO vendors (company_id, name, phone, notes, address, is_active, created_at) VALUES (?,?,?,?,?,1,?)",
         (cid(), name, str(data.get("phone") or "").strip()[:50] or None,
-         str(data.get("notes") or "").strip()[:200] or None, now_ts()),
+         str(data.get("notes") or "").strip()[:200] or None, address or None, now_ts()),
     )
     vid = cur.lastrowid
+    # A vendor with an address joins the address book (quick-add + parser).
+    _learn_vendor_location(conn, cid(), name, address)
     conn.commit()
     conn.close()
     return jsonify({"success": True, "id": vid})
+
+
+@app.route("/api/vendors/<int:vendor_id>/update", methods=["POST"])
+@login_required
+def update_vendor(vendor_id):
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    data = request.get_json(silent=True) or {}
+    conn = get_db()
+    row = conn.execute("SELECT id, name FROM vendors WHERE id=? AND company_id=?",
+                       (vendor_id, cid())).fetchone()
+    if row is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    name = str(data.get("name") or row["name"]).strip()[:120] or row["name"]
+    address = str(data.get("address") or "").strip()[:200]
+    conn.execute(
+        "UPDATE vendors SET name=?, phone=?, notes=?, address=? WHERE id=? AND company_id=?",
+        (name, str(data.get("phone") or "").strip()[:50] or None,
+         str(data.get("notes") or "").strip()[:200] or None, address or None,
+         vendor_id, cid()),
+    )
+    _learn_vendor_location(conn, cid(), name, address)
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
 
 
 @app.route("/api/vendors/<int:vendor_id>/deactivate", methods=["POST"])
