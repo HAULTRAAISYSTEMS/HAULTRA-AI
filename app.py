@@ -326,6 +326,51 @@ def _normalize_addr(text):
     return key.strip()
 
 
+# Words that signal a dispatch INSTRUCTION has leaked into a customer name
+# (e.g. "Gc Com , Set 30 To The Side While You Do This"). If one appears after
+# the first token, the name is cut there and the rest becomes an overflow note.
+_NAME_INSTRUCTION_WORDS = {
+    "set", "put", "use", "using", "before", "after", "while", "then", "do",
+    "place", "placed", "leave", "leaving", "make", "keep", "call", "ask",
+    "bring", "need", "needs", "must", "also", "when", "so", "and", "drop",
+    "dropoff", "pickup", "pull", "return", "dump", "swap", "move", "take",
+    "go", "please", "note", "tell", "have", "get", "put",
+}
+_NAME_MAX_LEN = 40
+
+
+def _clean_customer_name(name):
+    """Split a parsed customer name into (clean_name, overflow_note). A real
+    customer name is short and free of instruction verbs; anything past the
+    first instruction word (or past ~40 chars) is dispatch instruction that
+    belongs in the stop note, not the location name. Returns ('', '') for empty
+    input. Idempotent on already-clean names."""
+    n = (name or "").strip().strip(",")
+    if not n:
+        return "", ""
+    words = n.split()
+    cut = None
+    for i, w in enumerate(words):
+        wl = re.sub(r"[^a-z]", "", w.lower())
+        if i > 0 and wl in _NAME_INSTRUCTION_WORDS:
+            cut = i
+            break
+    if cut is not None:
+        head = " ".join(words[:cut]).strip(" ,")
+        tail = " ".join(words[cut:]).strip()
+    else:
+        head, tail = n, ""
+    # Length cap on a word boundary.
+    if len(head) > _NAME_MAX_LEN:
+        clip = head[:_NAME_MAX_LEN]
+        if " " in clip:
+            clip = clip.rsplit(" ", 1)[0]
+        rest = head[len(clip):].strip()
+        tail = (rest + ((" " + tail) if tail else "")).strip()
+        head = clip.strip(" ,")
+    return head.strip(" ,"), tail.strip()
+
+
 # ── Route text paste parser ───────────────────────────────────────────────────
 # Ordered most-specific → least-specific; first match wins.
 _ACTION_PATTERNS = [
@@ -3078,6 +3123,73 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
+    # --- Address book hygiene (fix/menu-shorthand-addressbook) ---
+    # Merge legacy duplicates that share a normalized address within a company
+    # (e.g. "Recovery" and "recovery" at 6403 Granby St). Keep the highest-usage
+    # row, SUM usage, fill any blank fields from the losers, re-point the
+    # frequency details, then delete the losers. Same-name DIFFERENT-address
+    # rows (Serv Pro's two sites) have different norm_keys and are never merged.
+    try:
+        _dupe_keys = conn.execute("""
+            SELECT company_id, norm_key
+              FROM saved_addresses
+             WHERE norm_key IS NOT NULL AND norm_key != ''
+             GROUP BY company_id, norm_key
+            HAVING COUNT(*) > 1
+        """).fetchall()
+        for _dk in _dupe_keys:
+            rows = conn.execute(
+                "SELECT * FROM saved_addresses WHERE company_id=? AND norm_key=? "
+                "ORDER BY times_used DESC, id ASC",
+                (_dk["company_id"], _dk["norm_key"])
+            ).fetchall()
+            if len(rows) < 2:
+                continue
+            keep = rows[0]
+            keep_id = keep["id"]
+            total = sum(int(r["times_used"] or 1) for r in rows)
+            # Fill blanks on the kept row from the losers.
+            merged = {c: keep[c] for c in keep.keys()}
+            for r in rows[1:]:
+                for col in ("customer_name", "address", "city", "state", "zip",
+                            "full_address", "label", "default_action",
+                            "default_container_size", "default_dump_location"):
+                    if not (merged.get(col) or "").strip() and (r[col] or "").strip():
+                        merged[col] = r[col]
+            conn.execute(
+                """UPDATE saved_addresses SET customer_name=?, address=?, city=?, state=?, zip=?,
+                          full_address=?, label=?, default_action=?, default_container_size=?,
+                          default_dump_location=?, times_used=? WHERE id=?""",
+                (merged.get("customer_name"), merged.get("address"), merged.get("city"),
+                 merged.get("state"), merged.get("zip"), merged.get("full_address"),
+                 merged.get("label"), merged.get("default_action"),
+                 merged.get("default_container_size"), merged.get("default_dump_location"),
+                 total, keep_id))
+            _loser_ids = [r["id"] for r in rows[1:]]
+            _ph = ",".join("?" * len(_loser_ids))
+            # Re-point frequency details to the kept row (skip rows that would
+            # collide with the kept row's existing combos), then drop leftovers.
+            conn.execute(
+                "UPDATE OR IGNORE saved_address_details SET saved_address_id=? WHERE saved_address_id IN (%s)" % _ph,
+                [keep_id] + _loser_ids)
+            conn.execute(
+                "DELETE FROM saved_address_details WHERE saved_address_id IN (%s)" % _ph, _loser_ids)
+            conn.execute(
+                "DELETE FROM saved_addresses WHERE id IN (%s)" % _ph, _loser_ids)
+        # Scrub dispatch instructions that leaked into existing location names.
+        _named = conn.execute(
+            "SELECT id, customer_name FROM saved_addresses "
+            "WHERE customer_name IS NOT NULL AND TRIM(customer_name) != ''"
+        ).fetchall()
+        for _r in _named:
+            _clean, _ = _clean_customer_name(_r["customer_name"])
+            if _clean != (_r["customer_name"] or "").strip():
+                conn.execute("UPDATE saved_addresses SET customer_name=? WHERE id=?",
+                             (_clean or None, _r["id"]))
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
     # One-time cleanup: collapse any duplicate OPEN routes for the same
     # driver+date into a single lane (from the api_dispatch duplicate-route bug).
     _merge_duplicate_open_routes(conn)
@@ -3108,6 +3220,41 @@ def init_db():
     conn.execute("UPDATE dump_locations SET company_id=? WHERE company_id IS NULL", (default_co_id,))
     conn.execute("UPDATE parse_vocab SET company_id=? WHERE company_id IS NULL", (default_co_id,))
     conn.commit()
+
+    # --- Parser shorthand dedupe (fix/menu-shorthand-addressbook) ---
+    # Usage/recency so re-learning a mapping bumps instead of piling up.
+    safe_add_column(conn, "parse_vocab", "times_used INTEGER NOT NULL DEFAULT 1")
+    safe_add_column(conn, "parse_vocab", "last_used_at TEXT")
+    # One-time cleanup: collapse duplicate (company_id, term, expansion) rows —
+    # case-insensitive on both — into a single row (keep the lowest id, sum the
+    # usage counts). This clears legacy piles like ~14x "hamp → Hampton".
+    try:
+        _dupes = conn.execute("""
+            SELECT MIN(id) AS keep_id,
+                   SUM(COALESCE(times_used,1)) AS total,
+                   COUNT(*) AS n,
+                   GROUP_CONCAT(id) AS all_ids
+              FROM parse_vocab
+             GROUP BY company_id, LOWER(TRIM(term)), LOWER(TRIM(expansion))
+            HAVING COUNT(*) > 1
+        """).fetchall()
+        for _d in _dupes:
+            _ids = [int(x) for x in (_d["all_ids"] or "").split(",") if x]
+            _drop = [i for i in _ids if i != _d["keep_id"]]
+            if _drop:
+                conn.execute(
+                    "UPDATE parse_vocab SET times_used=? WHERE id=?",
+                    (_d["total"] or 1, _d["keep_id"]))
+                conn.execute(
+                    "DELETE FROM parse_vocab WHERE id IN (%s)" % ",".join("?" * len(_drop)),
+                    _drop)
+        # Prevent future identical dupes (case-insensitive on the pair).
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_parse_vocab_pair "
+            "ON parse_vocab(company_id, LOWER(TRIM(term)), LOWER(TRIM(expansion)))")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
 
     existing_boss = cur.execute("SELECT id FROM users WHERE role='boss' LIMIT 1").fetchone()
     if not existing_boss:
@@ -5134,16 +5281,27 @@ def shell_page(title, body, extra_head=""):
         # lives per-row on Team, and Boss Panel / Orders / Live Dispatch keep
         # working at their old URLs but no longer have a nav entry (see PR notes).
         if user["role"] == "boss":
+            # Grouped More menu (fix/menu-shorthand-addressbook): small section
+            # headers, in the order TEAM → FLEET → (Team) → SETUP, then a
+            # separator + Logout. A header only renders if its group has items.
+            def _mhead(label):
+                return f'<div class="topnav-more-head">{label}</div>'
             _mparts = []
-            # Trucks/fleet — any management role can view (add/edit is gated
-            # server-side to owner/dispatcher).
-            _mparts.append(nav_link(url_for("trucks_page"), "🚛 Trucks", path))
-            _mparts.append(nav_link(url_for("vendors_page"), "🔧 Vendors", path))
+            # TEAM
+            _mparts.append(_mhead("Team"))
             _mparts.append(nav_link(url_for("team_hours_page"), "🕐 Team Hours", path))
             _mparts.append(nav_link(url_for("team_time_off_page"), "🌴 Team Time Off", path))
+            # FLEET — any management role can view (add/edit gated server-side).
+            _mparts.append(_mhead("Fleet"))
+            _mparts.append(nav_link(url_for("trucks_page"), "🚛 Trucks", path))
+            _mparts.append(nav_link(url_for("vendors_page"), "🔧 Vendors", path))
+            _mparts.append(nav_link(url_for("maintenance_page"), "🛠 Maintenance", path))
+            # Team roster sits between Fleet and Setup (per spec order).
             if is_disp:
                 _mparts.append(nav_link(url_for("team_page"), "👥 Team", path))
+            # SETUP
             if is_own:
+                _mparts.append(_mhead("Setup"))
                 _mparts.append(nav_link(url_for("yard_setup_page"), "🏗 Yard Setup", path))
                 _mparts.append(nav_link(url_for("settings_page"), "⚙ Settings", path))
             more_items = "".join(_mparts)
@@ -5178,6 +5336,7 @@ def shell_page(title, body, extra_head=""):
                             </div>
                             {more_items}
                             {superadmin_link}
+                            <div class="topnav-more-sep"></div>
                             <form method="POST" action="{url_for('logout')}" style="margin:0;padding:0;">
                                 <button type="submit" class="nav-item nav-logout">⏻ Logout</button>
                             </form>
@@ -5462,6 +5621,20 @@ a:hover {{ color: #FF9D5C; }}
     padding: 6px 10px 8px;
     border-bottom: 1px solid rgba(255,107,26,0.08);
     margin-bottom: 4px;
+}}
+.topnav-more-head {{
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: .6px;
+    color: #78786F;
+    text-transform: uppercase;
+    padding: 8px 10px 3px;
+    margin-top: 2px;
+}}
+.topnav-more-sep {{
+    height: 1px;
+    background: rgba(255,255,255,0.08);
+    margin: 6px 4px;
 }}
 
 .company-pill {{
@@ -12174,7 +12347,10 @@ def learn_location(conn, company_id, address, city="", state="", zip_code="",
     if not company_id:
         return
     addr  = (address or "").strip()
-    cname = (customer_name or "").strip()
+    # Never learn a dispatch instruction as a location name (defense-in-depth
+    # for callers that didn't pre-clean it; overflow is dropped here since a
+    # location has no note field — the stop keeps the full instruction).
+    cname, _ = _clean_customer_name((customer_name or "").strip())
     if not addr:
         return
     ts   = now_ts()
@@ -17709,12 +17885,26 @@ def add_parse_vocab():
         flash("Both the shorthand and what it means are required.", "error")
         return redirect(url_for("yard_setup_page") + "#parse-vocab")
     conn = get_db()
-    # Upsert per company: replace an existing company term with the same text.
-    conn.execute("DELETE FROM parse_vocab WHERE company_id=? AND term=?", (cid(), term))
-    conn.execute(
-        "INSERT INTO parse_vocab (company_id, term, expansion, kind, created_at) VALUES (?,?,?,'shorthand',?)",
-        (cid(), term, expansion, now_ts())
-    )
+    ts = now_ts()
+    # Upsert: the same mapping bumps usage/recency instead of adding a row; a
+    # new expansion for an existing term replaces it (one row per term).
+    existing = conn.execute(
+        "SELECT id, expansion FROM parse_vocab WHERE company_id=? AND LOWER(TRIM(term))=? "
+        "ORDER BY id LIMIT 1",
+        (cid(), term)
+    ).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE parse_vocab SET expansion=?, times_used=COALESCE(times_used,1)+1, last_used_at=? WHERE id=?",
+            (expansion, ts, existing["id"]))
+        # Drop any other rows for this term so it stays a single entry.
+        conn.execute("DELETE FROM parse_vocab WHERE company_id=? AND LOWER(TRIM(term))=? AND id!=?",
+                     (cid(), term, existing["id"]))
+    else:
+        conn.execute(
+            "INSERT INTO parse_vocab (company_id, term, expansion, kind, times_used, last_used_at, created_at) "
+            "VALUES (?,?,?,'shorthand',1,?,?)",
+            (cid(), term, expansion, ts, ts))
     conn.commit()
     conn.close()
     flash("Shorthand added.", "success")
@@ -17759,8 +17949,12 @@ def _address_book_section_html():
         addr = (_a["full_address"] or _a["address"] or "").strip()
         search = " ".join(p for p in [display, addr, _a["city"] or ""] if p).lower()
         is_hidden = bool(_a["hidden"])
+        # No customer name → fall back to the street address as the label
+        # (display-only; the street is friendlier than "(no name)").
+        _street = (_a["address"] or addr or "").split(",")[0].strip()
         name_cell = (f'<strong>{e(display)}</strong>' if display
-                     else '<span class="muted small">(no name)</span>')
+                     else (f'<strong>{e(_street)}</strong>' if _street
+                           else '<span class="muted small">(no name)</span>'))
         hidden_badge = ('<span class="badge" style="opacity:.6;">hidden</span>'
                         if is_hidden else '')
         hide_label = "Unhide" if is_hidden else "Hide"
@@ -19968,15 +20162,23 @@ def _validate_parser_stops(stops_in):
             return None, f"Stop {i} is missing an address."
         if s.get("confidence") == "low" and not s.get("reviewed"):
             return None, f"Stop {i} is still flagged for review — mark it reviewed before dispatching."
+        # Keep dispatch instructions out of the customer name: a long or
+        # verb-laden name is split — the clean customer stays, the overflow
+        # moves to the stop note so it's never learned as a location name.
+        _cust_clean, _cust_overflow = _clean_customer_name(
+            expand_abbrev((s.get("customer") or "").strip()))
+        _notes = expand_abbrev((s.get("notes") or "").strip())
+        if _cust_overflow:
+            _notes = (_cust_overflow + ((" — " + _notes) if _notes else "")).strip()
         clean_stops.append({
             "address": address,
             "action": _PARSER_ACTION_MAP[action_code],
-            "customer": expand_abbrev((s.get("customer") or "").strip()),
+            "customer": _cust_clean,
             "container_size": expand_abbrev((s.get("container_size") or "").strip()),
             # Multi-leg: dump/return legs of a single job (kept on the one stop).
             "dump_leg": expand_abbrev((s.get("dump_leg") or "").strip()),
             "return_leg": expand_abbrev((s.get("return_leg") or "").strip()),
-            "notes": expand_abbrev((s.get("notes") or "").strip()),
+            "notes": _notes,
             "insert_before": str(s.get("insert_before") or "end").strip(),
             # Empty-can leg plan: only accept the known values; anything else
             # (incl. absent) means "no explicit plan" → default per action-code.
