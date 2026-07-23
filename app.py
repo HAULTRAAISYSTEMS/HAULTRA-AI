@@ -6198,13 +6198,24 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 }}
 .cab-canplan-row {{ display: flex; gap: 8px; }}
 .cab-canplan-pill {{
-    width: 100%; min-height: 48px; padding: 8px 6px; border-radius: 10px;
+    flex: 1; width: 100%; min-height: 48px; padding: 8px 6px; border-radius: 10px;
     background: rgba(26,26,26,0.85); border: 1px solid rgba(255,255,255,0.12);
-    color: #B8B8AE; font-weight: 700; font-size: 12.5px; cursor: pointer; line-height: 1.2;
+    color: #7C7C74; font-weight: 700; font-size: 12.5px; cursor: pointer; line-height: 1.2;
+    opacity: 0.72; transition: transform 0.06s ease, opacity 0.12s ease, background 0.12s ease;
 }}
+.cab-canplan-pill:active {{ transform: scale(0.97); }}
+/* Selected choice: solid orange fill + checkmark, full opacity; others dim. */
 .cab-canplan-pill.active {{
-    background: rgba(255,107,26,0.16); border-color: rgba(255,107,26,0.6); color: #FF9D5C;
+    background: linear-gradient(135deg, #FF8A42 0%, #FF6B1A 100%);
+    border-color: #FF6B1A; color: #1A1000; opacity: 1;
+    box-shadow: 0 2px 10px rgba(255,107,26,0.35);
 }}
+.cab-canplan-toast {{
+    margin-top: 8px; padding: 8px 12px; border-radius: 9px;
+    background: rgba(255,82,82,0.15); border: 1px solid rgba(255,82,82,0.55);
+    color: #FF9B9B; font-size: 12.5px; font-weight: 700; text-align: center;
+}}
+.cab-canplan-toast[hidden] {{ display: none; }}
 .upload-details {{ margin: 10px 0; }}
 .upload-details summary {{
     color: #B8B8AE; font-size: 13px; font-weight: 600; cursor: pointer;
@@ -10784,21 +10795,77 @@ def driver_route_detail(route_id):
     if is_pr and not is_swap_pr and driver_status != "completed":
         _cur_plan = (_s.get("empty_can_plan") or "").strip() or "return_here"
         _plan_opts = [("return_here", "Return here"), ("carry_next", "Carry to next"), ("leave_site", "Leave on site")]
+        _url = url_for("set_empty_can_plan", stop_id=stop_id)
         _pill_html = ""
         for _pv, _plabel in _plan_opts:
-            _pcls = "cab-canplan-pill active" if _cur_plan == _pv else "cab-canplan-pill"
+            _active = (_cur_plan == _pv)
+            _pcls = "cab-canplan-pill active" if _active else "cab-canplan-pill"
+            _txt = ("✓ " + _plabel) if _active else _plabel
             _pill_html += (
-                f'<form method="POST" action="{url_for("set_empty_can_plan", stop_id=stop_id)}" style="flex:1;">'
-                f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
-                f'<input type="hidden" name="plan" value="{_pv}">'
-                f'<button type="submit" class="{_pcls}" style="width:100%;">{_plabel}</button>'
-                f'</form>'
+                f'<button type="button" class="{_pcls}" data-plan="{_pv}" data-label="{_plabel}" '
+                f'aria-pressed="{"true" if _active else "false"}">{_txt}</button>'
             )
+        # Self-contained optimistic picker: the active choice is visible on load
+        # (solid fill + checkmark), a tap flips the UI instantly (<100ms) and
+        # syncs in the background; on failure it reverts and offers a retry.
+        # Tapping the already-selected option does nothing. Braces below are
+        # literal — this string is inserted as a value into the page f-string.
+        _picker_js = """
+<script>
+(function(){
+  var wraps = document.querySelectorAll('.cab-canplan-wrap');
+  for (var i = 0; i < wraps.length; i++) {
+    (function(wrap){
+      if (wrap._wired) return; wrap._wired = true;
+      var url = wrap.getAttribute('data-url');
+      var csrf = wrap.getAttribute('data-csrf');
+      var toast = wrap.querySelector('.cab-canplan-toast');
+      var pills = wrap.querySelectorAll('.cab-canplan-pill');
+      var busy = false;
+      function showToast(msg){
+        if(!toast) return;
+        toast.textContent = msg; toast.hidden = false;
+        clearTimeout(toast._t);
+        toast._t = setTimeout(function(){ toast.hidden = true; }, 3200);
+      }
+      function paint(plan){
+        for (var j = 0; j < pills.length; j++) {
+          var p = pills[j];
+          var on = p.getAttribute('data-plan') === plan;
+          if (on) { p.classList.add('active'); } else { p.classList.remove('active'); }
+          p.setAttribute('aria-pressed', on ? 'true' : 'false');
+          p.textContent = (on ? '\\u2713 ' : '') + p.getAttribute('data-label');
+        }
+        wrap.setAttribute('data-plan', plan);
+      }
+      for (var k = 0; k < pills.length; k++) {
+        pills[k].addEventListener('click', function(){
+          var plan = this.getAttribute('data-plan');
+          var prev = wrap.getAttribute('data-plan');
+          if (plan === prev || busy) return;        // already selected → no-op
+          busy = true;
+          paint(plan);                              // optimistic flip
+          var body = '_csrf_token=' + encodeURIComponent(csrf) + '&plan=' + encodeURIComponent(plan);
+          fetch(url, {method:'POST', credentials:'same-origin',
+            headers:{'Content-Type':'application/x-www-form-urlencoded','X-Requested-With':'fetch'},
+            body: body})
+          .then(function(r){ if(!r.ok) throw new Error('bad'); return r.json(); })
+          .then(function(){ busy = false; })
+          .catch(function(){ busy = false; paint(prev); showToast('Couldn\\u2019t save \\u2014 tap to retry'); });
+        });
+      }
+    })(wraps[i]);
+  }
+})();
+</script>
+"""
         empty_can_picker_html = (
-            '<div class="cab-canplan-wrap">'
+            f'<div class="cab-canplan-wrap" data-url="{_url}" data-csrf="{_csrf}" data-plan="{_cur_plan}">'
             '<div class="cab-canplan-lbl">Empty can &mdash; tap if this is wrong</div>'
             f'<div class="cab-canplan-row">{_pill_html}</div>'
+            '<div class="cab-canplan-toast" role="status" hidden></div>'
             '</div>'
+            + _picker_js
         )
 
     # Action badge — vendor visits get a distinct wrench badge.
@@ -13463,14 +13530,52 @@ _EMPTY_CAN_PLANS = {
 }
 
 
+# Marker that identifies an auto-generated empty-can note line, so we can
+# collapse a stack of them down to a single current line (dedupe + replace)
+# instead of appending a fresh line on every tap.
+_EMPTY_CAN_NOTE_MARK = "set empty-can action:"
+
+
+def _strip_empty_can_notes(notes):
+    """Remove every auto-generated empty-can note line from a stop's notes,
+    keeping any human-written lines intact. Used when a new choice line is about
+    to be appended (so the result carries exactly one)."""
+    if not notes:
+        return ""
+    kept = [ln for ln in notes.splitlines() if _EMPTY_CAN_NOTE_MARK not in ln]
+    return "\n".join(kept).strip()
+
+
+def _collapse_empty_can_notes(notes):
+    """Collapse a stack of empty-can note lines down to just the LATEST one,
+    in place, preserving human-written lines. Used when the plan didn't change
+    but leftover stacked lines (from before dedupe existed) should be cleaned."""
+    if not notes:
+        return ""
+    lines = notes.splitlines()
+    can_idxs = [i for i, ln in enumerate(lines) if _EMPTY_CAN_NOTE_MARK in ln]
+    if len(can_idxs) <= 1:
+        return "\n".join(lines).strip()
+    keep = can_idxs[-1]
+    out = [ln for i, ln in enumerate(lines) if _EMPTY_CAN_NOTE_MARK not in ln or i == keep]
+    return "\n".join(out).strip()
+
+
 @app.route("/stop/<int:stop_id>/empty-can-plan", methods=["POST"])
 @login_required
 def set_empty_can_plan(stop_id):
     """Driver (or boss) corrects a stop's empty-can leg plan when the card's
-    action doesn't match reality. Persists empty_can_plan on the stop and
-    appends a dated note so the boss sees the change — no silent mismatch."""
+    action doesn't match reality. Persists empty_can_plan and keeps exactly ONE
+    dated note line recording the current choice — prior empty-can note lines
+    for the stop are collapsed away (dedupe + replace), never stacked. Tapping
+    the already-selected option is a no-op (no duplicate note). Returns JSON to
+    fetch callers for optimistic UI; falls back to a redirect for plain forms."""
+    wants_json = (request.headers.get("X-Requested-With") == "fetch"
+                  or "application/json" in (request.headers.get("Accept") or ""))
     plan = (request.form.get("plan") or "").strip()
     if plan not in _EMPTY_CAN_PLANS:
+        if wants_json:
+            return jsonify({"error": "unknown plan"}), 400
         flash("Unknown empty-can action.", "error")
         return redirect(url_for("dashboard"))
 
@@ -13483,23 +13588,40 @@ def set_empty_can_plan(stop_id):
     ).fetchone()
     if not stop:
         conn.close()
+        if wants_json:
+            return jsonify({"error": "not found"}), 404
         abort(404)
     if session.get("role") != "boss" and stop["assigned_to"] != session["user_id"]:
         conn.close()
+        if wants_json:
+            return jsonify({"error": "forbidden"}), 403
         flash("Access denied.", "error")
         return redirect(url_for("dashboard"))
 
-    if (stop["empty_can_plan"] or "") != plan:
+    changed = (stop["empty_can_plan"] or "") != plan
+    if changed:
+        # Replace: drop every prior empty-can line, then add the single current
+        # one — the note never stacks on repeated switches.
         who = "Driver" if session.get("role") == "driver" else "Boss"
+        base_notes = _strip_empty_can_notes(stop["notes"] or "")
         note_line = f"[{now_ts()}] {who} set empty-can action: {_EMPTY_CAN_PLANS[plan]}."
-        existing = (stop["notes"] or "").strip()
-        new_notes = (existing + ("\n" if existing else "") + note_line)
+        new_notes = (base_notes + ("\n" if base_notes else "") + note_line)
         conn.execute(
             "UPDATE stops SET empty_can_plan=?, notes=? WHERE id=?",
             (plan, new_notes, stop_id)
         )
         conn.commit()
+    else:
+        # No plan change (re-tap) — never add a note. Still collapse any leftover
+        # stacked lines down to the latest, so old duplicates get cleaned up.
+        collapsed = _collapse_empty_can_notes(stop["notes"] or "")
+        if collapsed != (stop["notes"] or "").strip():
+            conn.execute("UPDATE stops SET notes=? WHERE id=?", (collapsed, stop_id))
+            conn.commit()
     conn.close()
+
+    if wants_json:
+        return jsonify({"ok": True, "plan": plan, "changed": changed})
     if session.get("role") != "boss":
         return redirect(url_for("driver_route_detail", route_id=stop["rid"]))
     return redirect(url_for("view_route", route_id=stop["rid"]))
