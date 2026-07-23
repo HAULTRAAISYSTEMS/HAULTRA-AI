@@ -594,12 +594,19 @@
     toastTimer = setTimeout(function () { t.classList.remove('show'); }, 3200);
   }
 
-  function normalizeStop(raw, idx) {
+  // Monotonic id source so every card (parsed OR quick-added) has a stable,
+  // collision-free id — the two lanes coexist and must never share an id.
+  var stopSeq = 0;
+
+  function normalizeStop(raw) {
     var action = (raw && raw.action ? String(raw.action) : '').trim().toUpperCase();
     if (ACTION_CODES.indexOf(action) === -1) action = action || 'P';
     var confidence = (raw && raw.confidence === 'low') ? 'low' : 'high';
     return {
-      id: 'stop-' + idx,
+      id: 'stop-' + (stopSeq++),
+      // 'parsed' cards are replaced on every re-parse; 'quickadd' cards (chip /
+      // autocomplete) are preserved in place across re-parses.
+      source: (raw && raw.source === 'quickadd') ? 'quickadd' : 'parsed',
       action: action,
       address: (raw && raw.address) ? String(raw.address) : '',
       customer: (raw && raw.customer) ? String(raw.customer) : '',
@@ -649,7 +656,32 @@
   window.reparse = reparse;
 
   function renderStopCards(stops) {
-    currentStops = stops.map(normalizeStop);
+    // Re-parse REPLACES only the text-parsed cards. Quick-added cards
+    // (chip / autocomplete) are preserved in place: we drop the old parsed
+    // block and splice the freshly parsed one in at the same position, so
+    // re-parsing the same text twice never duplicates parsed stops and never
+    // deletes quick-added ones.
+    var newParsed = stops.map(function (raw) {
+      var s = normalizeStop(raw);
+      s.source = 'parsed';
+      return s;
+    });
+    var result = [];
+    var spliced = false;
+    currentStops.forEach(function (s) {
+      if (s.source === 'quickadd') {
+        result.push(s);                 // keep quick-added cards in place
+      } else if (!spliced) {
+        newParsed.forEach(function (p) { result.push(p); });  // new parsed block
+        spliced = true;
+      }
+      // old parsed cards are dropped (replaced by the block above)
+    });
+    if (!spliced) {
+      // No prior parsed cards — append the parsed block after existing quick-adds.
+      newParsed.forEach(function (p) { result.push(p); });
+    }
+    currentStops = result;
     renderAllCards();
     updateCounts();
   }
@@ -1044,6 +1076,7 @@
   function addQuickStop(loc) {
     var code = codeFromAction(loc.default_action);
     var stop = normalizeStop({
+      source: 'quickadd',   // preserved in place across re-parses
       action: code,
       address: locFullAddress(loc),
       customer: loc.customer_name || '',
@@ -1052,7 +1085,7 @@
       return_leg: '',
       confidence: 'high',
       notes: '',
-    }, currentStops.length);
+    });
     // Quick-add stops are trusted (came from a saved location) so they're
     // dispatch-ready immediately — never flagged for review.
     stop.reviewed = true;
