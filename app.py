@@ -2291,6 +2291,11 @@ def init_db():
     # Nullable; no existing stop behavior depends on these.
     safe_add_column(conn, "stops", "request_id INTEGER")
     safe_add_column(conn, "stops", "customer_id INTEGER")
+    # Vendor dispatch alert (feat/vendor-dispatch-alert): a driver-facing
+    # "vendor visit" stop links back to the defect + vendor it services, so
+    # completing it can close the defect. Nullable; normal stops leave these NULL.
+    safe_add_column(conn, "stops", "defect_item_id INTEGER")
+    safe_add_column(conn, "stops", "vendor_id INTEGER")
     # Customer Request System (Phase 3): boss's reason when denying a request.
     safe_add_column(conn, "requests", "deny_reason TEXT")
     # Phase 5 — two-stage workflow adds the 'accepted' status and a manager's
@@ -2702,6 +2707,13 @@ def init_db():
     safe_add_column(conn, "inspection_items", "at_vendor INTEGER NOT NULL DEFAULT 0")
     safe_add_column(conn, "inspection_items", "sent_vendor_id INTEGER")
     safe_add_column(conn, "inspection_items", "sent_at TEXT")
+    # Urgent/priority messages carry an acknowledgment ("Got it") and a link to
+    # the defect that triggered them, so the boss's defect card shows the ack —
+    # built on the existing messages thread, not a parallel notification system.
+    # (Placed after the messages CREATE TABLE above so the columns actually apply.)
+    safe_add_column(conn, "messages", "priority TEXT")
+    safe_add_column(conn, "messages", "acknowledged_at TEXT")
+    safe_add_column(conn, "messages", "defect_item_id INTEGER")
     safe_add_column(conn, "maintenance_entries", "vendor_id INTEGER")
     safe_add_column(conn, "maintenance_entries", "at_vendor INTEGER NOT NULL DEFAULT 0")
     safe_add_column(conn, "maintenance_entries", "sent_vendor_id INTEGER")
@@ -5724,6 +5736,25 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 }}
 .cab-action-badge.pickup {{ background: var(--cyan-dim); color: var(--cyan); border: 1px solid rgba(255,107,26,0.5); }}
 .cab-action-badge.dropswap {{ background: rgba(140,160,179,0.16); color: #8CA0B3; border: 1px solid rgba(140,160,179,0.45); }}
+.cab-action-badge.vendor {{ background: rgba(245,180,60,0.16); color: #F5B43C; border: 1px solid rgba(245,180,60,0.5); font-size: 13px; letter-spacing: .5px; }}
+
+/* Urgent vendor-dispatch banner — pinned, red, until acknowledged. */
+.cab-urgent-banner {{
+    background: var(--red-dim); border: 1px solid rgba(255,82,82,0.55);
+    border-radius: 12px; padding: 14px 16px; margin-bottom: 14px;
+    box-shadow: 0 0 0 1px rgba(255,82,82,0.15), 0 4px 18px rgba(255,82,82,0.18);
+    animation: urgentPulse 1.8s ease-in-out infinite;
+}}
+@keyframes urgentPulse {{ 0%,100% {{ box-shadow: 0 0 0 1px rgba(255,82,82,0.15), 0 4px 18px rgba(255,82,82,0.14); }}
+                          50% {{ box-shadow: 0 0 0 1px rgba(255,82,82,0.35), 0 4px 22px rgba(255,82,82,0.30); }} }}
+.cab-urgent-inner {{ display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }}
+.cab-urgent-body {{ flex: 1; min-width: 180px; color: #FFB4B4; font-size: 14px; font-weight: 700; line-height: 1.4; }}
+.cab-urgent-ack {{
+    flex-shrink: 0; min-height: 48px; padding: 0 20px; border-radius: 10px; cursor: pointer;
+    background: linear-gradient(135deg,#ff3b5c,#ff6d00); color: #fff; font-weight: 800;
+    font-size: 15px; border: none; letter-spacing: .02em;
+}}
+.cab-urgent-ack:disabled {{ opacity: .6; cursor: progress; }}
 .cab-action-name {{ font-size: 15px; font-weight: 700; color: #D8D8D0; letter-spacing: .3px; }}
 
 .cab-address {{
@@ -9632,6 +9663,62 @@ def new_route():
     """
     return render_template_string(shell_page("Create Route", body))
 
+
+# Urgent vendor-dispatch banner: acknowledge + a helper the 30s poller uses to
+# raise the banner when an urgent message lands between page loads.
+_URGENT_BANNER_JS = """
+<script>
+(function(){
+  var CSRF=(document.querySelector('meta[name=csrf-token]')||{}).content||'';
+  window.ackUrgent=function(btn){
+    var banner=document.getElementById('urgent-banner'); if(!banner) return;
+    var id=banner.getAttribute('data-msg-id');
+    btn.disabled=true;
+    fetch('/api/messages/'+id+'/ack',{method:'POST',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},body:'{}'})
+      .then(function(r){ if(r.ok){ banner.remove(); } else { btn.disabled=false; } })
+      .catch(function(){ btn.disabled=false; });
+  };
+  window.showUrgentBanner=function(id, body){
+    if(document.getElementById('urgent-banner')) return;   // already shown
+    var wrap=document.querySelector('.cab-wrap'); if(!wrap) return;
+    var b=document.createElement('div');
+    b.id='urgent-banner'; b.className='cab-urgent-banner'; b.setAttribute('data-msg-id', id);
+    var inner=document.createElement('div'); inner.className='cab-urgent-inner';
+    var txt=document.createElement('div'); txt.className='cab-urgent-body'; txt.textContent=body;
+    var ack=document.createElement('button'); ack.type='button'; ack.className='cab-urgent-ack';
+    ack.textContent='Got it'; ack.onclick=function(){ ackUrgent(ack); };
+    inner.appendChild(txt); inner.appendChild(ack); b.appendChild(inner);
+    wrap.insertBefore(b, wrap.firstChild);
+  };
+})();
+</script>
+"""
+
+
+# Vendor-visit stop completion: "Truck repaired?" → close or keep-open the defect.
+_VENDOR_STOP_JS = """
+<script>
+(function(){
+  var CSRF=(document.querySelector('meta[name=csrf-token]')||{}).content||'';
+  window.openVendorDone=function(){
+    var o=document.getElementById('vendor-done-overlay'), m=document.getElementById('vendor-done-modal');
+    if(o) o.hidden=false; if(m) m.hidden=false;
+  };
+  window.vendorDone=function(repaired, stopId){
+    var note=(document.getElementById('vendor-done-note')||{}).value||'';
+    fetch('/api/stops/'+stopId+'/vendor-complete',{method:'POST',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
+        body:JSON.stringify({repaired:!!repaired, note:note})})
+      .then(function(r){ if(r.ok){ window.location.reload(); } else { throw new Error(); } })
+      .catch(function(){ var e=document.getElementById('vendor-done-err');
+        if(e){ e.textContent='Could not save — check your connection and try again.'; e.hidden=false; } });
+  };
+})();
+</script>
+"""
+
+
 @app.route("/driver/route/<int:route_id>")
 @driver_required
 def driver_route_detail(route_id):
@@ -9684,7 +9771,28 @@ def driver_route_detail(route_id):
         (route_id, session["user_id"])
     ).fetchone()["n"]
 
+    # Latest unacknowledged urgent (vendor-dispatch) message → pinned banner.
+    urgent_msg = conn.execute(
+        """SELECT id, body FROM messages
+            WHERE route_id=? AND priority='urgent' AND acknowledged_at IS NULL
+              AND sender_user_id != ?
+            ORDER BY id DESC LIMIT 1""",
+        (route_id, session["user_id"])
+    ).fetchone()
+
     conn.close()
+
+    # Pinned urgent (vendor-dispatch) banner — shown until the driver taps
+    # "Got it". Built once here so both the working and all-done views show it.
+    urgent_banner_html = ""
+    if urgent_msg:
+        urgent_banner_html = (
+            '<div id="urgent-banner" class="cab-urgent-banner" data-msg-id="' + str(urgent_msg["id"]) + '">'
+            '<div class="cab-urgent-inner">'
+            '<div class="cab-urgent-body">' + e(urgent_msg["body"]) + '</div>'
+            '<button type="button" class="cab-urgent-ack" onclick="ackUrgent(this)">Got it</button>'
+            '</div></div>'
+        )
 
     completed_count = sum(1 for s in stops if s["status"] == "completed")
     total_count = len(stops)
@@ -9782,6 +9890,7 @@ def driver_route_detail(route_id):
         </div>
     </div>
     {nav_pref_modal_html}
+    {urgent_banner_html}
     <div class="cab-progress-label">{e(route['route_name'])} &middot; {e(route['route_date'])}</div>
     <div class="cab-progress-track"><div class="cab-progress-fill" style="width:100%;"></div></div>
 
@@ -9818,6 +9927,7 @@ def driver_route_detail(route_id):
 }})();
 </script>
 <script>{_gps_settings_js()}</script>
+{_URGENT_BANNER_JS}
 """
         return render_template_string(shell_page("Cab View", body))
 
@@ -9841,6 +9951,9 @@ def driver_route_detail(route_id):
     _full_addr_js = e(json.dumps(full_address))
 
     action_lower = (s["action"] or "").lower()
+    # Vendor-visit stop (inserted by the vendor-dispatch alert) — read-only,
+    # its own completion flow ("Truck repaired?"), no container workflow.
+    is_vendor = action_lower == "vendor"
     is_pr    = "pickup and return" in action_lower or ("swap" in action_lower and "pull" not in action_lower)
     is_pull  = "pull" in action_lower and "return" not in action_lower
     is_swap_pr = is_pr and bool(_s.get("swap_with_prev_pull"))
@@ -9955,6 +10068,35 @@ def driver_route_detail(route_id):
             <button type="button" class="btn orange" id="no-photo-complete-anyway">Complete Without Photo</button>
             <button type="button" class="btn secondary" id="no-photo-add-first">Add Photo First</button>
         </div>
+    </div>
+    """
+
+    # ── Vendor-visit stop: replace the container workflow + normal completion
+    #    with a "Truck repaired?" flow that closes (or keeps open) the defect. ──
+    if is_vendor:
+        workflow_btn_html = ""
+        complete_section = f"""
+    <button type="button" class="cab-complete-btn" onclick="openVendorDone()"
+            style="background:linear-gradient(135deg,#00c853,#00e57a);color:#001a0a;">
+        &#128295; Finish Vendor Visit
+    </button>
+    <div id="vendor-done-overlay" class="no-photo-confirm-overlay" hidden
+         onclick="document.getElementById('vendor-done-overlay').hidden=true;document.getElementById('vendor-done-modal').hidden=true;"></div>
+    <div id="vendor-done-modal" class="no-photo-confirm-modal" hidden style="text-align:left;">
+        <div class="no-photo-confirm-title" style="margin-bottom:6px;">&#128295; Truck repaired?</div>
+        <p class="no-photo-confirm-body" style="margin-bottom:12px;">Did the vendor fix the truck?</p>
+        <label class="uw-lbl" style="display:block;margin-bottom:4px;">Note (optional)</label>
+        <textarea id="vendor-done-note" rows="2" style="width:100%;margin-bottom:14px;"
+                  placeholder="e.g. sticker renewed, ready to roll"></textarea>
+        <div style="display:flex;flex-direction:column;gap:10px;">
+            <button type="button" class="btn green" style="min-height:48px;" onclick="vendorDone(true, {stop_id})">
+                &#9989; Yes &mdash; repaired, close defect
+            </button>
+            <button type="button" class="btn secondary" style="min-height:48px;" onclick="vendorDone(false, {stop_id})">
+                Not repaired &mdash; keep defect open
+            </button>
+        </div>
+        <div id="vendor-done-err" hidden style="color:#FF5252;font-size:12px;margin-top:8px;"></div>
     </div>
     """
 
@@ -10118,6 +10260,12 @@ def driver_route_detail(route_id):
         meta_bits.append(e(s["notes"]))
     meta_line = " &middot; ".join(meta_bits) if meta_bits else ""
     ticket_line = f'<div class="cab-meta-line"><strong>Ticket:</strong> {e(s["ticket_number"])}</div>' if s["ticket_number"] else ""
+
+    # Action badge — vendor visits get a distinct wrench badge.
+    if is_vendor:
+        cab_action_badge = '<div class="cab-action-badge vendor">&#128295; VENDOR</div>'
+    else:
+        cab_action_badge = f'<div class="cab-action-badge {badge_group}">{e(s["action"] or "STOP")}</div>'
     phone_line = f'<div class="cab-meta-line"><strong>Phone:</strong> <a href="tel:{e(_s["phone"])}" style="color:#3DDC84;">{e(_s["phone"])}</a></div>' if _s.get("phone") else ""
 
     body = f"""
@@ -10131,6 +10279,7 @@ def driver_route_detail(route_id):
         </div>
     </div>
     {nav_pref_modal_html}
+    {urgent_banner_html}
 
     <div id="route-updated-banner" class="route-updated-banner" hidden>
         <span id="route-updated-text"></span>
@@ -10150,7 +10299,7 @@ def driver_route_detail(route_id):
 
     <div class="cab-card">
         <div class="cab-action-row">
-            <div class="cab-action-badge {badge_group}">{e(s['action'] or 'STOP')}</div>
+            {cab_action_badge}
             <div class="cab-action-name">{e(s['customer_name'] or ('Stop ' + str(current_stop_num)))}</div>
         </div>
 
@@ -10255,6 +10404,12 @@ def driver_route_detail(route_id):
                             text.textContent = 'Route updated — ' + delta + ' stop' + (delta === 1 ? '' : 's') + ' added.';
                             banner.hidden = false;
                         }}
+                    }}
+
+                    // Urgent vendor-dispatch message arriving between loads →
+                    // raise the pinned banner (idempotent; ignored once acked).
+                    if (data.urgent && typeof window.showUrgentBanner === 'function') {{
+                        window.showUrgentBanner(data.urgent.id, data.urgent.body);
                     }}
 
                     if (typeof data.unread_messages === 'number') {{
@@ -10512,6 +10667,8 @@ def driver_route_detail(route_id):
 }})();
 {_message_thread_js()}
 </script>
+{_URGENT_BANNER_JS}
+{_VENDOR_STOP_JS}
 {cab_map_script}
 """
     return render_template_string(shell_page("Cab View", body, extra_head=cab_map_head))
@@ -11259,6 +11416,14 @@ def driver_route_status(route_id):
         (route_id, session["user_id"])
     ).fetchone()["n"]
 
+    urgent_row = conn.execute(
+        """SELECT id, body FROM messages
+            WHERE route_id=? AND priority='urgent' AND acknowledged_at IS NULL
+              AND sender_user_id != ?
+            ORDER BY id DESC LIMIT 1""",
+        (route_id, session["user_id"])
+    ).fetchone()
+
     conn.close()
 
     total = len(stops)
@@ -11272,7 +11437,98 @@ def driver_route_status(route_id):
     return jsonify({
         "total": total, "completed": completed, "current_stop_num": current_stop_num,
         "unread_messages": unread_messages,
+        "urgent": ({"id": urgent_row["id"], "body": urgent_row["body"]} if urgent_row else None),
     })
+
+
+@app.route("/api/messages/<int:msg_id>/ack", methods=["POST"])
+@login_required
+def ack_message(msg_id):
+    """Driver acknowledges an urgent message ("Got it"). Stamps acknowledged_at
+    (and read_at) so the boss's defect card shows the receipt. Scoped to a
+    message on a route the caller is assigned to (or a boss in the company)."""
+    conn = get_db()
+    m = conn.execute(
+        """SELECT m.id, m.acknowledged_at, r.assigned_to
+             FROM messages m JOIN routes r ON m.route_id = r.id
+            WHERE m.id=? AND r.company_id=?""",
+        (msg_id, cid())
+    ).fetchone()
+    if not m:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if session.get("role") != "boss" and m["assigned_to"] != session["user_id"]:
+        conn.close()
+        return jsonify({"error": "forbidden"}), 403
+    if not m["acknowledged_at"]:
+        ts = now_ts()
+        conn.execute(
+            "UPDATE messages SET acknowledged_at=?, read_at=COALESCE(read_at, ?) WHERE id=?",
+            (ts, ts, msg_id)
+        )
+        conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/stops/<int:stop_id>/vendor-complete", methods=["POST"])
+@login_required
+def vendor_complete(stop_id):
+    """Complete a vendor-visit stop. If the driver confirms the truck was
+    repaired, close the linked defect; otherwise keep it open and message the
+    boss. Reuses the messaging system rather than a parallel notifier."""
+    data = request.get_json(silent=True) or {}
+    repaired = bool(data.get("repaired"))
+    note = str(data.get("note") or "").strip()[:500]
+    conn = get_db()
+    stop = conn.execute(
+        """SELECT s.id, s.route_id, s.defect_item_id, r.assigned_to
+             FROM stops s JOIN routes r ON s.route_id = r.id
+            WHERE s.id=? AND r.company_id=?""",
+        (stop_id, cid())
+    ).fetchone()
+    if not stop:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if session.get("role") != "boss" and stop["assigned_to"] != session["user_id"]:
+        conn.close()
+        return jsonify({"error": "forbidden"}), 403
+
+    ts = now_ts()
+    conn.execute(
+        "UPDATE stops SET status='completed', driver_status='completed', completed_at=? WHERE id=?",
+        (ts, stop_id)
+    )
+    did = stop["defect_item_id"]
+    if did:
+        if repaired:
+            res_note = "Repaired at vendor (driver-confirmed)"
+            if note:
+                res_note += " — " + note
+            conn.execute(
+                """UPDATE inspection_items SET defect_status='repaired', at_vendor=0,
+                          resolved_by=?, resolved_at=?, resolution_note=?
+                    WHERE id=? AND defect_status='open'""",
+                (session["user_id"], ts, res_note[:500], did)
+            )
+            trow = conn.execute(
+                """SELECT i.truck_id FROM inspection_items ii
+                     JOIN inspections i ON ii.inspection_id=i.id WHERE ii.id=?""",
+                (did,)
+            ).fetchone()
+            if trow:
+                _recompute_truck_at_vendor(conn, trow["truck_id"])
+        else:
+            # Not repaired — keep the defect open and tell the boss on the thread.
+            body = "\U0001F527 Vendor visit done — truck NOT repaired"
+            body += (": " + note) if note else "."
+            conn.execute(
+                "INSERT INTO messages (route_id, sender_user_id, body, created_at) VALUES (?,?,?,?)",
+                (stop["route_id"], session["user_id"], body[:500], ts)
+            )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
 
 
 @app.route("/route/<int:route_id>/messages", methods=["GET", "POST"])
@@ -20600,7 +20856,11 @@ def maintenance_page():
                   ii.at_vendor AS item_at_vendor, ii.sent_vendor_id,
                   i.id AS inspection_id, i.type, i.created_at, i.truck_id,
                   t.name AS truck_name, t.out_of_service, t.at_vendor,
-                  COALESCE(u.username,'—') AS reporter
+                  COALESCE(u.username,'—') AS reporter,
+                  (SELECT m.id FROM messages m WHERE m.defect_item_id=ii.id
+                     AND m.priority='urgent' ORDER BY m.id DESC LIMIT 1) AS dispatch_msg_id,
+                  (SELECT m.acknowledged_at FROM messages m WHERE m.defect_item_id=ii.id
+                     AND m.priority='urgent' ORDER BY m.id DESC LIMIT 1) AS dispatch_ack
              FROM inspection_items ii
              JOIN inspections i ON ii.inspection_id=i.id
              JOIN trucks t ON i.truck_id=t.id
@@ -20645,6 +20905,22 @@ def maintenance_page():
             sent_chip = (f'<div style="margin-top:6px;"><span style="display:inline-block;padding:2px 9px;'
                          f'border-radius:999px;font-size:11px;font-weight:800;background:rgba(245,180,60,0.16);'
                          f'color:#F5B43C;border:1px solid rgba(245,180,60,0.45);">🔧 Sent to {e(vn)}</span></div>')
+        # Dispatch acknowledgment — like a read receipt: shown once the driver was
+        # dispatched for this defect, green once they tap "Got it".
+        dispatch_chip = ""
+        if d["dispatch_msg_id"]:
+            if d["dispatch_ack"]:
+                dispatch_chip = (
+                    f'<div style="margin-top:6px;"><span style="display:inline-block;padding:2px 9px;'
+                    f'border-radius:999px;font-size:11px;font-weight:800;background:var(--green-dim);'
+                    f'color:var(--green);border:1px solid rgba(61,220,132,0.45);">'
+                    f'✓ Driver got it · {e((d["dispatch_ack"] or "")[11:16])}</span></div>')
+            else:
+                dispatch_chip = (
+                    f'<div style="margin-top:6px;"><span style="display:inline-block;padding:2px 9px;'
+                    f'border-radius:999px;font-size:11px;font-weight:800;background:rgba(255,82,82,0.14);'
+                    f'color:#FF7A7A;border:1px solid rgba(255,82,82,0.45);">'
+                    f'📟 Dispatched · awaiting “Got it”</span></div>')
         repair_form = ""
         actions = ""
         if can_action:
@@ -20660,10 +20936,26 @@ def maintenance_page():
             repair_form = f"""
             <div id="send-form-{d['item_id']}" hidden style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
                 <label class="uw-lbl">Vendor</label>
-                <select id="sd-vendor-{d['item_id']}" style="width:100%;margin-bottom:10px;">{vendor_opts}</select>
+                <select id="sd-vendor-{d['item_id']}" style="width:100%;margin-bottom:10px;min-height:48px;">{vendor_opts}</select>
+                <label class="uw-lbl">Dispatch driver?</label>
+                <select id="sd-dispatch-{d['item_id']}" style="width:100%;margin-bottom:10px;min-height:48px;"
+                        onchange="onDispatchChange({d['item_id']})">
+                    <option value="none">Just log it &mdash; no dispatch</option>
+                    <option value="now">Go NOW &mdash; skip remaining stops</option>
+                    <option value="after_current">After current stop</option>
+                    <option value="after_n">After N more stops&hellip;</option>
+                </select>
+                <div id="sd-n-wrap-{d['item_id']}" hidden style="margin-bottom:10px;">
+                    <label class="uw-lbl">How many stops first?</label>
+                    <input id="sd-n-{d['item_id']}" type="number" min="1" max="20" value="2"
+                           style="width:100%;min-height:48px;">
+                </div>
+                <label class="uw-lbl">Note to driver (optional)</label>
+                <input id="sd-note-{d['item_id']}" maxlength="300" placeholder="e.g. ask for Mike, sticker renewal"
+                       style="width:100%;margin-bottom:10px;min-height:48px;">
                 <div style="display:flex;gap:8px;">
-                    <button class="btn green" style="flex:1;" onclick="submitSend({d['item_id']})">Mark sent</button>
-                    <button class="btn secondary" onclick="hideSend({d['item_id']})">Cancel</button>
+                    <button class="btn green" style="flex:1;min-height:48px;" onclick="submitSend({d['item_id']})">Mark sent</button>
+                    <button class="btn secondary" style="min-height:48px;" onclick="hideSend({d['item_id']})">Cancel</button>
                 </div>
             </div>
             <div id="repair-form-{d['item_id']}" hidden style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
@@ -20692,7 +20984,7 @@ def maintenance_page():
                    style="font-size:12px;color:var(--cyan);white-space:nowrap;">View report →</a>
             </div>
             <div style="font-weight:700;font-size:14px;margin-top:8px;color:#FF7A7A;">⚠ {e(d["label"])}</div>
-            {note}{sent_chip}
+            {note}{sent_chip}{dispatch_chip}
             <div style="display:flex;gap:10px;align-items:center;margin-top:8px;">
                 {thumb}
                 <div style="color:var(--slate);font-size:12px;">
@@ -20815,12 +21107,29 @@ _MAINTENANCE_PAGE_JS = """
   window.hideRepair=function(id){ var f=document.getElementById('repair-form-'+id); if(f) f.hidden=true; };
   window.showSend=function(id){ var f=document.getElementById('send-form-'+id); if(f) f.hidden=false; };
   window.hideSend=function(id){ var f=document.getElementById('send-form-'+id); if(f) f.hidden=true; };
+  window.onDispatchChange=function(id){
+    var sel=document.getElementById('sd-dispatch-'+id);
+    var nw=document.getElementById('sd-n-wrap-'+id);
+    if(nw){ nw.hidden = !(sel && sel.value==='after_n'); }
+  };
   window.submitSend=function(id){
+    var dispatch=(document.getElementById('sd-dispatch-'+id)||{}).value||'none';
+    var body={action:'sent',
+              vendor_id:(document.getElementById('sd-vendor-'+id)||{}).value||'',
+              dispatch:dispatch,
+              dispatch_n:(document.getElementById('sd-n-'+id)||{}).value||'',
+              dispatch_note:(document.getElementById('sd-note-'+id)||{}).value||''};
     fetch('/api/defects/'+id+'/resolve',{method:'POST',
         headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
-        body:JSON.stringify({action:'sent', vendor_id:(document.getElementById('sd-vendor-'+id)||{}).value||''})})
+        body:JSON.stringify(body)})
       .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
-      .then(function(res){ if(res.ok){ window.location.reload(); } else { err(id,(res.j&&res.j.error)||'Could not update.'); } })
+      .then(function(res){
+        if(res.ok){
+          var d=res.j&&res.j.dispatch;
+          if(d&&d.warning){ alert(d.warning); }
+          window.location.reload();
+        } else { err(id,(res.j&&res.j.error)||'Could not update.'); }
+      })
       .catch(function(){ err(id,'Network error — try again.'); });
   };
   window.submitRepair=function(id){
@@ -20875,6 +21184,100 @@ _MAINTENANCE_PAGE_JS = """
 """
 
 
+def _insert_vendor_stop(conn, route_id, after_working_index, vendor_name, address,
+                        defect_item_id, vendor_id, note):
+    """Insert a read-only 'Vendor' visit stop into an active route and renumber.
+
+    Mirrors api_insert_stops' locked-prefix rule: completed stops and the
+    driver's single current in-progress stop stay locked at the front; the new
+    stop lands in the unlocked 'working' list at `after_working_index`
+    (0 = the next stop after the current one), then every stop is renumbered
+    1..N. Returns the new stop id.
+    """
+    rows = conn.execute(
+        "SELECT id, status FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
+        (route_id,)
+    ).fetchall()
+    current_id = next((r["id"] for r in rows if r["status"] != "completed"), None)
+    locked, working = [], []
+    for r in rows:
+        if r["status"] == "completed" or r["id"] == current_id:
+            locked.append(r["id"])
+        else:
+            working.append(r["id"])
+    cur = conn.execute(
+        """INSERT INTO stops (route_id, stop_order, customer_name, address, action,
+                              notes, status, driver_status, defect_item_id, vendor_id, created_at)
+           VALUES (?, 0, ?, ?, 'Vendor', ?, 'open', 'pending', ?, ?, ?)""",
+        (route_id, vendor_name, address, note, defect_item_id, vendor_id, now_ts())
+    )
+    new_id = cur.lastrowid
+    idx = max(0, min(after_working_index, len(working)))
+    working.insert(idx, new_id)
+    for pos, sid in enumerate(locked + working, start=1):
+        conn.execute("UPDATE stops SET stop_order=? WHERE id=?", (pos, sid))
+    return new_id
+
+
+def _dispatch_driver_to_vendor(conn, defect_row, vendor_id, dispatch, dispatch_n, dispatch_note):
+    """Build on the messaging + mid-route insertion systems to alert the driver
+    that a defect went to a vendor. Returns a dict describing what happened
+    (for the boss UI). No route change / no message when dispatch is 'none'.
+
+    dispatch: 'now' | 'after_current' | 'after_n' | 'none'
+    """
+    if dispatch not in ("now", "after_current", "after_n"):
+        return {"dispatched": False}
+
+    driver_id = defect_row["driver_id"]
+    if not driver_id:
+        return {"dispatched": False, "warning": "No driver is linked to this defect."}
+
+    route_id = driver_active_route_id(conn, driver_id)
+    if not route_id:
+        return {"dispatched": False,
+                "warning": "Driver has no active route right now — vendor marked sent, "
+                           "but no dispatch was sent. Assign a route, then re-send."}
+
+    vname = _vendor_map(conn).get(vendor_id, "the vendor")
+    truck = defect_row["truck_name"] or "the truck"
+    label = defect_row["label"] or "defect"
+
+    if dispatch == "now":
+        timing, after_idx = "Go NOW — skip remaining stops", 0
+    elif dispatch == "after_current":
+        timing, after_idx = "After your current stop", 0
+    else:  # after_n
+        n = max(1, min(int(dispatch_n or 1), 20))
+        timing, after_idx = ("After %d more stop%s" % (n, "" if n == 1 else "s")), n
+
+    # Mid-route vendor stop (Go NOW / After N both insert into the route; the
+    # boss can reorder with the existing tools).
+    stop_id = _insert_vendor_stop(
+        conn, route_id, after_idx, vname, vname,
+        defect_row["id"], vendor_id, dispatch_note or None)
+    try:
+        compute_can_flow(conn, route_id)
+    except Exception:
+        pass
+
+    # Urgent message on that route's thread — priority + defect link power the
+    # driver's pinned banner and the boss card's acknowledgment state.
+    note_part = (" · Note: " + dispatch_note) if dispatch_note else ""
+    body = ("\U0001F527 VENDOR — %s · %s · Truck %s: %s%s"
+            % (vname, timing, truck, label, note_part))
+    conn.execute(
+        """INSERT INTO messages (route_id, sender_user_id, body, created_at, priority, defect_item_id)
+           VALUES (?, ?, ?, ?, 'urgent', ?)""",
+        (route_id, session["user_id"], body[:500], now_ts(), defect_row["id"])
+    )
+    # NOTE: background FCM push would fire here, but this app has no server-side
+    # FCM sender wired (the service worker onBackgroundMessage handler exists,
+    # but there is no token registration or admin-send path). The urgent message
+    # is delivered in-app via the existing Cab View poll (≤30s) + pinned banner.
+    return {"dispatched": True, "route_id": route_id, "stop_id": stop_id, "timing": timing}
+
+
 @app.route("/api/defects/<int:item_id>/resolve", methods=["POST"])
 @login_required
 def resolve_defect(item_id):
@@ -20905,9 +21308,11 @@ def resolve_defect(item_id):
             conn.close()
             return jsonify({"error": cost_err}), 400
     row = conn.execute(
-        """SELECT ii.id, ii.defect_status, i.truck_id
+        """SELECT ii.id, ii.label, ii.defect_status, i.truck_id, i.driver_id,
+                  t.name AS truck_name
              FROM inspection_items ii
              JOIN inspections i ON ii.inspection_id=i.id
+             JOIN trucks t ON i.truck_id=t.id
             WHERE ii.id=? AND i.company_id=? AND ii.result='defect'""",
         (item_id, cid()),
     ).fetchone()
@@ -20918,6 +21323,7 @@ def resolve_defect(item_id):
         conn.close()
         return jsonify({"error": "defect is not open"}), 409
 
+    dispatch_result = None
     if action == "sent":
         # Out to a shop — still an open defect, but flag the truck "at vendor".
         conn.execute(
@@ -20925,6 +21331,16 @@ def resolve_defect(item_id):
                        vendor_id=COALESCE(?, vendor_id) WHERE id=?""",
             (vendor_id, now_ts(), vendor_id, item_id),
         )
+        # Optional "Dispatch driver?" step — insert a vendor stop + urgent message.
+        dispatch = str(src.get("dispatch") or "none").strip().lower()
+        dispatch_note = str(src.get("dispatch_note") or "").strip()[:300]
+        try:
+            dispatch_n = int(src.get("dispatch_n") or 0)
+        except (ValueError, TypeError):
+            dispatch_n = 0
+        if dispatch in ("now", "after_current", "after_n"):
+            dispatch_result = _dispatch_driver_to_vendor(
+                conn, row, vendor_id, dispatch, dispatch_n, dispatch_note)
     else:
         conn.execute(
             """UPDATE inspection_items SET defect_status=?, resolution_note=?,
@@ -20938,7 +21354,10 @@ def resolve_defect(item_id):
     _recompute_truck_at_vendor(conn, row["truck_id"])
     conn.commit()
     conn.close()
-    return jsonify({"success": True, "status": action})
+    resp = {"success": True, "status": action}
+    if dispatch_result is not None:
+        resp["dispatch"] = dispatch_result
+    return jsonify(resp)
 
 
 @app.route("/maintenance-photo/<int:photo_id>")
