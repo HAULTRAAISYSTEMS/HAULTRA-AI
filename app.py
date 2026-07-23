@@ -1,6 +1,7 @@
 from flask import (
     Flask, request, redirect, url_for, session, flash,
-    render_template, render_template_string, send_file, send_from_directory, abort, jsonify
+    render_template, render_template_string, send_file, send_from_directory, abort, jsonify,
+    Response, stream_with_context
 )
 import sqlite3
 import os
@@ -2714,6 +2715,9 @@ def init_db():
     safe_add_column(conn, "messages", "priority TEXT")
     safe_add_column(conn, "messages", "acknowledged_at TEXT")
     safe_add_column(conn, "messages", "defect_item_id INTEGER")
+    # Client-generated id for optimistic/offline sends — makes POST idempotent
+    # so a retried or reconnect-flushed message never double-inserts.
+    safe_add_column(conn, "messages", "client_id TEXT")
     safe_add_column(conn, "maintenance_entries", "vendor_id INTEGER")
     safe_add_column(conn, "maintenance_entries", "at_vendor INTEGER NOT NULL DEFAULT 0")
     safe_add_column(conn, "maintenance_entries", "sent_vendor_id INTEGER")
@@ -5732,6 +5736,15 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     font-size: 13px; font-weight: 600; color: #FF9D5C;
 }}
 .route-updated-banner[hidden] {{ display: none; }}
+/* Realtime change highlight — a brief flash so a live update is noticeable. */
+@keyframes rtFlash {{
+    0%   {{ box-shadow: 0 0 0 0 rgba(255,107,26,0.55); }}
+    30%  {{ box-shadow: 0 0 0 4px rgba(255,107,26,0.35); background-color: rgba(255,107,26,0.16); }}
+    100% {{ box-shadow: 0 0 0 0 rgba(255,107,26,0); }}
+}}
+.rt-flash {{ animation: rtFlash 1.1s ease-out; }}
+@keyframes rtBubbleIn {{ from {{ opacity: 0; transform: translateY(6px); }} to {{ opacity: 1; transform: none; }} }}
+.msg-bubble.rt-new {{ animation: rtBubbleIn .35s ease-out; }}
 .route-updated-banner button {{
     background: none; border: none; color: #FF9D5C; cursor: pointer;
     font-size: 18px; line-height: 1; padding: 4px 6px; min-width: 32px; min-height: 32px;
@@ -5870,6 +5883,13 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     align-self: flex-end; background: linear-gradient(135deg, #FF8A42 0%, #FF6B1A 100%);
     color: #1A1000; border-bottom-right-radius: 3px;
 }}
+/* Optimistic / offline outbox bubbles: sending (dim), queued (dim), failed (red). */
+.msg-pending {{ opacity: .62; }}
+.msg-pending.msg-failed {{ opacity: 1; background: rgba(255,82,82,0.18); color: #FFC9C9;
+    border: 1px solid rgba(255,82,82,0.5); }}
+.msg-retry-btn {{ margin-top: 6px; min-height: 32px; padding: 4px 12px; border-radius: 8px;
+    border: 1px solid rgba(255,82,82,0.6); background: rgba(255,82,82,0.15); color: #FF7A7A;
+    font-weight: 700; font-size: 12px; cursor: pointer; }}
 .msg-compose {{ display: flex; gap: 8px; flex-shrink: 0; }}
 .msg-compose textarea {{
     flex: 1; resize: none; min-height: 48px; max-height: 100px;
@@ -9164,35 +9184,85 @@ def _message_thread_js():
         return d.innerHTML;
     }
 
-    function renderThread(messages) {
+    var serverMessages = [];        // last-known server thread
+    var lastRenderedMax = 0;        // for new-bubble highlight
+    var QKEY = 'haultra_msg_queue'; // offline/optimistic outbox (localStorage)
+
+    function loadQueue() {
+        try { return JSON.parse(localStorage.getItem(QKEY) || '[]'); } catch (e) { return []; }
+    }
+    function saveQueue(q) { try { localStorage.setItem(QKEY, JSON.stringify(q)); } catch (e) {} }
+    function queueFor(routeId) { return loadQueue().filter(function(i) { return i.routeId === routeId; }); }
+    function genId() { return 'c' + Date.now() + '-' + Math.random().toString(36).slice(2, 8); }
+
+    function bubbleHtml(sender, body, cls, extra) {
+        return '<div class="msg-bubble ' + cls + '">' +
+            '<div class="msg-bubble-meta">' + escapeHtml(sender) + '</div>' +
+            '<div class="msg-bubble-body">' + escapeHtml(body) + '</div>' +
+            (extra || '') + '</div>';
+    }
+
+    function renderThread() {
         var list = el('msg-list');
         if (!list) return;
-        if (!messages.length) {
-            list.innerHTML = '<div class="msg-empty">No messages yet.</div>';
-            return;
-        }
-        list.innerHTML = messages.map(function(m) {
-            var cls = 'msg-bubble ' + (m.is_me ? 'msg-me' : 'msg-them');
-            return '<div class="' + cls + '">' +
-                '<div class="msg-bubble-meta">' + escapeHtml(m.sender_username) + '</div>' +
-                '<div class="msg-bubble-body">' + escapeHtml(m.body) + '</div>' +
-                '</div>';
+        var html = serverMessages.map(function(m) {
+            var isNew = m.id > lastRenderedMax;
+            var cls = (m.is_me ? 'msg-me' : 'msg-them') + (isNew && lastRenderedMax ? ' rt-new' : '');
+            return bubbleHtml(m.sender_username, m.body, cls);
         }).join('');
+        // Optimistic / queued / failed bubbles for THIS thread, always mine.
+        queueFor(currentThreadRouteId).forEach(function(it) {
+            var meta, extra = '';
+            if (it.state === 'failed') {
+                meta = 'Failed';
+                extra = '<button type="button" class="msg-retry-btn" data-cid="' + it.cid + '">Retry</button>';
+            } else { meta = (it.state === 'queued') ? 'Queued — will send' : 'Sending…'; }
+            html += bubbleHtml(meta, it.body, 'msg-me msg-pending msg-' + it.state);
+        });
+        if (!html) { html = '<div class="msg-empty">No messages yet.</div>'; }
+        list.innerHTML = html;
+        list.querySelectorAll('.msg-retry-btn').forEach(function(b) {
+            b.addEventListener('click', function() { retrySend(b.dataset.cid); });
+        });
+        if (serverMessages.length) {
+            lastRenderedMax = Math.max(lastRenderedMax,
+                serverMessages[serverMessages.length - 1].id);
+        }
         list.scrollTop = list.scrollHeight;
+    }
+
+    function fetchThread(routeId, cb) {
+        fetch('/route/' + routeId + '/messages', { credentials: 'same-origin' })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                serverMessages = data.messages || [];
+                renderThread();
+                if (cb) cb();
+            })
+            .catch(function() {
+                if (el('msg-list') && !serverMessages.length) {
+                    el('msg-list').innerHTML = '<div class="msg-empty">Offline — messages will load when you reconnect.</div>';
+                }
+                renderThread();
+            });
     }
 
     window.openMessageThread = function(routeId, title) {
         currentThreadRouteId = routeId;
         currentThreadTitle = title || 'Messages';
+        lastRenderedMax = 0;
+        serverMessages = [];
         if (el('msg-modal-title')) el('msg-modal-title').textContent = 'Messages \\u2014 ' + currentThreadTitle;
         if (el('msg-overlay')) el('msg-overlay').hidden = false;
         if (el('msg-modal')) el('msg-modal').hidden = false;
-        fetch('/route/' + routeId + '/messages', { credentials: 'same-origin' })
-            .then(function(r) { return r.json(); })
-            .then(function(data) { renderThread(data.messages || []); })
-            .catch(function() {
-                if (el('msg-list')) el('msg-list').innerHTML = '<div class="msg-empty">Could not load messages.</div>';
-            });
+        renderThread();
+        fetchThread(routeId);
+    };
+
+    // Called by the Cab View SSE stream when a new message lands while the
+    // thread is open, so it updates live without a manual re-open.
+    window.refreshOpenThread = function() {
+        if (currentThreadRouteId != null) fetchThread(currentThreadRouteId);
     };
 
     window.closeMessageThread = function() {
@@ -9200,20 +9270,76 @@ def _message_thread_js():
         if (el('msg-modal')) el('msg-modal').hidden = true;
     };
 
-    function postMessage(body) {
-        if (!currentThreadRouteId || !body) return;
-        fetch('/route/' + currentThreadRouteId + '/messages', {
+    // Send with an idempotent client_id: the row is inserted once no matter how
+    // many times it's retried or flushed, so nothing double-sends.
+    function attemptSend(item) {
+        return fetch('/route/' + item.routeId + '/messages', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF },
             credentials: 'same-origin',
-            body: JSON.stringify({ body: body }),
-        })
-            .then(function(r) { return r.json(); })
-            .then(function(data) {
-                if (data && data.success) {
-                    window.openMessageThread(currentThreadRouteId, currentThreadTitle);
-                }
-            });
+            body: JSON.stringify({ body: item.body, client_id: item.cid }),
+        }).then(function(r) { return r.json().then(function(j) { return { ok: r.ok, j: j }; }); });
+    }
+
+    function setState(cid, state) {
+        var q = loadQueue();
+        for (var i = 0; i < q.length; i++) { if (q[i].cid === cid) { q[i].state = state; } }
+        saveQueue(q); renderThread();
+    }
+    function removeItem(cid) { saveQueue(loadQueue().filter(function(i) { return i.cid !== cid; })); }
+
+    var flushing = false;
+    function flushQueue() {
+        if (flushing || !navigator.onLine) return;
+        var pending = loadQueue().filter(function(i) { return i.state !== 'sending'; });
+        if (!pending.length) return;
+        flushing = true;
+        // Send strictly in order (oldest first) so messages arrive in sequence.
+        pending.sort(function(a, b) { return a.ts - b.ts; });
+        var i = 0;
+        function next() {
+            if (i >= pending.length) { flushing = false; return; }
+            var item = pending[i++];
+            setState(item.cid, 'sending');
+            attemptSend(item).then(function(res) {
+                if (res.ok && res.j && res.j.success) {
+                    removeItem(item.cid);
+                    if (item.routeId === currentThreadRouteId) fetchThread(item.routeId);
+                    else renderThread();
+                } else { setState(item.cid, 'failed'); }
+                next();
+            }).catch(function() { setState(item.cid, navigator.onLine ? 'failed' : 'queued'); flushing = false; });
+        }
+        next();
+    }
+
+    function enqueueAndSend(routeId, body) {
+        var item = { cid: genId(), routeId: routeId, body: body,
+                     ts: Date.now(), state: navigator.onLine ? 'sending' : 'queued' };
+        var q = loadQueue(); q.push(item); saveQueue(q);
+        renderThread();
+        if (navigator.onLine) {
+            attemptSend(item).then(function(res) {
+                if (res.ok && res.j && res.j.success) {
+                    removeItem(item.cid);
+                    fetchThread(routeId);
+                } else { setState(item.cid, 'failed'); }
+            }).catch(function() { setState(item.cid, navigator.onLine ? 'failed' : 'queued'); });
+        }
+    }
+
+    function retrySend(cid) {
+        var q = loadQueue();
+        for (var i = 0; i < q.length; i++) {
+            if (q[i].cid === cid) { q[i].state = navigator.onLine ? 'sending' : 'queued'; }
+        }
+        saveQueue(q); renderThread();
+        flushQueue();
+    }
+
+    function postMessage(body) {
+        if (!currentThreadRouteId || !body) return;
+        enqueueAndSend(currentThreadRouteId, body);
     }
 
     window.sendQuickMessage = function(text) { postMessage(text); };
@@ -9230,6 +9356,10 @@ def _message_thread_js():
     document.querySelectorAll('.msg-quick-btn').forEach(function(b) {
         b.addEventListener('click', function() { sendQuickMessage(b.dataset.msg); });
     });
+
+    // Flush the outbox when connectivity returns (landfill dead zones) or on load.
+    window.addEventListener('online', flushQueue);
+    flushQueue();
 })();
 """
 
@@ -10437,65 +10567,130 @@ def driver_route_detail(route_id):
         }}
     }} catch (e) {{ /* localStorage unavailable (e.g. private browsing) — skip the hint */ }}
 
-    // Poll for mid-route changes (a boss adding stops via Route Board) every
-    // ~30s. Never swaps the currently-displayed stop out from under the driver
-    // — only the progress counter/bar and a dismissible banner update live.
+    // Realtime Cab View: a Server-Sent Events stream pushes boss→driver changes
+    // (new messages, inserted/rerouted stops, urgent dispatch) within ~1.5s, so
+    // the driver never has to refresh. A slow poll stays as a fallback for when
+    // EventSource can't connect (old proxy, etc.). The displayed stop is never
+    // swapped out mid-action — only counters/banners update live, except a
+    // Go-NOW insert that changes the *current* stop triggers a soft reload.
     (function() {{
-        var baselineTotal = {total_count};
-        var lastKnownTotal = baselineTotal;
+        var lastKnownTotal  = {total_count};
         var lastKnownUnread = {unread_messages};
-        function poll() {{
+        var lastCurrentId   = null;
+        var lastMsgMax      = null;
+        var inited          = false;
+        var reloading       = false;
+
+        function pulse(el) {{
+            if (!el) return;
+            el.classList.remove('rt-flash');
+            void el.offsetWidth;           // restart the animation
+            el.classList.add('rt-flash');
+        }}
+
+        function applyStatus(data) {{
+            if (!data || typeof data.total !== 'number') return;
+            var banner = document.getElementById('route-updated-banner');
+            var text   = document.getElementById('route-updated-text');
+
+            // Progress counter/bar always reflect the latest truth.
+            var label = document.getElementById('cab-progress-label');
+            if (label && data.current_stop_num) {{
+                label.textContent = 'STOP ' + data.current_stop_num + ' OF ' + data.total;
+            }}
+            var fill = document.getElementById('cab-progress-fill');
+            if (fill && data.total > 0) {{
+                fill.style.width = Math.round((data.completed / data.total) * 100) + '%';
+            }}
+
+            // Stops added mid-route → banner + highlight. If the *current* stop
+            // itself changed (e.g. a "Go NOW" vendor stop jumped the queue),
+            // soft-reload so the driver actually sees the new current stop.
+            if (data.total > lastKnownTotal && inited) {{
+                var delta = data.total - lastKnownTotal;
+                if (banner && text) {{
+                    text.textContent = 'Route updated — ' + delta + ' stop' + (delta === 1 ? '' : 's') + ' added.';
+                    banner.hidden = false;
+                    pulse(banner);
+                }}
+                if (data.current_stop_id !== lastCurrentId && !reloading) {{
+                    reloading = true;
+                    setTimeout(function() {{ window.location.reload(); }}, 900);
+                }}
+            }}
+            lastKnownTotal = data.total;
+            lastCurrentId  = data.current_stop_id;
+
+            if (data.urgent && typeof window.showUrgentBanner === 'function') {{
+                window.showUrgentBanner(data.urgent.id, data.urgent.body);
+            }}
+
+            if (typeof data.unread_messages === 'number') {{
+                var msgBadge = document.getElementById('msg-boss-badge');
+                if (msgBadge) {{
+                    if (data.unread_messages > 0) {{
+                        msgBadge.textContent = data.unread_messages;
+                        msgBadge.hidden = false;
+                    }} else {{
+                        msgBadge.hidden = true;
+                    }}
+                }}
+                var threadOpen = document.getElementById('msg-modal') && !document.getElementById('msg-modal').hidden;
+                // New message arrived: if the thread is open, refresh it live;
+                // otherwise flag it with a highlighted banner + badge pulse.
+                if (data.msg_max_id != null && lastMsgMax != null && data.msg_max_id > lastMsgMax) {{
+                    if (data._ts) {{
+                        try {{ console.log('[HAULTRA rt] message received; emit→recv',
+                            (Date.now() - Date.parse(data._ts.replace(' ', 'T'))) + 'ms'); }} catch (e) {{}}
+                    }}
+                    if (threadOpen && typeof window.refreshOpenThread === 'function') {{
+                        window.refreshOpenThread();
+                    }} else if (banner && text) {{
+                        text.textContent = 'New message from boss';
+                        banner.hidden = false;
+                        pulse(banner);
+                        pulse(msgBadge);
+                    }}
+                }}
+                lastKnownUnread = data.unread_messages;
+                lastMsgMax = data.msg_max_id;
+            }}
+            inited = true;
+        }}
+
+        // ── SSE primary channel ──────────────────────────────────────────────
+        var es = null, fallbackTimer = null;
+        function startFallback() {{
+            if (fallbackTimer) return;
+            fallbackTimer = setInterval(function() {{
+                fetch('{url_for("driver_route_status", route_id=route_id)}', {{credentials: 'same-origin'}})
+                    .then(function(r) {{ return r.ok ? r.json() : null; }})
+                    .then(applyStatus).catch(function() {{}});
+            }}, 20000);
+        }}
+        function stopFallback() {{ if (fallbackTimer) {{ clearInterval(fallbackTimer); fallbackTimer = null; }} }}
+
+        function connectSSE() {{
+            if (typeof EventSource === 'undefined') {{ startFallback(); return; }}
+            try {{ es = new EventSource('{url_for("driver_route_stream", route_id=route_id)}'); }}
+            catch (e) {{ startFallback(); return; }}
+            es.onmessage = function(ev) {{
+                stopFallback();
+                try {{ applyStatus(JSON.parse(ev.data)); }} catch (e) {{}}
+            }};
+            es.onerror = function() {{
+                // Browser auto-reconnects EventSource; run the poll fallback
+                // meanwhile so the driver is never left stale.
+                startFallback();
+            }};
+        }}
+        connectSSE();
+        // On regaining connectivity, kick an immediate status fetch so nothing lags.
+        window.addEventListener('online', function() {{
             fetch('{url_for("driver_route_status", route_id=route_id)}', {{credentials: 'same-origin'}})
                 .then(function(r) {{ return r.ok ? r.json() : null; }})
-                .then(function(data) {{
-                    if (!data) return;
-                    var banner = document.getElementById('route-updated-banner');
-                    var text = document.getElementById('route-updated-text');
-
-                    if (typeof data.total === 'number' && data.total > lastKnownTotal) {{
-                        var delta = data.total - lastKnownTotal;
-                        lastKnownTotal = data.total;
-                        var label = document.getElementById('cab-progress-label');
-                        if (label && data.current_stop_num) {{
-                            label.textContent = 'STOP ' + data.current_stop_num + ' OF ' + data.total;
-                        }}
-                        var fill = document.getElementById('cab-progress-fill');
-                        if (fill && data.total > 0) {{
-                            fill.style.width = Math.round((data.completed / data.total) * 100) + '%';
-                        }}
-                        if (banner && text) {{
-                            text.textContent = 'Route updated — ' + delta + ' stop' + (delta === 1 ? '' : 's') + ' added.';
-                            banner.hidden = false;
-                        }}
-                    }}
-
-                    // Urgent vendor-dispatch message arriving between loads →
-                    // raise the pinned banner (idempotent; ignored once acked).
-                    if (data.urgent && typeof window.showUrgentBanner === 'function') {{
-                        window.showUrgentBanner(data.urgent.id, data.urgent.body);
-                    }}
-
-                    if (typeof data.unread_messages === 'number') {{
-                        var msgBadge = document.getElementById('msg-boss-badge');
-                        if (msgBadge) {{
-                            if (data.unread_messages > 0) {{
-                                msgBadge.textContent = data.unread_messages;
-                                msgBadge.hidden = false;
-                            }} else {{
-                                msgBadge.hidden = true;
-                            }}
-                        }}
-                        var threadOpen = document.getElementById('msg-modal') && !document.getElementById('msg-modal').hidden;
-                        if (data.unread_messages > lastKnownUnread && !threadOpen && banner && text) {{
-                            text.textContent = 'New message from boss';
-                            banner.hidden = false;
-                        }}
-                        lastKnownUnread = data.unread_messages;
-                    }}
-                }})
-                .catch(function() {{ /* offline or transient — try again next cycle */ }});
-        }}
-        setInterval(poll, 30000);
+                .then(applyStatus).catch(function() {{}});
+        }});
     }})();
 
     // Photo input opens the camera/file picker directly and uploads on
@@ -11504,6 +11699,100 @@ def driver_route_status(route_id):
     })
 
 
+def _route_realtime_snapshot(conn, route_id, uid):
+    """The realtime state a driver's Cab View reacts to: stop counts, current
+    stop identity, unread + newest message id, and any unacked urgent message.
+    Small and cheap so it can be polled every ~1.5s inside the SSE stream."""
+    stops = conn.execute(
+        "SELECT id, status FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
+        (route_id,)
+    ).fetchall()
+    total = len(stops)
+    completed = sum(1 for s in stops if s["status"] == "completed")
+    cur_id = cur_num = None
+    for i, s in enumerate(stops, start=1):
+        if s["status"] != "completed":
+            cur_id, cur_num = s["id"], i
+            break
+    msg_max = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) mx FROM messages WHERE route_id=?", (route_id,)
+    ).fetchone()["mx"]
+    unread = conn.execute(
+        "SELECT COUNT(*) n FROM messages WHERE route_id=? AND sender_user_id != ? AND read_at IS NULL",
+        (route_id, uid)
+    ).fetchone()["n"]
+    urow = conn.execute(
+        """SELECT id, body FROM messages
+            WHERE route_id=? AND priority='urgent' AND acknowledged_at IS NULL
+              AND sender_user_id != ? ORDER BY id DESC LIMIT 1""",
+        (route_id, uid)
+    ).fetchone()
+    return {
+        "total": total, "completed": completed,
+        "current_stop_num": cur_num, "current_stop_id": cur_id,
+        "msg_max_id": msg_max, "unread_messages": unread,
+        "urgent": ({"id": urow["id"], "body": urow["body"]} if urow else None),
+    }
+
+
+# How long a single SSE connection streams before it closes and the browser's
+# EventSource reconnects. Bounded so it never pins a worker thread indefinitely
+# on the small (2 worker × N thread) gunicorn pool; the client sees continuous
+# realtime because reconnects are seamless.
+_SSE_LIFETIME_SEC = 28
+_SSE_TICK_SEC = 1.0
+
+
+@app.route("/driver/route/<int:route_id>/stream")
+@login_required
+def driver_route_stream(route_id):
+    """Server-Sent Events stream for a driver's Cab View — pushes state changes
+    (new messages, inserted/rerouted stops, urgent dispatch) within ~1.5s so the
+    driver sees boss→driver events without polling/refresh. Replaces the 30s poll
+    as the primary channel; the poll stays as a low-frequency fallback."""
+    conn = get_db()
+    route = conn.execute(
+        "SELECT id, assigned_to FROM routes WHERE id=? AND company_id=?",
+        (route_id, cid())
+    ).fetchone()
+    conn.close()
+    if not route:
+        abort(404)
+    if session.get("role") != "boss" and route["assigned_to"] != session["user_id"]:
+        abort(403)
+    uid = session["user_id"]
+
+    @stream_with_context
+    def gen():
+        import time as _time
+        # Faster reconnect than the 3s EventSource default so a recycled stream
+        # resumes near-instantly.
+        yield "retry: 1200\n\n"
+        last = None
+        deadline = _time.time() + _SSE_LIFETIME_SEC
+        while _time.time() < deadline:
+            try:
+                c = get_db()
+                snap = _route_realtime_snapshot(c, route_id, uid)
+                c.close()
+            except Exception:
+                snap = None
+            if snap is not None and snap != last:
+                payload = dict(snap)
+                payload["_ts"] = now_ts()
+                yield "data: " + json.dumps(payload) + "\n\n"
+                last = snap
+            _time.sleep(_SSE_TICK_SEC)
+        # Clean end → EventSource reconnects with a fresh window.
+        yield "event: cycle\ndata: {}\n\n"
+
+    return Response(gen(), mimetype="text/event-stream", headers={
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",   # disable proxy buffering so events flush live
+        "Connection": "keep-alive",
+    })
+
+
 @app.route("/api/messages/<int:msg_id>/ack", methods=["POST"])
 @login_required
 def ack_message(msg_id):
@@ -11662,11 +11951,23 @@ def route_messages(route_id):
         if not body:
             conn.close()
             return jsonify({"error": "Message can't be empty."}), 400
+        client_id = (str(data.get("client_id") or "").strip() or None)
+
+        # Idempotent send: a retried or reconnect-flushed message carrying the
+        # same client_id never inserts twice.
+        if client_id:
+            dup = conn.execute(
+                "SELECT id FROM messages WHERE route_id=? AND sender_user_id=? AND client_id=?",
+                (route_id, session["user_id"], client_id)
+            ).fetchone()
+            if dup:
+                conn.close()
+                return jsonify({"success": True, "id": dup["id"], "duplicate": True})
 
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO messages (route_id, sender_user_id, body, created_at) VALUES (?, ?, ?, ?)",
-            (route_id, session["user_id"], body, now_ts())
+            "INSERT INTO messages (route_id, sender_user_id, body, created_at, client_id) VALUES (?, ?, ?, ?, ?)",
+            (route_id, session["user_id"], body, now_ts(), client_id)
         )
         conn.commit()
         msg_id = cur.lastrowid
