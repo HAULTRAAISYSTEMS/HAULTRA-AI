@@ -2183,6 +2183,36 @@ def init_db():
                 (_n, _a, _c, _s, _z, _notes, _ts)
             )
 
+    # Parser vocabulary — shorthand the boss's dispatch text uses, injected into
+    # the AI parse prompt so it resolves "newpt"→Newport News, recognizes dump
+    # sites, etc. company_id NULL = global default (all companies); a company row
+    # overrides/extends. Boss-editable under Settings → Locations.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS parse_vocab (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id  INTEGER,
+        term        TEXT NOT NULL,
+        expansion   TEXT NOT NULL,
+        kind        TEXT NOT NULL DEFAULT 'shorthand',
+        created_at  TEXT NOT NULL
+    )
+    """)
+    # Seed the global shorthand defaults once (company_id NULL).
+    if cur.execute("SELECT COUNT(*) FROM parse_vocab WHERE company_id IS NULL").fetchone()[0] == 0:
+        _seed_vocab = [
+            ("newpt", "Newport News"), ("nn", "Newport News"),
+            ("vb", "Virginia Beach"), ("ches", "Chesapeake"), ("norf", "Norfolk"),
+            ("ptown", "Portsmouth"), ("hamp", "Hampton"), ("suff", "Suffolk"),
+            ("smith", "Smithfield"), ("york", "Yorktown"),
+            ("dom", "Dominion"), ("wat", "Waterway"),
+        ]
+        _vts = now_ts()
+        for _t, _x in _seed_vocab:
+            cur.execute(
+                "INSERT INTO parse_vocab (company_id, term, expansion, kind, created_at) VALUES (NULL,?,?,'shorthand',?)",
+                (_t, _x, _vts)
+            )
+
     # --- column migrations (safe, idempotent) ---
     safe_add_column(conn, "users", "full_name TEXT")
     safe_add_column(conn, "users", "phone TEXT")
@@ -5852,6 +5882,17 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     color: #F5F5F0; line-height: 1.3; word-break: break-word; margin-bottom: 10px;
 }}
 .cab-meta-line {{ font-size: 14px; color: var(--text-muted); margin-bottom: 4px; }}
+.cab-legs {{
+    display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px;
+    font-size: 14px; font-weight: 700; color: var(--orange); margin: 0 0 10px;
+    padding: 8px 12px; border-radius: 10px;
+    background: rgba(255,107,26,0.10); border: 1px solid rgba(255,107,26,0.28);
+}}
+.cab-leg {{ white-space: nowrap; }}
+.cab-leg-lbl {{
+    font-size: 10px; font-weight: 800; letter-spacing: .5px; text-transform: uppercase;
+    color: var(--text-muted); margin-right: 3px;
+}}
 .cab-meta-line strong {{ color: #D8D8D0; }}
 
 .cab-nav-btn {{
@@ -10516,6 +10557,19 @@ def driver_route_detail(route_id):
     meta_line = " &middot; ".join(meta_bits) if meta_bits else ""
     ticket_line = f'<div class="cab-meta-line"><strong>Ticket:</strong> {e(s["ticket_number"])}</div>' if s["ticket_number"] else ""
 
+    # Multi-leg trip: show the dump + return legs compactly on the one card so
+    # the driver sees the whole job (pull → dump → return) at a glance.
+    _dleg = (_s.get("dump_location") or "").strip()
+    _rleg = (_s.get("return_destination") or "").strip()
+    legs_html = ""
+    if _dleg or _rleg:
+        _parts = []
+        if _dleg:
+            _parts.append(f'<span class="cab-leg"><span class="cab-leg-lbl">Dump</span> {e(_dleg)}</span>')
+        if _rleg:
+            _parts.append(f'<span class="cab-leg"><span class="cab-leg-lbl">Return</span> {e(_rleg)}</span>')
+        legs_html = '<div class="cab-legs">&#8594; ' + ' &#8594; '.join(_parts) + '</div>'
+
     # Action badge — vendor visits get a distinct wrench badge.
     if is_vendor:
         cab_action_badge = '<div class="cab-action-badge vendor">&#128295; VENDOR</div>'
@@ -10559,6 +10613,7 @@ def driver_route_detail(route_id):
         </div>
 
         <div class="cab-address">{e(full_address or 'No address on file')}</div>
+        {legs_html}
         {f'<div class="cab-meta-line">{meta_line}</div>' if meta_line else ''}
         {ticket_line}
         {phone_line}
@@ -13337,9 +13392,17 @@ def dump_ticket(stop_id):
         "SELECT * FROM dump_locations WHERE active=1 ORDER BY name"
     ).fetchall()
 
-    # Pre-select route dump location name
+    # Pre-select the dump site: the stop's parsed dump-leg (multi-leg jobs) wins,
+    # else the route-level dump location. Match the parsed name to a known site
+    # (case-insensitive) so the <select> pre-selects it.
     default_site = ""
-    if stop["dump_location_id"]:
+    _leg = (dict(stop).get("dump_location") or "").strip()
+    if _leg:
+        _match = conn.execute(
+            "SELECT name FROM dump_locations WHERE LOWER(name)=LOWER(?) LIMIT 1", (_leg,)
+        ).fetchone()
+        default_site = _match["name"] if _match else _leg
+    if not default_site and stop["dump_location_id"]:
         _dl = conn.execute(
             "SELECT name FROM dump_locations WHERE id=?", (stop["dump_location_id"],)
         ).fetchone()
@@ -14361,27 +14424,112 @@ def ai_dispatch():
 # =========================================================
 # AI ROUTE PARSER — Anthropic-backed dispatch text → stops
 # =========================================================
-_PARSE_SYSTEM_PROMPT = """You parse raw roll-off dispatch text into structured stops for a trucking dispatch system.
+_PARSE_SYSTEM_PROMPT_BASE = """You parse raw roll-off dispatch text into structured stops for a trucking dispatch system.
 
 Action codes:
   PR = pull & return (pull a full container, return it empty)
-  P  = pickup
+  P  = pull / pickup (pull a full container)
   D  = drop (deliver an empty container)
   S  = swap (drop an empty, pull a full — one stop)
   R  = relocate (move a container on-site or between addresses)
 
+MULTI-LEG STOPS (important): a single job can have up to three legs but is still ONE stop:
+  1. the primary action + address (where the container is),
+  2. an optional DUMP leg — haul the pulled container to a dump/landfill site,
+  3. an optional RETURN leg — return the (now empty) container to a yard or another site.
+  Text like "pull the 30yd at <addr>, dump <site>, then return it to <yard>" is ONE stop:
+  action PR, address <addr>, dump_leg "<site>", return_leg "<yard>". Never split the dump
+  or return into their own stops.
+
+PREAMBLE: a leading fragment that sets up the next instruction (e.g. "Before you return
+paragon use it to ...") is CONTEXT for the stop that follows, not its own stop. Fold it
+into that stop (as a return_leg/note as appropriate). Do NOT emit a separate stop for it
+and do NOT lower confidence just because the text opens with a preamble.
+
+For every stop extract:
+  action          one of PR, P, D, S, R
+  address         the primary street address (expand shorthand using KNOWN LOCATIONS below)
+  customer        the business/customer name if stated, else ""
+  container_size  e.g. "30yd", or null if not stated
+  dump_leg        the dump/landfill SITE NAME to haul to, or null (match KNOWN DUMP SITES)
+  return_leg      the yard/site to return the empty container to, or null
+  raw             the original text for this stop, verbatim
+  confidence      "low" or "high"
+  notes           any extra detail worth surfacing, or ""
+
 Rules:
-- Treat each instruction / line as exactly one stop.
-- For every stop extract: action (one of PR, P, D, S, R), address, container_size
-  (e.g. "30yd", or null if not stated), raw (the original line, verbatim), confidence
-  ("low" or "high"), and notes (any extra detail worth surfacing, or an empty string).
-- Set confidence to "low" whenever the action, address, or destination is ambiguous,
-  vague, or only partially stated (e.g. an unclear relocation, a missing address, or a
-  vague action word). Otherwise set confidence to "high".
-- Respond with ONLY valid JSON — no markdown code fences, no commentary — in exactly
-  this shape:
-  {"stops":[{"action":"","address":"","container_size":null,"raw":"","confidence":"","notes":""}]}
+- Use the KNOWN LOCATIONS & VOCABULARY to expand shorthand (e.g. "newpt" → "Newport News"),
+  to recognize dump sites (put them in dump_leg, not as a separate stop), and to recognize
+  yard and customer names.
+- Set confidence "low" ONLY when the action or address is genuinely ambiguous or missing —
+  not merely because a dump/return leg or a preamble is present.
+- Respond with ONLY valid JSON — no markdown, no commentary — in exactly this shape:
+  {"stops":[{"action":"","address":"","customer":"","container_size":null,"dump_leg":null,"return_leg":null,"raw":"","confidence":"","notes":""}]}
+
+WORKED EXAMPLE
+Input:
+  Before you return paragon use it to
+  Pr 527 j Clyde Morris blvd,newpt, Serv pro 30yd dump holland then return it to paragon
+Output:
+  {"stops":[{"action":"PR","address":"527 J Clyde Morris Blvd, Newport News","customer":"Serv Pro","container_size":"30yd","dump_leg":"Holland","return_leg":"Paragon","raw":"Pr 527 j Clyde Morris blvd,newpt, Serv pro 30yd dump holland then return it to paragon","confidence":"high","notes":""}]}
 """
+
+
+def _parse_vocab_context(conn, company_id):
+    """Company-specific vocabulary block injected into the parse prompt: known
+    dump sites, the yard, recent customer names, and shorthand mappings."""
+    lines = []
+    try:
+        dumps = conn.execute(
+            "SELECT name, city FROM dump_locations WHERE active=1 ORDER BY name"
+        ).fetchall()
+        if dumps:
+            lines.append("KNOWN DUMP SITES (use as dump_leg): " + ", ".join(
+                (d["name"] + (" (" + d["city"] + ")" if d["city"] else "")) for d in dumps))
+    except Exception:
+        pass
+    try:
+        co = conn.execute(
+            "SELECT yard_address, yard_city FROM companies WHERE id=?", (company_id,)
+        ).fetchone()
+        if co and (co["yard_address"] or co["yard_city"]):
+            yard = ", ".join(p for p in [co["yard_address"] or "", co["yard_city"] or ""] if p)
+            lines.append("YARD (a valid return_leg target): " + yard)
+    except Exception:
+        pass
+    try:
+        custs = conn.execute(
+            """SELECT DISTINCT s.customer_name FROM stops s
+                 JOIN routes r ON s.route_id = r.id
+                WHERE r.company_id=? AND s.customer_name IS NOT NULL
+                  AND TRIM(s.customer_name) != ''
+                ORDER BY s.id DESC LIMIT 40""",
+            (company_id,)
+        ).fetchall()
+        names = sorted({(c["customer_name"] or "").strip() for c in custs if (c["customer_name"] or "").strip()})
+        if names:
+            lines.append("KNOWN CUSTOMERS: " + ", ".join(names[:40]))
+    except Exception:
+        pass
+    try:
+        vocab = conn.execute(
+            """SELECT term, expansion FROM parse_vocab
+                WHERE company_id IS NULL OR company_id=?
+                ORDER BY term""",
+            (company_id,)
+        ).fetchall()
+        if vocab:
+            lines.append("SHORTHAND (expand these): " + ", ".join(
+                (v["term"] + " = " + v["expansion"]) for v in vocab))
+    except Exception:
+        pass
+    if not lines:
+        return ""
+    return "\n\nKNOWN LOCATIONS & VOCABULARY (this company):\n" + "\n".join(lines)
+
+
+def _build_parse_system_prompt(conn, company_id):
+    return _PARSE_SYSTEM_PROMPT_BASE + _parse_vocab_context(conn, company_id)
 
 
 @app.route("/api/parse", methods=["POST"])
@@ -14403,12 +14551,20 @@ def api_parse_dispatch():
     if not api_key:
         return jsonify({"error": "ANTHROPIC_API_KEY not configured on server."}), 500
 
+    # Inject this company's vocabulary (dump sites, yard, customers, shorthand)
+    # so the model resolves local shorthand and recognizes dump/return legs.
+    _pc = get_db()
+    try:
+        system_prompt = _build_parse_system_prompt(_pc, cid())
+    finally:
+        _pc.close()
+
     try:
         client = anthropic.Anthropic(api_key=api_key, timeout=20.0)
         resp = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=4096,
-            system=_PARSE_SYSTEM_PROMPT,
+            system=system_prompt,
             messages=[{"role": "user", "content": text}],
         )
         raw_reply = "".join(
@@ -16581,9 +16737,92 @@ def yard_setup_page():
         <p>Dump locations and your container fleet, in one place.</p>
     </div>
     {_dump_locations_section_html()}
+    {_parse_vocab_section_html()}
     {_containers_section_html()}
     """
     return render_template_string(shell_page("Yard Setup", body))
+
+
+def _parse_vocab_section_html():
+    """Boss-editable parser shorthand — the terms fed to the AI parser so it
+    resolves local abbreviations (e.g. newpt → Newport News)."""
+    conn = get_db()
+    rows_db = conn.execute(
+        "SELECT id, term, expansion, company_id FROM parse_vocab WHERE company_id IS NULL OR company_id=? ORDER BY term",
+        (cid(),)
+    ).fetchall()
+    conn.close()
+    _csrf = get_csrf_token()
+    rows = ""
+    for v in rows_db:
+        is_global = v["company_id"] is None
+        scope = '<span class="badge" style="opacity:.5;">default</span>' if is_global else '<span class="badge completed">yours</span>'
+        del_cell = "" if is_global else (
+            f'<form method="POST" action="{url_for("delete_parse_vocab", vocab_id=v["id"])}" style="display:inline;" '
+            f'onsubmit="return confirm(\'Remove this shorthand?\');">'
+            f'<button type="submit" style="background:transparent;color:#f87171;border:1px solid rgba(248,113,113,0.4);'
+            f'border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;">Remove</button></form>'
+        )
+        rows += (f'<tr><td><strong>{e(v["term"])}</strong></td><td class="muted small">{e(v["expansion"])}</td>'
+                 f'<td>{scope}</td><td style="text-align:right;">{del_cell}</td></tr>')
+    return f"""
+    <div class="card" id="parse-vocab">
+        <div class="row between" style="margin-bottom:16px;">
+            <h2 style="margin:0;">&#128172; Parser Shorthand</h2>
+        </div>
+        <p class="muted small" style="margin-bottom:14px;">Abbreviations the AI parser expands when reading your dispatch text
+        (e.g. <code>newpt</code> &rarr; Newport News). Defaults apply to everyone; add your own below.</p>
+        <form method="POST" action="{url_for('add_parse_vocab')}" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;">
+            <input type="hidden" name="_csrf_token" value="{_csrf}">
+            <input name="term" placeholder="shorthand (e.g. wburg)" required
+                   style="flex:1;min-width:140px;min-height:48px;padding:8px 12px;background:var(--bg-0);
+                          border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);">
+            <input name="expansion" placeholder="means… (e.g. Williamsburg)" required
+                   style="flex:1;min-width:140px;min-height:48px;padding:8px 12px;background:var(--bg-0);
+                          border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);">
+            <button class="btn" type="submit" style="min-height:48px;">+ Add</button>
+        </form>
+        <div class="table-wrap">
+            <table>
+                <thead><tr><th>Shorthand</th><th>Means</th><th>Scope</th><th></th></tr></thead>
+                <tbody>{rows or '<tr><td colspan="4" class="muted">No shorthand yet.</td></tr>'}</tbody>
+            </table>
+        </div>
+    </div>
+    """
+
+
+@app.route("/parse-vocab/add", methods=["POST"])
+@boss_required
+def add_parse_vocab():
+    term = (request.form.get("term") or "").strip().lower()[:40]
+    expansion = (request.form.get("expansion") or "").strip()[:120]
+    if not term or not expansion:
+        flash("Both the shorthand and what it means are required.", "error")
+        return redirect(url_for("yard_setup_page") + "#parse-vocab")
+    conn = get_db()
+    # Upsert per company: replace an existing company term with the same text.
+    conn.execute("DELETE FROM parse_vocab WHERE company_id=? AND term=?", (cid(), term))
+    conn.execute(
+        "INSERT INTO parse_vocab (company_id, term, expansion, kind, created_at) VALUES (?,?,?,'shorthand',?)",
+        (cid(), term, expansion, now_ts())
+    )
+    conn.commit()
+    conn.close()
+    flash("Shorthand added.", "success")
+    return redirect(url_for("yard_setup_page") + "#parse-vocab")
+
+
+@app.route("/parse-vocab/<int:vocab_id>/delete", methods=["POST"])
+@boss_required
+def delete_parse_vocab(vocab_id):
+    conn = get_db()
+    # Only a company's own terms are deletable (global defaults are shared).
+    conn.execute("DELETE FROM parse_vocab WHERE id=? AND company_id=?", (vocab_id, cid()))
+    conn.commit()
+    conn.close()
+    flash("Shorthand removed.", "success")
+    return redirect(url_for("yard_setup_page") + "#parse-vocab")
 
 
 # ── Legacy URLs — redirect to their new home on Yard Setup ──────────────────
@@ -17979,7 +18218,11 @@ def _validate_parser_stops(stops_in):
         clean_stops.append({
             "address": address,
             "action": _PARSER_ACTION_MAP[action_code],
+            "customer": expand_abbrev((s.get("customer") or "").strip()),
             "container_size": expand_abbrev((s.get("container_size") or "").strip()),
+            # Multi-leg: dump/return legs of a single job (kept on the one stop).
+            "dump_leg": expand_abbrev((s.get("dump_leg") or "").strip()),
+            "return_leg": expand_abbrev((s.get("return_leg") or "").strip()),
             "notes": expand_abbrev((s.get("notes") or "").strip()),
             "insert_before": str(s.get("insert_before") or "end").strip(),
         })
@@ -18041,10 +18284,12 @@ def api_dispatch():
     for s in clean_stops:
         next_order += 1
         cur.execute("""
-            INSERT INTO stops (route_id, stop_order, address, action, container_size, notes,
-                                status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'open', ?)
-        """, (route_id, next_order, s["address"], s["action"], s["container_size"], s["notes"], now_ts()))
+            INSERT INTO stops (route_id, stop_order, customer_name, address, action, container_size,
+                                dump_location, return_destination, notes, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+        """, (route_id, next_order, s.get("customer") or "", s["address"], s["action"],
+              s["container_size"], s.get("dump_leg") or "", s.get("return_leg") or "",
+              s["notes"], now_ts()))
 
     conn.commit()
     try:
@@ -18110,10 +18355,11 @@ def api_insert_stops(route_id):
     new_stops = []
     for s in clean_stops:
         cur.execute("""
-            INSERT INTO stops (route_id, stop_order, address, action, container_size, notes,
-                                status, created_at)
-            VALUES (?, 0, ?, ?, ?, ?, 'open', ?)
-        """, (route_id, s["address"], s["action"], s["container_size"], s["notes"], now_ts()))
+            INSERT INTO stops (route_id, stop_order, customer_name, address, action, container_size,
+                                dump_location, return_destination, notes, status, created_at)
+            VALUES (?, 0, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+        """, (route_id, s.get("customer") or "", s["address"], s["action"], s["container_size"],
+              s.get("dump_leg") or "", s.get("return_leg") or "", s["notes"], now_ts()))
         new_stops.append((cur.lastrowid, s["insert_before"]))
 
     # Merge new stops into the insertable (unlocked) sequence at their chosen position.
