@@ -341,6 +341,12 @@
     margin-top: 6px;
     font-style: italic;
   }
+  .stop-legs {
+    margin-top: 6px;
+    font-size: 0.82rem;
+    font-weight: 700;
+    color: var(--orange);
+  }
 
   .stop-raw {
     margin-top: 12px;
@@ -497,7 +503,10 @@
       id: 'stop-' + idx,
       action: action,
       address: (raw && raw.address) ? String(raw.address) : '',
+      customer: (raw && raw.customer) ? String(raw.customer) : '',
       container_size: (raw && raw.container_size) ? String(raw.container_size) : '',
+      dump_leg: (raw && raw.dump_leg) ? String(raw.dump_leg) : '',
+      return_leg: (raw && raw.return_leg) ? String(raw.return_leg) : '',
       raw: (raw && raw.raw) ? String(raw.raw) : '',
       confidence: confidence,
       notes: (raw && raw.notes) ? String(raw.notes) : '',
@@ -631,17 +640,61 @@
       contInput.addEventListener('input', function () { stop.container_size = contInput.value; });
       contWrap.appendChild(contInput);
       main.appendChild(contWrap);
+      var custWrap = document.createElement('div');
+      custWrap.className = 'stop-container';
+      custWrap.style.marginTop = '8px';
+      var custInput = document.createElement('input');
+      custInput.type = 'text';
+      custInput.value = stop.customer || '';
+      custInput.placeholder = 'Customer (optional)';
+      custInput.addEventListener('input', function () { stop.customer = custInput.value; });
+      custWrap.appendChild(custInput);
+      main.appendChild(custWrap);
+
+      var dumpWrap = document.createElement('div');
+      dumpWrap.className = 'stop-container';
+      var dumpInput = document.createElement('input');
+      dumpInput.type = 'text';
+      dumpInput.value = stop.dump_leg || '';
+      dumpInput.placeholder = 'Dump at (site, optional)';
+      dumpInput.addEventListener('input', function () { stop.dump_leg = dumpInput.value; });
+      dumpWrap.appendChild(dumpInput);
+      main.appendChild(dumpWrap);
+
+      var retWrap = document.createElement('div');
+      retWrap.className = 'stop-container';
+      var retInput = document.createElement('input');
+      retInput.type = 'text';
+      retInput.value = stop.return_leg || '';
+      retInput.placeholder = 'Return to (yard/site, optional)';
+      retInput.addEventListener('input', function () { stop.return_leg = retInput.value; });
+      retWrap.appendChild(retInput);
+      main.appendChild(retWrap);
     } else {
       var addr = document.createElement('div');
       addr.className = 'stop-address';
       addr.textContent = stop.address || '(no address detected)';
       main.appendChild(addr);
 
-      if (stop.container_size) {
+      var subBits = [];
+      if (stop.container_size) subBits.push(stop.container_size);
+      if (stop.customer) subBits.push(stop.customer);
+      if (subBits.length) {
         var cont = document.createElement('div');
         cont.className = 'stop-container';
-        cont.textContent = stop.container_size;
+        cont.textContent = subBits.join(' · ');
         main.appendChild(cont);
+      }
+
+      // Multi-leg trip: "→ Dump: Holland → Return: Paragon"
+      if (stop.dump_leg || stop.return_leg) {
+        var legs = document.createElement('div');
+        legs.className = 'stop-legs';
+        var t = '';
+        if (stop.dump_leg) t += '→ Dump: ' + stop.dump_leg + ' ';
+        if (stop.return_leg) t += '→ Return: ' + stop.return_leg;
+        legs.textContent = t.trim();
+        main.appendChild(legs);
       }
     }
 
@@ -781,7 +834,10 @@
           return {
             action: s.action,
             address: s.address,
+            customer: s.customer,
             container_size: s.container_size,
+            dump_leg: s.dump_leg,
+            return_leg: s.return_leg,
             notes: s.notes,
             confidence: s.confidence,
             reviewed: s.reviewed,
@@ -801,7 +857,10 @@
           return {
             action: s.action,
             address: s.address,
+            customer: s.customer,
             container_size: s.container_size,
+            dump_leg: s.dump_leg,
+            return_leg: s.return_leg,
             notes: s.notes,
             confidence: s.confidence,
             reviewed: s.reviewed,
