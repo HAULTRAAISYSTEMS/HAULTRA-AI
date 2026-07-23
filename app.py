@@ -2720,6 +2720,21 @@ def init_db():
     safe_add_column(conn, "maintenance_entries", "sent_at TEXT")
     safe_add_column(conn, "maintenance_entries", "completed_at TEXT")
     safe_add_column(conn, "trucks", "at_vendor INTEGER NOT NULL DEFAULT 0")
+    # Vendor status lifecycle (feat/vendor-status-lifecycle) — a defect and its
+    # truck move scheduled → en_route → at_vendor. NULL = no vendor badge.
+    safe_add_column(conn, "inspection_items", "vendor_status TEXT")
+    safe_add_column(conn, "trucks", "vendor_status TEXT")
+    # Soft-delete for defects + maintenance events (boss "Delete") and a
+    # driver "report mistake" flag on their own defect. Deleted rows are kept
+    # (deleted_at + who) but hidden from every view; the DVIR itself is never
+    # altered — only the mutable defect-follow-up entry is flagged/hidden.
+    safe_add_column(conn, "inspection_items", "deleted_at TEXT")
+    safe_add_column(conn, "inspection_items", "deleted_by INTEGER")
+    safe_add_column(conn, "inspection_items", "flagged_at TEXT")
+    safe_add_column(conn, "inspection_items", "flagged_by INTEGER")
+    safe_add_column(conn, "inspection_items", "flag_note TEXT")
+    safe_add_column(conn, "maintenance_entries", "deleted_at TEXT")
+    safe_add_column(conn, "maintenance_entries", "deleted_by INTEGER")
     safe_add_column(conn, "bins", "label TEXT")
     safe_add_column(conn, "bins", "drop_photo_path TEXT")
     safe_add_column(conn, "bins", "drop_stop_id INTEGER")
@@ -4723,7 +4738,7 @@ def shell_page(title, body, extra_head=""):
             _open_defects = _rc.execute(
                 """SELECT COUNT(*) AS n FROM inspection_items ii
                      JOIN inspections i ON ii.inspection_id = i.id
-                    WHERE i.company_id = ? AND ii.result='defect' AND ii.defect_status='open'""",
+                    WHERE i.company_id = ? AND ii.result='defect' AND ii.defect_status='open' AND ii.deleted_at IS NULL""",
                 (session.get("company_id"),),
             ).fetchone()["n"]
             _rc.close()
@@ -9234,11 +9249,12 @@ def _build_route_board_html(user):
                u.username AS driver_username,
                s.id AS stop_id, s.stop_order, s.customer_name, s.address, s.city,
                s.action, s.container_size, s.status AS stop_status, s.driver_status,
-               s.completed_at,
+               s.completed_at, ii.vendor_status AS vendor_status,
                EXISTS(SELECT 1 FROM route_photos rp WHERE rp.stop_id = s.id) AS has_photo
         FROM routes r
         LEFT JOIN users u ON r.assigned_to = u.id
         LEFT JOIN stops s ON s.route_id = r.id
+        LEFT JOIN inspection_items ii ON ii.id = s.defect_item_id
         WHERE r.company_id = ? AND r.route_date = ?
     """
     if user["role"] != "boss":
@@ -9354,6 +9370,18 @@ def _build_route_board_html(user):
             urgent_html = '<span class="stop-mini-urgent">&#9888; OVERDUE</span>' if is_urgent else ""
             photo_html = '<span class="stop-mini-photo" title="Has photo">&#128247;</span>' if s["has_photo"] else ""
 
+            # Vendor-visit stop carries the truck's live vendor lifecycle pill.
+            vendor_pill = ""
+            if (s["action"] or "").lower() == "vendor" and dict(s).get("vendor_status"):
+                _vl = {"scheduled": "SCHEDULED", "en_route": "EN ROUTE",
+                       "at_vendor": "AT VENDOR"}.get(s["vendor_status"], "")
+                _vs = {"scheduled": "background:rgba(140,160,179,0.14);color:#C9B47A;border:1px solid rgba(200,180,120,0.5);",
+                       "en_route": "background:rgba(255,107,26,0.16);color:#FF8A3D;border:1px solid rgba(255,107,26,0.55);",
+                       "at_vendor": "background:#F5B43C;color:#1a1206;border:1px solid #F5B43C;"}.get(s["vendor_status"], "")
+                if _vl:
+                    vendor_pill = ('<span style="display:inline-block;padding:1px 7px;border-radius:999px;'
+                                   'font-size:9px;font-weight:800;letter-spacing:.4px;' + _vs + '">🔧 ' + _vl + '</span>')
+
             link = (url_for("edit_stop", stop_id=s["stop_id"]) if user["role"] == "boss"
                     else url_for("view_route", route_id=s["route_id"]))
 
@@ -9361,6 +9389,7 @@ def _build_route_board_html(user):
             <a class="stop-mini {card_cls}" href="{link}">
                 <div class="stop-mini-top">
                     <span class="stop-mini-badge {group}">{e(letter)}</span>
+                    {vendor_pill}
                     {urgent_html}
                     {photo_html}
                 </div>
@@ -9701,6 +9730,12 @@ _VENDOR_STOP_JS = """
 <script>
 (function(){
   var CSRF=(document.querySelector('meta[name=csrf-token]')||{}).content||'';
+  window.vendorArrive=function(stopId){
+    fetch('/api/stops/'+stopId+'/vendor-arrive',{method:'POST',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},body:'{}'})
+      .then(function(r){ if(r.ok){ window.location.reload(); } else { throw new Error(); } })
+      .catch(function(){ alert('Could not mark arrival — check your connection and try again.'); });
+  };
   window.openVendorDone=function(){
     var o=document.getElementById('vendor-done-overlay'), m=document.getElementById('vendor-done-modal');
     if(o) o.hidden=false; if(m) m.hidden=false;
@@ -9779,6 +9814,24 @@ def driver_route_detail(route_id):
             ORDER BY id DESC LIMIT 1""",
         (route_id, session["user_id"])
     ).fetchone()
+
+    # EN ROUTE transition: when the driver's current stop is a scheduled vendor
+    # visit, the truck is now en route to the shop (whichever fires first with
+    # the Navigate tap). Idempotent — only bumps 'scheduled' → 'en_route'.
+    _cur_stop = next((st for st in stops if st["status"] != "completed"), None)
+    if (_cur_stop and (_cur_stop["action"] or "").lower() == "vendor"
+            and _cur_stop["defect_item_id"]):
+        _dv = conn.execute(
+            """SELECT ii.vendor_status, i.truck_id FROM inspection_items ii
+                 JOIN inspections i ON ii.inspection_id=i.id
+                WHERE ii.id=? AND ii.deleted_at IS NULL""",
+            (_cur_stop["defect_item_id"],)
+        ).fetchone()
+        if _dv and _dv["vendor_status"] == "scheduled":
+            conn.execute("UPDATE inspection_items SET vendor_status='en_route' WHERE id=?",
+                         (_cur_stop["defect_item_id"],))
+            _recompute_truck_at_vendor(conn, _dv["truck_id"])
+            conn.commit()
 
     conn.close()
 
@@ -10071,15 +10124,25 @@ def driver_route_detail(route_id):
     </div>
     """
 
-    # ── Vendor-visit stop: replace the container workflow + normal completion
-    #    with a "Truck repaired?" flow that closes (or keeps open) the defect. ──
+    # ── Vendor-visit stop: two-step read-only flow — Arrived at Vendor (→ AT
+    #    VENDOR), then Finish Vendor Visit ("Truck repaired?"). No container
+    #    workflow, no photo gate. ──
     if is_vendor:
         workflow_btn_html = ""
-        complete_section = f"""
-    <button type="button" class="cab-complete-btn" onclick="openVendorDone()"
-            style="background:linear-gradient(135deg,#00c853,#00e57a);color:#001a0a;">
-        &#128295; Finish Vendor Visit
-    </button>
+        if driver_status != "arrived":
+            # En route → arrival marks the truck AT VENDOR.
+            _finish_btn = (
+                '<button type="button" class="cab-complete-btn" onclick="vendorArrive(%d)" '
+                'style="background:linear-gradient(135deg,#ff8a3d,#F5B43C);color:#1a1206;">'
+                '&#128295; Arrived at Vendor</button>' % stop_id
+            )
+        else:
+            _finish_btn = (
+                '<button type="button" class="cab-complete-btn" onclick="openVendorDone()" '
+                'style="background:linear-gradient(135deg,#00c853,#00e57a);color:#001a0a;">'
+                '&#128295; Finish Vendor Visit</button>'
+            )
+        complete_section = _finish_btn + f"""
     <div id="vendor-done-overlay" class="no-photo-confirm-overlay" hidden
          onclick="document.getElementById('vendor-done-overlay').hidden=true;document.getElementById('vendor-done-modal').hidden=true;"></div>
     <div id="vendor-done-modal" class="no-photo-confirm-modal" hidden style="text-align:left;">
@@ -11471,6 +11534,42 @@ def ack_message(msg_id):
     return jsonify({"success": True})
 
 
+@app.route("/api/stops/<int:stop_id>/vendor-arrive", methods=["POST"])
+@login_required
+def vendor_arrive(stop_id):
+    """Driver marks arrival at the vendor stop → truck is AT VENDOR. Moves the
+    stop's driver_status pending→arrived and the defect vendor_status→at_vendor."""
+    conn = get_db()
+    stop = conn.execute(
+        """SELECT s.id, s.defect_item_id, s.driver_status, r.assigned_to
+             FROM stops s JOIN routes r ON s.route_id = r.id
+            WHERE s.id=? AND r.company_id=?""",
+        (stop_id, cid())
+    ).fetchone()
+    if not stop:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if session.get("role") != "boss" and stop["assigned_to"] != session["user_id"]:
+        conn.close()
+        return jsonify({"error": "forbidden"}), 403
+    conn.execute("UPDATE stops SET driver_status='arrived', arrived_at=? WHERE id=?",
+                 (now_ts(), stop_id))
+    did = stop["defect_item_id"]
+    if did:
+        conn.execute(
+            "UPDATE inspection_items SET vendor_status='at_vendor' WHERE id=? AND defect_status='open'",
+            (did,))
+        trow = conn.execute(
+            """SELECT i.truck_id FROM inspection_items ii
+                 JOIN inspections i ON ii.inspection_id=i.id WHERE ii.id=?""",
+            (did,)).fetchone()
+        if trow:
+            _recompute_truck_at_vendor(conn, trow["truck_id"])
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
 @app.route("/api/stops/<int:stop_id>/vendor-complete", methods=["POST"])
 @login_required
 def vendor_complete(stop_id):
@@ -11507,25 +11606,32 @@ def vendor_complete(stop_id):
                 res_note += " — " + note
             conn.execute(
                 """UPDATE inspection_items SET defect_status='repaired', at_vendor=0,
-                          resolved_by=?, resolved_at=?, resolution_note=?
+                          vendor_status=NULL, resolved_by=?, resolved_at=?, resolution_note=?
                     WHERE id=? AND defect_status='open'""",
                 (session["user_id"], ts, res_note[:500], did)
             )
-            trow = conn.execute(
-                """SELECT i.truck_id FROM inspection_items ii
-                     JOIN inspections i ON ii.inspection_id=i.id WHERE ii.id=?""",
-                (did,)
-            ).fetchone()
-            if trow:
-                _recompute_truck_at_vendor(conn, trow["truck_id"])
         else:
-            # Not repaired — keep the defect open and tell the boss on the thread.
+            # Not repaired — keep the defect OPEN and revert the truck to VENDOR
+            # SCHEDULED (needs another trip); tell the boss on the thread.
+            open_note = ("Vendor visit — not repaired" + (": " + note if note else "."))
+            conn.execute(
+                """UPDATE inspection_items SET vendor_status='scheduled', resolution_note=?
+                    WHERE id=? AND defect_status='open'""",
+                (open_note[:500], did)
+            )
             body = "\U0001F527 Vendor visit done — truck NOT repaired"
             body += (": " + note) if note else "."
             conn.execute(
                 "INSERT INTO messages (route_id, sender_user_id, body, created_at) VALUES (?,?,?,?)",
                 (stop["route_id"], session["user_id"], body[:500], ts)
             )
+        trow = conn.execute(
+            """SELECT i.truck_id FROM inspection_items ii
+                 JOIN inspections i ON ii.inspection_id=i.id WHERE ii.id=?""",
+            (did,)
+        ).fetchone()
+        if trow:
+            _recompute_truck_at_vendor(conn, trow["truck_id"])
     conn.commit()
     conn.close()
     return jsonify({"success": True})
@@ -19594,7 +19700,7 @@ def _open_defect_count(conn):
         """SELECT COUNT(*) AS n
              FROM inspection_items ii
              JOIN inspections i ON ii.inspection_id = i.id
-            WHERE i.company_id = ? AND ii.result='defect' AND ii.defect_status='open'""",
+            WHERE i.company_id = ? AND ii.result='defect' AND ii.defect_status='open' AND ii.deleted_at IS NULL""",
         (cid(),),
     ).fetchone()["n"]
 
@@ -19660,11 +19766,11 @@ def _truck_maintenance_log(conn, truck_id, date_from=None, date_to=None, categor
              FROM inspection_items ii
              JOIN inspections i ON ii.inspection_id = i.id
             WHERE i.company_id=? AND i.truck_id=? AND ii.result='defect'
-              AND ii.defect_status='repaired'""",
+              AND ii.defect_status='repaired' AND ii.deleted_at IS NULL""",
         (cid(), truck_id),
     ).fetchall()
     manuals = conn.execute(
-        "SELECT * FROM maintenance_entries WHERE company_id=? AND truck_id=?",
+        "SELECT * FROM maintenance_entries WHERE company_id=? AND truck_id=? AND deleted_at IS NULL",
         (cid(), truck_id),
     ).fetchall()
     vmap = _vendor_map(conn)
@@ -19716,11 +19822,11 @@ def _truck_spend(conn, truck_id):
         """SELECT ii.cost_cents AS c, substr(ii.resolved_at,1,10) AS dt
              FROM inspection_items ii JOIN inspections i ON ii.inspection_id=i.id
             WHERE i.company_id=? AND i.truck_id=? AND ii.result='defect'
-              AND ii.defect_status='repaired' AND ii.cost_cents IS NOT NULL""",
+              AND ii.defect_status='repaired' AND ii.cost_cents IS NOT NULL AND ii.deleted_at IS NULL""",
         (cid(), truck_id)).fetchall()
     m_rows = conn.execute(
         """SELECT cost_cents AS c, entry_date AS dt FROM maintenance_entries
-            WHERE company_id=? AND truck_id=? AND voided=0 AND cost_cents IS NOT NULL""",
+            WHERE company_id=? AND truck_id=? AND voided=0 AND cost_cents IS NOT NULL AND deleted_at IS NULL""",
         (cid(), truck_id)).fetchall()
     month = year = life = 0
     for r in list(d_rows) + list(m_rows):
@@ -19767,34 +19873,75 @@ def _clean_vendor_id(conn, raw):
     return int(s) if row else None
 
 
+# Vendor lifecycle ordering — the truck badge shows the furthest-along status
+# across its open defects / active manual entries.
+_VENDOR_STATUS_RANK = {"scheduled": 1, "en_route": 2, "at_vendor": 3}
+
+
 def _recompute_truck_at_vendor(conn, truck_id):
-    """Set trucks.at_vendor = 1 iff any open defect or active manual entry for
-    the truck is currently 'sent to vendor'. Called after every send/repair
-    transition so the informational flag is always accurate."""
-    d = conn.execute(
-        """SELECT 1 FROM inspection_items ii JOIN inspections i ON ii.inspection_id=i.id
+    """Recompute the truck's vendor lifecycle from its open defects + active
+    manual entries and store it on trucks.vendor_status (NULL when none).
+    trucks.at_vendor is kept in sync (=1 only when actually AT the vendor) so
+    existing callers that read the flag stay correct. Called after every
+    send / arrive / repair transition so the badge is always accurate."""
+    statuses = []
+    for r in conn.execute(
+        """SELECT ii.vendor_status AS vs FROM inspection_items ii
+             JOIN inspections i ON ii.inspection_id=i.id
             WHERE i.company_id=? AND i.truck_id=? AND ii.result='defect'
-              AND ii.defect_status='open' AND ii.at_vendor=1 LIMIT 1""",
-        (cid(), truck_id)).fetchone()
+              AND ii.defect_status='open' AND ii.deleted_at IS NULL
+              AND ii.vendor_status IS NOT NULL""",
+        (cid(), truck_id)).fetchall():
+        statuses.append(r["vs"])
+    # Manual maintenance entries only track a binary at-vendor → treat as at_vendor.
     m = conn.execute(
         """SELECT 1 FROM maintenance_entries
-            WHERE company_id=? AND truck_id=? AND voided=0 AND at_vendor=1
-              AND completed_at IS NULL LIMIT 1""",
+            WHERE company_id=? AND truck_id=? AND voided=0 AND deleted_at IS NULL
+              AND at_vendor=1 AND completed_at IS NULL LIMIT 1""",
         (cid(), truck_id)).fetchone()
-    conn.execute("UPDATE trucks SET at_vendor=? WHERE id=?",
-                 (1 if (d or m) else 0, truck_id))
+    if m:
+        statuses.append("at_vendor")
+    best = None
+    for s in statuses:
+        if s in _VENDOR_STATUS_RANK and (best is None or
+                _VENDOR_STATUS_RANK[s] > _VENDOR_STATUS_RANK[best]):
+            best = s
+    conn.execute(
+        "UPDATE trucks SET vendor_status=?, at_vendor=? WHERE id=?",
+        (best, 1 if best == "at_vendor" else 0, truck_id))
+
+
+# Per-status badge styling: scheduled = neutral gray-gold outline, en_route =
+# orange, at_vendor = solid gold.
+_VENDOR_BADGE_STYLE = {
+    "scheduled": ("🔧 Vendor scheduled",
+                  "background:rgba(140,160,179,0.12);color:#C9B47A;"
+                  "border:1px solid rgba(200,180,120,0.5);"),
+    "en_route":  ("🔧 En route to vendor",
+                  "background:rgba(255,107,26,0.16);color:#FF8A3D;"
+                  "border:1px solid rgba(255,107,26,0.55);"),
+    "at_vendor": ("🔧 At vendor",
+                  "background:#F5B43C;color:#1a1206;border:1px solid #F5B43C;"),
+}
 
 
 def _truck_at_vendor_badge(row):
-    """Yellow, informational (non-blocking) 'At vendor' pill — mirrors the OOS
-    badge shape. Shown wherever a truck currently out at a shop appears."""
+    """Vendor lifecycle pill (scheduled / en route / at vendor). Reads
+    trucks.vendor_status; falls back to the legacy at_vendor flag when a query
+    hasn't selected vendor_status. OOS takes visual precedence (no pill)."""
     d = dict(row) if row is not None else {}
-    if not d.get("at_vendor") or d.get("out_of_service"):
-        return ""  # OOS takes visual precedence
+    if d.get("out_of_service"):
+        return ""
+    status = d.get("vendor_status")
+    if not status:
+        # Legacy fallback for rows that only carry the boolean flag.
+        status = "at_vendor" if d.get("at_vendor") else None
+    if status not in _VENDOR_BADGE_STYLE:
+        return ""
+    label, style = _VENDOR_BADGE_STYLE[status]
     return ('<span style="display:inline-block;padding:2px 9px;border-radius:999px;'
             'font-size:10px;font-weight:800;letter-spacing:.5px;text-transform:uppercase;'
-            'background:rgba(245,180,60,0.16);color:#F5B43C;border:1px solid rgba(245,180,60,0.45);'
-            'margin-left:6px;">🔧 At vendor</span>')
+            + style + 'margin-left:6px;">' + label + '</span>')
 
 
 def _truck_status_badges(row):
@@ -19811,7 +19958,7 @@ def _company_has_costs(conn):
     if d:
         return True
     m = conn.execute(
-        "SELECT 1 FROM maintenance_entries WHERE company_id=? AND voided=0 AND cost_cents IS NOT NULL LIMIT 1",
+        "SELECT 1 FROM maintenance_entries WHERE company_id=? AND voided=0 AND cost_cents IS NOT NULL AND deleted_at IS NULL LIMIT 1",
         (cid(),)).fetchone()
     return bool(m)
 
@@ -19825,10 +19972,10 @@ def _truck_event_counts(conn, truck_id):
     d_rows = conn.execute(
         """SELECT substr(ii.resolved_at,1,10) AS dt FROM inspection_items ii
              JOIN inspections i ON ii.inspection_id=i.id
-            WHERE i.company_id=? AND i.truck_id=? AND ii.result='defect' AND ii.defect_status='repaired'""",
+            WHERE i.company_id=? AND i.truck_id=? AND ii.result='defect' AND ii.defect_status='repaired' AND ii.deleted_at IS NULL""",
         (cid(), truck_id)).fetchall()
     m_rows = conn.execute(
-        "SELECT entry_date AS dt FROM maintenance_entries WHERE company_id=? AND truck_id=? AND voided=0",
+        "SELECT entry_date AS dt FROM maintenance_entries WHERE company_id=? AND truck_id=? AND voided=0 AND deleted_at IS NULL",
         (cid(), truck_id)).fetchall()
     month = year = life = 0
     for r in list(d_rows) + list(m_rows):
@@ -19849,7 +19996,7 @@ def trucks_page():
                   (SELECT COUNT(*) FROM inspection_items ii
                      JOIN inspections i ON ii.inspection_id=i.id
                     WHERE i.truck_id=t.id AND ii.result='defect'
-                      AND ii.defect_status='open') AS open_defects
+                      AND ii.defect_status='open' AND ii.deleted_at IS NULL) AS open_defects
              FROM trucks t
             WHERE t.company_id=? AND t.is_active=1
             ORDER BY t.out_of_service DESC, LOWER(t.name), t.id""",
@@ -20059,7 +20206,7 @@ def truck_detail_page(truck_id):
         f"""SELECT i.*,
                    COALESCE(u.username,'—') AS driver_name,
                    (SELECT COUNT(*) FROM inspection_items ii
-                     WHERE ii.inspection_id=i.id AND ii.result='defect') AS defect_count
+                     WHERE ii.inspection_id=i.id AND ii.result='defect' AND ii.deleted_at IS NULL) AS defect_count
               FROM inspections i
          LEFT JOIN users u ON i.driver_id=u.id
              WHERE {' AND '.join(where)}
@@ -20657,9 +20804,9 @@ def my_inspections():
     """A driver's own inspection history, newest first."""
     conn = get_db()
     rows = conn.execute(
-        """SELECT i.*, t.name AS truck_name, t.out_of_service, t.at_vendor,
+        """SELECT i.*, t.name AS truck_name, t.out_of_service, t.at_vendor, t.vendor_status,
                   (SELECT COUNT(*) FROM inspection_items ii
-                    WHERE ii.inspection_id=i.id AND ii.result='defect') AS defect_count
+                    WHERE ii.inspection_id=i.id AND ii.result='defect' AND ii.deleted_at IS NULL) AS defect_count
              FROM inspections i
              JOIN trucks t ON i.truck_id=t.id
             WHERE i.driver_id=? AND i.company_id=?
@@ -20699,7 +20846,7 @@ def inspection_report(inspection_id):
     """Read-only full report. Management sees any; a driver sees only their own."""
     conn = get_db()
     insp = conn.execute(
-        """SELECT i.*, t.name AS truck_name, t.make_model, t.plate, t.out_of_service, t.at_vendor,
+        """SELECT i.*, t.name AS truck_name, t.make_model, t.plate, t.out_of_service, t.at_vendor, t.vendor_status,
                   COALESCE(u.username,'—') AS driver_name,
                   COALESCE(u.full_name,'') AS driver_full
              FROM inspections i
@@ -20770,13 +20917,25 @@ def inspection_report(inspection_id):
                 cost_block = (f'<div style="font-size:12px;margin-top:4px;color:var(--slate);">'
                               f'{" · ".join(_bits)}</div>')
         receipts_block = _receipt_thumbs_html(receipts_by_item.get(it["id"])) if is_mgmt else ""
+        # Driver "report mistake": flags their OWN open defect for the boss —
+        # the immutable DVIR is untouched. Shows the flagged state once set.
+        flag_block = ""
+        if it["result"] == "defect" and not dict(it).get("deleted_at"):
+            if dict(it).get("flagged_at"):
+                flag_block = ('<div style="font-size:12px;margin-top:6px;color:#FF8A3D;font-weight:700;">'
+                              '⚑ Flagged as a mistake — boss notified</div>')
+            elif (not is_mgmt) and it["defect_status"] == "open":
+                flag_block = (
+                    f'<button type="button" class="btn secondary" style="margin-top:8px;min-height:48px;font-size:13px;" '
+                    f'onclick="reportMistake({it["id"]})">⚑ Report a mistake</button>'
+                    f'<div id="flag-err-{it["id"]}" hidden style="color:#FF5252;font-size:12px;margin-top:6px;"></div>')
         rows_html += f"""
         <div style="border-top:1px solid var(--border);padding:12px 0;">
             <div style="display:flex;justify-content:space-between;gap:10px;">
                 <span style="font-weight:700;font-size:14px;">{e(it["label"])}</span>
                 <span style="color:{color};font-weight:800;font-size:12px;">{label_txt}</span>
             </div>
-            {note}{photo}{defstat}{cost_block}{receipts_block}
+            {note}{photo}{defstat}{cost_block}{receipts_block}{flag_block}
         </div>"""
 
     _OVR_COLOR = {"safe": "#3DDC84", "defects_safe": "#FF8A3D", "out_of_service": "#FF7A7A"}
@@ -20805,6 +20964,21 @@ def inspection_report(inspection_id):
         <div style="font-weight:700;font-size:16px;margin-top:4px;">✍️ {e(insp["signature_name"])}</div>
         <div style="color:var(--slate);font-size:12px;margin-top:2px;">{e(insp["created_at"])} · immutable record</div>
     </div>
+    <script>
+    (function(){{
+      var CSRF=(document.querySelector('meta[name=csrf-token]')||{{}}).content||'';
+      window.reportMistake=function(id){{
+        var note=prompt('Report this defect as a mistake to the boss. Add a note (optional):');
+        if(note===null) return;
+        fetch('/api/defects/'+id+'/report-mistake',{{method:'POST',
+            headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},
+            body:JSON.stringify({{note:note}})}})
+          .then(function(r){{ if(r.ok){{ window.location.reload(); }} else {{ throw new Error(); }} }})
+          .catch(function(){{ var e=document.getElementById('flag-err-'+id);
+            if(e){{ e.textContent='Could not send — try again.'; e.hidden=false; }} }});
+      }};
+    }})();
+    </script>
     """
     return render_template_string(shell_page("Inspection Report", body))
 
@@ -20854,8 +21028,9 @@ def maintenance_page():
     defects = conn.execute(
         """SELECT ii.id AS item_id, ii.label, ii.note, ii.photo_path, ii.defect_status,
                   ii.at_vendor AS item_at_vendor, ii.sent_vendor_id,
+                  ii.vendor_status AS item_vendor_status, ii.flagged_at, ii.flag_note,
                   i.id AS inspection_id, i.type, i.created_at, i.truck_id,
-                  t.name AS truck_name, t.out_of_service, t.at_vendor,
+                  t.name AS truck_name, t.out_of_service, t.at_vendor, t.vendor_status,
                   COALESCE(u.username,'—') AS reporter,
                   (SELECT m.id FROM messages m WHERE m.defect_item_id=ii.id
                      AND m.priority='urgent' ORDER BY m.id DESC LIMIT 1) AS dispatch_msg_id,
@@ -20865,7 +21040,7 @@ def maintenance_page():
              JOIN inspections i ON ii.inspection_id=i.id
              JOIN trucks t ON i.truck_id=t.id
         LEFT JOIN users u ON i.driver_id=u.id
-            WHERE i.company_id=? AND ii.result='defect' AND ii.defect_status='open'
+            WHERE i.company_id=? AND ii.result='defect' AND ii.defect_status='open' AND ii.deleted_at IS NULL
             ORDER BY t.out_of_service DESC, i.created_at ASC, ii.id ASC""",
         (cid(),),
     ).fetchall()
@@ -20874,7 +21049,7 @@ def maintenance_page():
     has_costs = _company_has_costs(conn)
     # Per-truck totals — spend when costs exist, else event counts (A4 revision).
     trucks = conn.execute(
-        "SELECT id, name, out_of_service, at_vendor FROM trucks WHERE company_id=? AND is_active=1 ORDER BY LOWER(name), id",
+        "SELECT id, name, out_of_service, at_vendor, vendor_status FROM trucks WHERE company_id=? AND is_active=1 ORDER BY LOWER(name), id",
         (cid(),),
     ).fetchall()
     total_rows = []
@@ -20921,17 +21096,27 @@ def maintenance_page():
                     f'border-radius:999px;font-size:11px;font-weight:800;background:rgba(255,82,82,0.14);'
                     f'color:#FF7A7A;border:1px solid rgba(255,82,82,0.45);">'
                     f'📟 Dispatched · awaiting “Got it”</span></div>')
+        # Driver "report mistake" flag → boss-visible chip on the card.
+        flag_chip = ""
+        if d["flagged_at"]:
+            _fn = f' — {e(d["flag_note"])}' if d["flag_note"] else ""
+            flag_chip = (
+                f'<div style="margin-top:6px;"><span style="display:inline-block;padding:2px 9px;'
+                f'border-radius:999px;font-size:11px;font-weight:800;background:rgba(255,138,61,0.16);'
+                f'color:#FF8A3D;border:1px solid rgba(255,138,61,0.5);">'
+                f'⚑ Driver flagged as mistake{_fn}</span></div>')
         repair_form = ""
         actions = ""
         if can_action:
             _iid = d["item_id"]
-            _send_btn = ("" if d["item_at_vendor"] else
-                         f'<button class="btn secondary" style="flex:1;" onclick="showSend({_iid})">Send to vendor</button>')
+            _send_btn = ("" if d["item_vendor_status"] else
+                         f'<button class="btn secondary" style="flex:1;min-height:48px;" onclick="showSend({_iid})">Send to vendor</button>')
             actions = f"""
             <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;">
-                <button class="btn green" style="flex:1;min-width:90px;" onclick="showRepair({d['item_id']})">Repaired</button>
+                <button class="btn green" style="flex:1;min-width:90px;min-height:48px;" onclick="showRepair({d['item_id']})">Repaired</button>
                 {_send_btn}
-                <button class="btn secondary" style="flex:1;min-width:70px;" onclick="deferDefect({d['item_id']})">Defer</button>
+                <button class="btn secondary" style="flex:1;min-width:70px;min-height:48px;" onclick="deferDefect({d['item_id']})">Defer</button>
+                <button class="btn secondary" style="min-height:48px;color:#FF5252;border-color:rgba(255,82,82,0.35);background:rgba(255,82,82,0.08);" onclick="deleteDefect({d['item_id']})" title="Delete defect">🗑</button>
             </div>"""
             repair_form = f"""
             <div id="send-form-{d['item_id']}" hidden style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
@@ -20984,7 +21169,7 @@ def maintenance_page():
                    style="font-size:12px;color:var(--cyan);white-space:nowrap;">View report →</a>
             </div>
             <div style="font-weight:700;font-size:14px;margin-top:8px;color:#FF7A7A;">⚠ {e(d["label"])}</div>
-            {note}{sent_chip}{dispatch_chip}
+            {note}{sent_chip}{dispatch_chip}{flag_chip}
             <div style="display:flex;gap:10px;align-items:center;margin-top:8px;">
                 {thumb}
                 <div style="color:var(--slate);font-size:12px;">
@@ -21158,6 +21343,14 @@ _MAINTENANCE_PAGE_JS = """
       .then(function(res){ if(res.ok){ removeCard(id); } else { err(id,(res.j&&res.j.error)||'Could not update.'); } })
       .catch(function(){ err(id,'Network error — try again.'); });
   };
+  window.deleteDefect=function(id){
+    if(!confirm('This removes the record permanently. Sure?\\n\\nAny dispatched vendor stop is pulled from the driver\\'s route.')) return;
+    fetch('/api/defects/'+id+'/delete',{method:'POST',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},body:'{}'})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
+      .then(function(res){ if(res.ok){ removeCard(id); } else { err(id,(res.j&&res.j.error)||'Could not delete.'); } })
+      .catch(function(){ err(id,'Network error — try again.'); });
+  };
   window.toggleAddEntry=function(){ var f=document.getElementById('add-entry-form'); if(f) f.hidden=!f.hidden; };
   function eerr(m){ var e=document.getElementById('add-entry-err'); if(e){ e.textContent=m; e.hidden=false; } }
   window.submitEntry=function(){
@@ -21275,6 +21468,13 @@ def _dispatch_driver_to_vendor(conn, defect_row, vendor_id, dispatch, dispatch_n
     # FCM sender wired (the service worker onBackgroundMessage handler exists,
     # but there is no token registration or admin-send path). The urgent message
     # is delivered in-app via the existing Cab View poll (≤30s) + pinned banner.
+
+    # Dispatched → truck is VENDOR SCHEDULED (not yet at the shop). The Cab View
+    # bumps it to EN ROUTE when the vendor stop becomes current, then AT VENDOR
+    # on arrival. "Just log it" never reaches here, so it never badges the truck.
+    conn.execute("UPDATE inspection_items SET vendor_status='scheduled' WHERE id=?",
+                 (defect_row["id"],))
+    _recompute_truck_at_vendor(conn, defect_row["truck_id"])
     return {"dispatched": True, "route_id": route_id, "stop_id": stop_id, "timing": timing}
 
 
@@ -21313,7 +21513,7 @@ def resolve_defect(item_id):
              FROM inspection_items ii
              JOIN inspections i ON ii.inspection_id=i.id
              JOIN trucks t ON i.truck_id=t.id
-            WHERE ii.id=? AND i.company_id=? AND ii.result='defect'""",
+            WHERE ii.id=? AND i.company_id=? AND ii.result='defect' AND ii.deleted_at IS NULL""",
         (item_id, cid()),
     ).fetchone()
     if row is None:
@@ -21325,9 +21525,11 @@ def resolve_defect(item_id):
 
     dispatch_result = None
     if action == "sent":
-        # Out to a shop — still an open defect, but flag the truck "at vendor".
+        # Record the vendor assignment. The truck badge is driven by the
+        # dispatch lifecycle below (vendor_status), NOT by this call — so a
+        # paper-only "Just log it" assignment never badges the truck.
         conn.execute(
-            """UPDATE inspection_items SET at_vendor=1, sent_vendor_id=?, sent_at=?,
+            """UPDATE inspection_items SET sent_vendor_id=?, sent_at=?,
                        vendor_id=COALESCE(?, vendor_id) WHERE id=?""",
             (vendor_id, now_ts(), vendor_id, item_id),
         )
@@ -21345,7 +21547,7 @@ def resolve_defect(item_id):
         conn.execute(
             """UPDATE inspection_items SET defect_status=?, resolution_note=?,
                        resolved_by=?, resolved_at=?, cost_cents=?, vendor_id=?,
-                       at_vendor=0 WHERE id=?""",
+                       at_vendor=0, vendor_status=NULL WHERE id=?""",
             (action, note, session["user_id"], now_ts(), cost_cents, vendor_id, item_id),
         )
         if action == "repaired":
@@ -21358,6 +21560,98 @@ def resolve_defect(item_id):
     if dispatch_result is not None:
         resp["dispatch"] = dispatch_result
     return jsonify(resp)
+
+
+def _remove_stop_and_reindex(conn, stop_id):
+    """Delete a stop and renumber its route 1..N. Returns the route_id."""
+    row = conn.execute("SELECT route_id FROM stops WHERE id=?", (stop_id,)).fetchone()
+    if not row:
+        return None
+    rid = row["route_id"]
+    conn.execute("DELETE FROM stops WHERE id=?", (stop_id,))
+    remaining = conn.execute(
+        "SELECT id FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC", (rid,)
+    ).fetchall()
+    for pos, r in enumerate(remaining, start=1):
+        conn.execute("UPDATE stops SET stop_order=? WHERE id=?", (pos, r["id"]))
+    return rid
+
+
+@app.route("/api/defects/<int:item_id>/delete", methods=["POST"])
+@login_required
+def delete_defect(item_id):
+    """Boss soft-deletes a defect (hidden everywhere, kept with deleted_at+who).
+    If it had a dispatched, not-yet-completed vendor stop, that stop is pulled
+    from the driver's route and an info message is left on the thread."""
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    row = conn.execute(
+        """SELECT ii.id, i.truck_id FROM inspection_items ii
+             JOIN inspections i ON ii.inspection_id=i.id
+            WHERE ii.id=? AND i.company_id=? AND ii.result='defect'
+              AND ii.deleted_at IS NULL""",
+        (item_id, cid())
+    ).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    ts = now_ts()
+    conn.execute("UPDATE inspection_items SET deleted_at=?, deleted_by=? WHERE id=?",
+                 (ts, session["user_id"], item_id))
+    # Cancel any live vendor stop dispatched for this defect.
+    vstop = conn.execute(
+        """SELECT s.id, s.route_id FROM stops s
+            WHERE s.defect_item_id=? AND s.action='Vendor' AND s.status!='completed'
+            ORDER BY s.id DESC LIMIT 1""",
+        (item_id,)
+    ).fetchone()
+    if vstop:
+        conn.execute(
+            "INSERT INTO messages (route_id, sender_user_id, body, created_at) VALUES (?,?,?,?)",
+            (vstop["route_id"], session["user_id"], "\U0001F527 Vendor stop cancelled by boss.", ts)
+        )
+        _remove_stop_and_reindex(conn, vstop["id"])
+        try:
+            compute_can_flow(conn, vstop["route_id"])
+        except Exception:
+            pass
+    _recompute_truck_at_vendor(conn, row["truck_id"])
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/defects/<int:item_id>/report-mistake", methods=["POST"])
+@login_required
+def report_defect_mistake(item_id):
+    """Driver flags THEIR OWN defect entry as a mistake for the boss to review.
+    The immutable DVIR is never altered — only the mutable follow-up entry is
+    flagged (flagged_at/by + optional note). Not a delete."""
+    data = request.get_json(silent=True) or {}
+    note = str(data.get("note") or "").strip()[:300]
+    conn = get_db()
+    row = conn.execute(
+        """SELECT ii.id, i.driver_id FROM inspection_items ii
+             JOIN inspections i ON ii.inspection_id=i.id
+            WHERE ii.id=? AND i.company_id=? AND ii.result='defect'
+              AND ii.deleted_at IS NULL""",
+        (item_id, cid())
+    ).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    # Only the reporting driver may flag it (boss uses Delete instead).
+    if session.get("role") != "boss" and row["driver_id"] != session["user_id"]:
+        conn.close()
+        return jsonify({"error": "forbidden"}), 403
+    conn.execute(
+        "UPDATE inspection_items SET flagged_at=?, flagged_by=?, flag_note=? WHERE id=?",
+        (now_ts(), session["user_id"], note or None, item_id)
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
 
 
 @app.route("/maintenance-photo/<int:photo_id>")
@@ -21574,6 +21868,28 @@ def void_maintenance_entry(entry_id):
     return jsonify({"success": True})
 
 
+@app.route("/api/maintenance/entries/<int:entry_id>/delete", methods=["POST"])
+@login_required
+def delete_maintenance_entry(entry_id):
+    """Boss soft-deletes a maintenance event (deleted_at+who) — hidden from
+    every view but kept in the DB, so nothing is truly lost."""
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    entry = _load_manual_entry(conn, entry_id)
+    if entry is None or entry["deleted_at"]:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    conn.execute(
+        "UPDATE maintenance_entries SET deleted_at=?, deleted_by=? WHERE id=?",
+        (now_ts(), session["user_id"], entry_id),
+    )
+    _recompute_truck_at_vendor(conn, entry["truck_id"])
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
 # ── Vendors CRUD (owner/dispatcher manage; any management views) ──────────
 @app.route("/vendors")
 @roles_required("owner", "customer_manager", "dispatcher")
@@ -21703,7 +22019,7 @@ def maintenance_entry_detail(entry_id):
         conn.close()
         flash("Maintenance entry not found.", "error")
         return redirect(url_for("maintenance_page"))
-    truck = conn.execute("SELECT id, name, out_of_service, at_vendor FROM trucks WHERE id=? AND company_id=?",
+    truck = conn.execute("SELECT id, name, out_of_service, at_vendor, vendor_status FROM trucks WHERE id=? AND company_id=?",
                          (entry["truck_id"], cid())).fetchone()
     receipts = _maintenance_receipts(conn, manual_entry_id=entry_id)
     creator = conn.execute("SELECT COALESCE(full_name, username) AS n FROM users WHERE id=?",
@@ -21751,8 +22067,9 @@ def maintenance_entry_detail(entry_id):
         cost_val = "" if entry["cost_cents"] is None else f'{entry["cost_cents"]//100}.{entry["cost_cents"]%100:02d}'
         edit_ui = f"""
         <div style="max-width:640px;margin-bottom:12px;display:flex;gap:8px;">
-            <button class="btn secondary" style="flex:1;" onclick="toggleEdit()">Edit</button>
-            <button class="btn red" style="flex:1;" onclick="voidEntry()">Void</button>
+            <button class="btn secondary" style="flex:1;min-height:48px;" onclick="toggleEdit()">Edit</button>
+            <button class="btn red" style="flex:1;min-height:48px;" onclick="voidEntry()">Void</button>
+            <button class="btn secondary" style="min-height:48px;color:#FF5252;border-color:rgba(255,82,82,0.35);background:rgba(255,82,82,0.08);" onclick="deleteEntry()" title="Delete permanently">🗑 Delete</button>
         </div>
         <div id="edit-form" hidden class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
             <div id="edit-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
@@ -21779,8 +22096,11 @@ def maintenance_entry_detail(entry_id):
         </div>"""
     elif can_action and not entry["voided"]:
         edit_ui = ('<div style="max-width:640px;margin-bottom:12px;">'
-                   '<div style="color:var(--slate);font-size:12px;margin-bottom:8px;">Edit window has passed — this entry is locked. It can still be voided.</div>'
-                   '<button class="btn red" style="width:100%;" onclick="voidEntry()">Void</button></div>')
+                   '<div style="color:var(--slate);font-size:12px;margin-bottom:8px;">Edit window has passed — this entry is locked. It can still be voided or deleted.</div>'
+                   '<div style="display:flex;gap:8px;">'
+                   '<button class="btn red" style="flex:1;min-height:48px;" onclick="voidEntry()">Void</button>'
+                   '<button class="btn secondary" style="min-height:48px;color:#FF5252;border-color:rgba(255,82,82,0.35);background:rgba(255,82,82,0.08);" onclick="deleteEntry()" title="Delete permanently">🗑 Delete</button>'
+                   '</div></div>')
 
     body = f"""
     <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
@@ -21857,6 +22177,14 @@ def _maintenance_entry_js(entry_id, truck_id):
         headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},body:JSON.stringify({{note:note}})}})
       .then(function(r){{return r.json().then(function(j){{return {{ok:r.ok,j:j}};}});}})
       .then(function(res){{ if(res.ok){{ window.location.reload(); }} else {{ alert((res.j&&res.j.error)||'Could not void.'); }} }})
+      .catch(function(){{ alert('Network error — try again.'); }});
+  }};
+  window.deleteEntry=function(){{
+    if(!confirm('This removes the record permanently. Sure?')) return;
+    fetch('/api/maintenance/entries/'+EID+'/delete',{{method:'POST',
+        headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},body:'{{}}'}})
+      .then(function(r){{return r.json().then(function(j){{return {{ok:r.ok,j:j}};}});}})
+      .then(function(res){{ if(res.ok){{ window.location.href='{url_for('truck_detail_page', truck_id=entry['truck_id'])}'; }} else {{ alert((res.j&&res.j.error)||'Could not delete.'); }} }})
       .catch(function(){{ alert('Network error — try again.'); }});
   }};
 }})();
