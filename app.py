@@ -1824,7 +1824,7 @@ def _fmt_hours_1(h):
     return ("%.1f" % h) if h is not None else "&mdash;"
 
 
-def render_week_hours_card(summary, nav_base_url, w, extra_qs="", heading="This Week"):
+def render_week_hours_card(summary, nav_base_url, w, extra_qs="", heading="This Week", off_dates=None):
     """
     Render the shared weekly-hours card (one row per Mon→Sun day + big total,
     with ‹ › week arrows). Used verbatim by the driver clock page and the boss
@@ -1865,9 +1865,15 @@ def render_week_hours_card(summary, nav_base_url, w, extra_qs="", heading="This 
 
     # ── day rows ──────────────────────────────────────────────────────────
     rows = []
+    _off = off_dates or set()
     for day in summary["days"]:
         wd = day["weekday"]
-        if day["missing_out"]:
+        # Approved time off: an OFF row (no hours expected), unless the driver
+        # actually worked that day anyway (punches present → show the hours).
+        if day["date"] in _off and not day["start"]:
+            detail = ('<span style="color:#3DDC84;font-weight:700;">&#127796; OFF</span>')
+            hrs_cell = '<span style="color:var(--text-faint);">&mdash;</span>'
+        elif day["missing_out"]:
             detail = ('<span style="color:var(--red);font-weight:600;">'
                       '&#9888; no clock-out</span>')
             hrs_cell = '<span style="color:var(--red);font-weight:700;">&mdash;</span>'
@@ -2636,6 +2642,73 @@ def init_db():
         clock_out_at TEXT,
         notes        TEXT,
         created_at   TEXT NOT NULL,
+        FOREIGN KEY (driver_id) REFERENCES users(id)
+    )
+    """)
+
+    # ── Time off system (feat/time-off) ───────────────────────────────────────
+    # One-time day/range off requests. status: pending|approved|denied.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS time_off_requests (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id  INTEGER NOT NULL,
+        driver_id   INTEGER NOT NULL,
+        start_date  TEXT NOT NULL,
+        end_date    TEXT NOT NULL,
+        reason      TEXT,
+        status      TEXT NOT NULL DEFAULT 'pending',
+        boss_note   TEXT,
+        decided_by  INTEGER,
+        decided_at  TEXT,
+        created_at  TEXT NOT NULL,
+        FOREIGN KEY (driver_id) REFERENCES users(id)
+    )
+    """)
+    # Recurring days-off rules. weekday 0=Mon..6=Sun (date.weekday()).
+    # frequency: weekly | biweekly | monthly (same weekday-of-month as anchor).
+    # anchor_date is a matching weekday and the parity/ordinal anchor. A rule is
+    # approved once by the boss; ended_on (exclusive) ends it for future dates.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS recurring_days_off (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id  INTEGER NOT NULL,
+        driver_id   INTEGER NOT NULL,
+        weekday     INTEGER NOT NULL,
+        frequency   TEXT NOT NULL DEFAULT 'weekly',
+        anchor_date TEXT NOT NULL,
+        status      TEXT NOT NULL DEFAULT 'pending',
+        ended_on    TEXT,
+        created_by  INTEGER,
+        created_at  TEXT NOT NULL,
+        FOREIGN KEY (driver_id) REFERENCES users(id)
+    )
+    """)
+    # A single occurrence of a recurring rule flipped back to WORKING
+    # ("need him this Monday"). Presence of a row = that date is NOT off.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS recurring_off_overrides (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id  INTEGER NOT NULL,
+        rule_id     INTEGER NOT NULL,
+        off_date    TEXT NOT NULL,
+        created_by  INTEGER,
+        created_at  TEXT NOT NULL,
+        UNIQUE(rule_id, off_date),
+        FOREIGN KEY (rule_id) REFERENCES recurring_days_off(id)
+    )
+    """)
+    # "Running late for work" check-ins. One active (cleared_at NULL) per
+    # driver+day matters; clearing happens the moment the driver clocks in.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS late_checkins (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id  INTEGER NOT NULL,
+        driver_id   INTEGER NOT NULL,
+        work_date   TEXT NOT NULL,
+        eta         TEXT,
+        reason      TEXT,
+        created_at  TEXT NOT NULL,
+        cleared_at  TEXT,
         FOREIGN KEY (driver_id) REFERENCES users(id)
     )
     """)
@@ -5063,6 +5136,7 @@ def shell_page(title, body, extra_head=""):
             _mparts.append(nav_link(url_for("trucks_page"), "🚛 Trucks", path))
             _mparts.append(nav_link(url_for("vendors_page"), "🔧 Vendors", path))
             _mparts.append(nav_link(url_for("team_hours_page"), "🕐 Team Hours", path))
+            _mparts.append(nav_link(url_for("team_time_off_page"), "🌴 Team Time Off", path))
             if is_disp:
                 _mparts.append(nav_link(url_for("team_page"), "👥 Team", path))
             if is_own:
@@ -8861,12 +8935,13 @@ def reassign_route(route_id):
 
     conn = get_db()
     route = conn.execute(
-        "SELECT id FROM routes WHERE id=? AND company_id=?", (route_id, cid())
+        "SELECT id, route_date FROM routes WHERE id=? AND company_id=?", (route_id, cid())
     ).fetchone()
     if not route:
         conn.close()
         abort(404)
 
+    off_info = None
     if driver_id is not None:
         driver = conn.execute(
             "SELECT id FROM users WHERE id=? AND role='driver' AND company_id=?",
@@ -8876,12 +8951,19 @@ def reassign_route(route_id):
             conn.close()
             flash("Driver not found.", "error")
             return redirect(url_for("boss_dashboard"))
+        # Time-off aware: warn (don't block) when assigning a driver who is
+        # approved off that date. The reassignment still goes through.
+        off_info = _approved_off_on(conn, cid(), driver_id, route["route_date"])
 
     conn.execute("UPDATE routes SET assigned_to=? WHERE id=? AND company_id=?",
                  (driver_id, route_id, cid()))
     conn.commit()
     conn.close()
-    flash("Route reassigned.", "success")
+    if off_info:
+        flash("⚠ That driver is approved OFF on " + (route["route_date"] or "that date")
+              + " — reassigned anyway.", "error")
+    else:
+        flash("Route reassigned.", "success")
     return redirect(url_for("boss_dashboard"))
 
 
@@ -9733,6 +9815,17 @@ def _build_route_board_html(user):
             GROUP BY m.route_id
         """, (company_id, today, user["id"])).fetchall()
     }
+
+    # Time-off / late marks per assigned driver (feat/time-off): approved-OFF
+    # today and any active running-late check-in, surfaced on the lane header.
+    _co = conn.execute("SELECT * FROM companies WHERE id=?", (company_id,)).fetchone()
+    _co_settings = {k: _co[k] for k in _co.keys()} if _co else {}
+    driver_marks = {}
+    for _did in {r["assigned_to"] for r in board_rows if r["assigned_to"]}:
+        driver_marks[_did] = (
+            _approved_off_on(conn, company_id, _did, today),
+            _late_active(conn, company_id, _did, today, _co_settings),
+        )
     conn.close()
 
     lanes = {}
@@ -9740,6 +9833,7 @@ def _build_route_board_html(user):
         driver_key = row["driver_username"] or "__unassigned__"
         lane = lanes.setdefault(driver_key, {
             "driver_username": row["driver_username"],
+            "driver_id": row["assigned_to"],
             "route_names": [],
             "route_ids_seen": set(),
             "stops": [],
@@ -9854,12 +9948,26 @@ def _build_route_board_html(user):
         if not cards_html:
             cards_html = '<div class="muted small" style="padding:10px;">No stops.</div>'
 
+        # Time-off / late chips (feat/time-off)
+        _off_info, _late_row = driver_marks.get(lane.get("driver_id"), (None, None))
+        timeoff_chip = ""
+        if _off_info:
+            timeoff_chip += ('<span class="lane-off-badge" style="display:inline-block;margin-left:6px;'
+                             'font-size:9px;font-weight:800;letter-spacing:.4px;padding:2px 7px;border-radius:999px;'
+                             'background:rgba(0,232,125,0.14);color:#3DDC84;border:1px solid rgba(0,232,125,0.45);">OFF</span>')
+        if _late_row:
+            timeoff_chip += ('<span class="lane-late-badge" style="display:inline-block;margin-left:6px;'
+                             'font-size:9px;font-weight:800;letter-spacing:.4px;padding:2px 7px;border-radius:999px;'
+                             'background:rgba(255,107,26,0.14);color:#FF9D5C;border:1px solid rgba(255,107,26,0.5);">&#9201; LATE '
+                             + e(_late_row["eta"] or "") + '</span>')
+
         lanes_html += f"""
         <div class="lane">
             <div class="lane-driver">
                 <div class="lane-name-row">
                     <span class="lane-status-dot {dot_cls}"></span>
                     <span class="lane-name">{e(display_name)}</span>
+                    {timeoff_chip}
                 </div>
                 <div class="lane-sub">{e(route_label)}<br>{e(progress_label)}</div>
                 <div class="lane-actions">
@@ -18425,6 +18533,726 @@ def team_hours_export():
 # =========================================================
 # PHASE 5B — MANUAL CLOCK-IN / CLOCK-OUT  (/driver/clock)
 # =========================================================
+# =========================================================
+# TIME OFF SYSTEM (feat/time-off)
+# Drivers request days off + report running late; the boss manages it from one
+# team calendar; the Route Board + weekly hours respect it. Everything is
+# company_id-scoped. There is no server-side FCM in this app, so "push" here
+# means the existing realtime channels: the boss Route Board's 30s poll and the
+# driver Cab View's ~4s poll surface late/off state; the calendar and the
+# driver's own request list reflect approvals on their next poll/load.
+# =========================================================
+_TIMEOFF_FREQS = {"weekly", "biweekly", "monthly"}
+_WEEKDAY_ABBR = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def _iso(d):
+    return d.isoformat()
+
+
+def _parse_iso(s):
+    try:
+        return date.fromisoformat((s or "").strip())
+    except Exception:
+        return None
+
+
+def _ordinal_of_month(d):
+    """1st..5th occurrence of this weekday within its month."""
+    return (d.day - 1) // 7 + 1
+
+
+def _recurring_fires(freq, anchor, weekday, ended_on, d):
+    """True if a recurring rule (weekday/freq anchored at `anchor`, optionally
+    ended on `ended_on` exclusive) puts date `d` off. All args are date objs
+    except freq/weekday."""
+    if d.weekday() != weekday or d < anchor:
+        return False
+    if ended_on and d >= ended_on:
+        return False
+    if freq == "weekly":
+        return True
+    if freq == "biweekly":
+        return (d - anchor).days % 14 == 0
+    if freq == "monthly":
+        return _ordinal_of_month(d) == _ordinal_of_month(anchor)
+    return False
+
+
+def _time_off_for_range(conn, company_id, driver_id, start, end):
+    """Project a driver's time off across [start, end] inclusive.
+    Returns {date_str: {status, source, reason, note, id?/rule_id?}} where an
+    approved one-time request or an approved recurring occurrence (that hasn't
+    been overridden back to working) yields status 'approved'; a still-pending
+    one-time request yields 'pending'. Approved always wins over pending."""
+    out = {}
+    rows = conn.execute(
+        """SELECT id, start_date, end_date, reason, status, boss_note
+             FROM time_off_requests
+            WHERE company_id=? AND driver_id=? AND status IN ('approved','pending')
+              AND NOT (end_date < ? OR start_date > ?)""",
+        (company_id, driver_id, _iso(start), _iso(end))
+    ).fetchall()
+    for r in rows:
+        rs = _parse_iso(r["start_date"]) or start
+        re_ = _parse_iso(r["end_date"]) or end
+        dd = max(start, rs)
+        last = min(end, re_)
+        while dd <= last:
+            key = _iso(dd)
+            cur = out.get(key)
+            if cur is None or (cur["status"] != "approved" and r["status"] == "approved"):
+                out[key] = {"status": r["status"], "source": "request",
+                            "reason": r["reason"] or "", "note": r["boss_note"] or "",
+                            "id": r["id"]}
+            dd += timedelta(days=1)
+    rules = conn.execute(
+        """SELECT id, weekday, frequency, anchor_date, ended_on
+             FROM recurring_days_off
+            WHERE company_id=? AND driver_id=? AND status='approved'""",
+        (company_id, driver_id)
+    ).fetchall()
+    for rule in rules:
+        anchor = _parse_iso(rule["anchor_date"])
+        if not anchor:
+            continue
+        ended = _parse_iso(rule["ended_on"]) if rule["ended_on"] else None
+        ov = {o["off_date"] for o in conn.execute(
+            "SELECT off_date FROM recurring_off_overrides WHERE rule_id=?", (rule["id"],)).fetchall()}
+        dd = start
+        while dd <= end:
+            if _recurring_fires(rule["frequency"], anchor, rule["weekday"], ended, dd):
+                key = _iso(dd)
+                if key not in ov and (out.get(key, {}).get("status") != "approved"):
+                    out[key] = {"status": "approved", "source": "recurring",
+                                "reason": "Recurring day off", "note": "",
+                                "rule_id": rule["id"]}
+            dd += timedelta(days=1)
+    return out
+
+
+def _approved_off_on(conn, company_id, driver_id, date_str):
+    """Info dict if the driver is APPROVED off on date_str, else None."""
+    d = _parse_iso(date_str)
+    if not d:
+        return None
+    info = _time_off_for_range(conn, company_id, driver_id, d, d).get(date_str)
+    return info if (info and info["status"] == "approved") else None
+
+
+def _late_active(conn, company_id, driver_id, date_str, co_settings=None):
+    """The driver's active late check-in for date_str, or None. Auto-clears
+    (stamps cleared_at) the moment the driver has a start punch that day — the
+    row stays for record, but the chip is considered cleared."""
+    row = conn.execute(
+        """SELECT * FROM late_checkins
+            WHERE company_id=? AND driver_id=? AND work_date=? AND cleared_at IS NULL
+            ORDER BY id DESC LIMIT 1""",
+        (company_id, driver_id, date_str)
+    ).fetchone()
+    if not row:
+        return None
+    start_ts = None
+    try:
+        start_ts, _ = resolve_driver_day_punches(conn, driver_id, date_str, co_settings or {})
+    except Exception:
+        start_ts = None
+    if start_ts:
+        try:
+            conn.execute("UPDATE late_checkins SET cleared_at=? WHERE id=? AND cleared_at IS NULL",
+                         (now_ts(), row["id"]))
+            conn.commit()
+        except Exception:
+            pass
+        return None
+    return row
+
+
+def _driver_off_or_late_marks(conn, company_id, driver_id, date_str, co_settings=None):
+    """Compact (off_info, late_row) pair for one driver+date — used by the Route
+    Board lanes and the Cab View realtime snapshot."""
+    return (_approved_off_on(conn, company_id, driver_id, date_str),
+            _late_active(conn, company_id, driver_id, date_str, co_settings))
+
+
+# ── Driver endpoints ─────────────────────────────────────────────────────────
+@app.route("/time-off/request", methods=["POST"])
+@driver_required
+def time_off_request():
+    start = _parse_iso(request.form.get("start_date"))
+    end = _parse_iso(request.form.get("end_date")) or start
+    reason = (request.form.get("reason") or "").strip()[:200]
+    driver_id = session["user_id"]
+    today = _parse_iso(today_str())
+    if not start:
+        flash("Pick a start date.", "error")
+        return redirect(url_for("driver_clock"))
+    if end < start:
+        end = start
+    if start < today:
+        flash("You can't request a day off in the past.", "error")
+        return redirect(url_for("driver_clock"))
+    conn = get_db()
+    company_id = cid()
+    # Already recurring-off for a single-day request → say so, don't duplicate.
+    if start == end and _approved_off_on(conn, company_id, driver_id, _iso(start)):
+        conn.close()
+        flash("You're already scheduled off that day.", "info")
+        return redirect(url_for("driver_clock"))
+    # No overlapping duplicate (pending or approved) request.
+    dupe = conn.execute(
+        """SELECT id FROM time_off_requests
+            WHERE company_id=? AND driver_id=? AND status IN ('pending','approved')
+              AND NOT (end_date < ? OR start_date > ?) LIMIT 1""",
+        (company_id, driver_id, _iso(start), _iso(end))
+    ).fetchone()
+    if dupe:
+        conn.close()
+        flash("You already have a request covering those dates.", "info")
+        return redirect(url_for("driver_clock"))
+    conn.execute(
+        """INSERT INTO time_off_requests
+           (company_id, driver_id, start_date, end_date, reason, status, created_at)
+           VALUES (?,?,?,?,?,'pending',?)""",
+        (company_id, driver_id, _iso(start), _iso(end), reason, now_ts())
+    )
+    conn.commit()
+    conn.close()
+    flash("Time-off request sent.", "success")
+    return redirect(url_for("driver_clock"))
+
+
+@app.route("/time-off/<int:req_id>/cancel", methods=["POST"])
+@driver_required
+def time_off_cancel(req_id):
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id, status FROM time_off_requests WHERE id=? AND company_id=? AND driver_id=?",
+        (req_id, cid(), session["user_id"])
+    ).fetchone()
+    if not row:
+        conn.close()
+        abort(404)
+    if row["status"] != "pending":
+        conn.close()
+        flash("Only pending requests can be cancelled.", "error")
+        return redirect(url_for("driver_clock"))
+    conn.execute("DELETE FROM time_off_requests WHERE id=? AND company_id=? AND driver_id=?",
+                 (req_id, cid(), session["user_id"]))
+    conn.commit()
+    conn.close()
+    flash("Request cancelled.", "success")
+    return redirect(url_for("driver_clock"))
+
+
+@app.route("/recurring-off/create", methods=["POST"])
+@login_required
+def recurring_off_create():
+    """Driver or boss creates a recurring day-off rule. Boss-created rules are
+    approved immediately; driver-created rules are pending until the boss OKs."""
+    is_boss = session.get("role") == "boss"
+    start = _parse_iso(request.form.get("start_date"))
+    freq = (request.form.get("frequency") or "weekly").strip().lower()
+    if freq not in _TIMEOFF_FREQS:
+        freq = "weekly"
+    # Boss may target a specific driver; a driver targets themselves.
+    if is_boss:
+        try:
+            driver_id = int(request.form.get("driver_id") or 0)
+        except (TypeError, ValueError):
+            driver_id = 0
+    else:
+        driver_id = session["user_id"]
+    if not start or not driver_id:
+        flash("Pick a driver and a start date.", "error")
+        return redirect(url_for("team_time_off_page") if is_boss else url_for("driver_clock"))
+    conn = get_db()
+    ok_driver = conn.execute(
+        "SELECT id FROM users WHERE id=? AND company_id=? AND role='driver'",
+        (driver_id, cid())
+    ).fetchone()
+    if not ok_driver:
+        conn.close()
+        flash("Driver not found.", "error")
+        return redirect(url_for("team_time_off_page") if is_boss else url_for("driver_clock"))
+    conn.execute(
+        """INSERT INTO recurring_days_off
+           (company_id, driver_id, weekday, frequency, anchor_date, status, created_by, created_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (cid(), driver_id, start.weekday(), freq, _iso(start),
+         "approved" if is_boss else "pending", session["user_id"], now_ts())
+    )
+    conn.commit()
+    conn.close()
+    flash("Recurring day off " + ("added." if is_boss else "requested."), "success")
+    return redirect(url_for("team_time_off_page") if is_boss else url_for("driver_clock"))
+
+
+@app.route("/late/checkin", methods=["POST"])
+@driver_required
+def late_checkin():
+    eta = (request.form.get("eta") or "").strip()[:40]
+    reason = (request.form.get("reason") or "").strip()[:200]
+    driver_id = session["user_id"]
+    today = today_str()
+    conn = get_db()
+    company_id = cid()
+    company = conn.execute("SELECT * FROM companies WHERE id=?", (company_id,)).fetchone()
+    co_settings = {k: company[k] for k in company.keys()} if company else {}
+    # Only meaningful before the driver has clocked in.
+    try:
+        start_ts, _ = resolve_driver_day_punches(conn, driver_id, today, co_settings)
+    except Exception:
+        start_ts = None
+    if start_ts:
+        conn.close()
+        flash("You're already clocked in.", "info")
+        return redirect(url_for("driver_clock"))
+    # Replace any existing active late check-in for today (latest wins).
+    conn.execute(
+        "UPDATE late_checkins SET cleared_at=? WHERE company_id=? AND driver_id=? AND work_date=? AND cleared_at IS NULL",
+        (now_ts(), company_id, driver_id, today)
+    )
+    conn.execute(
+        """INSERT INTO late_checkins (company_id, driver_id, work_date, eta, reason, created_at)
+           VALUES (?,?,?,?,?,?)""",
+        (company_id, driver_id, today, eta, reason, now_ts())
+    )
+    conn.commit()
+    conn.close()
+    flash("Boss notified you're running late.", "success")
+    return redirect(url_for("driver_clock"))
+
+
+# ── Boss decisions ───────────────────────────────────────────────────────────
+@app.route("/time-off/<int:req_id>/decide", methods=["POST"])
+@boss_required
+def time_off_decide(req_id):
+    decision = (request.form.get("decision") or "").strip()
+    note = (request.form.get("boss_note") or "").strip()[:200]
+    if decision not in ("approved", "denied"):
+        abort(400)
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id FROM time_off_requests WHERE id=? AND company_id=? AND status='pending'",
+        (req_id, cid())
+    ).fetchone()
+    if not row:
+        conn.close()
+        flash("That request was already handled.", "error")
+        return redirect(url_for("team_time_off_page"))
+    conn.execute(
+        "UPDATE time_off_requests SET status=?, boss_note=?, decided_by=?, decided_at=? WHERE id=? AND company_id=?",
+        (decision, note, session["user_id"], now_ts(), req_id, cid())
+    )
+    conn.commit()
+    conn.close()
+    flash("Request " + decision + ".", "success")
+    return redirect(request.form.get("return_to") or url_for("team_time_off_page"))
+
+
+@app.route("/recurring-off/<int:rule_id>/action", methods=["POST"])
+@boss_required
+def recurring_off_action(rule_id):
+    """Boss controls a recurring rule: approve it, end it (future dates only), or
+    override/restore a single occurrence."""
+    act = (request.form.get("act") or "").strip()
+    conn = get_db()
+    rule = conn.execute(
+        "SELECT * FROM recurring_days_off WHERE id=? AND company_id=?", (rule_id, cid())
+    ).fetchone()
+    if not rule:
+        conn.close()
+        abort(404)
+    if act == "approve":
+        conn.execute("UPDATE recurring_days_off SET status='approved' WHERE id=? AND company_id=?",
+                     (rule_id, cid()))
+        flash("Recurring day off approved.", "success")
+    elif act == "end":
+        # End from today (or a given date) — future dates only, never rewrites past.
+        end_on = _parse_iso(request.form.get("ended_on")) or _parse_iso(today_str())
+        conn.execute("UPDATE recurring_days_off SET ended_on=? WHERE id=? AND company_id=?",
+                     (_iso(end_on), rule_id, cid()))
+        flash("Recurring rule ended for future dates.", "success")
+    elif act in ("override", "restore"):
+        d = _parse_iso(request.form.get("off_date"))
+        if d:
+            if act == "override":
+                conn.execute(
+                    "INSERT OR IGNORE INTO recurring_off_overrides (company_id, rule_id, off_date, created_by, created_at) VALUES (?,?,?,?,?)",
+                    (cid(), rule_id, _iso(d), session["user_id"], now_ts()))
+                flash("That day flipped back to working.", "success")
+            else:
+                conn.execute("DELETE FROM recurring_off_overrides WHERE rule_id=? AND off_date=?",
+                             (rule_id, _iso(d)))
+                flash("That day is off again.", "success")
+    conn.commit()
+    conn.close()
+    return redirect(request.form.get("return_to") or url_for("team_time_off_page"))
+
+
+def _month_bounds(m_str):
+    """(first_of_month, grid_start(Mon), grid_end(Sun), prev_m, next_m) for a
+    'YYYY-MM' string (defaults to the current month)."""
+    d = _parse_iso((m_str or "") + "-01") if m_str else None
+    if not d:
+        t = _parse_iso(today_str()) or date.today()
+        d = date(t.year, t.month, 1)
+    first = date(d.year, d.month, 1)
+    grid_start = first - timedelta(days=first.weekday())          # Monday on/before the 1st
+    if d.month == 12:
+        nxt_first = date(d.year + 1, 1, 1)
+    else:
+        nxt_first = date(d.year, d.month + 1, 1)
+    last = nxt_first - timedelta(days=1)
+    grid_end = last + timedelta(days=(6 - last.weekday()))        # Sunday on/after the last
+    prev_first = (first - timedelta(days=1)).replace(day=1)
+    prev_m = "%04d-%02d" % (prev_first.year, prev_first.month)
+    next_m = "%04d-%02d" % (nxt_first.year, nxt_first.month)
+    return first, grid_start, grid_end, prev_m, next_m
+
+
+@app.route("/team-time-off")
+@boss_required
+def team_time_off_page():
+    conn = get_db()
+    company_id = cid()
+    company = conn.execute("SELECT * FROM companies WHERE id=?", (company_id,)).fetchone()
+    co_settings = {k: company[k] for k in company.keys()} if company else {}
+    today = today_str()
+    m_str = (request.args.get("m") or "").strip()
+    first, gstart, gend, prev_m, next_m = _month_bounds(m_str)
+    month_label = first.strftime("%B %Y")
+
+    drivers = conn.execute(
+        "SELECT id, username, full_name FROM users WHERE role='driver' AND company_id=? ORDER BY username",
+        (company_id,)
+    ).fetchall()
+    dname = {d["id"]: (d["full_name"] or d["username"] or "Driver") for d in drivers}
+
+    # Project each driver's off/pending across the visible grid; late only today.
+    per_driver = {}
+    late_today = {}
+    for d in drivers:
+        per_driver[d["id"]] = _time_off_for_range(conn, company_id, d["id"], gstart, gend)
+        lr = _late_active(conn, company_id, d["id"], today, co_settings)
+        if lr:
+            late_today[d["id"]] = lr
+
+    # Build day → list of chips.
+    def _chips_for(day_str, is_today):
+        chips = []
+        for d in drivers:
+            did = d["id"]
+            info = per_driver[did].get(day_str)
+            late = late_today.get(did) if is_today else None
+            nm = e(dname[did]).upper()
+            conflict = bool(info and info["status"] == "approved" and late)
+            if info and info["status"] == "approved":
+                style = ("background:rgba(0,232,125,0.14);color:#3DDC84;border:1px solid rgba(0,232,125,0.4);"
+                         if not conflict else
+                         "background:rgba(255,82,82,0.16);color:#FF9B9B;border:1px solid rgba(255,82,82,0.55);")
+                lbl = nm + (" OFF" if not conflict else " OFF+LATE")
+                chips.append('<div class="tc-chip" style="' + style + '">' + lbl + '</div>')
+            elif info and info["status"] == "pending":
+                chips.append('<div class="tc-chip" style="background:rgba(120,120,111,0.14);color:#A6A69E;'
+                             'border:1px solid rgba(140,160,179,0.4);">' + nm + '?</div>')
+            if late and not (info and info["status"] == "approved"):
+                chips.append('<div class="tc-chip" style="background:rgba(255,107,26,0.12);color:#FF9D5C;'
+                             'border:1px solid rgba(255,107,26,0.5);">' + nm + ' LATE ' + e(late["eta"] or "") + '</div>')
+        return chips
+
+    # Month grid.
+    weekhdr = "".join('<div class="tc-wd">' + w + '</div>' for w in _WEEKDAY_ABBR)
+    cells = ""
+    dd = gstart
+    while dd <= gend:
+        ds = _iso(dd)
+        in_month = (dd.month == first.month)
+        is_today = (ds == today)
+        chips = _chips_for(ds, is_today)
+        cls = "tc-cell" + ("" if in_month else " tc-out") + (" tc-today" if is_today else "")
+        cells += ('<a class="' + cls + '" href="' + url_for("team_time_off_page")
+                  + "?m=" + ("%04d-%02d" % (first.year, first.month)) + "&day=" + ds + '">'
+                  + '<div class="tc-daynum">' + str(dd.day) + '</div>'
+                  + "".join(chips) + '</a>')
+        dd += timedelta(days=1)
+
+    # Pending requests (action list).
+    pend_rows = conn.execute(
+        """SELECT id, driver_id, start_date, end_date, reason
+             FROM time_off_requests
+            WHERE company_id=? AND status='pending' ORDER BY start_date""",
+        (company_id,)
+    ).fetchall()
+    csrf = get_csrf_token()
+    pend_html = ""
+    for r in pend_rows:
+        rng = e(r["start_date"]) + (" → " + e(r["end_date"]) if r["end_date"] != r["start_date"] else "")
+        pend_html += (
+            '<div class="tc-pend">'
+            '<div><b>' + e(dname.get(r["driver_id"], "Driver")) + '</b> &middot; ' + rng
+            + ('<div class="muted small">' + e(r["reason"]) + '</div>' if r["reason"] else '') + '</div>'
+            '<form method="POST" action="' + url_for("time_off_decide", req_id=r["id"]) + '" class="tc-decide">'
+            '<input type="hidden" name="_csrf_token" value="' + csrf + '">'
+            '<input name="boss_note" placeholder="note (optional)" class="tc-note">'
+            '<button name="decision" value="approved" class="tc-approve">Approve</button>'
+            '<button name="decision" value="denied" class="tc-deny">Deny</button>'
+            '</form></div>')
+    if not pend_html:
+        pend_html = '<div class="muted small">No pending requests.</div>'
+
+    # Recurring rules (approve / end / with per-rule note).
+    rule_rows = conn.execute(
+        """SELECT id, driver_id, weekday, frequency, anchor_date, status, ended_on
+             FROM recurring_days_off WHERE company_id=? ORDER BY status, anchor_date""",
+        (company_id,)
+    ).fetchall()
+    freq_lbl = {"weekly": "every week", "biweekly": "every other week", "monthly": "monthly"}
+    rules_html = ""
+    for r in rule_rows:
+        desc = (e(dname.get(r["driver_id"], "Driver")) + " &middot; " + _WEEKDAY_ABBR[r["weekday"]]
+                + " " + freq_lbl.get(r["frequency"], r["frequency"]) + " from " + e(r["anchor_date"]))
+        badge = ('<span class="tc-badge tc-ok">approved</span>' if r["status"] == "approved"
+                 else '<span class="tc-badge tc-pend">pending</span>')
+        if r["ended_on"]:
+            badge += ' <span class="tc-badge">ends ' + e(r["ended_on"]) + '</span>'
+        ctrls = ('<input type="hidden" name="_csrf_token" value="' + csrf + '">')
+        approve_btn = ('<button form="rule-appr-' + str(r["id"]) + '" class="tc-approve">Approve</button>'
+                       if r["status"] != "approved" else "")
+        rules_html += (
+            '<div class="tc-rule"><div>' + desc + ' ' + badge + '</div>'
+            '<div class="tc-rule-ctrls">'
+            + ('<form id="rule-appr-' + str(r["id"]) + '" method="POST" action="'
+               + url_for("recurring_off_action", rule_id=r["id"]) + '">' + ctrls
+               + '<input type="hidden" name="act" value="approve"></form>' + approve_btn
+               if r["status"] != "approved" else "")
+            + '<form method="POST" action="' + url_for("recurring_off_action", rule_id=r["id"]) + '">'
+            + ctrls + '<input type="hidden" name="act" value="end">'
+            + '<button class="tc-end">End (future)</button></form>'
+            '</div></div>')
+    if not rules_html:
+        rules_html = '<div class="muted small">No recurring rules yet.</div>'
+
+    driver_opts = "".join('<option value="' + str(d["id"]) + '">' + e(dname[d["id"]]) + '</option>' for d in drivers)
+
+    # Optional day detail.
+    day_detail = ""
+    day_q = (request.args.get("day") or "").strip()
+    if _parse_iso(day_q):
+        items = ""
+        for d in drivers:
+            info = per_driver.get(d["id"], {}).get(day_q)
+            late = late_today.get(d["id"]) if day_q == today else None
+            if not info and not late:
+                continue
+            bits = []
+            if info and info["status"] == "approved":
+                bits.append('<span style="color:#3DDC84;font-weight:700;">OFF</span> ('
+                            + e(info.get("source", "")) + (', ' + e(info["note"]) if info.get("note") else '') + ')')
+            elif info and info["status"] == "pending":
+                bits.append('<span style="color:#A6A69E;font-weight:700;">PENDING</span>')
+            if late:
+                bits.append('<span style="color:#FF9D5C;font-weight:700;">LATE ETA ' + e(late["eta"] or "") + '</span>')
+            items += '<li><b>' + e(dname[d["id"]]) + '</b> — ' + " · ".join(bits) + '</li>'
+        day_detail = ('<div class="card"><h3 style="margin-top:0;">' + e(day_q) + '</h3><ul class="tc-daylist">'
+                      + (items or '<li class="muted">Nobody off or late this day.</li>') + '</ul></div>')
+
+    conn.close()
+
+    css = """
+    <style>
+    .tc-toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:14px;flex-wrap:wrap;}
+    .tc-nav{display:flex;align-items:center;gap:8px;}
+    .tc-nav a,.tc-today-btn{min-height:44px;min-width:44px;display:inline-flex;align-items:center;justify-content:center;
+      padding:0 14px;border-radius:10px;border:1px solid rgba(255,255,255,0.14);color:var(--text);text-decoration:none;font-weight:700;}
+    .tc-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:6px;}
+    .tc-wd{font-size:11px;font-weight:800;letter-spacing:.4px;color:#8CA0B3;text-align:center;padding:4px 0;}
+    .tc-cell{min-height:92px;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:6px;
+      display:flex;flex-direction:column;gap:3px;text-decoration:none;color:var(--text);background:rgba(255,255,255,0.02);}
+    .tc-cell:hover{border-color:rgba(255,107,26,0.5);}
+    .tc-out{opacity:.4;}
+    .tc-today{border-color:#FF6B1A;box-shadow:0 0 0 1px #FF6B1A inset;}
+    .tc-daynum{font-size:12px;font-weight:800;color:#A6A69E;}
+    .tc-chip{font-size:10px;font-weight:800;letter-spacing:.2px;padding:2px 5px;border-radius:6px;line-height:1.25;
+      overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    .tc-pend,.tc-rule{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;
+      padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.07);}
+    .tc-decide,.tc-rule-ctrls{display:flex;gap:6px;align-items:center;flex-wrap:wrap;}
+    .tc-note{min-height:40px;padding:6px 10px;background:var(--bg-0,#121212);border:1px solid rgba(255,255,255,0.12);
+      border-radius:8px;color:var(--text);font-size:13px;}
+    .tc-approve,.tc-deny,.tc-end{min-height:44px;padding:0 14px;border-radius:9px;border:none;cursor:pointer;font-weight:800;font-size:13px;}
+    .tc-approve{background:rgba(0,232,125,0.16);color:#3DDC84;border:1px solid rgba(0,232,125,0.5);}
+    .tc-deny{background:rgba(255,82,82,0.14);color:#FF9B9B;border:1px solid rgba(255,82,82,0.5);}
+    .tc-end{background:rgba(255,157,92,0.12);color:#FF9D5C;border:1px solid rgba(255,157,92,0.45);}
+    .tc-badge{font-size:10px;font-weight:800;padding:2px 7px;border-radius:6px;background:rgba(255,255,255,0.06);color:#A6A69E;}
+    .tc-badge.tc-ok{background:rgba(0,232,125,0.14);color:#3DDC84;}
+    .tc-badge.tc-pend{background:rgba(120,120,111,0.14);color:#A6A69E;}
+    .tc-daylist{margin:6px 0 0;padding-left:18px;line-height:1.7;}
+    .tc-addrule{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px;}
+    .tc-addrule select,.tc-addrule input{min-height:44px;padding:6px 10px;background:var(--bg-0,#121212);
+      border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);}
+    </style>
+    """
+    body = css + (
+        '<div class="hero"><h1>Team Time Off</h1>'
+        '<p>Approved days off, pending requests, recurring rules, and today&rsquo;s late check-ins &mdash; one calendar.</p></div>'
+        + day_detail
+        + '<div class="card">'
+        + '<div class="tc-toolbar">'
+        + '<div class="tc-nav">'
+        + '<a href="' + url_for("team_time_off_page") + '?m=' + prev_m + '">&lsaquo;</a>'
+        + '<b style="font-size:18px;">' + e(month_label) + '</b>'
+        + '<a href="' + url_for("team_time_off_page") + '?m=' + next_m + '">&rsaquo;</a>'
+        + '</div>'
+        + '<a class="tc-today-btn" href="' + url_for("team_time_off_page") + '">Today</a>'
+        + '</div>'
+        + '<div class="tc-grid">' + weekhdr + cells + '</div>'
+        + '</div>'
+        + '<div class="card"><h2 style="margin-top:0;">Pending requests</h2>' + pend_html + '</div>'
+        + '<div class="card"><h2 style="margin-top:0;">Recurring days off</h2>' + rules_html
+        + '<form method="POST" action="' + url_for("recurring_off_create") + '" class="tc-addrule">'
+        + '<input type="hidden" name="_csrf_token" value="' + csrf + '">'
+        + '<select name="driver_id" required><option value="">Driver&hellip;</option>' + driver_opts + '</select>'
+        + '<select name="frequency"><option value="weekly">Every week</option>'
+        + '<option value="biweekly">Every other week</option><option value="monthly">Monthly</option></select>'
+        + '<input type="date" name="start_date" required>'
+        + '<button class="tc-approve" style="min-width:120px;">+ Add rule</button>'
+        + '</form></div>'
+    )
+    return render_template_string(shell_page("Team Time Off", body))
+
+
+def _driver_time_off_card_html(conn, company_id, driver_id, today, co_settings, csrf):
+    """The driver's TIME OFF card for the clock page: request form + own request
+    list with status badges + cancel, a recurring-off request, and (when not yet
+    clocked in) the Running-late control."""
+    reqs = conn.execute(
+        """SELECT id, start_date, end_date, reason, status, boss_note
+             FROM time_off_requests WHERE company_id=? AND driver_id=?
+            ORDER BY start_date DESC LIMIT 20""",
+        (company_id, driver_id)
+    ).fetchall()
+    rules = conn.execute(
+        """SELECT weekday, frequency, anchor_date, status, ended_on
+             FROM recurring_days_off WHERE company_id=? AND driver_id=? ORDER BY status, anchor_date""",
+        (company_id, driver_id)
+    ).fetchall()
+    # Is the driver currently clocked in today? (governs the Late control)
+    try:
+        start_ts, _ = resolve_driver_day_punches(conn, driver_id, today, co_settings)
+    except Exception:
+        start_ts = None
+    late = _late_active(conn, company_id, driver_id, today, co_settings)
+
+    badge = {"pending": ("PENDING", "rgba(120,120,111,0.14)", "#A6A69E"),
+             "approved": ("APPROVED", "rgba(0,232,125,0.14)", "#3DDC84"),
+             "denied": ("DENIED", "rgba(255,82,82,0.14)", "#FF9B9B")}
+    req_html = ""
+    for r in reqs:
+        lbl, bg, col = badge.get(r["status"], badge["pending"])
+        rng = e(r["start_date"]) + (" → " + e(r["end_date"]) if r["end_date"] != r["start_date"] else "")
+        cancel = ""
+        if r["status"] == "pending":
+            cancel = ('<form method="POST" action="' + url_for("time_off_cancel", req_id=r["id"]) + '" style="margin:0;">'
+                      '<input type="hidden" name="_csrf_token" value="' + csrf + '">'
+                      '<button style="min-height:36px;padding:4px 12px;border-radius:8px;border:1px solid rgba(255,82,82,0.4);'
+                      'background:transparent;color:#FF9B9B;font-size:12px;cursor:pointer;">Cancel</button></form>')
+        note = ('<div class="muted small">' + e(r["boss_note"]) + '</div>') if r["boss_note"] else ""
+        reason = ('<div class="muted small">' + e(r["reason"]) + '</div>') if r["reason"] else ""
+        req_html += (
+            '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;'
+            'padding:9px 0;border-bottom:1px solid rgba(255,255,255,0.07);">'
+            '<div>' + rng + reason + note + '</div>'
+            '<div style="display:flex;align-items:center;gap:8px;">'
+            '<span style="font-size:10px;font-weight:800;padding:3px 8px;border-radius:6px;background:' + bg + ';color:' + col + ';">' + lbl + '</span>'
+            + cancel + '</div></div>')
+    if not req_html:
+        req_html = '<div class="muted small">No requests yet.</div>'
+
+    freq_lbl = {"weekly": "every week", "biweekly": "every other week", "monthly": "monthly"}
+    rule_html = ""
+    for r in rules:
+        st = "approved" if r["status"] == "approved" else "pending"
+        col = "#3DDC84" if st == "approved" else "#A6A69E"
+        rule_html += ('<div class="muted small">' + _WEEKDAY_ABBR[r["weekday"]] + " "
+                      + freq_lbl.get(r["frequency"], r["frequency"]) + " from " + e(r["anchor_date"])
+                      + ' <span style="color:' + col + ';font-weight:700;">(' + st + ')</span>'
+                      + (' · ends ' + e(r["ended_on"]) if r["ended_on"] else '') + '</div>')
+
+    # Running-late control (only before clocked in).
+    late_html = ""
+    if not start_ts:
+        if late:
+            late_html = ('<div style="margin-top:12px;padding:10px 12px;border-radius:10px;'
+                         'background:rgba(255,107,26,0.12);border:1px solid rgba(255,107,26,0.5);color:#FF9D5C;font-weight:700;">'
+                         '&#9201; Boss notified: running late, ETA ' + e(late["eta"] or "") + '. Clears when you clock in.</div>')
+        else:
+            late_html = (
+                '<div style="margin-top:12px;">'
+                '<button type="button" onclick="document.getElementById(\'late-modal\').hidden=false"'
+                ' style="width:100%;min-height:48px;border-radius:10px;border:1px solid rgba(255,107,26,0.5);'
+                'background:rgba(255,107,26,0.1);color:#FF9D5C;font-weight:800;cursor:pointer;">&#9201; Running late</button>'
+                '<div id="late-modal" hidden style="margin-top:10px;padding:12px;border-radius:10px;'
+                'border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.03);">'
+                '<form method="POST" action="' + url_for("late_checkin") + '">'
+                '<input type="hidden" name="_csrf_token" value="' + csrf + '">'
+                '<label class="muted small">ETA</label>'
+                '<div style="display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 10px;">'
+                + "".join('<label style="flex:1;min-width:64px;text-align:center;min-height:44px;display:flex;'
+                          'align-items:center;justify-content:center;border:1px solid rgba(255,255,255,0.14);'
+                          'border-radius:8px;cursor:pointer;"><input type="radio" name="eta" value="' + v + '" style="display:none;">' + v + '</label>'
+                          for v in ["15 min", "30 min", "45 min", "60+ min"])
+                + '</div>'
+                '<input name="eta" placeholder="or a time, e.g. be in by 7:30" '
+                'style="width:100%;min-height:44px;padding:8px 10px;background:var(--bg-0,#121212);'
+                'border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);margin-bottom:8px;">'
+                '<input name="reason" placeholder="reason (optional)" '
+                'style="width:100%;min-height:44px;padding:8px 10px;background:var(--bg-0,#121212);'
+                'border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);margin-bottom:10px;">'
+                '<button style="width:100%;min-height:48px;border-radius:10px;border:none;cursor:pointer;font-weight:800;'
+                'background:linear-gradient(135deg,#ff8a3d,#F5B43C);color:#1a1206;">Send</button>'
+                '</form></div></div>')
+
+    return (
+        '<div class="card" style="margin-top:16px;">'
+        '<h2 style="margin-top:0;">&#127796; Time Off</h2>'
+        '<form method="POST" action="' + url_for("time_off_request") + '" '
+        'style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:6px;">'
+        '<input type="hidden" name="_csrf_token" value="' + csrf + '">'
+        '<div><label class="muted small">From</label><br>'
+        '<input type="date" name="start_date" required style="min-height:44px;padding:6px 10px;'
+        'background:var(--bg-0,#121212);border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);"></div>'
+        '<div><label class="muted small">To (optional)</label><br>'
+        '<input type="date" name="end_date" style="min-height:44px;padding:6px 10px;'
+        'background:var(--bg-0,#121212);border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);"></div>'
+        '<div style="flex:1;min-width:120px;"><label class="muted small">Reason (optional)</label><br>'
+        '<input name="reason" style="width:100%;min-height:44px;padding:6px 10px;'
+        'background:var(--bg-0,#121212);border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);"></div>'
+        '<button style="min-height:44px;padding:0 18px;border-radius:9px;border:none;cursor:pointer;font-weight:800;'
+        'background:linear-gradient(135deg,#00c853,#00e57a);color:#001a0a;">Request</button>'
+        '</form>'
+        + late_html
+        + '<div style="margin-top:14px;">' + req_html + '</div>'
+        + ('<details style="margin-top:12px;"><summary class="muted small" style="cursor:pointer;min-height:36px;">'
+           'Recurring days off</summary>'
+           '<div style="margin-top:8px;">' + (rule_html or '<div class="muted small">None yet.</div>')
+           + '<form method="POST" action="' + url_for("recurring_off_create") + '" '
+           'style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:10px;">'
+           '<input type="hidden" name="_csrf_token" value="' + csrf + '">'
+           '<select name="frequency" style="min-height:44px;padding:6px 10px;background:var(--bg-0,#121212);'
+           'border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);">'
+           '<option value="weekly">Every week</option><option value="biweekly">Every other week</option>'
+           '<option value="monthly">Monthly</option></select>'
+           '<input type="date" name="start_date" required style="min-height:44px;padding:6px 10px;'
+           'background:var(--bg-0,#121212);border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);">'
+           '<button style="min-height:44px;padding:0 14px;border-radius:9px;border:1px solid rgba(255,255,255,0.14);'
+           'background:transparent;color:var(--text);font-weight:700;cursor:pointer;">Request recurring</button>'
+           '</form></div></details>')
+        + '</div>'
+    )
+
+
 @app.route("/driver/clock", methods=["GET", "POST"])
 @login_required
 def driver_clock():
@@ -18501,6 +19329,11 @@ def driver_clock():
         # ── clock_in ────────────────────────────────────────────────────────
         if action == "clock_in" and start_rule == "manual":
             _upsert_ci(ts, _note(_e.get("notes"), "clock_in"))
+            # Clocking in auto-clears today's "running late" check-in (the row
+            # stays for the record; the amber chips clear everywhere).
+            conn.execute(
+                "UPDATE late_checkins SET cleared_at=? WHERE company_id=? AND driver_id=? AND work_date=? AND cleared_at IS NULL",
+                (ts, cid(), driver_id, today))
             conn.commit(); conn.close()
             flash("Clocked in.", "success")
             return redirect(url_for("driver_clock"))
@@ -18590,9 +19423,15 @@ def driver_clock():
     _week_monday = company_week_start_for(co_settings, _now_local) + timedelta(days=7 * _w)
     week_summary = get_driver_week_summary(
         conn, driver_id, _week_monday, co_settings, _now_local)
+    # Approved-off days render as OFF rows in the weekly-hours card (no hours).
+    _week_off = _time_off_for_range(conn, cid(), driver_id, _week_monday, _week_monday + timedelta(days=6))
+    _week_off_dates = {k for k, v in _week_off.items() if v.get("status") == "approved"}
     week_card_html = render_week_hours_card(
-        week_summary, url_for("driver_clock"), _w, heading="This Week")
+        week_summary, url_for("driver_clock"), _w, heading="This Week", off_dates=_week_off_dates)
     week_tick_js = _WEEK_LIVE_TICK_JS if (week_summary["has_live"] and _w == 0) else ""
+
+    # Time Off card (request form + own list + running-late control).
+    time_off_card_html = _driver_time_off_card_html(conn, cid(), driver_id, today, co_settings, csrf_tok)
 
     conn.close()
 
@@ -18785,6 +19624,8 @@ def driver_clock():
         # ── THIS WEEK summary (below today's status) ─────────────────────
         + week_card_html
         + week_tick_js
+        # ── TIME OFF (below weekly hours) ────────────────────────────────
+        + time_off_card_html
     )
     return render_template_string(shell_page("Clock In / Out", body))
 
