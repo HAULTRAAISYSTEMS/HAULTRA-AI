@@ -1,18 +1,27 @@
 # Parser regression tests
 
 Real dispatch texts, frozen as permanent regression fixtures, so the parser
-never regresses on the boss's actual language.
+never regresses on the boss's actual language — plus deterministic multi-tenant
+checks that need no API key.
 
 ## Run
 
 ```bash
-# Strict, live — parses each text through the real /api/parse LLM parser:
+# Real-text suite — strict, live (parses through the real /api/parse LLM parser):
 ANTHROPIC_API_KEY=sk-... python tests/test_parser_real_texts.py
 
-# Keyless (CI without a key) — self-tests the matcher engine and SKIPS the
-# live assertions (exit 0). Never red-fails just for a missing key:
+# Real-text suite — keyless (CI without a key): self-tests the matcher engine
+# and SKIPS the live assertions (exit 0). Never red-fails for a missing key:
 python tests/test_parser_real_texts.py
+
+# Multi-tenant scoping + onboarding seed — fully deterministic, no key needed:
+python tests/test_parser_multitenant.py
 ```
+
+`test_parser_multitenant.py` verifies the per-company isolation guarantees
+(one company's dump sites / shorthand never appear in another's parse context)
+and the self-calibrating onboarding seed. It's a green-in-CI regression guard
+for `feat/parser-multitenant`.
 
 Exit code is non-zero if any **hard** expectation regresses. Advisory
 expectations (LLM nuances we watch but don't gate on yet) print a `⚠` and
@@ -20,7 +29,17 @@ never fail the suite.
 
 ## Add a real text
 
-Append an object to `fixtures` in [`parser_fixtures.json`](./parser_fixtures.json).
+Fixtures are **keyed by company** so the suite scales to any tenant:
+
+```json
+{ "companies": [
+    { "company_key": "haultra-1", "label": "HAULTRA (company 1)",
+      "fixtures": [ { "id": "...", "text": "...", "expect": { ... } } ] }
+] }
+```
+
+Append a fixture object to the right company's `fixtures`, or add a new company
+object for a new tenant, in [`parser_fixtures.json`](./parser_fixtures.json).
 Never delete an existing fixture — that's the regression guard.
 
 ```json

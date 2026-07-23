@@ -1,5 +1,5 @@
 {
-  "_about": "Permanent parser regression fixtures — REAL dispatch texts the boss actually sends. Append a new object to \"fixtures\" whenever a real text surfaces a case worth guarding. The suite (tests/test_parser_real_texts.py) runs each text through the live /api/parse LLM parser and asserts the structured output. It runs strict assertions when ANTHROPIC_API_KEY is set (locally or in CI with a key) and skips cleanly otherwise. Never delete a fixture — that's the whole point (permanent regression guard).",
+  "_about": "Permanent parser regression fixtures — REAL dispatch texts, keyed by company so the suite scales to any tenant. Company 1 holds OUR three real texts. Add a new company object (or append to an existing company's \"fixtures\") whenever a real text surfaces a case worth guarding. The suite (tests/test_parser_real_texts.py) runs each text through the live /api/parse LLM parser under that company's session and asserts the structured output. Strict when ANTHROPIC_API_KEY is set; skips cleanly otherwise. Never delete a fixture — that's the point (permanent regression guard).",
   "_matchers": {
     "equals_ci": "case-insensitive equality after trim",
     "contains_ci": "list — every substring must appear (case-insensitive)",
@@ -9,7 +9,11 @@
     "nonempty": "true → field must be non-empty",
     "_note": "A field's matchers ALL must pass. 'fields' are hard (fail the suite). 'advisory' matchers are reported with a ⚠ but never fail — used for LLM-nuance we want to watch but not gate on yet."
   },
-  "fixtures": [
+  "companies": [
+   {
+    "company_key": "haultra-1",
+    "label": "HAULTRA (company 1 — our real dispatch texts)",
+    "fixtures": [
     {
       "id": "harbor-view-ew-40",
       "text": "Pr 7021 harbor view blvd,suff,Ew 40yd dump holland",
@@ -68,5 +72,7 @@
         }
       }
     }
+    ]
+   }
   ]
 }
