@@ -18389,6 +18389,39 @@ def deny_request(req_id):
     return jsonify({"success": True, "request_id": req_id, "status": "denied"})
 
 
+@app.route("/api/requests/<int:req_id>/cancel", methods=["POST"])
+@login_required
+def cancel_request(req_id):
+    """Delete a cancelled job from the Unassigned Work queue.
+
+    Scoped to the company and limited to an accepted request that has NOT yet
+    been turned into a scheduled stop (stop_id IS NULL) — so nothing on a route
+    or in stop history is ever affected. There is no 'cancelled' request status
+    in the schema, and marking it 'denied' would show the customer a misleading
+    "we couldn't do this — call us" portal message, so a cancelled unscheduled
+    job is simply removed.
+    """
+    if not has_role("dispatcher"):
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    req = conn.execute(
+        """SELECT r.id, r.status, r.stop_id FROM requests r
+             JOIN customers c ON r.customer_id = c.id
+            WHERE r.id = ? AND c.company_id = ?""",
+        (req_id, cid()),
+    ).fetchone()
+    if req is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if req["status"] != "accepted" or req["stop_id"] is not None:
+        conn.close()
+        return jsonify({"error": "only unscheduled accepted jobs can be deleted"}), 409
+    conn.execute("DELETE FROM requests WHERE id=?", (req_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "request_id": req_id})
+
+
 # Requests page client script. Plain (non-f) string — its JS braces must not
 # collide with the page's f-string. Approve/Deny call the PATCH endpoints and
 # remove the card on success; errors render inline per card.
@@ -18478,6 +18511,17 @@ _UNASSIGNED_PAGE_JS = """
       .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
       .then(function(res){ if(res.ok){ removeCard(id); }
                            else { err(id, (res.j && res.j.error) || 'Something went wrong.'); } })
+      .catch(function(){ err(id, 'Network error — try again.'); });
+  };
+  // Delete a cancelled job — removes it from the queue (confirmed first).
+  window.deleteUnassigned=function(id){
+    if(!confirm('Delete this job? It will be removed from Unassigned Work. This cannot be undone.')) return;
+    fetch('/api/requests/'+id+'/cancel', {method:'POST',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
+        body:'{}'})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
+      .then(function(res){ if(res.ok){ removeCard(id); }
+                           else { err(id, (res.j && res.j.error) || 'Could not delete.'); } })
       .catch(function(){ err(id, 'Network error — try again.'); });
   };
 })();
@@ -18588,8 +18632,11 @@ def unassigned_work():
             {size_html}
             <div style="color:var(--slate);font-size:12px;margin-top:4px;">🕑 {age}</div>
             {notes_html}
-            <div style="margin-top:12px;">
-                <button class="btn green" style="width:100%;" onclick="showAssign({rid})">Assign</button>
+            <div style="margin-top:12px;display:flex;gap:8px;">
+                <button class="btn green" style="flex:1;min-height:48px;" onclick="showAssign({rid})">Assign</button>
+                <button class="btn secondary" style="min-height:48px;min-width:48px;color:#FF5252;
+                        border-color:rgba(255,82,82,0.35);background:rgba(255,82,82,0.08);"
+                        onclick="deleteUnassigned({rid})" title="Delete cancelled job">🗑 Delete</button>
             </div>
             <div id="err-{rid}" hidden style="color:#FF5252;font-size:12px;margin-top:8px;"></div>
             <div id="assign-form-{rid}" hidden style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px;">
