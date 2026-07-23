@@ -1,3 +1,15 @@
+# ── gevent cooperative multitasking (MUST run before any other import that
+# touches sockets/ssl/threads) ───────────────────────────────────────────────
+# Under gevent workers, long-lived SSE streams (driver Cab View realtime) are
+# cheap greenlets that yield while idle instead of pinning an OS thread — this
+# is what keeps the app fast while many streams are open. Guarded so the app
+# still runs anywhere gevent isn't installed (local dev, tests, sync workers).
+try:
+    from gevent import monkey as _gevent_monkey
+    _gevent_monkey.patch_all()
+except Exception:
+    pass
+
 from flask import (
     Flask, request, redirect, url_for, session, flash,
     render_template, render_template_string, send_file, send_from_directory, abort, jsonify,
@@ -1954,6 +1966,52 @@ def format_cents(cents):
     return f"{'-' if neg else ''}${dollars:,}.{rem:02d}"
 
 
+def _merge_duplicate_open_routes(conn):
+    """Merge duplicate OPEN/in_progress routes for the same (company, driver,
+    date) into the earliest one. Stops and messages are re-pointed onto the
+    kept route (stops renumbered by dispatch order — original route id then
+    stop_order), and the emptied duplicate routes are deleted. Idempotent: a
+    clean DB has no groups with COUNT>1, so this is a cheap no-op."""
+    try:
+        groups = conn.execute(
+            """SELECT company_id, assigned_to, route_date, MIN(id) AS keep_id, COUNT(*) AS c
+                 FROM routes
+                WHERE assigned_to IS NOT NULL AND status IN ('open','in_progress')
+                GROUP BY company_id, assigned_to, route_date
+               HAVING COUNT(*) > 1""").fetchall()
+        merged = 0
+        for g in groups:
+            keep = g["keep_id"]
+            dupes = [r["id"] for r in conn.execute(
+                """SELECT id FROM routes
+                    WHERE company_id=? AND assigned_to=? AND route_date=?
+                      AND status IN ('open','in_progress') AND id != ?
+                    ORDER BY id""",
+                (g["company_id"], g["assigned_to"], g["route_date"], keep)).fetchall()]
+            order = conn.execute(
+                "SELECT COALESCE(MAX(stop_order), 0) AS m FROM stops WHERE route_id=?", (keep,)
+            ).fetchone()["m"]
+            for dupe in dupes:
+                for st in conn.execute(
+                    "SELECT id FROM stops WHERE route_id=? ORDER BY stop_order, id", (dupe,)
+                ).fetchall():
+                    order += 1
+                    conn.execute("UPDATE stops SET route_id=?, stop_order=? WHERE id=?",
+                                 (keep, order, st["id"]))
+                conn.execute("UPDATE messages SET route_id=? WHERE route_id=?", (keep, dupe))
+                conn.execute("DELETE FROM routes WHERE id=?", (dupe,))
+                merged += 1
+            try:
+                compute_can_flow(conn, keep)
+            except Exception:
+                pass
+        if merged:
+            conn.commit()
+            app.logger.info("Merged %d duplicate open route(s) into their primary lane.", merged)
+    except Exception as exc:
+        app.logger.warning("_merge_duplicate_open_routes skipped: %s", exc)
+
+
 def init_db():
     conn = get_db()
     cur = conn.cursor()
@@ -2742,6 +2800,10 @@ def init_db():
     safe_add_column(conn, "bins", "label TEXT")
     safe_add_column(conn, "bins", "drop_photo_path TEXT")
     safe_add_column(conn, "bins", "drop_stop_id INTEGER")
+
+    # One-time cleanup: collapse any duplicate OPEN routes for the same
+    # driver+date into a single lane (from the api_dispatch duplicate-route bug).
+    _merge_duplicate_open_routes(conn)
 
     # --- default company bootstrap ---
     default_co = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()
@@ -10670,7 +10732,11 @@ def driver_route_detail(route_id):
         }}
         function stopFallback() {{ if (fallbackTimer) {{ clearInterval(fallbackTimer); fallbackTimer = null; }} }}
 
+        function closeSSE() {{
+            if (es) {{ try {{ es.close(); }} catch (e) {{}} es = null; }}
+        }}
         function connectSSE() {{
+            if (es) return;                         // exactly one stream per page
             if (typeof EventSource === 'undefined') {{ startFallback(); return; }}
             try {{ es = new EventSource('{url_for("driver_route_stream", route_id=route_id)}'); }}
             catch (e) {{ startFallback(); return; }}
@@ -10685,6 +10751,15 @@ def driver_route_detail(route_id):
             }};
         }}
         connectSSE();
+
+        // Release the stream when the tab is hidden/backgrounded so it doesn't
+        // hold a server greenlet while nobody's looking; reopen when visible.
+        document.addEventListener('visibilitychange', function() {{
+            if (document.hidden) {{ closeSSE(); }}
+            else {{ connectSSE(); }}
+        }});
+        window.addEventListener('pagehide', closeSSE);
+
         // On regaining connectivity, kick an immediate status fetch so nothing lags.
         window.addEventListener('online', function() {{
             fetch('{url_for("driver_route_status", route_id=route_id)}', {{credentials: 'same-origin'}})
@@ -11770,21 +11845,30 @@ def driver_route_stream(route_id):
         yield "retry: 1200\n\n"
         last = None
         deadline = _time.time() + _SSE_LIFETIME_SEC
-        while _time.time() < deadline:
+        # One connection for the whole stream (WAL reads don't block writers) —
+        # avoids opening/closing a DB handle every tick.
+        c = get_db()
+        try:
+            while _time.time() < deadline:
+                try:
+                    snap = _route_realtime_snapshot(c, route_id, uid)
+                except Exception:
+                    snap = None
+                if snap is not None and snap != last:
+                    payload = dict(snap)
+                    payload["_ts"] = now_ts()
+                    # A failed yield (client gone) raises here and ends the
+                    # greenlet, so dead connections clean themselves up.
+                    yield "data: " + json.dumps(payload) + "\n\n"
+                    last = snap
+                _time.sleep(_SSE_TICK_SEC)
+            # Clean end → EventSource reconnects with a fresh window.
+            yield "event: cycle\ndata: {}\n\n"
+        finally:
             try:
-                c = get_db()
-                snap = _route_realtime_snapshot(c, route_id, uid)
                 c.close()
             except Exception:
-                snap = None
-            if snap is not None and snap != last:
-                payload = dict(snap)
-                payload["_ts"] = now_ts()
-                yield "data: " + json.dumps(payload) + "\n\n"
-                last = snap
-            _time.sleep(_SSE_TICK_SEC)
-        # Clean end → EventSource reconnects with a fresh window.
-        yield "event: cycle\ndata: {}\n\n"
+                pass
 
     return Response(gen(), mimetype="text/event-stream", headers={
         "Cache-Control": "no-cache, no-transform",
@@ -17927,21 +18011,40 @@ def api_dispatch():
         conn.close()
         return jsonify({"error": "Selected driver not found."}), 400
 
-    route_name = f"{driver['username']} — {route_date}"
+    # Never create a parallel route for a driver who already has an OPEN one
+    # today — dispatching appends to it (stops at the end). A fresh route is
+    # only created when there's no open/in_progress route for that driver+date.
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO routes (route_date, route_name, raw_text, assigned_to, created_by,
-                             status, notes, company_id, created_at)
-        VALUES (?, ?, '', ?, ?, 'open', '', ?, ?)
-    """, (route_date, route_name, driver_id, session["user_id"], cid(), now_ts()))
-    route_id = cur.lastrowid
+    existing = conn.execute(
+        """SELECT id FROM routes
+            WHERE company_id=? AND assigned_to=? AND route_date=?
+              AND status IN ('open','in_progress')
+            ORDER BY id LIMIT 1""",
+        (cid(), driver_id, route_date)
+    ).fetchone()
+    if existing:
+        route_id = existing["id"]
+        appended_to_existing = True
+    else:
+        route_name = f"{driver['username']} — {route_date}"
+        cur.execute("""
+            INSERT INTO routes (route_date, route_name, raw_text, assigned_to, created_by,
+                                 status, notes, company_id, created_at)
+            VALUES (?, ?, '', ?, ?, 'open', '', ?, ?)
+        """, (route_date, route_name, driver_id, session["user_id"], cid(), now_ts()))
+        route_id = cur.lastrowid
+        appended_to_existing = False
 
-    for idx, s in enumerate(clean_stops, start=1):
+    next_order = conn.execute(
+        "SELECT COALESCE(MAX(stop_order), 0) AS m FROM stops WHERE route_id=?", (route_id,)
+    ).fetchone()["m"]
+    for s in clean_stops:
+        next_order += 1
         cur.execute("""
             INSERT INTO stops (route_id, stop_order, address, action, container_size, notes,
                                 status, created_at)
             VALUES (?, ?, ?, ?, ?, ?, 'open', ?)
-        """, (route_id, idx, s["address"], s["action"], s["container_size"], s["notes"], now_ts()))
+        """, (route_id, next_order, s["address"], s["action"], s["container_size"], s["notes"], now_ts()))
 
     conn.commit()
     try:
@@ -17956,6 +18059,7 @@ def api_dispatch():
         "route_id": route_id,
         "driver": driver["username"],
         "stop_count": len(clean_stops),
+        "appended": appended_to_existing,
     })
 
 
