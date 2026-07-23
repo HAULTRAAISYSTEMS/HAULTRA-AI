@@ -194,6 +194,90 @@
   }
   .raw-textarea:focus { border-color: var(--teal-border); }
 
+  /* ── Quick add + live autocomplete ─────────────────────────────── */
+  .quick-add { margin-bottom: 18px; }
+  .qa-head-row {
+    display: flex; align-items: baseline; justify-content: space-between;
+    flex-wrap: wrap; gap: 6px; margin-bottom: 10px;
+  }
+  .qa-hint { font-family: var(--font-body); font-size: 0.72rem; color: var(--text-faint); letter-spacing: 0; }
+  .qa-field { position: relative; }
+  .qa-input {
+    width: 100%;
+    min-height: 52px;
+    background: var(--bg-0);
+    border: 1px solid var(--teal-border);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font-family: var(--font-body);
+    font-size: 1rem;
+    padding: 12px 14px;
+    outline: none;
+  }
+  .qa-input:focus { border-color: var(--teal); box-shadow: 0 0 0 3px var(--teal-dim); }
+  .qa-input::placeholder { color: var(--text-faint); }
+
+  .qa-suggest {
+    position: absolute; left: 0; right: 0; top: calc(100% + 6px);
+    z-index: 120;
+    background: var(--bg-2);
+    border: 1px solid rgba(255,255,255,0.14);
+    border-radius: var(--radius-sm);
+    box-shadow: 0 12px 32px rgba(0,0,0,0.55);
+    max-height: 340px; overflow-y: auto;
+    padding: 4px;
+  }
+  .qa-suggest[hidden] { display: none; }
+  .qa-row {
+    display: flex; align-items: center; gap: 12px;
+    width: 100%;
+    min-height: 48px;
+    padding: 8px 10px;
+    background: none; border: none; border-radius: 8px;
+    text-align: left; cursor: pointer;
+    color: var(--text);
+  }
+  .qa-row:hover, .qa-row:focus { background: rgba(255,255,255,0.06); outline: none; }
+  .qa-badge {
+    min-width: 42px; min-height: 42px;
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--font-head); font-size: 1.05rem; letter-spacing: 0.5px;
+    border-radius: 9px; flex-shrink: 0;
+  }
+  .qa-badge.pickup { background: var(--orange-dim); color: var(--orange); border: 1px solid var(--orange-border); }
+  .qa-badge.dropswap { background: var(--slate-dim); color: var(--slate); border: 1px solid var(--slate-border); }
+  .qa-text { flex: 1; min-width: 0; }
+  .qa-label { font-size: 0.98rem; font-weight: 700; line-height: 1.25; word-break: break-word; }
+  .qa-sub {
+    font-size: 0.8rem; color: var(--text-dim); margin-top: 2px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .qa-size {
+    font-family: var(--font-mono); font-size: 0.72rem; font-weight: 600;
+    color: var(--teal); background: var(--teal-dim); border: 1px solid var(--teal-border);
+    border-radius: 6px; padding: 2px 7px; flex-shrink: 0;
+  }
+  .qa-empty { padding: 14px 12px; color: var(--text-faint); font-size: 0.85rem; text-align: center; }
+
+  .qa-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .qa-chip {
+    display: inline-flex; align-items: center; gap: 8px;
+    min-height: 44px;
+    padding: 6px 12px;
+    background: var(--bg-2);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 22px;
+    color: var(--text);
+    font-family: var(--font-body); font-size: 0.84rem; font-weight: 600;
+    cursor: pointer;
+  }
+  .qa-chip:hover, .qa-chip:focus { border-color: var(--teal-border); background: var(--teal-dim); outline: none; }
+  .qa-chip .qa-chip-badge {
+    font-family: var(--font-head); font-size: 0.82rem; letter-spacing: 0.5px;
+    color: var(--teal);
+  }
+  .qa-chips-empty { display: none; }
+
   .btn {
     font-family: var(--font-body);
     font-weight: 700;
@@ -432,6 +516,21 @@
 
 <main class="layout">
   <section class="col col-input">
+    <div class="quick-add">
+      <div class="qa-head-row">
+        <div class="col-header" style="margin-bottom:0;">QUICK ADD</div>
+        <span class="qa-hint">type a name, street, or city &mdash; tap to add a stop</span>
+      </div>
+      <div class="qa-field">
+        <input id="qa-input" class="qa-input" type="text" autocomplete="off"
+               autocapitalize="words" spellcheck="false" enterkeyhint="done"
+               placeholder="e.g. Serv Pro, Clyde Morris, Newport News&hellip;"
+               aria-label="Quick add a saved location" aria-autocomplete="list"
+               aria-controls="qa-suggest">
+        <div id="qa-suggest" class="qa-suggest" role="listbox" hidden></div>
+      </div>
+      <div id="qa-chips" class="qa-chips" aria-label="Recent and frequent locations"></div>
+    </div>
     <div class="col-header">STEP 1 &middot; RAW DISPATCH TEXT</div>
     <textarea id="raw-text" class="raw-textarea" placeholder="Paste dispatch text here... e.g.&#10;pull n return 4512 elm st 30yd&#10;drop empty 88 harbor rd 20&#10;swap 770 industrial pkwy 40yd"></textarea>
     <button id="reparse-btn" class="btn btn-teal-outline" onclick="reparse()">✦ Re-parse with AI</button>
@@ -495,12 +594,19 @@
     toastTimer = setTimeout(function () { t.classList.remove('show'); }, 3200);
   }
 
-  function normalizeStop(raw, idx) {
+  // Monotonic id source so every card (parsed OR quick-added) has a stable,
+  // collision-free id — the two lanes coexist and must never share an id.
+  var stopSeq = 0;
+
+  function normalizeStop(raw) {
     var action = (raw && raw.action ? String(raw.action) : '').trim().toUpperCase();
     if (ACTION_CODES.indexOf(action) === -1) action = action || 'P';
     var confidence = (raw && raw.confidence === 'low') ? 'low' : 'high';
     return {
-      id: 'stop-' + idx,
+      id: 'stop-' + (stopSeq++),
+      // 'parsed' cards are replaced on every re-parse; 'quickadd' cards (chip /
+      // autocomplete) are preserved in place across re-parses.
+      source: (raw && raw.source === 'quickadd') ? 'quickadd' : 'parsed',
       action: action,
       address: (raw && raw.address) ? String(raw.address) : '',
       customer: (raw && raw.customer) ? String(raw.customer) : '',
@@ -550,7 +656,32 @@
   window.reparse = reparse;
 
   function renderStopCards(stops) {
-    currentStops = stops.map(normalizeStop);
+    // Re-parse REPLACES only the text-parsed cards. Quick-added cards
+    // (chip / autocomplete) are preserved in place: we drop the old parsed
+    // block and splice the freshly parsed one in at the same position, so
+    // re-parsing the same text twice never duplicates parsed stops and never
+    // deletes quick-added ones.
+    var newParsed = stops.map(function (raw) {
+      var s = normalizeStop(raw);
+      s.source = 'parsed';
+      return s;
+    });
+    var result = [];
+    var spliced = false;
+    currentStops.forEach(function (s) {
+      if (s.source === 'quickadd') {
+        result.push(s);                 // keep quick-added cards in place
+      } else if (!spliced) {
+        newParsed.forEach(function (p) { result.push(p); });  // new parsed block
+        spliced = true;
+      }
+      // old parsed cards are dropped (replaced by the block above)
+    });
+    if (!spliced) {
+      // No prior parsed cards — append the parsed block after existing quick-adds.
+      newParsed.forEach(function (p) { result.push(p); });
+    }
+    currentStops = result;
     renderAllCards();
     updateCounts();
   }
@@ -908,6 +1039,176 @@
       });
   }
   window.confirmDispatch = confirmDispatch;
+
+  // ── Quick add + live autocomplete ───────────────────────────────
+  // A persistent lane above the raw-text box: type 2+ chars → live saved-
+  // location suggestions; tap a suggestion (or a recent/frequent chip) to add
+  // a pre-filled, editable stop card to the route. The field clears and keeps
+  // focus so the keyboard stays up for rapid-fire entry. This never touches the
+  // raw dispatch text box — that stays free-text parse only.
+  var ACTION_BY_NAME = {
+    'pickup and return': 'PR', 'pull and return': 'PR', 'p&r': 'PR', 'pr': 'PR',
+    'pull': 'P', 'pickup': 'P', 'pick up': 'P', 'p': 'P',
+    'delivery': 'D', 'deliver': 'D', 'drop': 'D', 'drop off': 'D', 'd': 'D',
+    'swap': 'S', 's': 'S',
+    'relocate': 'R', 'move': 'R', 'reposition': 'R', 'r': 'R',
+  };
+  function codeFromAction(name) {
+    return ACTION_BY_NAME[(name || '').trim().toLowerCase()] || 'P';
+  }
+
+  var qaInput   = el('qa-input');
+  var qaSuggest = el('qa-suggest');
+  var qaChips   = el('qa-chips');
+  var qaTimer   = null;
+  var qaReqSeq  = 0;   // guards against out-of-order autocomplete responses
+
+  function locFullAddress(loc) {
+    var full = (loc.full_address || '').trim();
+    if (full) return full;
+    return [loc.address, loc.city, loc.state, loc.zip]
+      .filter(function (p) { return p && String(p).trim(); })
+      .join(', ');
+  }
+
+  function hideSuggest() { if (qaSuggest) { qaSuggest.hidden = true; qaSuggest.innerHTML = ''; } }
+
+  function addQuickStop(loc) {
+    var code = codeFromAction(loc.default_action);
+    var stop = normalizeStop({
+      source: 'quickadd',   // preserved in place across re-parses
+      action: code,
+      address: locFullAddress(loc),
+      customer: loc.customer_name || '',
+      container_size: loc.default_container_size || '',
+      dump_leg: loc.default_dump_location || '',
+      return_leg: '',
+      confidence: 'high',
+      notes: '',
+    });
+    // Quick-add stops are trusted (came from a saved location) so they're
+    // dispatch-ready immediately — never flagged for review.
+    stop.reviewed = true;
+    currentStops.push(stop);
+    renderAllCards();
+    updateCounts();
+    showToast('Added ' + (loc.customer_name || locFullAddress(loc) || 'stop'));
+  }
+
+  function buildQaRow(loc) {
+    var meta = ACTION_META[codeFromAction(loc.default_action)] || ACTION_META.P;
+    var row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'qa-row';
+    row.setAttribute('role', 'option');
+
+    var badge = document.createElement('span');
+    badge.className = 'qa-badge ' + meta.group;
+    badge.textContent = codeFromAction(loc.default_action);
+    row.appendChild(badge);
+
+    var text = document.createElement('span');
+    text.className = 'qa-text';
+    var label = document.createElement('div');
+    label.className = 'qa-label';
+    label.textContent = loc.customer_name || locFullAddress(loc) || 'Saved location';
+    text.appendChild(label);
+    var sub = document.createElement('div');
+    sub.className = 'qa-sub';
+    sub.textContent = loc.customer_name ? locFullAddress(loc) : (loc.city || '');
+    if (sub.textContent) text.appendChild(sub);
+    row.appendChild(text);
+
+    if (loc.default_container_size) {
+      var size = document.createElement('span');
+      size.className = 'qa-size';
+      size.textContent = loc.default_container_size;
+      row.appendChild(size);
+    }
+
+    // mousedown (not click) so we act before the input's blur hides the list;
+    // then refocus the input so the mobile keyboard stays up.
+    row.addEventListener('mousedown', function (ev) {
+      ev.preventDefault();
+      addQuickStop(loc);
+      qaInput.value = '';
+      hideSuggest();
+      qaInput.focus();
+    });
+    return row;
+  }
+
+  function renderSuggestions(list) {
+    qaSuggest.innerHTML = '';
+    if (!list || !list.length) {
+      var empty = document.createElement('div');
+      empty.className = 'qa-empty';
+      empty.textContent = 'No saved match — dispatch it once and it’ll be here next time.';
+      qaSuggest.appendChild(empty);
+      qaSuggest.hidden = false;
+      return;
+    }
+    list.forEach(function (loc) { qaSuggest.appendChild(buildQaRow(loc)); });
+    qaSuggest.hidden = false;
+  }
+
+  function fetchSuggestions(q) {
+    var mySeq = ++qaReqSeq;
+    fetch('/api/address-suggestions?q=' + encodeURIComponent(q), { credentials: 'same-origin' })
+      .then(function (r) { return r.ok ? r.json() : []; })
+      .then(function (list) {
+        if (mySeq !== qaReqSeq) return;               // a newer request superseded this one
+        if (document.activeElement !== qaInput) return; // field lost focus meanwhile
+        renderSuggestions(Array.isArray(list) ? list : []);
+      })
+      .catch(function () { /* silent — autocomplete is best-effort */ });
+  }
+
+  function renderChips(list) {
+    if (!qaChips) return;
+    qaChips.innerHTML = '';
+    if (!list || !list.length) return;
+    list.forEach(function (loc) {
+      var chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'qa-chip';
+      var b = document.createElement('span');
+      b.className = 'qa-chip-badge';
+      b.textContent = codeFromAction(loc.default_action);
+      chip.appendChild(b);
+      chip.appendChild(document.createTextNode(
+        loc.customer_name || locFullAddress(loc) || 'Saved'));
+      chip.addEventListener('click', function () {
+        addQuickStop(loc);
+        qaInput.focus();
+      });
+      qaChips.appendChild(chip);
+    });
+  }
+
+  function loadChips() {
+    fetch('/api/locations/top?limit=8', { credentials: 'same-origin' })
+      .then(function (r) { return r.ok ? r.json() : []; })
+      .then(function (list) { renderChips(Array.isArray(list) ? list : []); })
+      .catch(function () { /* silent */ });
+  }
+
+  if (qaInput) {
+    qaInput.addEventListener('input', function () {
+      var v = qaInput.value.trim();
+      clearTimeout(qaTimer);
+      if (v.length < 2) { hideSuggest(); return; }
+      qaTimer = setTimeout(function () { fetchSuggestions(v); }, 150);
+    });
+    qaInput.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape') { hideSuggest(); }
+    });
+    // Delay hide so a suggestion's mousedown fires first.
+    qaInput.addEventListener('blur', function () {
+      setTimeout(hideSuggest, 150);
+    });
+    loadChips();
+  }
 
   var driverSelectEl = el('driver-select');
   if (driverSelectEl) {

@@ -251,6 +251,81 @@ def expand_abbrev(value):
     return expanded if expanded else stripped
 
 
+# --- Address normalization for the self-building address book ---------------
+# Two addresses that mean the same place must collapse to one norm_key so the
+# book dedupes regardless of how a dispatcher typed it. We lowercase, drop
+# punctuation, expand street-suffix + directional + city shorthand token by
+# token, and collapse whitespace. This is a MATCHING key only — never shown to
+# a user, so aggressive canonicalization is safe.
+_ADDR_SUFFIX_MAP = {
+    "st": "street", "st.": "street", "str": "street",
+    "ave": "avenue", "av": "avenue",
+    "blvd": "boulevard", "boul": "boulevard",
+    "rd": "road",
+    "dr": "drive", "drv": "drive",
+    "ln": "lane",
+    "ct": "court",
+    "cir": "circle", "cr": "circle",
+    "pl": "place",
+    "hwy": "highway",
+    "pkwy": "parkway", "pky": "parkway",
+    "pkway": "parkway",
+    "ter": "terrace", "terr": "terrace",
+    "trl": "trail",
+    "sq": "square",
+    "loop": "loop",
+    "way": "way",
+    "cres": "crescent",
+    "expy": "expressway",
+}
+_ADDR_DIR_MAP = {
+    "n": "north", "s": "south", "e": "east", "w": "west",
+    "ne": "northeast", "nw": "northwest",
+    "se": "southeast", "sw": "southwest",
+}
+# City shorthand (superset of the parser's city map, plus book-specific entries).
+_ADDR_CITY_MAP = {
+    "vb": "virginia beach", "va beach": "virginia beach",
+    "ches": "chesapeake",
+    "norf": "norfolk",
+    "smithfld": "smithfield",
+    "suff": "suffolk",
+    "hamp": "hampton",
+    "nn": "newport news", "newpt": "newport news",
+    "ports": "portsmouth", "port": "portsmouth", "prt": "portsmouth",
+    "wburg": "williamsburg", "wmsburg": "williamsburg",
+    "yorktwn": "yorktown",
+}
+
+
+def _normalize_addr(text):
+    """Collapse an address string to a stable matching key (lowercase, no
+    punctuation, expanded street/directional/city shorthand). Returns '' for
+    empty input. Used only for deduping the address book — never displayed."""
+    if not text:
+        return ""
+    s = str(text).lower()
+    # Drop punctuation that varies by typist (periods, commas, #, etc.)
+    s = re.sub(r"[.,#/\\\-]", " ", s)
+    tokens = [t for t in s.split() if t]
+    out = []
+    for tok in tokens:
+        if tok in _ADDR_SUFFIX_MAP:
+            out.append(_ADDR_SUFFIX_MAP[tok])
+        elif tok in _ADDR_DIR_MAP:
+            out.append(_ADDR_DIR_MAP[tok])
+        elif tok in _ADDR_CITY_MAP:
+            out.append(_ADDR_CITY_MAP[tok])
+        else:
+            out.append(tok)
+    key = " ".join(out)
+    # Multi-word city shorthand (e.g. "va beach") — apply after token join.
+    for short, full in _ADDR_CITY_MAP.items():
+        if " " in short:
+            key = key.replace(short, full)
+    return key.strip()
+
+
 # ── Route text paste parser ───────────────────────────────────────────────────
 # Ordered most-specific → least-specific; first match wins.
 _ACTION_PATTERNS = [
@@ -2830,6 +2905,43 @@ def init_db():
     safe_add_column(conn, "bins", "label TEXT")
     safe_add_column(conn, "bins", "drop_photo_path TEXT")
     safe_add_column(conn, "bins", "drop_stop_id INTEGER")
+
+    # --- Self-building address book (feat/address-book) ---
+    # norm_key: normalized address (case/spacing/abbrev-insensitive) used to
+    #   dedupe a location regardless of how it was typed. Every learned stop
+    #   dedupes on (company_id, norm_key) so "527 j clyde morris blvd" and
+    #   "527 J. Clyde Morris Boulevard" collapse to one entry.
+    # hidden: boss can hide a location from the quick-add suggestions/chips
+    #   without deleting its history.
+    # label: boss-set display name overriding the learned customer_name.
+    safe_add_column(conn, "saved_addresses", "norm_key TEXT")
+    safe_add_column(conn, "saved_addresses", "hidden INTEGER NOT NULL DEFAULT 0")
+    safe_add_column(conn, "saved_addresses", "label TEXT")
+    # Per-company one-time backfill flag: seeds the address book from all
+    # historical stops the first time the company's parser/quick-add loads.
+    safe_add_column(conn, "companies", "address_book_seeded INTEGER NOT NULL DEFAULT 0")
+    # Speeds up the normalized dedupe lookup that runs on every learned stop.
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_saved_addr_normkey "
+            "ON saved_addresses(company_id, norm_key)"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    # Backfill norm_key for any pre-existing rows so old saves dedupe too.
+    try:
+        _sa_missing = conn.execute(
+            "SELECT id, address, city FROM saved_addresses WHERE norm_key IS NULL OR norm_key=''"
+        ).fetchall()
+        for _r in _sa_missing:
+            _nk = _normalize_addr(", ".join(
+                p for p in [(_r["address"] or ""), (_r["city"] or "")] if p.strip()))
+            conn.execute("UPDATE saved_addresses SET norm_key=? WHERE id=?", (_nk, _r["id"]))
+        if _sa_missing:
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
 
     # One-time cleanup: collapse any duplicate OPEN routes for the same
     # driver+date into a single lane (from the api_dispatch duplicate-route bug).
@@ -11707,45 +11819,63 @@ _PASTE_ROUTE_JS = """
 """
 
 
-def upsert_saved_address(conn, company_id, customer_name, address,
-                          city, state, zip_code, action, container_size, dump_location):
-    """Save or update a customer address in saved_addresses for autocomplete.
-    Also tracks each (action, container_size, dump_location) combination in
-    saved_address_details so the API can return the most-frequently-used defaults.
-    """
+def learn_location(conn, company_id, address, city="", state="", zip_code="",
+                   customer_name="", action="", container_size="", dump_location=""):
+    """Self-building address book: upsert a dispatched/inserted location keyed on
+    its NORMALIZED address so the same place collapses to one entry no matter how
+    it was typed. Unlike the old behavior, a customer name is NOT required — an
+    address alone is enough to learn it. On a repeat, usage is incremented,
+    recency refreshed, and any newly-learned field (customer, city/state/zip)
+    is filled in if it was previously blank. Each (action, container_size,
+    dump_location) combination is tracked in saved_address_details for
+    frequency-based smart defaults. Never raises — a bad row must not break
+    dispatch."""
     if not company_id:
         return
-    cname = (customer_name or "").strip()
     addr  = (address or "").strip()
-    if not cname:
+    cname = (customer_name or "").strip()
+    if not addr:
         return
     ts   = now_ts()
     full = ", ".join(p for p in [addr, city or "", state or "", zip_code or ""] if p.strip())
+    norm = _normalize_addr(full)
+    if not norm:
+        return
     try:
         existing = conn.execute(
-            "SELECT id FROM saved_addresses WHERE company_id=? AND customer_name=? AND address=?",
-            (company_id, cname, addr)
+            "SELECT * FROM saved_addresses WHERE company_id=? AND norm_key=? "
+            "ORDER BY times_used DESC, id ASC LIMIT 1",
+            (company_id, norm)
         ).fetchone()
         if existing:
             sa_id = existing["id"]
+            # Fill newly-learned fields only when they were previously blank —
+            # keep the existing value whenever we already have one so a later,
+            # sparser/abbreviated entry never clobbers a richer earlier one.
+            new_cname = (existing["customer_name"] or "").strip() or cname
+            new_city  = (existing["city"]  or "").strip() or (city  or "").strip()
+            new_state = (existing["state"] or "").strip() or (state or "").strip()
+            new_zip   = (existing["zip"]   or "").strip() or (zip_code or "").strip()
+            new_full  = (existing["full_address"] or "").strip() or full
             conn.execute("""
                 UPDATE saved_addresses SET
-                    city=?, state=?, zip=?, full_address=?,
+                    customer_name=?, city=?, state=?, zip=?, full_address=?,
                     times_used=times_used+1, last_used_at=?
                 WHERE id=?
-            """, (city or "", state or "", zip_code or "", full, ts, sa_id))
+            """, (new_cname, new_city, new_state, new_zip, new_full, ts, sa_id))
         else:
             conn.execute("""
                 INSERT INTO saved_addresses
                     (company_id, customer_name, address, city, state, zip, full_address,
                      default_action, default_container_size, default_dump_location,
-                     times_used, last_used_at, created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)
+                     norm_key, hidden, times_used, last_used_at, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,0,1,?,?)
             """, (company_id, cname, addr, city or "", state or "", zip_code or "", full,
-                  action or "", container_size or "", dump_location or "", ts, ts))
+                  action or "", container_size or "", dump_location or "", norm, ts, ts))
             _sarow = conn.execute(
-                "SELECT id FROM saved_addresses WHERE company_id=? AND customer_name=? AND address=?",
-                (company_id, cname, addr)
+                "SELECT id FROM saved_addresses WHERE company_id=? AND norm_key=? "
+                "ORDER BY id DESC LIMIT 1",
+                (company_id, norm)
             ).fetchone()
             if not _sarow:
                 return
@@ -11773,7 +11903,55 @@ def upsert_saved_address(conn, company_id, customer_name, address,
                 (sa_id, act, cs, dl, ts)
             )
     except Exception as e:
-        app.logger.warning("upsert_saved_address failed for %r: %s", addr, e)
+        app.logger.warning("learn_location failed for %r: %s", addr, e)
+
+
+def upsert_saved_address(conn, company_id, customer_name, address,
+                          city, state, zip_code, action, container_size, dump_location):
+    """Back-compat shim for the form-based add/edit-stop flows. Delegates to
+    learn_location, which now dedupes on the normalized address and no longer
+    requires a customer name."""
+    learn_location(conn, company_id, address, city, state, zip_code,
+                   customer_name, action, container_size, dump_location)
+
+
+def _ensure_address_book(conn, company_id):
+    """One-time per-company backfill: seed the address book from ALL existing
+    historical stops so quick-add/autocomplete start full, not empty. Guarded
+    by companies.address_book_seeded so it runs at most once per company. Cheap
+    no-op on every call after the first. Never raises."""
+    if not company_id:
+        return
+    try:
+        row = conn.execute(
+            "SELECT address_book_seeded FROM companies WHERE id=?", (company_id,)
+        ).fetchone()
+        if row is None or (row["address_book_seeded"] or 0):
+            return
+    except Exception:
+        return
+    try:
+        stops = conn.execute("""
+            SELECT s.customer_name, s.address, s.city, s.state, s.zip_code,
+                   s.action, s.container_size, s.dump_location
+              FROM stops s
+              JOIN routes r ON s.route_id = r.id
+             WHERE r.company_id=? AND s.address IS NOT NULL AND TRIM(s.address) != ''
+             ORDER BY s.id ASC
+        """, (company_id,)).fetchall()
+        for s in stops:
+            learn_location(
+                conn, company_id,
+                s["address"], s["city"] or "", s["state"] or "", s["zip_code"] or "",
+                s["customer_name"] or "", s["action"] or "",
+                s["container_size"] or "", s["dump_location"] or "")
+        conn.execute(
+            "UPDATE companies SET address_book_seeded=1 WHERE id=?", (company_id,))
+        conn.commit()
+        app.logger.info("address book seeded for company %s from %d stops",
+                        company_id, len(stops))
+    except Exception as e:
+        app.logger.warning("_ensure_address_book failed for company %s: %s", company_id, e)
 
 
 @app.route("/driver/route/<int:route_id>/status")
@@ -14523,6 +14701,38 @@ def _parse_vocab_context(conn, company_id):
                 (v["term"] + " = " + v["expansion"]) for v in vocab))
     except Exception:
         pass
+    # Self-building address book: the company's most-used saved locations, so
+    # the model can resolve a bare customer name or street fragment to the full
+    # known address and its typical action/size.
+    try:
+        locs = conn.execute(
+            """SELECT COALESCE(NULLIF(label, ''), customer_name) AS cname,
+                      COALESCE(NULLIF(full_address, ''), address) AS addr,
+                      default_action, default_container_size
+                 FROM saved_addresses
+                WHERE company_id=? AND COALESCE(hidden, 0) = 0
+                  AND TRIM(COALESCE(address, '')) != ''
+                ORDER BY times_used DESC, last_used_at DESC
+                LIMIT 50""",
+            (company_id,)
+        ).fetchall()
+        loc_parts = []
+        for l in locs:
+            label = (l["cname"] or "").strip()
+            addr  = (l["addr"] or "").strip()
+            if not addr:
+                continue
+            extra = " ".join(p for p in [(l["default_action"] or "").strip(),
+                                         (l["default_container_size"] or "").strip()] if p)
+            piece = (label + " — " + addr) if label else addr
+            if extra:
+                piece += " [" + extra + "]"
+            loc_parts.append(piece)
+        if loc_parts:
+            lines.append("KNOWN LOCATIONS (resolve names/fragments to these): "
+                         + "; ".join(loc_parts))
+    except Exception:
+        pass
     if not lines:
         return ""
     return "\n\nKNOWN LOCATIONS & VOCABULARY (this company):\n" + "\n".join(lines)
@@ -16738,6 +16948,7 @@ def yard_setup_page():
     </div>
     {_dump_locations_section_html()}
     {_parse_vocab_section_html()}
+    {_address_book_section_html()}
     {_containers_section_html()}
     """
     return render_template_string(shell_page("Yard Setup", body))
@@ -16823,6 +17034,118 @@ def delete_parse_vocab(vocab_id):
     conn.close()
     flash("Shorthand removed.", "success")
     return redirect(url_for("yard_setup_page") + "#parse-vocab")
+
+
+def _address_book_section_html():
+    """Boss-editable address book: the self-built list of learned locations that
+    powers quick-add and autocomplete. Light-touch edits only — set a display
+    label (overrides the learned customer name in suggestions) and hide a
+    location from suggestions without deleting its history. Type-ahead filters
+    the list client-side."""
+    conn = get_db()
+    _ensure_address_book(conn, cid())
+    rows_db = conn.execute(
+        """SELECT id, customer_name, label, address, city, state, full_address,
+                  hidden, times_used, last_used_at
+             FROM saved_addresses
+            WHERE company_id=? AND TRIM(COALESCE(address,'')) != ''
+            ORDER BY hidden ASC, times_used DESC, last_used_at DESC
+            LIMIT 300""",
+        (cid(),)
+    ).fetchall()
+    conn.close()
+    _csrf = get_csrf_token()
+    rows = ""
+    for a in rows_db:
+        _a = dict(a)
+        display = (_a["label"] or _a["customer_name"] or "").strip()
+        addr = (_a["full_address"] or _a["address"] or "").strip()
+        search = " ".join(p for p in [display, addr, _a["city"] or ""] if p).lower()
+        is_hidden = bool(_a["hidden"])
+        name_cell = (f'<strong>{e(display)}</strong>' if display
+                     else '<span class="muted small">(no name)</span>')
+        hidden_badge = ('<span class="badge" style="opacity:.6;">hidden</span>'
+                        if is_hidden else '')
+        hide_label = "Unhide" if is_hidden else "Hide"
+        row_style = ' style="opacity:.55;"' if is_hidden else ''
+        rows += (
+            f'<tr data-search="{e(search)}"{row_style}>'
+            f'<td>{name_cell} {hidden_badge}'
+            f'<div class="muted small">{e(addr)}</div></td>'
+            f'<td class="muted small" style="text-align:center;">{_a["times_used"]}</td>'
+            f'<td>'
+            f'<form method="POST" action="{url_for("update_address_book", sa_id=_a["id"])}" '
+            f'style="display:flex;gap:6px;align-items:center;">'
+            f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
+            f'<input type="hidden" name="action" value="label">'
+            f'<input name="label" value="{e(_a["label"] or "")}" placeholder="{e(_a["customer_name"] or "display name")}" '
+            f'style="flex:1;min-width:120px;min-height:40px;padding:6px 10px;background:var(--bg-0);'
+            f'border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);font-size:13px;">'
+            f'<button type="submit" style="min-height:40px;background:transparent;color:#FF9D5C;'
+            f'border:1px solid rgba(255,157,92,0.4);border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer;">Save</button>'
+            f'</form></td>'
+            f'<td style="text-align:right;white-space:nowrap;">'
+            f'<form method="POST" action="{url_for("update_address_book", sa_id=_a["id"])}" style="display:inline;">'
+            f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
+            f'<input type="hidden" name="action" value="toggle_hide">'
+            f'<button type="submit" style="background:transparent;color:#8CA0B3;'
+            f'border:1px solid rgba(140,160,179,0.4);border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer;">'
+            f'{hide_label}</button></form>'
+            f'</td></tr>'
+        )
+    return f"""
+    <div class="card" id="address-book">
+        <div class="row between" style="margin-bottom:16px;">
+            <h2 style="margin:0;">&#128205; Address Book</h2>
+            <span class="muted small">{len(rows_db)} saved location{'' if len(rows_db) == 1 else 's'}</span>
+        </div>
+        <p class="muted small" style="margin-bottom:14px;">Every dispatched stop is learned here automatically and powers
+        Quick&nbsp;Add on the parser. Set a display name to override what shows in suggestions, or hide a location to keep it
+        out of the quick-add list (its history stays).</p>
+        <input id="ab-filter" type="text" placeholder="Search name, street, or city&hellip;"
+               oninput="(function(v){{v=v.toLowerCase();document.querySelectorAll('#address-book tbody tr[data-search]').forEach(function(r){{r.style.display=r.getAttribute('data-search').indexOf(v)>-1?'':'none';}});}})(this.value)"
+               style="width:100%;min-height:48px;padding:10px 14px;margin-bottom:14px;background:var(--bg-0);
+                      border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);">
+        <div class="table-wrap">
+            <table>
+                <thead><tr><th>Location</th><th style="width:60px;text-align:center;">Uses</th>
+                <th style="width:260px;">Display name</th><th style="width:90px;"></th></tr></thead>
+                <tbody>{rows or '<tr><td colspan="4" class="muted">No locations learned yet — dispatch a stop and it&rsquo;ll appear here.</td></tr>'}</tbody>
+            </table>
+        </div>
+    </div>
+    """
+
+
+@app.route("/address-book/<int:sa_id>/update", methods=["POST"])
+@boss_required
+def update_address_book(sa_id):
+    """Light boss edits to a learned location: set a display label or toggle its
+    hidden flag. Company-scoped — a boss can only touch their own rows."""
+    action = (request.form.get("action") or "").strip()
+    conn = get_db()
+    owned = conn.execute(
+        "SELECT id, hidden FROM saved_addresses WHERE id=? AND company_id=?",
+        (sa_id, cid())
+    ).fetchone()
+    if not owned:
+        conn.close()
+        flash("Location not found.", "error")
+        return redirect(url_for("yard_setup_page") + "#address-book")
+    if action == "label":
+        label = (request.form.get("label") or "").strip()[:120]
+        conn.execute("UPDATE saved_addresses SET label=? WHERE id=? AND company_id=?",
+                     (label or None, sa_id, cid()))
+        conn.commit()
+        flash("Display name updated." if label else "Display name cleared.", "success")
+    elif action == "toggle_hide":
+        new_hidden = 0 if (owned["hidden"] or 0) else 1
+        conn.execute("UPDATE saved_addresses SET hidden=? WHERE id=? AND company_id=?",
+                     (new_hidden, sa_id, cid()))
+        conn.commit()
+        flash("Location hidden from quick add." if new_hidden else "Location back in quick add.", "success")
+    conn.close()
+    return redirect(url_for("yard_setup_page") + "#address-book")
 
 
 # ── Legacy URLs — redirect to their new home on Yard Setup ──────────────────
@@ -18290,6 +18613,10 @@ def api_dispatch():
         """, (route_id, next_order, s.get("customer") or "", s["address"], s["action"],
               s["container_size"], s.get("dump_leg") or "", s.get("return_leg") or "",
               s["notes"], now_ts()))
+        # Self-building address book: learn every dispatched stop's address.
+        learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
+                       action=s["action"], container_size=s["container_size"],
+                       dump_location=s.get("dump_leg") or "")
 
     conn.commit()
     try:
@@ -18361,6 +18688,10 @@ def api_insert_stops(route_id):
         """, (route_id, s.get("customer") or "", s["address"], s["action"], s["container_size"],
               s.get("dump_leg") or "", s.get("return_leg") or "", s["notes"], now_ts()))
         new_stops.append((cur.lastrowid, s["insert_before"]))
+        # Self-building address book: learn every inserted stop's address.
+        learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
+                       action=s["action"], container_size=s["container_size"],
+                       dump_location=s.get("dump_leg") or "")
 
     # Merge new stops into the insertable (unlocked) sequence at their chosen position.
     # Multiple stops targeting the same anchor stack in submission order, immediately
@@ -18401,9 +18732,15 @@ def address_suggestions():
     if len(q) < 2:
         return jsonify([])
     conn = get_db()
+    _ensure_address_book(conn, cid())
     like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    # Match on customer name, street address, city, or the assembled full
+    # address so a fragment of any of them surfaces the location. Hidden
+    # locations (boss-hidden) never appear. label overrides customer_name for
+    # display. Ranked frequency-then-recency.
     rows = conn.execute("""
-        SELECT sa.customer_name, sa.address, sa.city, sa.state, sa.zip,
+        SELECT COALESCE(NULLIF(sa.label, ''), sa.customer_name) AS customer_name,
+               sa.address, sa.city, sa.state, sa.zip, sa.full_address,
                COALESCE(sad.action, '')         AS default_action,
                COALESCE(sad.container_size, '') AS default_container_size,
                COALESCE(sad.dump_location, '')  AS default_dump_location
@@ -18417,10 +18754,53 @@ def address_suggestions():
                       ORDER BY times_used DESC, last_used_at DESC
                       LIMIT 1
                   )
-        WHERE sa.company_id=? AND (sa.customer_name LIKE ? ESCAPE '\\' OR sa.address LIKE ? ESCAPE '\\')
+        WHERE sa.company_id=? AND COALESCE(sa.hidden, 0) = 0
+          AND (sa.customer_name LIKE ? ESCAPE '\\'
+               OR sa.label        LIKE ? ESCAPE '\\'
+               OR sa.address      LIKE ? ESCAPE '\\'
+               OR sa.city         LIKE ? ESCAPE '\\'
+               OR sa.full_address LIKE ? ESCAPE '\\')
         ORDER BY sa.times_used DESC, sa.last_used_at DESC
         LIMIT 10
-    """, (cid(), like, like)).fetchall()
+    """, (cid(), like, like, like, like, like)).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/locations/top")
+@login_required
+def api_locations_top():
+    """Recent & frequent locations for the quick-add chips row. Returns the top
+    N non-hidden locations ranked by frequency then recency, each shaped like an
+    autocomplete suggestion (customer label, address, default action/size)."""
+    try:
+        limit = int(request.args.get("limit") or 8)
+    except (TypeError, ValueError):
+        limit = 8
+    limit = max(1, min(limit, 24))
+    conn = get_db()
+    _ensure_address_book(conn, cid())
+    rows = conn.execute("""
+        SELECT COALESCE(NULLIF(sa.label, ''), sa.customer_name) AS customer_name,
+               sa.address, sa.city, sa.state, sa.zip, sa.full_address,
+               COALESCE(sad.action, '')         AS default_action,
+               COALESCE(sad.container_size, '') AS default_container_size,
+               COALESCE(sad.dump_location, '')  AS default_dump_location
+        FROM saved_addresses sa
+        LEFT JOIN saved_address_details sad
+               ON sad.saved_address_id = sa.id
+              AND sad.id = (
+                      SELECT id FROM saved_address_details
+                      WHERE saved_address_id = sa.id
+                        AND (action != '' OR container_size != '' OR dump_location != '')
+                      ORDER BY times_used DESC, last_used_at DESC
+                      LIMIT 1
+                  )
+        WHERE sa.company_id=? AND COALESCE(sa.hidden, 0) = 0
+          AND TRIM(COALESCE(sa.address, '')) != ''
+        ORDER BY sa.times_used DESC, sa.last_used_at DESC
+        LIMIT ?
+    """, (cid(), limit)).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
 
@@ -23019,6 +23399,7 @@ def parser_view():
         if session.get("role") != "boss":
             abort(403)
         conn = get_db()
+        _ensure_address_book(conn, cid())
         route_row = conn.execute(
             """SELECT r.id, r.route_name, u.username AS driver_username
                FROM routes r LEFT JOIN users u ON r.assigned_to = u.id
@@ -23077,6 +23458,8 @@ def parser_view():
         assign_html = f'<input type="hidden" id="insert-route-id" value="{route_row["id"]}">'
     else:
         conn = get_db()
+        # Seed the address book from historical stops on first parser load.
+        _ensure_address_book(conn, cid())
         drivers = conn.execute(
             "SELECT id, username, full_name FROM users WHERE role='driver' AND company_id=? ORDER BY username",
             (cid(),)
