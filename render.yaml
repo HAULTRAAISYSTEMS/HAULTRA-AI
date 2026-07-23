@@ -3,7 +3,10 @@ services:
     name: haultra-ai-systems
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --workers 2 --threads 2 --bind 0.0.0.0:$PORT
+    # 8 threads/worker so long-lived SSE streams (driver Cab View realtime) can
+    # sit idle without starving normal requests; --timeout 120 keeps gunicorn
+    # from killing a streaming worker mid-connection.
+    startCommand: gunicorn app:app --workers 2 --threads 8 --bind 0.0.0.0:$PORT --timeout 120
     envVars:
       - key: SECRET_KEY
         generateValue: true       # Render auto-generates a secure random value
