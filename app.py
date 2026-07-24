@@ -3211,6 +3211,15 @@ def init_db():
     safe_add_column(conn, "inspection_items", "flag_note TEXT")
     safe_add_column(conn, "maintenance_entries", "deleted_at TEXT")
     safe_add_column(conn, "maintenance_entries", "deleted_by INTEGER")
+
+    # Driver-initiated breakdown (feat/driver-breakdown): a breakdown IS a
+    # driver-reported defect that goes straight to the vendor-dispatch lifecycle,
+    # so it reuses inspections + inspection_items + vendor_status wholesale. This
+    # flag marks the synthetic parent inspection so it is excluded from DVIR
+    # inspection listings (it is not a real pre/post-trip) while its defect item
+    # still flows through Open Defects, vendor dispatch, and the maintenance log.
+    safe_add_column(conn, "inspections", "is_breakdown INTEGER NOT NULL DEFAULT 0")
+
     safe_add_column(conn, "bins", "label TEXT")
     safe_add_column(conn, "bins", "drop_photo_path TEXT")
     safe_add_column(conn, "bins", "drop_stop_id INTEGER")
@@ -6463,6 +6472,22 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 }}
 .cab-copy-btn:hover {{ background: rgba(255,255,255,0.1); }}
 .cab-copy-hint {{ font-size: 11.5px; color: var(--text-muted); text-align: center; margin-top: 8px; line-height: 1.5; }}
+
+/* Driver-initiated breakdown — always-visible ⚠ Truck Issue button. */
+.cab-issue-btn {{
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    width: 100%; min-height: 52px; margin-bottom: 18px;
+    background: rgba(255,82,82,0.12); border: 1px solid rgba(255,82,82,0.55);
+    color: #FF7A7A; font-weight: 800; font-size: 15px; letter-spacing: .3px;
+    border-radius: 12px; cursor: pointer;
+}}
+.cab-issue-btn:hover {{ background: rgba(255,82,82,0.2); }}
+.cab-issue-btn.reported {{ background: rgba(245,180,60,0.14); border-color: rgba(245,180,60,0.55); color: #F5B43C; }}
+.bk-type-btn {{
+    min-height: 52px; border-radius: 12px; cursor: pointer; font-weight: 700; font-size: 15px;
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.16); color: #E6E6E0;
+}}
+.bk-type-btn.sel {{ background: rgba(255,82,82,0.18); border-color: var(--red); color: #FF9D9D; }}
 
 .cab-photo-status {{ font-size: 12.5px; color: var(--text-muted); text-align: center; margin-top: 14px; }}
 .cab-photo-status.ready {{ color: var(--green); }}
@@ -10144,11 +10169,14 @@ def _build_route_board_html(user):
     _co = conn.execute("SELECT * FROM companies WHERE id=?", (company_id,)).fetchone()
     _co_settings = {k: _co[k] for k in _co.keys()} if _co else {}
     driver_marks = {}
+    breakdown_drivers = set()
     for _did in {r["assigned_to"] for r in board_rows if r["assigned_to"]}:
         driver_marks[_did] = (
             _approved_off_on(conn, company_id, _did, today),
             _late_active(conn, company_id, _did, today, _co_settings),
         )
+        if _driver_active_breakdown(conn, _did):
+            breakdown_drivers.add(_did)
     conn.close()
 
     lanes = {}
@@ -10285,6 +10313,12 @@ def _build_route_board_html(user):
                              'font-size:9px;font-weight:800;letter-spacing:.4px;padding:2px 7px;border-radius:999px;'
                              'background:rgba(255,107,26,0.14);color:#FF9D5C;border:1px solid rgba(255,107,26,0.5);">&#9201; LATE '
                              + e(_late_row["eta"] or "") + '</span>')
+        # Red breakdown chip until the boss dispatches to a vendor (after which the
+        # existing SCHEDULED/EN ROUTE/AT VENDOR stop pills take over the lane).
+        if lane.get("driver_id") in breakdown_drivers:
+            timeoff_chip += ('<span class="lane-breakdown-badge" style="display:inline-block;margin-left:6px;'
+                             'font-size:9px;font-weight:800;letter-spacing:.4px;padding:2px 7px;border-radius:999px;'
+                             'background:rgba(255,82,82,0.18);color:#FF7A7A;border:1px solid rgba(255,82,82,0.55);">&#9888; BREAKDOWN</span>')
 
         _lane_avatar = ""
         if lane.get("driver_id"):
@@ -10643,6 +10677,118 @@ _VENDOR_STOP_JS = """
 })();
 </script>
 """
+
+
+_BREAKDOWN_DRIVER_JS = """
+window.openTruckIssue = function() {
+    document.getElementById('bk-overlay').hidden = false;
+    document.getElementById('bk-modal').hidden = false;
+    window.__bkGps = null;
+    if (typeof window.captureGpsStamp === 'function') {
+        window.captureGpsStamp(function(g) { window.__bkGps = g; });
+    }
+};
+window.closeTruckIssue = function() {
+    document.getElementById('bk-overlay').hidden = true;
+    document.getElementById('bk-modal').hidden = true;
+};
+window.bkPick = function(btn) {
+    var all = document.querySelectorAll('.bk-type-btn');
+    for (var i = 0; i < all.length; i++) { all[i].classList.remove('sel'); }
+    btn.classList.add('sel');
+    document.getElementById('bk-type').value = btn.getAttribute('data-t');
+};
+function bkCompress(file, cb) {
+    try {
+        var img = new Image(), url = URL.createObjectURL(file);
+        img.onload = function() {
+            var MAX = 1024, w = img.width, h = img.height;
+            if (w > h && w > MAX) { h = Math.round(h * MAX / w); w = MAX; }
+            else if (h >= w && h > MAX) { w = Math.round(w * MAX / h); h = MAX; }
+            var c = document.createElement('canvas'); c.width = w; c.height = h;
+            c.getContext('2d').drawImage(img, 0, 0, w, h);
+            URL.revokeObjectURL(url);
+            c.toBlob(function(b) { cb(b || file); }, 'image/jpeg', 0.6);
+        };
+        img.onerror = function() { URL.revokeObjectURL(url); cb(file); };
+        img.src = url;
+    } catch (e) { cb(file); }
+}
+window.bkSubmit = function() {
+    var t = document.getElementById('bk-type').value;
+    var status = document.getElementById('bk-status');
+    var btn = document.getElementById('bk-send');
+    if (!t) { status.hidden = false; status.textContent = 'Pick what is wrong first.'; return; }
+    btn.disabled = true; status.hidden = false; status.textContent = 'Sending\\u2026';
+    function post(photoBlob) {
+        var fd = new FormData();
+        fd.append('_csrf_token', BK_CSRF);
+        fd.append('issue_type', t);
+        fd.append('note', document.getElementById('bk-note').value || '');
+        fd.append('container', document.getElementById('bk-container').value || '');
+        var g = window.__bkGps;
+        if (g && g.lat && g.lng) { fd.append('lat', String(g.lat)); fd.append('lng', String(g.lng)); }
+        if (photoBlob) { fd.append('photo', photoBlob, 'breakdown.jpg'); }
+        fetch('/api/breakdown/report', { method: 'POST', headers: { 'X-CSRF-Token': BK_CSRF }, body: fd })
+            .then(function(r) { return r.json().then(function(j) { return { ok: r.ok, j: j }; }); })
+            .then(function(res) {
+                if (res.ok && res.j.success) {
+                    status.textContent = 'Boss alerted \\u2713';
+                    var ib = document.getElementById('cab-issue-btn');
+                    if (ib) { ib.classList.add('reported'); ib.innerHTML = '\\u26A0 Breakdown reported'; }
+                    setTimeout(function() { closeTruckIssue(); }, 900);
+                } else {
+                    btn.disabled = false;
+                    status.textContent = (res.j && res.j.error) || 'Could not send \\u2014 try again.';
+                }
+            })
+            .catch(function() { btn.disabled = false; status.textContent = 'Network error \\u2014 try again.'; });
+    }
+    var f = document.getElementById('bk-photo').files[0];
+    if (f) { bkCompress(f, post); } else { post(null); }
+};
+"""
+
+
+def _breakdown_driver_ui_html(route_id, container_prefill, csrf):
+    """Cab View ⚠ Truck Issue modal + submit JS. Reuses window.captureGpsStamp
+    for GPS and an avatar-style canvas downscale so the photo stays small on a
+    weak signal, then posts multipart to /api/breakdown/report. No cropper UI;
+    ≥48px touch targets; theme tokens."""
+    type_btns = "".join(
+        '<button type="button" class="bk-type-btn" data-t="%s" onclick="bkPick(this)">%s</button>'
+        % (e(t), e(t)) for t in BREAKDOWN_ISSUE_TYPES
+    )
+    modal = f"""
+<div id="bk-overlay" class="no-photo-confirm-overlay" hidden onclick="closeTruckIssue()"></div>
+<div id="bk-modal" class="no-photo-confirm-modal" hidden style="max-width:440px;text-align:left;">
+    <div class="no-photo-confirm-title" style="color:#FF7A7A;">&#9888; Truck Issue</div>
+    <p class="no-photo-confirm-body" style="margin-bottom:12px;">What&rsquo;s wrong? The boss gets an urgent alert.</p>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px;">{type_btns}</div>
+    <input type="hidden" id="bk-type" value="">
+    <label class="uw-lbl">Container on board # (optional)</label>
+    <input id="bk-container" maxlength="40" value="{e(container_prefill)}" placeholder="e.g. 1234"
+           style="width:100%;min-height:48px;margin-bottom:10px;">
+    <label class="uw-lbl">Note (optional)</label>
+    <input id="bk-note" maxlength="300" placeholder="e.g. flat right rear at the dump site"
+           style="width:100%;min-height:48px;margin-bottom:10px;">
+    <label class="uw-lbl">Photo (optional)</label>
+    <input id="bk-photo" type="file" accept="image/*" capture="environment"
+           style="width:100%;min-height:48px;margin-bottom:8px;">
+    <div id="bk-status" class="cab-photo-status" hidden style="margin-top:4px;"></div>
+    <div class="no-photo-confirm-actions" style="margin-top:14px;">
+        <button type="button" class="btn orange" id="bk-send" style="flex:1;min-height:52px;" onclick="bkSubmit()">Send Alert</button>
+        <button type="button" class="btn secondary" style="min-height:52px;" onclick="closeTruckIssue()">Cancel</button>
+    </div>
+</div>
+<script>
+(function() {{
+    var BK_CSRF = {json.dumps(csrf)};
+    {_BREAKDOWN_DRIVER_JS}
+}})();
+</script>
+"""
+    return modal
 
 
 @app.route("/driver/route/<int:route_id>")
@@ -11363,6 +11509,13 @@ def driver_route_detail(route_id):
         cab_action_badge = f'<div class="cab-action-badge {badge_group}">{e(s["action"] or "STOP")}</div>'
     phone_line = f'<div class="cab-meta-line"><strong>Phone:</strong> <a href="tel:{e(_s["phone"])}" style="color:#3DDC84;">{e(_s["phone"])}</a></div>' if _s.get("phone") else ""
 
+    # Driver-initiated breakdown: always-visible ⚠ Truck Issue button + modal.
+    try:
+        _bk_container = e((s["container_size"] or "") if ("container_size" in s.keys()) else "")
+    except Exception:
+        _bk_container = ""
+    breakdown_ui_html = _breakdown_driver_ui_html(route_id, _bk_container, _csrf)
+
     body = f"""
 <div class="cab-wrap">
     <div class="cab-header">
@@ -11383,6 +11536,8 @@ def driver_route_detail(route_id):
 
     <div class="cab-progress-label" id="cab-progress-label">STOP {current_stop_num} OF {total_count}</div>
     <div class="cab-progress-track"><div class="cab-progress-fill" id="cab-progress-fill" style="width:{pct}%;"></div></div>
+
+    <button type="button" id="cab-issue-btn" class="cab-issue-btn" onclick="openTruckIssue()">&#9888; Truck Issue</button>
 
     {f'''
     <form method="POST" action="{url_for('toggle_stop_complete', stop_id=prev_stop['id'])}" style="margin-bottom:14px;"
@@ -11436,6 +11591,8 @@ def driver_route_detail(route_id):
 {cab_map_panel}
 
 {_message_thread_modal_html(show_quick_taps=True)}
+
+{breakdown_ui_html}
 
 <div id="gps-preprompt-overlay" class="no-photo-confirm-overlay" hidden></div>
 <div id="gps-preprompt-modal" class="no-photo-confirm-modal" hidden>
@@ -12899,9 +13056,12 @@ def vendor_complete(stop_id):
             )
             body = "\U0001F527 Vendor visit done — truck NOT repaired"
             body += (": " + note) if note else "."
+            # Urgent so the boss gets an actionable alert to decide the next move
+            # (re-dispatch or continue), linked to the still-open defect.
             conn.execute(
-                "INSERT INTO messages (route_id, sender_user_id, body, created_at) VALUES (?,?,?,?)",
-                (stop["route_id"], session["user_id"], body[:500], ts)
+                """INSERT INTO messages (route_id, sender_user_id, body, created_at, priority, defect_item_id)
+                   VALUES (?,?,?,?,'urgent',?)""",
+                (stop["route_id"], session["user_id"], body[:500], ts, did)
             )
         trow = conn.execute(
             """SELECT i.truck_id FROM inspection_items ii
@@ -23222,7 +23382,9 @@ def truck_detail_page(truck_id):
 
     date_from = (request.args.get("from") or "").strip()
     date_to   = (request.args.get("to") or "").strip()
-    where = ["i.company_id=?", "i.truck_id=?"]
+    # Exclude synthetic breakdown inspections — they are not DVIRs; their defect
+    # still surfaces in Open Defects + the maintenance log below.
+    where = ["i.company_id=?", "i.truck_id=?", "COALESCE(i.is_breakdown,0)=0"]
     params = [cid(), truck_id]
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_from):
         where.append("substr(i.created_at,1,10) >= ?")
@@ -23839,7 +24001,7 @@ def my_inspections():
                     WHERE ii.inspection_id=i.id AND ii.result='defect' AND ii.deleted_at IS NULL) AS defect_count
              FROM inspections i
              JOIN trucks t ON i.truck_id=t.id
-            WHERE i.driver_id=? AND i.company_id=?
+            WHERE i.driver_id=? AND i.company_id=? AND COALESCE(i.is_breakdown,0)=0
             ORDER BY i.created_at DESC, i.id DESC""",
         (session["user_id"], cid()),
     ).fetchall()
@@ -24059,9 +24221,9 @@ def maintenance_page():
         """SELECT ii.id AS item_id, ii.label, ii.note, ii.photo_path, ii.defect_status,
                   ii.at_vendor AS item_at_vendor, ii.sent_vendor_id,
                   ii.vendor_status AS item_vendor_status, ii.flagged_at, ii.flag_note,
-                  i.id AS inspection_id, i.type, i.created_at, i.truck_id,
+                  i.id AS inspection_id, i.type, i.created_at, i.truck_id, i.is_breakdown,
                   t.name AS truck_name, t.out_of_service, t.at_vendor, t.vendor_status,
-                  COALESCE(u.username,'—') AS reporter,
+                  COALESCE(u.full_name, u.username, '—') AS reporter,
                   (SELECT m.id FROM messages m WHERE m.defect_item_id=ii.id
                      AND m.priority='urgent' ORDER BY m.id DESC LIMIT 1) AS dispatch_msg_id,
                   (SELECT m.acknowledged_at FROM messages m WHERE m.defect_item_id=ii.id
@@ -24071,9 +24233,15 @@ def maintenance_page():
              JOIN trucks t ON i.truck_id=t.id
         LEFT JOIN users u ON i.driver_id=u.id
             WHERE i.company_id=? AND ii.result='defect' AND ii.defect_status='open' AND ii.deleted_at IS NULL
-            ORDER BY t.out_of_service DESC, i.created_at ASC, ii.id ASC""",
+            ORDER BY COALESCE(i.is_breakdown,0) DESC, t.out_of_service DESC, i.created_at ASC, ii.id ASC""",
         (cid(),),
     ).fetchall()
+    # Breakdown cards show their driver-attached photo from the maintenance-photo
+    # pipeline (management-only serve), so gather those receipts before we close.
+    _bk_receipts = {
+        d["item_id"]: _maintenance_receipts(conn, defect_item_id=d["item_id"])
+        for d in defects if d["is_breakdown"]
+    }
     vendors = _company_vendors(conn)
     vmap = _vendor_map(conn)
     has_costs = _company_has_costs(conn)
@@ -24198,8 +24366,26 @@ def maintenance_page():
                     <button class="btn secondary" onclick="hideRepair({d['item_id']})">Cancel</button>
                 </div>
             </div>"""
+        # Breakdown decorations: a red driver banner, the driver's attached photo
+        # (from the maintenance-photo pipeline), and a "No vendor — continue route"
+        # action. A breakdown IS a defect, so it reuses every card control above.
+        bk_banner = bk_thumbs = bk_continue = ""
+        if d["is_breakdown"]:
+            _bid = d["item_id"]
+            bk_banner = (
+                '<div style="margin:-16px -16px 12px;padding:8px 16px;border-radius:14px 14px 0 0;'
+                'background:rgba(255,82,82,0.16);border-bottom:1px solid rgba(255,82,82,0.4);'
+                'color:#FF7A7A;font-weight:800;font-size:12px;letter-spacing:.4px;">'
+                '⚠ DRIVER BREAKDOWN · ' + e(d["reporter"]) + '</div>')
+            bk_thumbs = _receipt_thumbs_html(_bk_receipts.get(_bid) or [])
+            if can_action and not d["item_vendor_status"]:
+                bk_continue = (
+                    '<button class="btn secondary" style="width:100%;margin-top:8px;min-height:48px;" '
+                    'onclick="bkContinue(' + str(_bid) + ')">No vendor &mdash; continue route</button>')
+        _type_label = "Reported live from Cab View" if d["is_breakdown"] else e(_INSPECTION_TYPE_LABEL.get(d["type"], d["type"]))
         cards += f"""
         <div class="bin-card" id="defect-{d['item_id']}" style="padding:16px;">
+            {bk_banner}
             <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;">
                 <div style="font-weight:700;font-size:15px;">🚛 {e(d["truck_name"])}{_truck_status_badges(d)}</div>
                 <a href="{url_for('inspection_report', inspection_id=d['inspection_id'])}"
@@ -24208,13 +24394,13 @@ def maintenance_page():
             <div style="font-weight:700;font-size:14px;margin-top:8px;color:#FF7A7A;">⚠ {e(d["label"])}</div>
             {note}{sent_chip}{dispatch_chip}{flag_chip}
             <div style="display:flex;gap:10px;align-items:center;margin-top:8px;">
-                {thumb}
+                {thumb}{bk_thumbs}
                 <div style="color:var(--slate);font-size:12px;">
-                    {e(_INSPECTION_TYPE_LABEL.get(d["type"], d["type"]))} · {e(d["reporter"])}<br>{e((d["created_at"] or "")[:16])}
+                    {_type_label} · {e(d["reporter"])}<br>{e((d["created_at"] or "")[:16])}
                 </div>
             </div>
             <div id="defect-err-{d['item_id']}" hidden style="color:#FF5252;font-size:12px;margin-top:8px;"></div>
-            {actions}{repair_form}
+            {actions}{bk_continue}{repair_form}
         </div>"""
 
     # Totals table — spend (when any cost recorded) or event counts otherwise.
@@ -24373,6 +24559,18 @@ _MAINTENANCE_PAGE_JS = """
           if(d&&d.warning){ alert(d.warning); }
           window.location.reload();
         } else { err(id,(res.j&&res.j.error)||'Could not update.'); }
+      })
+      .catch(function(){ err(id,'Network error — try again.'); });
+  };
+  window.bkContinue=function(id){
+    var note=prompt('Tell the driver to continue — optional note:','')||'';
+    fetch('/api/breakdown/'+id+'/continue',{method:'POST',
+        headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
+        body:JSON.stringify({note:note})})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
+      .then(function(res){
+        if(res.ok){ window.location.reload(); }
+        else { err(id,(res.j&&res.j.error)||'Could not update.'); }
       })
       .catch(function(){ err(id,'Network error — try again.'); });
   };
@@ -24541,6 +24739,167 @@ def _dispatch_driver_to_vendor(conn, defect_row, vendor_id, dispatch, dispatch_n
                  (defect_row["id"],))
     _recompute_truck_at_vendor(conn, defect_row["truck_id"])
     return {"dispatched": True, "route_id": route_id, "stop_id": stop_id, "timing": timing}
+
+
+# ── Driver-initiated truck breakdown (feat/driver-breakdown) ──────────────────
+# A breakdown is a driver-reported defect that goes straight to the existing
+# vendor-dispatch lifecycle. We create the same inspection_items 'defect' row the
+# rest of the fleet workflow already understands (flagged via a synthetic
+# is_breakdown inspection), so vendor dispatch, the scheduled→en_route→at_vendor
+# status walk, the "Repaired?" completion, and the maintenance log all reuse
+# their existing code with no parallel system.
+BREAKDOWN_ISSUE_TYPES = ("Flat tire", "Hydraulics", "Brakes", "Engine", "Other")
+
+
+def _driver_truck_id(conn, driver_id):
+    """The truck a driver is on = the truck of their most recent inspection.
+    Same rule the inspection screen uses to preselect the truck."""
+    row = conn.execute(
+        "SELECT truck_id FROM inspections WHERE driver_id=? AND company_id=? ORDER BY id DESC LIMIT 1",
+        (driver_id, cid()),
+    ).fetchone()
+    return row["truck_id"] if row else None
+
+
+def _driver_active_breakdown(conn, driver_id):
+    """The driver's open, not-yet-dispatched breakdown (drives the red route-board
+    chip). Once the boss dispatches to a vendor, vendor_status is set and the
+    existing SCHEDULED/EN ROUTE/AT VENDOR pills take over, so this returns None."""
+    return conn.execute(
+        """SELECT ii.id, ii.label FROM inspection_items ii
+             JOIN inspections i ON ii.inspection_id=i.id
+            WHERE i.company_id=? AND i.driver_id=? AND i.is_breakdown=1
+              AND ii.result='defect' AND ii.defect_status='open'
+              AND ii.deleted_at IS NULL AND ii.vendor_status IS NULL
+            ORDER BY ii.id DESC LIMIT 1""",
+        (cid(), driver_id),
+    ).fetchone()
+
+
+@app.route("/api/breakdown/report", methods=["POST"])
+@driver_required
+def report_breakdown():
+    """Driver taps ⚠ Truck Issue on the Cab View. Records the breakdown as an
+    open defect on their truck and alerts the boss with an URGENT message on the
+    active route thread (existing priority path + pinned banner). Multipart so an
+    optional (client-compressed) photo rides along, reusing the maintenance photo
+    pipeline. Optional container # and GPS are folded into the note the boss sees."""
+    src = request.form if request.form else (request.get_json(silent=True) or {})
+    issue = str(src.get("issue_type") or "").strip()
+    if issue not in BREAKDOWN_ISSUE_TYPES:
+        return jsonify({"error": "pick an issue type"}), 400
+    note_in   = str(src.get("note") or "").strip()[:300]
+    container = str(src.get("container") or "").strip()[:40]
+    lat = str(src.get("lat") or "").strip()[:24]
+    lng = str(src.get("lng") or "").strip()[:24]
+
+    conn = get_db()
+    driver_id = session["user_id"]
+    truck_id = _driver_truck_id(conn, driver_id)
+    if not truck_id:
+        conn.close()
+        return jsonify({"error": "No truck on file yet — run a truck inspection first, then report the issue."}), 400
+
+    user = get_current_user()
+    sig = (user["full_name"] if user and user["full_name"] else (user["username"] if user else "Driver"))
+
+    # Synthetic parent inspection (is_breakdown=1 keeps it out of DVIR listings).
+    cur = conn.execute(
+        """INSERT INTO inspections (company_id, truck_id, driver_id, type, overall,
+               signature_name, created_at, is_breakdown)
+           VALUES (?,?,?,'pre_trip','out_of_service',?,?,1)""",
+        (cid(), truck_id, driver_id, sig, now_ts()),
+    )
+    insp_id = cur.lastrowid
+
+    # Note the boss reads: container on board, driver's words, and a maps link.
+    detail_bits = []
+    if container:
+        detail_bits.append("Container on board: #" + container)
+    if note_in:
+        detail_bits.append(note_in)
+    gps_link = ""
+    if lat and lng and re.fullmatch(r"-?\d{1,3}\.\d+", lat) and re.fullmatch(r"-?\d{1,3}\.\d+", lng):
+        gps_link = "https://maps.google.com/?q=%s,%s" % (lat, lng)
+        detail_bits.append("Location: " + gps_link)
+    note_full = " · ".join(detail_bits)[:500]
+
+    cur = conn.execute(
+        """INSERT INTO inspection_items (inspection_id, checklist_item_id, label, result,
+               note, defect_status)
+           VALUES (?, NULL, ?, 'defect', ?, 'open')""",
+        (insp_id, issue, note_full or None),
+    )
+    item_id = cur.lastrowid
+
+    # Optional photo → reuse the maintenance receipt pipeline (management-only serve).
+    photo = request.files.get("photo")
+    if photo:
+        _save_maintenance_receipts(conn, [photo], defect_item_id=item_id)
+
+    # URGENT alert to the boss on the driver's active route thread (if any).
+    tname_row = conn.execute("SELECT name FROM trucks WHERE id=?", (truck_id,)).fetchone()
+    tname = (tname_row["name"] if tname_row else "the truck")
+    route_id = driver_active_route_id(conn, driver_id)
+    if route_id:
+        body = "⚠ BREAKDOWN — %s · Truck %s" % (issue, tname)
+        if container:
+            body += " · container #" + container
+        if note_in:
+            body += " · " + note_in
+        conn.execute(
+            """INSERT INTO messages (route_id, sender_user_id, body, created_at, priority, defect_item_id)
+               VALUES (?, ?, ?, ?, 'urgent', ?)""",
+            (route_id, driver_id, body[:500], now_ts(), item_id),
+        )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "item_id": item_id, "issue": issue})
+
+
+@app.route("/api/breakdown/<int:item_id>/continue", methods=["POST"])
+@login_required
+def breakdown_continue(item_id):
+    """Boss answers a breakdown with "No vendor — continue route": clears the
+    breakdown (defer the defect) and tells the driver to carry on. Uses the same
+    defect record — no vendor stop, no lifecycle badge."""
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    src = request.form if request.form else (request.get_json(silent=True) or {})
+    note = str(src.get("note") or "").strip()[:300]
+    conn = get_db()
+    row = conn.execute(
+        """SELECT ii.id, ii.defect_status, i.truck_id, i.driver_id
+             FROM inspection_items ii
+             JOIN inspections i ON ii.inspection_id=i.id
+            WHERE ii.id=? AND i.company_id=? AND i.is_breakdown=1
+              AND ii.result='defect' AND ii.deleted_at IS NULL""",
+        (item_id, cid()),
+    ).fetchone()
+    if row is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if row["defect_status"] != "open":
+        conn.close()
+        return jsonify({"error": "already resolved"}), 409
+    res_note = "No vendor — continue route" + (": " + note if note else "")
+    conn.execute(
+        """UPDATE inspection_items SET defect_status='deferred', vendor_status=NULL,
+               resolution_note=?, resolved_by=?, resolved_at=? WHERE id=?""",
+        (res_note, session["user_id"], now_ts(), item_id),
+    )
+    _recompute_truck_at_vendor(conn, row["truck_id"])
+    route_id = driver_active_route_id(conn, row["driver_id"])
+    if route_id:
+        body = "✅ Continue your route — no vendor needed." + (" " + note if note else "")
+        conn.execute(
+            """INSERT INTO messages (route_id, sender_user_id, body, created_at, priority)
+               VALUES (?, ?, ?, ?, 'urgent')""",
+            (route_id, session["user_id"], body[:500], now_ts()),
+        )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
 
 
 @app.route("/api/defects/<int:item_id>/resolve", methods=["POST"])
