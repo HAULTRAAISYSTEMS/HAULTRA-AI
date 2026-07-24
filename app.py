@@ -179,6 +179,21 @@ def e(value):
     return html.escape("" if value is None else str(value))
 
 
+_URL_RE = re.compile(r'(https?://[^\s<]+)')
+
+
+def _linkify(value):
+    """Escape text, then turn bare http(s) URLs into tappable links (used for
+    the GPS maps link a breakdown carries in its note)."""
+    if value is None or value == "":
+        return ""
+    esc = e(value)
+    return _URL_RE.sub(
+        r'<a href="\1" target="_blank" rel="noopener" style="color:var(--cyan);word-break:break-all;">\1</a>',
+        esc,
+    )
+
+
 try:
     from zoneinfo import ZoneInfo as _ZoneInfo
     _EASTERN = _ZoneInfo("America/New_York")
@@ -3219,6 +3234,12 @@ def init_db():
     # inspection listings (it is not a real pre/post-trip) while its defect item
     # still flows through Open Defects, vendor dispatch, and the maintenance log.
     safe_add_column(conn, "inspections", "is_breakdown INTEGER NOT NULL DEFAULT 0")
+
+    # Held stops (fix/breakdown-flow): a "Go NOW" vendor dispatch parks the
+    # remaining stops behind the vendor visit. held_at != NULL = parked: the
+    # stop is dimmed, cannot be completed, and resumes when the vendor stop
+    # resolves (Repaired = yes) or the boss releases it manually.
+    safe_add_column(conn, "stops", "held_at TEXT")
 
     safe_add_column(conn, "bins", "label TEXT")
     safe_add_column(conn, "bins", "drop_photo_path TEXT")
@@ -6729,6 +6750,9 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .stop-mini.st-done    {{ border-left-color: var(--green); }}
 .stop-mini.st-enroute {{ border-left-color: var(--cyan); }}
 .stop-mini.st-pending {{ border-left-color: #55554C; }}
+.stop-mini.st-held {{ border-left-color: #8CA0B3; }}
+.stop-mini.held {{ opacity: .5; }}
+.stop-mini-hold {{ font-size: 12px; line-height: 1; }}
 
 .stop-mini-top {{ display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 6px; }}
 .stop-mini-badge {{
@@ -6750,6 +6774,7 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .stop-mini-pill.done    {{ background: rgba(61,220,132,0.14); color: var(--green); }}
 .stop-mini-pill.enroute {{ background: rgba(255,107,26,0.16); color: #FF9D5C; }}
 .stop-mini-pill.pending {{ background: rgba(255,255,255,0.06); color: #A6A69E; }}
+.stop-mini-pill.held    {{ background: rgba(140,160,179,0.16); color: #B8C6D4; }}
 .stop-mini-time {{ font-size: 10px; color: var(--text-muted); margin-top: 4px; }}
 
 /* ══════════════════════════════════════════════════════════
@@ -10014,6 +10039,18 @@ def _message_thread_js():
         if (currentThreadRouteId != null) fetchThread(currentThreadRouteId);
     };
 
+    // Boss releases the stops parked behind a Go NOW vendor visit.
+    window.releaseHolds = function(routeId) {
+        if (!confirm('Release the held stops so the driver can work them again?')) return;
+        var CSRF = (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
+        fetch('/api/routes/' + routeId + '/release-holds', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF }
+        }).then(function(r) { return r.json(); })
+          .then(function(){ if (typeof refreshBoard === 'function') { refreshBoard(); } else { location.reload(); } })
+          .catch(function(){ location.reload(); });
+    };
+
     window.closeMessageThread = function() {
         if (el('msg-overlay')) el('msg-overlay').hidden = true;
         if (el('msg-modal')) el('msg-modal').hidden = true;
@@ -10129,7 +10166,7 @@ def _build_route_board_html(user):
                u.avatar_path AS driver_avatar,
                s.id AS stop_id, s.stop_order, s.customer_name, s.address, s.city,
                s.action, s.container_size, s.status AS stop_status, s.driver_status,
-               s.completed_at, ii.vendor_status AS vendor_status,
+               s.completed_at, s.held_at, ii.vendor_status AS vendor_status,
                EXISTS(SELECT 1 FROM route_photos rp WHERE rp.stop_id = s.id) AS has_photo
         FROM routes r
         LEFT JOIN users u ON r.assigned_to = u.id
@@ -10238,6 +10275,13 @@ def _build_route_board_html(user):
                 f'onclick="openMessageThread({_lane_route_id}, {e(json.dumps(display_name))})">'
                 f'&#128172; Message{_lane_msg_badge}</button>'
             )
+            # Truck parked at a vendor (Go NOW) → offer a manual hold release.
+            if any(dict(x).get("held_at") and x["stop_status"] != "completed" for x in stops):
+                message_html += (
+                    f'<button type="button" class="lane-message-btn" '
+                    f'style="border-color:rgba(140,160,179,0.5);color:#B8C6D4;" '
+                    f'onclick="releaseHolds({_lane_route_id})">&#9208; Release holds</button>'
+                )
 
         cards_html = ""
         for s in stops:
@@ -10245,12 +10289,17 @@ def _build_route_board_html(user):
             stop_status = s["stop_status"]
             driver_status = s["driver_status"] or "pending"
 
+            held = bool(dict(s).get("held_at")) and stop_status != "completed"
             if stop_status == "completed":
                 pill_label, pill_cls, card_cls = "Done", "done", "st-done"
+            elif held:
+                pill_label, pill_cls, card_cls = "Held", "held", "st-held"
             elif driver_status != "pending":
                 pill_label, pill_cls, card_cls = "En Route", "enroute", "st-enroute"
             else:
                 pill_label, pill_cls, card_cls = "Pending", "pending", "st-pending"
+            held_cls = " held" if held else ""
+            hold_icon = '<span class="stop-mini-hold" title="Held — truck at vendor">&#9208;</span>' if held else ""
 
             addr_text = ", ".join(p for p in [s["address"] or "", s["city"] or ""] if p) or (s["customer_name"] or "Stop")
             addr_cls = "stop-mini-addr done" if stop_status == "completed" else "stop-mini-addr"
@@ -10283,9 +10332,10 @@ def _build_route_board_html(user):
                     else url_for("view_route", route_id=s["route_id"]))
 
             cards_html += f"""
-            <a class="stop-mini {card_cls}" href="{link}">
+            <a class="stop-mini {card_cls}{held_cls}" href="{link}">
                 <div class="stop-mini-top">
                     <span class="stop-mini-badge {group}">{e(letter)}</span>
+                    {hold_icon}
                     {vendor_pill}
                     {urgent_html}
                     {photo_html}
@@ -11211,6 +11261,21 @@ def driver_route_detail(route_id):
         <div id="vendor-done-err" hidden style="color:#FF5252;font-size:12px;margin-top:8px;"></div>
     </div>
     """
+
+    # Held current stop (a not-yet-released stop surfaced as current after a
+    # vendor visit that did NOT repair the truck) — the driver can't work it
+    # until the boss releases holds or re-dispatches. Show a clear parked state.
+    if _s.get("held_at") and not is_vendor:
+        complete_section = (
+            '<div class="cab-held-banner" style="border-radius:14px;padding:16px;'
+            'background:rgba(140,160,179,0.12);border:1px solid rgba(140,160,179,0.5);'
+            'color:#C8D4E0;text-align:center;min-height:48px;">'
+            '<div style="font-size:22px;">&#9208;</div>'
+            '<div style="font-weight:800;margin-top:4px;">Held — truck at the vendor</div>'
+            '<div style="font-size:13px;color:#9FB0C0;margin-top:4px;">'
+            'This stop is on hold until the boss releases it. Message the boss if you have questions.</div>'
+            '</div>'
+        )
 
     # ══════════════════════════════════════════════════════════
     # DRIVER ROUTE MAP — read-only toggle showing this driver's whole
@@ -13045,6 +13110,9 @@ def vendor_complete(stop_id):
                     WHERE id=? AND defect_status='open'""",
                 (session["user_id"], ts, res_note[:500], did)
             )
+            # Truck is fixed → release the stops parked behind this vendor visit;
+            # the stop that was current before the Go NOW resumes automatically.
+            _release_holds(conn, stop["route_id"])
         else:
             # Not repaired — keep the defect OPEN and revert the truck to VENDOR
             # SCHEDULED (needs another trip); tell the boss on the thread.
@@ -14096,6 +14164,15 @@ def toggle_stop_complete(stop_id):
         conn.close()
         flash("Access denied.", "error")
         return redirect(url_for("dashboard"))
+
+    # Held stops are parked behind a Go NOW vendor visit — they can't be completed
+    # until the truck is repaired or the boss releases them. (Reopening is fine.)
+    if ("held_at" in stop.keys() and stop["held_at"] and stop["status"] == "open"):
+        conn.close()
+        if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+            return jsonify({"error": "held", "message": "This stop is held — the truck is at the vendor."}), 409
+        flash("This stop is held while the truck is at the vendor.", "error")
+        return redirect(url_for("driver_route_detail", route_id=stop["route_id"]))
 
     # Conflict detection for offline sync replays
     is_replay = (request.headers.get("X-Sync-Replay") == "1" or
@@ -24081,7 +24158,7 @@ def inspection_report(inspection_id):
     rows_html = ""
     for it in items:
         label_txt, color = _RES.get(it["result"], (it["result"], "var(--slate)"))
-        note = f'<div style="font-size:13px;color:#C9C9C2;margin-top:4px;">{e(it["note"])}</div>' if it["note"] else ""
+        note = f'<div style="font-size:13px;color:#C9C9C2;margin-top:4px;">{_linkify(it["note"])}</div>' if it["note"] else ""
         photo = ""
         if it["photo_path"]:
             purl = url_for("serve_inspection_photo", item_id=it["id"])
@@ -24138,7 +24215,7 @@ def inspection_report(inspection_id):
     <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
         <div>
             <h1 style="margin-bottom:4px;">🚛 {e(insp["truck_name"])}{_truck_oos_badge(insp)}{_truck_at_vendor_badge(insp) if is_mgmt else ""}</h1>
-            <p style="margin:0;">{e(_INSPECTION_TYPE_LABEL.get(insp["type"], insp["type"]))} inspection · {e((insp["created_at"] or ""))}</p>
+            <p style="margin:0;">{('⚠ Breakdown (driver-reported)' if dict(insp).get('is_breakdown') else e(_INSPECTION_TYPE_LABEL.get(insp["type"], insp["type"])) + ' inspection')} · {e((insp["created_at"] or ""))}</p>
         </div>
         <a class="btn secondary" href="{back}" style="white-space:nowrap;">← Back</a>
     </div>
@@ -24271,7 +24348,7 @@ def maintenance_page():
             purl = url_for("serve_inspection_photo", item_id=d["item_id"])
             thumb = (f'<a href="{purl}" target="_blank"><img src="{purl}" loading="lazy" '
                      f'style="width:64px;height:64px;object-fit:cover;border-radius:8px;border:1px solid var(--border);"></a>')
-        note = f'<div style="font-size:13px;color:#C9C9C2;margin-top:4px;">{e(d["note"])}</div>' if d["note"] else ""
+        note = f'<div style="font-size:13px;color:#C9C9C2;margin-top:4px;">{_linkify(d["note"])}</div>' if d["note"] else ""
         sent_chip = ""
         if d["item_at_vendor"]:
             vn = vmap.get(d["sent_vendor_id"], "a vendor")
@@ -24389,7 +24466,7 @@ def maintenance_page():
             <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;">
                 <div style="font-weight:700;font-size:15px;">🚛 {e(d["truck_name"])}{_truck_status_badges(d)}</div>
                 <a href="{url_for('inspection_report', inspection_id=d['inspection_id'])}"
-                   style="font-size:12px;color:var(--cyan);white-space:nowrap;">View report →</a>
+                   style="font-size:12px;color:var(--cyan);white-space:nowrap;">{'Open →' if d['is_breakdown'] else 'View report →'}</a>
             </div>
             <div style="font-weight:700;font-size:14px;margin-top:8px;color:#FF7A7A;">⚠ {e(d["label"])}</div>
             {note}{sent_chip}{dispatch_chip}{flag_chip}
@@ -24543,8 +24620,12 @@ _MAINTENANCE_PAGE_JS = """
   };
   window.submitSend=function(id){
     var dispatch=(document.getElementById('sd-dispatch-'+id)||{}).value||'none';
+    var vsel=(document.getElementById('sd-vendor-'+id)||{}).value||'';
+    // Dispatching the driver requires a real vendor — otherwise the created stop
+    // has no name/address for Navigate to open.
+    if(dispatch!=='none' && !vsel){ err(id,'Pick a vendor to dispatch the driver to.'); return; }
     var body={action:'sent',
-              vendor_id:(document.getElementById('sd-vendor-'+id)||{}).value||'',
+              vendor_id:vsel,
               dispatch:dispatch,
               dispatch_n:(document.getElementById('sd-n-'+id)||{}).value||'',
               vendor_address:(document.getElementById('sd-addr-'+id)||{}).value||'',
@@ -24669,6 +24750,40 @@ def _insert_vendor_stop(conn, route_id, after_working_index, vendor_name, addres
     return new_id
 
 
+def _reprioritize_for_vendor(conn, route_id, vendor_stop_id):
+    """Go NOW: make the vendor stop the driver's CURRENT stop and park every
+    other incomplete stop (held). Completed stops keep their place at the front;
+    the vendor stop lands right after them; the rest follow, held. Returns the
+    number of stops put on hold."""
+    rows = conn.execute(
+        "SELECT id, status FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
+        (route_id,),
+    ).fetchall()
+    completed = [r["id"] for r in rows if r["status"] == "completed"]
+    others = [r["id"] for r in rows
+              if r["status"] != "completed" and r["id"] != vendor_stop_id]
+    order = completed + [vendor_stop_id] + others
+    for pos, sid in enumerate(order, start=1):
+        conn.execute("UPDATE stops SET stop_order=? WHERE id=?", (pos, sid))
+    ts = now_ts()
+    for sid in others:
+        conn.execute("UPDATE stops SET held_at=? WHERE id=?", (ts, sid))
+    conn.execute("UPDATE stops SET held_at=NULL WHERE id=?", (vendor_stop_id,))
+    return len(others)
+
+
+def _release_holds(conn, route_id):
+    """Clear every hold on a route (Repaired = yes, or a manual boss release).
+    Returns how many stops were released."""
+    n = conn.execute(
+        "SELECT COUNT(*) c FROM stops WHERE route_id=? AND held_at IS NOT NULL",
+        (route_id,),
+    ).fetchone()["c"]
+    if n:
+        conn.execute("UPDATE stops SET held_at=NULL WHERE route_id=?", (route_id,))
+    return n
+
+
 def _dispatch_driver_to_vendor(conn, defect_row, vendor_id, dispatch, dispatch_n, dispatch_note):
     """Build on the messaging + mid-route insertion systems to alert the driver
     that a defect went to a vendor. Returns a dict describing what happened
@@ -24678,6 +24793,12 @@ def _dispatch_driver_to_vendor(conn, defect_row, vendor_id, dispatch, dispatch_n
     """
     if dispatch not in ("now", "after_current", "after_n"):
         return {"dispatched": False}
+
+    # A dispatch with no vendor would create a nameless "the vendor" stop with no
+    # address and nothing for Navigate to open. Require a bound vendor.
+    if not vendor_id:
+        return {"dispatched": False,
+                "warning": "Pick a vendor to dispatch the driver to."}
 
     driver_id = defect_row["driver_id"]
     if not driver_id:
@@ -24712,6 +24833,12 @@ def _dispatch_driver_to_vendor(conn, defect_row, vendor_id, dispatch, dispatch_n
     stop_id = _insert_vendor_stop(
         conn, route_id, after_idx, vname, vaddr,
         defect_row["id"], vendor_id, dispatch_note or None)
+    # Go NOW = the truck goes to the shop first: make the vendor stop CURRENT and
+    # park every other incomplete stop (held) so the driver can't work them while
+    # the truck is down. Holds release on Repaired = yes or a manual boss release.
+    held_count = 0
+    if dispatch == "now":
+        held_count = _reprioritize_for_vendor(conn, route_id, stop_id)
     try:
         compute_can_flow(conn, route_id)
     except Exception:
@@ -24738,7 +24865,8 @@ def _dispatch_driver_to_vendor(conn, defect_row, vendor_id, dispatch, dispatch_n
     conn.execute("UPDATE inspection_items SET vendor_status='scheduled' WHERE id=?",
                  (defect_row["id"],))
     _recompute_truck_at_vendor(conn, defect_row["truck_id"])
-    return {"dispatched": True, "route_id": route_id, "stop_id": stop_id, "timing": timing}
+    return {"dispatched": True, "route_id": route_id, "stop_id": stop_id,
+            "timing": timing, "held": held_count}
 
 
 # ── Driver-initiated truck breakdown (feat/driver-breakdown) ──────────────────
@@ -24900,6 +25028,33 @@ def breakdown_continue(item_id):
     conn.commit()
     conn.close()
     return jsonify({"success": True})
+
+
+@app.route("/api/routes/<int:route_id>/release-holds", methods=["POST"])
+@login_required
+def release_route_holds(route_id):
+    """Boss manually releases the stops parked behind a Go NOW vendor visit
+    (truck might be down for days — let the driver work the rest, or after
+    reassigning). Clears every hold on the route and tells the driver."""
+    if not _can_action_fleet():
+        return jsonify({"error": "forbidden"}), 403
+    conn = get_db()
+    r = conn.execute("SELECT id, assigned_to FROM routes WHERE id=? AND company_id=?",
+                     (route_id, cid())).fetchone()
+    if r is None:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    n = _release_holds(conn, route_id)
+    if n:
+        conn.execute(
+            """INSERT INTO messages (route_id, sender_user_id, body, created_at, priority)
+               VALUES (?, ?, ?, ?, 'urgent')""",
+            (route_id, session["user_id"],
+             "✅ Held stops released — resume your route.", now_ts()),
+        )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "released": n})
 
 
 @app.route("/api/defects/<int:item_id>/resolve", methods=["POST"])
