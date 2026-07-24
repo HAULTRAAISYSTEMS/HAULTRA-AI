@@ -1108,6 +1108,68 @@ def safe_add_column(conn, table_name, ddl):
         pass
 
 
+def _migrate_parse_vocab(conn, default_co_id):
+    """Collapse duplicate parse_vocab rows, stamp legacy NULL-company rows onto
+    the bootstrap company, then enforce uniqueness on the pair.
+
+    Ordering is the entire point of this function:
+
+      1. dedupe FIRST, grouping on COALESCE(company_id, default_co_id)
+      2. THEN stamp the surviving NULLs
+      3. THEN create the unique index
+
+    The COALESCE in step 1 is what makes it correct. A NULL-company row and its
+    already-stamped twin are not duplicates *yet* — they only collide once the
+    stamp rewrites NULL to default_co_id — so grouping on the raw company_id
+    leaves them in separate buckets and the collision survives the dedupe. That
+    is what raised, at boot, on every deploy after the index first existed:
+
+        sqlite3.IntegrityError: UNIQUE constraint failed: index 'idx_parse_vocab_pair'
+
+    Idempotent and safe against a half-applied run: the index may or may not
+    already exist, and any mix of stamped / unstamped / duplicate rows is fine.
+    Runs in one transaction, so a failure leaves the table as it was.
+    """
+    def _drop_ids(ids):
+        # Chunked to stay under SQLite's bound-variable limit.
+        for i in range(0, len(ids), 400):
+            part = ids[i:i + 400]
+            conn.execute(
+                "DELETE FROM parse_vocab WHERE id IN (%s)" % ",".join("?" * len(part)),
+                part)
+
+    with conn:  # commits on success, rolls back on any exception
+        # 1. Collapse duplicates, treating an unstamped row as if it already
+        #    belonged to the bootstrap company. Keeps the lowest id and sums the
+        #    usage counts, so a legacy pile like ~14x "hamp → Hampton" becomes a
+        #    single row carrying the combined count.
+        dupes = conn.execute("""
+            SELECT MIN(id)                      AS keep_id,
+                   SUM(COALESCE(times_used, 1)) AS total,
+                   GROUP_CONCAT(id)             AS all_ids
+              FROM parse_vocab
+             GROUP BY COALESCE(company_id, ?), LOWER(TRIM(term)), LOWER(TRIM(expansion))
+            HAVING COUNT(*) > 1
+        """, (default_co_id,)).fetchall()
+        for _d in dupes:
+            _ids = [int(x) for x in (_d["all_ids"] or "").split(",") if x]
+            _drop = [i for i in _ids if i != _d["keep_id"]]
+            if not _drop:
+                continue
+            conn.execute("UPDATE parse_vocab SET times_used=? WHERE id=?",
+                         (_d["total"] or 1, _d["keep_id"]))
+            _drop_ids(_drop)
+
+        # 2. Safe now: every surviving NULL row is alone in its pair group.
+        conn.execute("UPDATE parse_vocab SET company_id=? WHERE company_id IS NULL",
+                     (default_co_id,))
+
+        # 3. Table is clean — enforce it going forward.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_parse_vocab_pair "
+            "ON parse_vocab(company_id, LOWER(TRIM(term)), LOWER(TRIM(expansion)))")
+
+
 def _haversine_mi(lat1, lon1, lat2, lon2):
     """Straight-line distance in miles between two lat/lng points."""
     R = 3958.8
@@ -2440,8 +2502,13 @@ def init_db():
         created_at  TEXT NOT NULL
     )
     """)
-    # Seed the global shorthand defaults once (company_id NULL).
-    if cur.execute("SELECT COUNT(*) FROM parse_vocab WHERE company_id IS NULL").fetchone()[0] == 0:
+    # Seed the global shorthand defaults once, at first bootstrap only.
+    # The guard is "table is empty", NOT "no NULL-company rows": the multi-tenant
+    # migration below stamps every NULL row onto the bootstrap company, so a
+    # NULL-based guard re-seeds these same 12 pairs on EVERY boot and then
+    # collides with the already-stamped copies under idx_parse_vocab_pair. That
+    # re-seed loop is what took the site down.
+    if cur.execute("SELECT COUNT(*) FROM parse_vocab").fetchone()[0] == 0:
         _seed_vocab = [
             ("newpt", "Newport News"), ("nn", "Newport News"),
             ("vb", "Virginia Beach"), ("ches", "Chesapeake"), ("norf", "Norfolk"),
@@ -3298,43 +3365,16 @@ def init_db():
     # add sites or run parser onboarding). Same for the region/company-specific
     # shorthand that was seeded at the global (NULL) tier.
     conn.execute("UPDATE dump_locations SET company_id=? WHERE company_id IS NULL", (default_co_id,))
-    conn.execute("UPDATE parse_vocab SET company_id=? WHERE company_id IS NULL", (default_co_id,))
     conn.commit()
 
-    # --- Parser shorthand dedupe (fix/menu-shorthand-addressbook) ---
+    # --- Parser shorthand dedupe + NULL-company migration ---
     # Usage/recency so re-learning a mapping bumps instead of piling up.
     safe_add_column(conn, "parse_vocab", "times_used INTEGER NOT NULL DEFAULT 1")
     safe_add_column(conn, "parse_vocab", "last_used_at TEXT")
-    # One-time cleanup: collapse duplicate (company_id, term, expansion) rows —
-    # case-insensitive on both — into a single row (keep the lowest id, sum the
-    # usage counts). This clears legacy piles like ~14x "hamp → Hampton".
-    try:
-        _dupes = conn.execute("""
-            SELECT MIN(id) AS keep_id,
-                   SUM(COALESCE(times_used,1)) AS total,
-                   COUNT(*) AS n,
-                   GROUP_CONCAT(id) AS all_ids
-              FROM parse_vocab
-             GROUP BY company_id, LOWER(TRIM(term)), LOWER(TRIM(expansion))
-            HAVING COUNT(*) > 1
-        """).fetchall()
-        for _d in _dupes:
-            _ids = [int(x) for x in (_d["all_ids"] or "").split(",") if x]
-            _drop = [i for i in _ids if i != _d["keep_id"]]
-            if _drop:
-                conn.execute(
-                    "UPDATE parse_vocab SET times_used=? WHERE id=?",
-                    (_d["total"] or 1, _d["keep_id"]))
-                conn.execute(
-                    "DELETE FROM parse_vocab WHERE id IN (%s)" % ",".join("?" * len(_drop)),
-                    _drop)
-        # Prevent future identical dupes (case-insensitive on the pair).
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_parse_vocab_pair "
-            "ON parse_vocab(company_id, LOWER(TRIM(term)), LOWER(TRIM(expansion)))")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
+    # parse_vocab is deliberately NOT stamped alongside the tables above: it is
+    # the one table carrying a unique index over company_id, so it needs
+    # dedupe-before-stamp ordering. See _migrate_parse_vocab for why.
+    _migrate_parse_vocab(conn, default_co_id)
 
     existing_boss = cur.execute("SELECT id FROM users WHERE role='boss' LIMIT 1").fetchone()
     if not existing_boss:
