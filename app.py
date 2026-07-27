@@ -79,6 +79,8 @@ STRIPE_PURCHASABLE_PLANS = {"starter", "pro"}
 # file (.well-known/assetlinks.json) and for detecting a Google Play TWA
 # launch server-side (see is_native_app()).
 ANDROID_PACKAGE_NAME = "com.rockkstaar.haultra"
+APPLE_TEAM_ID = os.environ.get("APPLE_TEAM_ID", "").strip()
+ANDROID_SHA256_FINGERPRINT = os.environ.get("ANDROID_SHA256_FINGERPRINT", "").strip()
 
 # ----------------------------------------------------------
 app = Flask(__name__)
@@ -7563,6 +7565,13 @@ def login():
         flash("Username or password incorrect.", "error")
         return redirect(url_for("login"))
 
+    signup_prompt = "" if is_native_app() else """
+                <div style="margin-top:10px;text-align:center;" class="small muted">
+                Need an account?
+                <a href="/signup">Create one here</a>
+                </div>
+    """
+
     body = f"""
     <div style="min-height:calc(100vh - 60px);display:flex;align-items:center;justify-content:center;padding:24px;">
       <div style="width:100%;max-width:420px;">
@@ -7602,10 +7611,7 @@ def login():
                 <a href="{url_for('forgot_password')}" class="small">Forgot password?</a>
                 </div>
 
-                <div style="margin-top:10px;text-align:center;" class="small muted">
-                Need an account?
-                <a href="/signup">Create one here</a>
-                </div>
+                {signup_prompt}
 
                </form>
         </div>
@@ -7919,8 +7925,7 @@ def landing():
 
 @app.route("/demo")
 def demo():
-    # TODO: once a seeded demo company/account exists, log the visitor
-    # straight into it instead of bouncing to the login page.
+    flash("Use the HAULTRA review account credentials provided with the app submission.", "info")
     return redirect(url_for("login"))
 
 
@@ -16081,6 +16086,9 @@ def onboarding_parser_page():
 @app.route("/register-company", methods=["GET", "POST"])
 def company_register():
     init_db()
+    if is_native_app():
+        flash("Company account setup is handled outside the mobile app.", "info")
+        return redirect(url_for("login"))
 
     if request.method == "POST":
         company_name = request.form.get("company_name", "").strip()
@@ -16486,7 +16494,7 @@ def settings_page():
                     '<div style="background:rgba(248,113,113,0.15);border:1px solid rgba(248,113,113,0.4);'
                     'border-radius:10px;padding:14px 18px;margin-bottom:18px;">'
                     '&#128274; Your trial has expired.'
-                    + (' Manage your plan on the web to restore full access.' if native
+                    + (' Contact your organization administrator to restore access.' if native
                        else ' Upgrade to restore full access.')
                     + '</div>'
                 )
@@ -16578,11 +16586,7 @@ def settings_page():
     pc = plan_color_map.get(plan, "#D8D8D0")
 
     if native:
-        available_plans_block = """
-        <div class="stat" style="margin-top:22px;padding:16px 18px;">
-            <div class="muted small">Manage your plan on the web.</div>
-        </div>
-        """
+        available_plans_block = ""
         checkout_form_block = ""
     else:
         available_plans_block = f"""
@@ -16603,7 +16607,7 @@ def settings_page():
     subscription_body = f"""
     <div class="card" id="subscription" style="margin-top:8px;">
         <h2 style="margin:0 0 4px;">Subscription &amp; Billing</h2>
-        <p style="color:#B8B8AE;font-size:13px;margin-bottom:16px;">Your plan details, usage, and upgrade options.</p>
+        <p style="color:#B8B8AE;font-size:13px;margin-bottom:16px;">Your organization&rsquo;s current access status and usage.</p>
 
         {trial_banner}
 
@@ -16851,7 +16855,7 @@ def create_checkout_session():
         # inside the native shell, but block it server-side too in case
         # anything ever links here directly. Apple counts any in-app path
         # to an external payment flow as steering.
-        flash("Manage your plan on the web.", "error")
+        flash("Contact your organization administrator for account changes.", "error")
         return redirect(url_for("settings_page") + "#subscription")
 
     if not STRIPE_ENABLED or not stripe_configured:
@@ -17064,7 +17068,7 @@ def subscription_blocked():
 
     if status == "suspended" and plan == "trial":
         reason = "Your 14-day free trial has ended."
-        action = "Manage your plan on the web to restore access." if native else "Upgrade to a paid plan to restore access."
+        action = "Contact your organization administrator to restore access." if native else "Upgrade to a paid plan to restore access."
     elif status == "suspended":
         reason = "Your account has been suspended."
         action = "Please contact support." if native else "Please contact support or upgrade your plan."
@@ -26119,22 +26123,20 @@ def parser_view():
 # so haultra-systems.com links open the app instead of a browser tab
 # (see @capacitor/app in package.json and STORE_LAUNCH.md).
 #
-# PLACEHOLDER VALUES — these must be filled in with real credentials
-# before deep-linking will actually work; until then these routes are
-# harmless (the OS just won't verify the app for these domains):
-#   - REPLACE_WITH_APPLE_TEAM_ID: your 10-character Apple Developer Team ID
-#   - REPLACE_WITH_ANDROID_SHA256_FINGERPRINT: your release keystore's
-#     SHA-256 signing certificate fingerprint
-# See STORE_LAUNCH.md for exactly where to find both.
+# The routes return 404 until their signing identity environment variables
+# are configured. This prevents placeholder credentials from being published.
+# See STORE_LAUNCH.md for exactly where to find both values.
 # =========================================================
 @app.route('/.well-known/apple-app-site-association')
 def apple_app_site_association():
+    if not APPLE_TEAM_ID:
+        abort(404)
     return jsonify({
         "applinks": {
             "apps": [],
             "details": [
                 {
-                    "appID": "REPLACE_WITH_APPLE_TEAM_ID.com.rockkstaar.haultra",
+                    "appID": f"{APPLE_TEAM_ID}.com.rockkstaar.haultra",
                     "paths": ["*"],
                 }
             ],
@@ -26144,13 +26146,15 @@ def apple_app_site_association():
 
 @app.route('/.well-known/assetlinks.json')
 def android_asset_links():
+    if not ANDROID_SHA256_FINGERPRINT:
+        abort(404)
     return jsonify([
         {
             "relation": ["delegate_permission/common.handle_all_urls"],
             "target": {
                 "namespace": "android_app",
                 "package_name": ANDROID_PACKAGE_NAME,
-                "sha256_cert_fingerprints": ["REPLACE_WITH_ANDROID_SHA256_FINGERPRINT"],
+                "sha256_cert_fingerprints": [ANDROID_SHA256_FINGERPRINT],
             },
         }
     ])
