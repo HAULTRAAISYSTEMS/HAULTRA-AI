@@ -55,6 +55,33 @@ def prune(backup_dir, keep):
         print(f"Pruned old backup: {f}")
 
 
+def upload_offsite(path):
+    """Upload to S3-compatible storage when BACKUP_S3_BUCKET is configured."""
+    bucket = os.environ.get("BACKUP_S3_BUCKET", "").strip()
+    if not bucket:
+        return None
+
+    import boto3
+
+    prefix = os.environ.get("BACKUP_S3_PREFIX", "haultra").strip("/")
+    region = os.environ.get("BACKUP_S3_REGION", "us-east-1").strip()
+    endpoint = os.environ.get("BACKUP_S3_ENDPOINT", "").strip() or None
+    key = f"{prefix}/{os.path.basename(path)}" if prefix else os.path.basename(path)
+    client = boto3.client("s3", region_name=region, endpoint_url=endpoint)
+    client.upload_file(
+        path,
+        bucket,
+        key,
+        ExtraArgs={
+            "ServerSideEncryption": "AES256",
+            "ContentType": "application/vnd.sqlite3",
+        },
+    )
+    destination = f"s3://{bucket}/{key}"
+    print(f"Uploaded encrypted off-site backup -> {destination}")
+    return destination
+
+
 if __name__ == "__main__":
     db_path = os.environ.get("DATABASE_PATH", "").strip()
     if not db_path:
@@ -63,6 +90,7 @@ if __name__ == "__main__":
     backup_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)) or ".", "backups")
 
     dest = backup(db_path, backup_dir)
+    upload_offsite(dest)
 
     if "--keep" in sys.argv:
         keep_n = int(sys.argv[sys.argv.index("--keep") + 1])

@@ -13,6 +13,26 @@ Password reset emails are sent via [Resend](https://resend.com). Set these envir
 
 The mail-sending logic lives entirely in the `send_email()` helper in `app.py` — swap providers by editing that one function.
 
+### Production backups and retention
+
+The web workers create a consistent SQLite snapshot once per day. Configure
+`BACKUP_S3_BUCKET`, `BACKUP_S3_REGION`, and AWS-compatible credentials so each
+snapshot is copied to independent encrypted object storage. Set
+`BACKUP_S3_ENDPOINT` when using a non-AWS S3 provider. Configure a 90-day
+lifecycle policy on the bucket and test restoration before launch.
+
+The service checks for due account deletions every six hours. Individual user
+accounts are anonymized after their 30-day window; closed companies and their
+operational uploads are purged. Maintenance can also be run manually:
+
+```bash
+python3 scripts/purge_deleted_accounts.py
+python3 scripts/backup_db.py --keep 3
+```
+
+Production readiness is reported by `/health`, which checks SQLite integrity,
+database access, writable persistent storage, and at least 128 MB free space.
+
 ### Break-glass password reset
 
 If email is down, `RESEND_API_KEY` isn't set, or it's the boss's own account and they're locked out, reset a password directly from the server shell (e.g. the Render Shell) without needing email at all:
