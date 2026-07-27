@@ -22,6 +22,16 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>NSCameraUsageDescription</key>
+	<string>HAULTRA uses the camera so drivers can attach job-site and inspection photos to stops and vehicle reports.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>HAULTRA lets drivers choose existing job-site and inspection photos to attach to stops and vehicle reports.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>HAULTRA can save job-site and inspection photos to your photo library when you choose to keep a copy.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>HAULTRA records location while you use the app to verify completed stops and signed vehicle inspections.</string>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIMainStoryboardFile</key>

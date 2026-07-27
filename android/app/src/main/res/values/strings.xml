@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">HAULTRA</string>
+    <string name="title_activity_main">HAULTRA</string>
+    <string name="package_name">com.rockkstaar.haultra</string>
+    <string name="custom_url_scheme">com.rockkstaar.haultra</string>
+</resources>
