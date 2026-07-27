@@ -31,6 +31,22 @@ services:
         sync: false   # set manually in Render dashboard — Stripe Price ID for the Pro plan
       - key: STRIPE_WEBHOOK_SECRET
         sync: false   # set manually in Render dashboard — never commit the value
+      - key: APPLE_TEAM_ID
+        sync: false   # Apple Developer Team ID for Universal Links
+      - key: ANDROID_SHA256_FINGERPRINT
+        sync: false   # Play App Signing certificate SHA-256 fingerprint
+      - key: BACKUP_S3_BUCKET
+        sync: false   # required for independent disaster-recovery backups
+      - key: BACKUP_S3_PREFIX
+        value: haultra-production
+      - key: BACKUP_S3_REGION
+        value: us-east-1
+      - key: BACKUP_S3_ENDPOINT
+        sync: false   # optional for non-AWS S3-compatible storage
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
     disk:
       name: haultra-data
       mountPath: /opt/render/project/src

@@ -91,6 +91,15 @@ if not _secret_key:
         "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
     )
 app.secret_key = _secret_key
+_secure_cookie_default = "1" if os.environ.get("RENDER") else "0"
+app.config.update(
+    SESSION_COOKIE_SECURE=(
+        os.environ.get("SESSION_COOKIE_SECURE", _secure_cookie_default) == "1"
+    ),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+)
 
 # DATABASE_PATH must be set explicitly — no fallbacks, no hidden paths.
 _db_env = os.environ.get("DATABASE_PATH", "").strip()
@@ -924,6 +933,9 @@ def get_db():
     # alongside the 2 gunicorn workers x 2 threads handling requests.
     conn = sqlite3.connect(DATABASE, timeout=30)
     conn.row_factory = sqlite3.Row
+    # SQLite does not enforce declared FOREIGN KEY constraints unless every
+    # connection enables them explicitly.
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
     return conn
@@ -933,6 +945,73 @@ def get_csrf_token():
     if "_csrf_token" not in session:
         session["_csrf_token"] = secrets.token_hex(32)
     return session["_csrf_token"]
+
+
+MIN_PASSWORD_LENGTH = 12
+
+
+def password_policy_error(password):
+    """Return a user-safe validation error, or None when the password passes."""
+    if len(password or "") < MIN_PASSWORD_LENGTH:
+        return f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
+    if password.isspace():
+        return "Password cannot contain only spaces."
+    return None
+
+
+def _rate_limit_identity(identifier=""):
+    """Stable, privacy-preserving key shared by all Gunicorn workers."""
+    client_ip = request.headers.get("CF-Connecting-IP", "").strip()
+    if not client_ip:
+        client_ip = (request.remote_addr or "unknown").strip()
+    material = f"{client_ip}|{str(identifier).strip().casefold()}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def rate_limit_allow(scope, identifier, limit, window_seconds):
+    """Atomic fixed-window limiter backed by SQLite, not worker-local memory."""
+    now_epoch = int(time.time())
+    window_start = now_epoch - (now_epoch % window_seconds)
+    key_hash = _rate_limit_identity(identifier)
+    conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "DELETE FROM auth_rate_limits WHERE window_start < ?",
+            (now_epoch - 86400,),
+        )
+        row = conn.execute(
+            """SELECT attempts FROM auth_rate_limits
+               WHERE scope=? AND key_hash=? AND window_start=?""",
+            (scope, key_hash, window_start),
+        ).fetchone()
+        attempts = int(row["attempts"] or 0) if row else 0
+        if attempts >= limit:
+            conn.rollback()
+            return False, max(1, window_start + window_seconds - now_epoch)
+        conn.execute(
+            """INSERT INTO auth_rate_limits
+                   (scope, key_hash, window_start, attempts, updated_at)
+               VALUES (?, ?, ?, 1, ?)
+               ON CONFLICT(scope, key_hash, window_start)
+               DO UPDATE SET attempts=attempts+1, updated_at=excluded.updated_at""",
+            (scope, key_hash, window_start, now_ts()),
+        )
+        conn.commit()
+        return True, 0
+    finally:
+        conn.close()
+
+
+def rate_limit_reset(scope, identifier):
+    key_hash = _rate_limit_identity(identifier)
+    conn = get_db()
+    conn.execute(
+        "DELETE FROM auth_rate_limits WHERE scope=? AND key_hash=?",
+        (scope, key_hash),
+    )
+    conn.commit()
+    conn.close()
 
 
 def send_email(to_email, subject, html_body):
@@ -1010,18 +1089,60 @@ def _log_request_latency(response):
     return response
 
 
+@app.after_request
+def _security_headers(response):
+    """Baseline browser defenses for both the web app and Capacitor shell."""
+    response.headers.setdefault(
+        "Strict-Transport-Security",
+        "max-age=31536000; includeSubDomains",
+    )
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault(
+        "Permissions-Policy",
+        "camera=(self), geolocation=(self), microphone=()",
+    )
+    # The application currently contains intentional inline scripts/styles.
+    # These directives still block framing, plugins, and base-tag injection
+    # without breaking those established screens.
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "frame-ancestors 'none'; object-src 'none'; base-uri 'self'",
+    )
+    return response
+
+
 @app.route("/health")
 def health_check():
-    """Lightweight, unauthenticated liveness probe. Its latency (surfaced via
-    the X-Response-Time-ms header and the after_request log line) is the
-    baseline request-handling time to watch in Render logs — if /health itself
-    starts reporting seconds, request workers are starved."""
-    return jsonify({"ok": True, "ts": now_ts()})
+    """Readiness probe: verify database access and usable persistent storage."""
+    checks = {"database": False, "storage": False}
+    error = None
+    try:
+        conn = get_db()
+        db_result = conn.execute("PRAGMA quick_check(1)").fetchone()
+        conn.close()
+        checks["database"] = bool(db_result and db_result[0] == "ok")
+
+        db_dir = os.path.dirname(os.path.abspath(DATABASE)) or "."
+        stat = os.statvfs(db_dir)
+        free_bytes = stat.f_bavail * stat.f_frsize
+        checks["storage"] = os.access(db_dir, os.W_OK) and free_bytes >= 128 * 1024 * 1024
+        checks["storage_free_mb"] = round(free_bytes / (1024 * 1024))
+    except Exception as exc:
+        error = type(exc).__name__
+        app.logger.error("health readiness check failed: %s", exc)
+
+    ok = checks["database"] and checks["storage"]
+    payload = {"ok": ok, "ts": now_ts(), "checks": checks}
+    if error:
+        payload["error"] = error
+    return jsonify(payload), 200 if ok else 503
 
 
 @app.before_request
 def csrf_protect():
-    if request.method == "POST":
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         if request.endpoint in _CSRF_EXEMPT_ENDPOINTS:
             return
         token = session.get("_csrf_token")
@@ -1033,6 +1154,35 @@ def csrf_protect():
             form_token = request.form.get("_csrf_token")
         if not token or token != form_token:
             abort(403)
+
+
+_maintenance_lock = threading.Lock()
+_maintenance_last_started = 0.0
+
+
+@app.before_request
+def run_scheduled_maintenance():
+    """Run deletion/retention work in production at most once every six hours."""
+    global _maintenance_last_started
+    if not (_on_render or os.environ.get("ENABLE_MAINTENANCE_JOBS") == "1"):
+        return
+    now_mono = time.monotonic()
+    if now_mono - _maintenance_last_started < 6 * 60 * 60:
+        return
+    if not _maintenance_lock.acquire(blocking=False):
+        return
+    _maintenance_last_started = now_mono
+
+    def _worker():
+        try:
+            purge_due_deletions()
+            run_due_backup()
+        except Exception:
+            app.logger.exception("scheduled production maintenance failed")
+        finally:
+            _maintenance_lock.release()
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 # Routes that are always accessible regardless of subscription status
@@ -2321,6 +2471,7 @@ def _merge_duplicate_open_routes(conn):
                     conn.execute("UPDATE stops SET route_id=?, stop_order=? WHERE id=?",
                                  (keep, order, st["id"]))
                 conn.execute("UPDATE messages SET route_id=? WHERE route_id=?", (keep, dupe))
+                conn.execute("UPDATE dump_tickets SET route_id=? WHERE route_id=?", (keep, dupe))
                 conn.execute("DELETE FROM routes WHERE id=?", (dupe,))
                 merged += 1
             try:
@@ -2838,6 +2989,43 @@ def init_db():
         expires_at TEXT NOT NULL,
         used_at    TEXT,
         FOREIGN KEY (user_id) REFERENCES users(id)
+    )
+    """)
+
+    # Shared authentication throttling. Keeping this in SQLite means both
+    # Gunicorn workers enforce the same limits and restarts do not erase an
+    # active abuse window.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS auth_rate_limits (
+        scope        TEXT NOT NULL,
+        key_hash     TEXT NOT NULL,
+        window_start INTEGER NOT NULL,
+        attempts     INTEGER NOT NULL DEFAULT 0,
+        updated_at   TEXT NOT NULL,
+        PRIMARY KEY (scope, key_hash, window_start)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS maintenance_state (
+        name       TEXT PRIMARY KEY,
+        value      TEXT,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    # Durable intake for the public account-deletion page. Email is only a
+    # notification channel; the request remains actionable if Resend is
+    # unavailable or a notification is filtered.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS account_deletion_requests (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_name  TEXT NOT NULL,
+        account_email TEXT NOT NULL,
+        status        TEXT NOT NULL DEFAULT 'pending'
+                      CHECK(status IN ('pending','verified','completed','rejected')),
+        created_at    TEXT NOT NULL,
+        processed_at  TEXT
     )
     """)
 
@@ -7512,6 +7700,18 @@ def login():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "").strip()
+        allowed_user, retry_user = rate_limit_allow(
+            "login-user", username, limit=10, window_seconds=15 * 60
+        )
+        allowed_ip, retry_ip = rate_limit_allow(
+            "login-ip", "", limit=50, window_seconds=15 * 60
+        )
+        if not allowed_user or not allowed_ip:
+            retry_after = max(retry_user, retry_ip)
+            flash("Too many login attempts. Wait a few minutes and try again.", "error")
+            response = redirect(url_for("login"))
+            response.headers["Retry-After"] = str(retry_after)
+            return response, 429
 
         try:
             conn = get_db()
@@ -7535,7 +7735,9 @@ def login():
             return redirect(url_for("login"))
 
         if user and check_password_hash(user["password_hash"], password):
+            rate_limit_reset("login-user", username)
             session.clear()
+            session.permanent = True
             session["user_id"]       = user["id"]
             session["username"]      = user["username"]
             session["role"]          = user["role"]
@@ -7632,6 +7834,14 @@ def forgot_password():
     if request.method == "POST":
         email = request.form.get("email", "").strip().lower()
         want_username = request.form.get("_action") == "username"
+        allowed, retry_after = rate_limit_allow(
+            "account-recovery", email, limit=5, window_seconds=60 * 60
+        )
+        if not allowed:
+            flash("Too many recovery requests. Wait before trying again.", "error")
+            response = redirect(url_for("forgot_password"))
+            response.headers["Retry-After"] = str(retry_after)
+            return response, 429
 
         if email:
             conn = get_db()
@@ -7748,9 +7958,10 @@ def reset_password(token):
         password = request.form.get("password", "").strip()
         confirm = request.form.get("confirm_password", "").strip()
 
-        if len(password) < 8:
+        policy_error = password_policy_error(password)
+        if policy_error:
             conn.close()
-            flash("Password must be at least 8 characters.", "error")
+            flash(policy_error, "error")
             return redirect(url_for("reset_password", token=token))
         if password != confirm:
             conn.close()
@@ -7786,9 +7997,9 @@ def reset_password(token):
             <p class="muted small" style="margin-bottom:18px;">Resetting password for <strong>{e(row['username'])}</strong>.</p>
             <form method="POST">
                 <label>New Password</label>
-                <input type="password" name="password" required minlength="8" autocomplete="new-password">
+                <input type="password" name="password" required minlength="12" autocomplete="new-password">
                 <label>Confirm Password</label>
-                <input type="password" name="confirm_password" required minlength="8" autocomplete="new-password">
+                <input type="password" name="confirm_password" required minlength="12" autocomplete="new-password">
                 <div style="margin-top:16px;">
                     <button type="submit" style="width:100%;min-height:48px;font-size:15px;">Set New Password</button>
                 </div>
@@ -8496,12 +8707,288 @@ def delete_user(user_id):
             (user_id, cid())
         )
 
-    conn.execute("DELETE FROM users WHERE id=? AND company_id=?", (user_id, cid()))
+    if target["role"] == "boss":
+        replacement = conn.execute(
+            """SELECT id FROM users
+               WHERE company_id=? AND role='boss' AND id!=? AND is_active=1
+               ORDER BY role_owner DESC, id ASC LIMIT 1""",
+            (cid(), user_id),
+        ).fetchone()
+        if replacement:
+            conn.execute(
+                "UPDATE companies SET owner_id=? WHERE id=? AND owner_id=?",
+                (replacement["id"], cid(), user_id),
+            )
+
+    conn.execute("DELETE FROM password_reset_tokens WHERE user_id=?", (user_id,))
+    deleted_username = f"deleted-{user_id}-{secrets.token_hex(6)}"
+    conn.execute(
+        """UPDATE users SET username=?, password_hash=?, full_name=NULL,
+               phone=NULL, email=NULL, avatar_path=NULL, nav_preference=NULL,
+               role_owner=0, role_customer_manager=0, role_dispatcher=0,
+               is_active=0, pending_deletion_at=NULL
+           WHERE id=? AND company_id=?""",
+        (
+            deleted_username,
+            generate_password_hash(secrets.token_urlsafe(48)),
+            user_id,
+            cid(),
+        ),
+    )
     conn.commit()
     conn.close()
+    _remove_managed_upload(target["avatar_path"])
 
     flash(f"User '{target['username']}' has been deleted.", "success")
     return redirect(url_for("team_page"))
+
+
+def _remove_managed_upload(path_value):
+    """Remove one database-referenced upload without allowing path traversal."""
+    if not path_value:
+        return
+    upload_root = os.path.realpath(app.config["UPLOAD_FOLDER"])
+    candidate = str(path_value)
+    if not os.path.isabs(candidate):
+        candidate = os.path.join(app.root_path, candidate)
+    candidate = os.path.realpath(candidate)
+    try:
+        if os.path.commonpath([upload_root, candidate]) != upload_root:
+            app.logger.warning("refused to delete upload outside managed root: %s", candidate)
+            return
+    except ValueError:
+        return
+    try:
+        if os.path.isfile(candidate):
+            os.remove(candidate)
+    except OSError as exc:
+        app.logger.warning("could not remove expired upload %s: %s", candidate, exc)
+
+
+def run_due_backup():
+    """Create a daily SQLite snapshot and upload it to independent storage."""
+    conn = get_db()
+    claimed = False
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT value FROM maintenance_state WHERE name='daily-backup'"
+        ).fetchone()
+        last = row["value"] if row else None
+        if last:
+            try:
+                last_dt = datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
+                if datetime.now() - last_dt < timedelta(hours=24):
+                    conn.rollback()
+                    return {"skipped": True}
+            except ValueError:
+                pass
+        claimed_at = now_ts()
+        conn.execute(
+            """INSERT INTO maintenance_state(name, value, updated_at)
+               VALUES ('daily-backup', ?, ?)
+               ON CONFLICT(name) DO UPDATE
+               SET value=excluded.value, updated_at=excluded.updated_at""",
+            (claimed_at, claimed_at),
+        )
+        conn.commit()
+        claimed = True
+    finally:
+        conn.close()
+
+    if not claimed:
+        return {"skipped": True}
+
+    try:
+        from scripts.backup_db import backup, prune, upload_offsite
+
+        backup_dir = os.path.join(
+            os.path.dirname(os.path.abspath(DATABASE)) or ".",
+            "backups",
+        )
+        backup_path = backup(DATABASE, backup_dir)
+        remote = upload_offsite(backup_path)
+        prune(backup_dir, keep=3)
+        if not remote:
+            app.logger.error(
+                "BACKUP_S3_BUCKET is not configured; backup remains on the primary disk only"
+            )
+        return {"skipped": False, "offsite": bool(remote)}
+    except Exception:
+        # Release the daily claim so the next six-hour maintenance tick retries.
+        conn = get_db()
+        conn.execute("DELETE FROM maintenance_state WHERE name='daily-backup'")
+        conn.commit()
+        conn.close()
+        raise
+
+
+def purge_due_deletions():
+    """Purge closed companies and anonymize due individual accounts.
+
+    Company data is deleted after the documented 30-day export window.
+    Individual employees are anonymized while employer-owned operational and
+    safety records remain intact.
+    """
+    conn = get_db()
+    uploads_to_remove = []
+    purged_companies = 0
+    anonymized_users = 0
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        due_companies = conn.execute(
+            """SELECT id FROM companies
+               WHERE closed_at IS NOT NULL
+                 AND datetime(closed_at) <= datetime('now', '-30 days')"""
+        ).fetchall()
+        for company_row in due_companies:
+            company_id = company_row["id"]
+
+            file_queries = [
+                ("""SELECT rp.file_path AS path FROM route_photos rp
+                    JOIN stops s ON s.id=rp.stop_id
+                    JOIN routes r ON r.id=s.route_id WHERE r.company_id=?""", (company_id,)),
+                ("""SELECT s.photo_path AS path FROM stops s
+                    JOIN routes r ON r.id=s.route_id
+                    WHERE r.company_id=? AND s.photo_path IS NOT NULL""", (company_id,)),
+                ("SELECT photo_path AS path FROM dump_tickets WHERE company_id=? AND photo_path IS NOT NULL", (company_id,)),
+                ("""SELECT ii.photo_path AS path FROM inspection_items ii
+                    JOIN inspections i ON i.id=ii.inspection_id
+                    WHERE i.company_id=? AND ii.photo_path IS NOT NULL""", (company_id,)),
+                ("SELECT file_path AS path FROM maintenance_photos WHERE company_id=?", (company_id,)),
+                ("SELECT drop_photo_path AS path FROM bins b JOIN customers c ON c.id=b.customer_id WHERE c.company_id=? AND b.drop_photo_path IS NOT NULL", (company_id,)),
+                ("SELECT avatar_path AS path FROM users WHERE company_id=? AND avatar_path IS NOT NULL", (company_id,)),
+            ]
+            for sql, params in file_queries:
+                uploads_to_remove.extend(
+                    row["path"] for row in conn.execute(sql, params).fetchall() if row["path"]
+                )
+
+            route_ids = [r["id"] for r in conn.execute(
+                "SELECT id FROM routes WHERE company_id=?", (company_id,)
+            ).fetchall()]
+            customer_ids = [r["id"] for r in conn.execute(
+                "SELECT id FROM customers WHERE company_id=?", (company_id,)
+            ).fetchall()]
+            inspection_ids = [r["id"] for r in conn.execute(
+                "SELECT id FROM inspections WHERE company_id=?", (company_id,)
+            ).fetchall()]
+            saved_ids = [r["id"] for r in conn.execute(
+                "SELECT id FROM saved_addresses WHERE company_id=?", (company_id,)
+            ).fetchall()]
+            user_ids = [r["id"] for r in conn.execute(
+                "SELECT id FROM users WHERE company_id=?", (company_id,)
+            ).fetchall()]
+            recurring_ids = [r["id"] for r in conn.execute(
+                "SELECT id FROM recurring_days_off WHERE company_id=?", (company_id,)
+            ).fetchall()]
+
+            def _delete_ids(table, column, ids):
+                for offset in range(0, len(ids), 500):
+                    part = ids[offset:offset + 500]
+                    placeholders = ",".join("?" * len(part))
+                    conn.execute(
+                        f"DELETE FROM {table} WHERE {column} IN ({placeholders})",
+                        part,
+                    )
+
+            _delete_ids("messages", "route_id", route_ids)
+            stop_ids = []
+            for offset in range(0, len(route_ids), 500):
+                part = route_ids[offset:offset + 500]
+                placeholders = ",".join("?" * len(part))
+                stop_ids.extend(
+                    r["id"] for r in conn.execute(
+                        f"SELECT id FROM stops WHERE route_id IN ({placeholders})",
+                        part,
+                    ).fetchall()
+                )
+            _delete_ids("route_photos", "stop_id", stop_ids)
+            _delete_ids("dump_tickets", "stop_id", stop_ids)
+            conn.execute("DELETE FROM customer_containers WHERE company_id=?", (company_id,))
+            _delete_ids("stops", "id", stop_ids)
+            _delete_ids("routes", "id", route_ids)
+
+            _delete_ids("inspection_items", "inspection_id", inspection_ids)
+            conn.execute("DELETE FROM maintenance_photos WHERE company_id=?", (company_id,))
+            conn.execute("DELETE FROM maintenance_entries WHERE company_id=?", (company_id,))
+            _delete_ids("inspections", "id", inspection_ids)
+            conn.execute("DELETE FROM trucks WHERE company_id=?", (company_id,))
+            conn.execute("DELETE FROM vendors WHERE company_id=?", (company_id,))
+            conn.execute("DELETE FROM checklist_items WHERE company_id=?", (company_id,))
+
+            _delete_ids("requests", "customer_id", customer_ids)
+            _delete_ids("bins", "customer_id", customer_ids)
+            _delete_ids("sites", "customer_id", customer_ids)
+            _delete_ids("customers", "id", customer_ids)
+
+            _delete_ids("saved_address_details", "saved_address_id", saved_ids)
+            _delete_ids("saved_addresses", "id", saved_ids)
+            _delete_ids("recurring_off_overrides", "rule_id", recurring_ids)
+            conn.execute("DELETE FROM recurring_days_off WHERE company_id=?", (company_id,))
+            conn.execute("DELETE FROM time_off_requests WHERE company_id=?", (company_id,))
+            conn.execute("DELETE FROM late_checkins WHERE company_id=?", (company_id,))
+            conn.execute("DELETE FROM driver_clock_entries WHERE company_id=?", (company_id,))
+
+            _delete_ids("password_reset_tokens", "user_id", user_ids)
+            conn.execute("DELETE FROM orders WHERE company_id=?", (company_id,))
+            conn.execute("DELETE FROM load_scores WHERE company_id=?", (company_id,))
+            conn.execute("DELETE FROM dump_locations WHERE company_id=?", (company_id,))
+            conn.execute("DELETE FROM parse_vocab WHERE company_id=?", (company_id,))
+            conn.execute("DELETE FROM containers WHERE company_id=?", (company_id,))
+            conn.execute("DELETE FROM subscriptions WHERE company_id=?", (company_id,))
+            conn.execute("UPDATE companies SET owner_id=NULL WHERE id=?", (company_id,))
+            _delete_ids("users", "id", user_ids)
+            conn.execute("DELETE FROM companies WHERE id=?", (company_id,))
+            purged_companies += 1
+
+        due_users = conn.execute(
+            """SELECT id, avatar_path FROM users
+               WHERE pending_deletion_at IS NOT NULL
+                 AND date(pending_deletion_at) <= date('now')"""
+        ).fetchall()
+        for user in due_users:
+            user_id = user["id"]
+            if user["avatar_path"]:
+                uploads_to_remove.append(user["avatar_path"])
+            conn.execute("DELETE FROM password_reset_tokens WHERE user_id=?", (user_id,))
+            conn.execute("DELETE FROM recurring_off_overrides WHERE rule_id IN "
+                         "(SELECT id FROM recurring_days_off WHERE driver_id=?)", (user_id,))
+            conn.execute("DELETE FROM recurring_days_off WHERE driver_id=?", (user_id,))
+            conn.execute("DELETE FROM time_off_requests WHERE driver_id=?", (user_id,))
+            conn.execute("DELETE FROM late_checkins WHERE driver_id=?", (user_id,))
+            conn.execute("DELETE FROM driver_clock_entries WHERE driver_id=?", (user_id,))
+            deleted_username = f"deleted-{user_id}-{secrets.token_hex(6)}"
+            conn.execute(
+                """UPDATE users SET username=?, password_hash=?, full_name=NULL,
+                       phone=NULL, email=NULL, avatar_path=NULL, nav_preference=NULL,
+                       role_owner=0, role_customer_manager=0, role_dispatcher=0,
+                       is_active=0, pending_deletion_at=NULL
+                   WHERE id=?""",
+                (deleted_username, generate_password_hash(secrets.token_urlsafe(48)), user_id),
+            )
+            anonymized_users += 1
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    for path_value in set(uploads_to_remove):
+        _remove_managed_upload(path_value)
+    if purged_companies or anonymized_users:
+        app.logger.info(
+            "deletion maintenance: purged_companies=%d anonymized_users=%d",
+            purged_companies,
+            anonymized_users,
+        )
+    return {
+        "purged_companies": purged_companies,
+        "anonymized_users": anonymized_users,
+    }
 
 
 @app.route("/account/delete", methods=["POST"])
@@ -8565,17 +9052,57 @@ def close_company():
         flash("Type CLOSE to confirm closing the company.", "error")
         return redirect(url_for("settings_page") + "#delete-account")
 
+    company_id = cid()
     conn = get_db()
+    company = conn.execute(
+        "SELECT stripe_subscription_id FROM companies WHERE id=?",
+        (company_id,),
+    ).fetchone()
+    subscription_id = company["stripe_subscription_id"] if company else None
+
+    # Cancel remotely before deactivating the tenant. Otherwise a closed
+    # account could continue billing after its users can no longer sign in.
+    if subscription_id:
+        if not stripe_configured:
+            conn.close()
+            app.logger.error(
+                "Company closure blocked: Stripe is not configured (company_id=%s)",
+                company_id,
+            )
+            flash(
+                "We couldn't cancel billing automatically. Your account is still "
+                "active and has not been closed. Please contact support.",
+                "error",
+            )
+            return redirect(url_for("settings_page") + "#delete-account")
+        try:
+            stripe.Subscription.cancel(subscription_id)
+        except Exception as exc:
+            conn.close()
+            app.logger.exception(
+                "Stripe cancellation failed during company closure "
+                "(company_id=%s, subscription_id=%s): %s",
+                company_id,
+                subscription_id,
+                exc,
+            )
+            flash(
+                "We couldn't cancel billing automatically. Your account is still "
+                "active and has not been closed. Please try again or contact support.",
+                "error",
+            )
+            return redirect(url_for("settings_page") + "#delete-account")
+
     removal_date = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
     conn.execute(
         "UPDATE users SET is_active=0, pending_deletion_at=? WHERE company_id=? AND is_active=1",
-        (removal_date, cid())
+        (removal_date, company_id)
     )
     conn.execute(
         "UPDATE companies SET subscription_status='cancelled', closed_at=? WHERE id=?",
-        (now_ts(), cid())
+        (now_ts(), company_id)
     )
-    conn.execute("UPDATE routes SET assigned_to=NULL WHERE company_id=?", (cid(),))
+    conn.execute("UPDATE routes SET assigned_to=NULL WHERE company_id=?", (company_id,))
     conn.commit()
     conn.close()
 
@@ -8643,6 +9170,13 @@ def public_order_form():
     init_db()
 
     if request.method == "POST":
+        allowed, retry_after = rate_limit_allow(
+            "public-order", request.args.get("company", ""), limit=10, window_seconds=60 * 60
+        )
+        if not allowed:
+            response = jsonify({"error": "Too many requests. Try again later."})
+            response.headers["Retry-After"] = str(retry_after)
+            return response, 429
         customer_name = request.form.get("customer_name", "").strip()
         phone = request.form.get("phone", "").strip()
         email = request.form.get("email", "").strip()
@@ -8777,8 +9311,12 @@ def register():
         phone     = request.form.get("phone", "").strip()
         email     = request.form.get("email", "").strip()
 
+        policy_error = password_policy_error(password)
         if not username or not password or role not in ("boss", "driver"):
             flash("Fill everything correctly.", "error")
+            return redirect(url_for("register"))
+        if policy_error:
+            flash(policy_error, "error")
             return redirect(url_for("register"))
 
         company_id = cid()
@@ -8837,7 +9375,7 @@ def register():
             <label>Username</label>
             <input name="username" required>
             <label>Password</label>
-            <input type="password" name="password" required>
+            <input type="password" name="password" required minlength="12">
             <label>Full Name</label>
             <input name="full_name">
             <label>Email</label>
@@ -14049,6 +14587,34 @@ def edit_stop(stop_id):
 # =========================================================
 # DELETE ROUTE
 # =========================================================
+def _detach_stop_references(conn, stop_ids):
+    """Detach optional references before deliberately removing stop history."""
+    if not stop_ids:
+        return
+    for offset in range(0, len(stop_ids), 500):
+        part = stop_ids[offset:offset + 500]
+        placeholders = ",".join("?" * len(part))
+        conn.execute(
+            f"""UPDATE requests SET stop_id=NULL, status='accepted', updated_at=?
+                WHERE stop_id IN ({placeholders})""",
+            [now_ts()] + part,
+        )
+        conn.execute(
+            f"UPDATE customer_containers SET delivered_stop_id=NULL "
+            f"WHERE delivered_stop_id IN ({placeholders})",
+            part,
+        )
+        conn.execute(
+            f"UPDATE customer_containers SET pulled_stop_id=NULL "
+            f"WHERE pulled_stop_id IN ({placeholders})",
+            part,
+        )
+        conn.execute(
+            f"UPDATE bins SET drop_stop_id=NULL WHERE drop_stop_id IN ({placeholders})",
+            part,
+        )
+
+
 @app.route("/route/<int:route_id>/delete", methods=["POST"])
 @boss_required
 def delete_route(route_id):
@@ -14059,7 +14625,30 @@ def delete_route(route_id):
         conn.close()
         abort(404)
 
+    stop_rows = conn.execute(
+        "SELECT id FROM stops WHERE route_id=?", (route_id,)
+    ).fetchall()
+    stop_ids = [row["id"] for row in stop_rows]
+    upload_paths = [
+        row["file_path"] for row in conn.execute(
+            """SELECT rp.file_path FROM route_photos rp
+               JOIN stops s ON s.id=rp.stop_id WHERE s.route_id=?""",
+            (route_id,),
+        ).fetchall()
+    ]
+    upload_paths.extend(
+        row["path"] for row in conn.execute(
+            """SELECT photo_path AS path FROM stops
+               WHERE route_id=? AND photo_path IS NOT NULL
+               UNION ALL
+               SELECT dt.photo_path AS path FROM dump_tickets dt
+               WHERE dt.route_id=? AND dt.photo_path IS NOT NULL""",
+            (route_id, route_id),
+        ).fetchall()
+    )
+    _detach_stop_references(conn, stop_ids)
     # delete child records first
+    conn.execute("DELETE FROM messages WHERE route_id=?", (route_id,))
     conn.execute("DELETE FROM route_photos WHERE stop_id IN (SELECT id FROM stops WHERE route_id=?)", (route_id,))
     conn.execute("DELETE FROM dump_tickets WHERE stop_id IN (SELECT id FROM stops WHERE route_id=?)", (route_id,))
     conn.execute("DELETE FROM stops WHERE route_id=?", (route_id,))
@@ -14067,6 +14656,8 @@ def delete_route(route_id):
 
     conn.commit()
     conn.close()
+    for upload_path in upload_paths:
+        _remove_managed_upload(upload_path)
 
     flash("Route deleted.", "success")
     return redirect(url_for("routes_page"))
@@ -14134,6 +14725,22 @@ def delete_stop(stop_id):
         abort(404)
     route_id = row["route_id"]
 
+    upload_paths = [
+        row["file_path"] for row in conn.execute(
+            "SELECT file_path FROM route_photos WHERE stop_id=?", (stop_id,)
+        ).fetchall()
+    ]
+    upload_paths.extend(
+        row["path"] for row in conn.execute(
+            """SELECT photo_path AS path FROM stops
+               WHERE id=? AND photo_path IS NOT NULL
+               UNION ALL
+               SELECT photo_path AS path FROM dump_tickets
+               WHERE stop_id=? AND photo_path IS NOT NULL""",
+            (stop_id, stop_id),
+        ).fetchall()
+    )
+    _detach_stop_references(conn, [stop_id])
     conn.execute("DELETE FROM route_photos WHERE stop_id=?", (stop_id,))
     conn.execute("DELETE FROM dump_tickets WHERE stop_id=?", (stop_id,))
     conn.execute("DELETE FROM stops WHERE id=?", (stop_id,))
@@ -14142,6 +14749,8 @@ def delete_stop(stop_id):
     compute_can_flow(conn, route_id)
     conn.commit()
     conn.close()
+    for upload_path in upload_paths:
+        _remove_managed_upload(upload_path)
 
     flash("Stop deleted.", "success")
     return redirect(url_for("view_route", route_id=route_id))
@@ -16097,9 +16706,21 @@ def company_register():
         full_name    = request.form.get("full_name", "").strip()
         phone        = request.form.get("phone", "").strip()
         email        = request.form.get("email", "").strip()
+        allowed, retry_after = rate_limit_allow(
+            "company-registration", username, limit=5, window_seconds=60 * 60
+        )
+        if not allowed:
+            flash("Too many registration attempts. Wait before trying again.", "error")
+            response = redirect(url_for("company_register"))
+            response.headers["Retry-After"] = str(retry_after)
+            return response, 429
 
         if not company_name or not username or not password:
             flash("Company name, username, and password are required.", "error")
+            return redirect(url_for("company_register"))
+        policy_error = password_policy_error(password)
+        if policy_error:
+            flash(policy_error, "error")
             return redirect(url_for("company_register"))
 
         # make a URL-safe slug from company name
@@ -16180,7 +16801,7 @@ def company_register():
                 <label>Your Username (boss login)</label>
                 <input name="username" required>
                 <label>Password</label>
-                <input type="password" name="password" required>
+                <input type="password" name="password" required minlength="12">
                 <label>Full Name</label>
                 <input name="full_name">
                 <label>Email</label>
@@ -17251,7 +17872,7 @@ def privacy_policy():
         <h2>3. Information We Collect</h2>
         <ul>
             <li><strong>Account data</strong> — company name, owner name, username, password
-            (stored as a bcrypt hash; we never store your plaintext password), and, where provided,
+            (stored using a salted adaptive password hash; we never store your plaintext password), and, where provided,
             phone number and email address for the people on your account.</li>
             <li><strong>Operational data</strong> — routes, stops, customer addresses, order notes,
             and driver assignments you enter into the system.</li>
@@ -17310,9 +17931,9 @@ def privacy_policy():
         </ul>
 
         <h2>7. Data Isolation</h2>
-        <p>Every company on HAULTRA operates in a fully isolated data environment. Your routes,
+        <p>Every company on HAULTRA operates in a logically isolated tenant environment. Your routes,
         drivers, orders, and uploaded photos are never visible to other companies on the platform.
-        Technical access controls enforce this at the database layer on every request.</p>
+        Server-side authorization and company-scoped database queries enforce this on every request.</p>
 
         <h2>8. International Data Processing</h2>
         <p>HAULTRA is based in Virginia, USA, and your data is stored and processed on servers
@@ -17335,6 +17956,11 @@ def privacy_policy():
         details. This data is processed under Anthropic's commercial API data policies and is not
         used to train AI models. We do not sell or rent your data to any third party for marketing
         purposes.</p>
+        <p>We also use Render for application hosting, Cloudflare for network delivery and
+        security, Resend for transactional email, Stripe for subscription billing, Firebase for
+        optional live-dispatch messaging, and encrypted S3-compatible object storage for disaster
+        recovery backups. These providers process only the information needed to supply their
+        contracted service.</p>
 
         <h2>10. Data Retention</h2>
         <p>Your operational data (routes, stops, photos) is retained for as long as your account
@@ -17343,7 +17969,7 @@ def privacy_policy():
         Billing and subscription records are retained for 7 years per section 5 above.</p>
 
         <h2>11. Security</h2>
-        <p>All data is transmitted over HTTPS/TLS. Passwords are hashed with bcrypt. Sessions
+        <p>All data is transmitted over HTTPS/TLS. Passwords use salted adaptive hashing. Sessions
         use cryptographically signed cookies with CSRF protection on all state-changing requests.
         We perform regular internal security reviews.</p>
 
@@ -17399,10 +18025,29 @@ def delete_account_request():
         company_name  = request.form.get("company_name", "").strip()
         account_email = request.form.get("account_email", "").strip()
         confirmed     = request.form.get("confirm", "") == "yes"
+        allowed, retry_after = rate_limit_allow(
+            "public-deletion-request",
+            account_email,
+            limit=5,
+            window_seconds=60 * 60,
+        )
+        if not allowed:
+            response = jsonify({"error": "Too many requests. Try again later."})
+            response.headers["Retry-After"] = str(retry_after)
+            return response, 429
 
         if not company_name or not account_email or not confirmed:
             flash("Fill in your company name and account email, and check the confirmation box.", "error")
         else:
+            conn = get_db()
+            conn.execute(
+                """INSERT INTO account_deletion_requests
+                   (company_name, account_email, status, created_at)
+                   VALUES (?, ?, 'pending', ?)""",
+                (company_name, account_email, now_ts()),
+            )
+            conn.commit()
+            conn.close()
             submitted = True
             email_sent = send_email(
                 "info@haultraai.com",
@@ -18574,6 +19219,11 @@ def delete_container(c_id):
     if not c:
         conn.close()
         abort(404)
+    conn.execute(
+        "UPDATE customer_containers SET container_id=NULL "
+        "WHERE container_id=? AND company_id=?",
+        (c_id, cid()),
+    )
     conn.execute("DELETE FROM containers WHERE id=?", (c_id,))
     conn.commit()
     conn.close()
@@ -21133,6 +21783,14 @@ def customer_create_request(token):
     if customer is None:
         conn.close()
         return _not_found()
+    allowed, retry_after = rate_limit_allow(
+        "customer-request", token, limit=20, window_seconds=60 * 60
+    )
+    if not allowed:
+        conn.close()
+        response = jsonify({"error": "too many requests; try again later"})
+        response.headers["Retry-After"] = str(retry_after)
+        return response, 429
 
     def bad(msg):
         conn.close()
@@ -21256,6 +21914,14 @@ def customer_rename_bin(token, bin_id):
     if customer is None:
         conn.close()
         return _not_found()
+    allowed, retry_after = rate_limit_allow(
+        "customer-bin-label", token, limit=30, window_seconds=60 * 60
+    )
+    if not allowed:
+        conn.close()
+        response = jsonify({"error": "too many requests; try again later"})
+        response.headers["Retry-After"] = str(retry_after)
+        return response, 429
     owned = conn.execute(
         "SELECT id FROM bins WHERE id=? AND customer_id=?", (bin_id, customer["id"])
     ).fetchone()
@@ -25187,6 +25853,9 @@ def _remove_stop_and_reindex(conn, stop_id):
     if not row:
         return None
     rid = row["route_id"]
+    _detach_stop_references(conn, [stop_id])
+    conn.execute("DELETE FROM route_photos WHERE stop_id=?", (stop_id,))
+    conn.execute("DELETE FROM dump_tickets WHERE stop_id=?", (stop_id,))
     conn.execute("DELETE FROM stops WHERE id=?", (stop_id,))
     remaining = conn.execute(
         "SELECT id FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC", (rid,)

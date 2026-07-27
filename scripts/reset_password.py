@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from werkzeug.security import generate_password_hash
 
-from app import get_db, now_ts
+from app import get_db, now_ts, password_policy_error
 
 
 def main():
@@ -31,8 +31,9 @@ def main():
     username = sys.argv[1].strip()
     new_password = sys.argv[2]
 
-    if len(new_password) < 8:
-        print("Password must be at least 8 characters.")
+    policy_error = password_policy_error(new_password)
+    if policy_error:
+        print(policy_error)
         sys.exit(1)
 
     conn = get_db()

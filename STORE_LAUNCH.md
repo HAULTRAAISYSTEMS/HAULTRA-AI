@@ -97,6 +97,21 @@ certificate fingerprint used by installed Play builds. Use the **app
 signing certificate** fingerprint from Play Console, not merely the local
 upload-key fingerprint. The app-link endpoint returns 404 until configured.
 
+## Production service gates
+
+Before submitting either binary:
+
+- merge the release pull request and require all GitHub production-readiness
+  checks to pass
+- configure `APPLE_TEAM_ID` and `ANDROID_SHA256_FINGERPRINT`, then verify both
+  `/.well-known/` association endpoints return HTTP 200
+- configure `BACKUP_S3_BUCKET` and AWS-compatible credentials, run a manual
+  backup, and complete a restore drill
+- confirm `/health` returns HTTP 200 and reports both database and storage as
+  healthy
+- run `scripts/purge_deleted_accounts.py` once and confirm no overdue deletion
+  jobs remain
+
 ## Store listing checklist
 
 - 1024×1024 iOS icon and Google Play 512×512 icon

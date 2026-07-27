@@ -16,7 +16,7 @@ from werkzeug.security import generate_password_hash
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app import get_db, init_db, now_ts
+from app import get_db, init_db, now_ts, password_policy_error
 
 
 def required_env(name):
@@ -29,6 +29,9 @@ def required_env(name):
 def main():
     username = required_env("APP_REVIEW_USERNAME")
     password = required_env("APP_REVIEW_PASSWORD")
+    policy_error = password_policy_error(password)
+    if policy_error:
+        raise SystemExit(policy_error)
     company_name = os.environ.get(
         "APP_REVIEW_COMPANY", "HAULTRA App Review Fleet"
     ).strip()
