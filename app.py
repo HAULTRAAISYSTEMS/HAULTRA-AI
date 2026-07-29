@@ -2033,6 +2033,61 @@ def get_driver_day_hours(conn, driver_id, date_str, company_settings):
         return None, None, None
 
 
+# ── Timesheet corrections (feat/clock-correction) ─────────────────────────────
+# One shared upsert so the driver self-service form and the boss Driver-Hours
+# editor behave identically. Manual entries always win in resolve_driver_day_
+# punches(), so writing clock_in_at/clock_out_at here is what fixes a forgotten
+# clock-out on a PAST day (the /driver/clock page can only touch "today").
+def _valid_hhmm(raw):
+    """Accept a 24-hour 'HH:MM' string (from <input type=time>); else None."""
+    raw = (raw or "").strip()
+    if re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", raw):
+        return raw
+    return None
+
+
+def _apply_clock_correction(conn, company_id, driver_id, date_str, ci_hhmm,
+                            co_hhmm, actor_id, actor_desc):
+    """Upsert the driver_clock_entries row for (company, driver, date), setting
+    clock-in and/or clock-out from HH:MM values interpreted on date_str. A blank
+    time leaves that side unchanged. Appends a timestamped audit note. Returns
+    (ok: bool, error: str|None). Validates date shape, at-least-one-time, and
+    clock-out not before clock-in. Company + future-date checks are the caller's."""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str or ""):
+        return False, "Pick a valid date."
+    ci = _valid_hhmm(ci_hhmm)
+    co = _valid_hhmm(co_hhmm)
+    if not ci and not co:
+        return False, "Enter a clock-in and/or clock-out time."
+    row = conn.execute(
+        "SELECT * FROM driver_clock_entries WHERE company_id=? AND driver_id=? AND date=?",
+        (company_id, driver_id, date_str)
+    ).fetchone()
+    cur_ci = (row["clock_in_at"] if row else None) or None
+    cur_co = (row["clock_out_at"] if row else None) or None
+    new_ci = ("%s %s:00" % (date_str, ci)) if ci else cur_ci
+    new_co = ("%s %s:00" % (date_str, co)) if co else cur_co
+    if new_ci and new_co and new_co[:19] < new_ci[:19]:
+        return False, "Clock-out can't be before clock-in."
+    ts = now_ts()
+    audit = "correction by %s: in=%s out=%s" % (actor_desc, new_ci or "—", new_co or "—")
+    base_notes = ((row["notes"] if row else "") or "")
+    notes = (base_notes + "\n[%s] %s" % (ts, audit)).strip()
+    if row:
+        conn.execute(
+            "UPDATE driver_clock_entries SET clock_in_at=?, clock_out_at=?, notes=? WHERE id=?",
+            (new_ci, new_co, notes, row["id"])
+        )
+    else:
+        conn.execute(
+            "INSERT INTO driver_clock_entries "
+            "(company_id, driver_id, date, clock_in_at, clock_out_at, notes, created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (company_id, driver_id, date_str, new_ci, new_co, notes, ts)
+        )
+    return True, None
+
+
 # =========================================================
 # WEEKLY HOURS  — shared summary + renderer (feat/weekly-hours)
 # Week runs Mon 00:00 → Sun 23:59 in company-local time. Hours to 1 decimal.
@@ -19394,9 +19449,24 @@ def driver_hours_page():
     _del_btn_style = ('padding:4px 12px;font-size:12px;font-weight:600;border-radius:6px;'
                       'border:1px solid rgba(255,59,92,0.30);cursor:pointer;'
                       'background:rgba(255,59,92,0.10);color:#ff3b5c;')
+    _edit_btn_style = ('padding:4px 12px;font-size:12px;font-weight:600;border-radius:6px;'
+                       'border:1px solid rgba(255,107,26,0.30);cursor:pointer;'
+                       'background:rgba(255,107,26,0.10);color:#FF9D5C;')
+
+    def _hhmm(ts):
+        return str(ts)[11:16] if ts and len(str(ts)) >= 16 else ""
+
     activity_html = ""
     for ar in activity_rows:
         badge = _manual_badge if ar["source"] == "manual" else _auto_badge
+        # Every day (manual or auto) can be corrected/created; a manual row can
+        # also be deleted. The Edit button pre-fills the correction form below.
+        _day = str(ar["day"])
+        edit_btn = (
+            '<button type="button" style="' + _edit_btn_style + '" '
+            "onclick=\"fillClockFix('" + _day + "','" + _hhmm(ar["start"]) + "','"
+            + _hhmm(ar["end"]) + "')\">&#9998; Edit</button>"
+        )
         if ar["source"] == "manual" and ar.get("entry_id"):
             _eid = str(ar["entry_id"])
             _did = str(selected_driver_id)
@@ -19412,10 +19482,12 @@ def driver_hours_page():
             )
         else:
             delete_cell = ""
+        action_cell = ('<div style="display:flex;gap:6px;justify-content:flex-end;">'
+                       + edit_btn + delete_cell + '</div>')
         activity_html += (
             "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
                 _day_lbl(ar["day"]), _fmt_ts(ar["start"]), _fmt_ts(ar["end"]),
-                badge, delete_cell
+                badge, action_cell
             )
         )
 
@@ -19475,19 +19547,59 @@ def driver_hours_page():
         </div>
     </div>
 
-    <div class="card">
+    <div class="card" style="margin-bottom:16px;">
         <div style="font-size:13px;font-weight:700;color:#FF9D5C;margin-bottom:14px;">
             Clock Activity &mdash; %s
         </div>
         <div class="table-wrap">
             <table>
                 <thead>
-                    <tr><th>Date</th><th>Start</th><th>End</th><th>Source</th><th></th></tr>
+                    <tr><th>Date</th><th>Start</th><th>End</th><th>Source</th><th style="text-align:right;">Actions</th></tr>
                 </thead>
                 <tbody>%s</tbody>
             </table>
         </div>
     </div>
+
+    <div class="card" id="clock-fix">
+        <div style="font-size:13px;font-weight:700;color:#FF9D5C;margin-bottom:6px;">
+            Correct / add a day
+        </div>
+        <p class="small muted" style="margin-bottom:14px;">
+            Fix a forgotten clock-out or add a missing day for <strong>%s</strong>.
+            Blank fields are left unchanged. Tap &#9998; Edit on a row above to pre-fill it.
+        </p>
+        <form method="POST" action="%s" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;">
+            <input type="hidden" name="_csrf_token" value="%s">
+            <input type="hidden" name="driver_id" value="%s">
+            <div>
+                <label style="font-size:12px;display:block;margin-bottom:4px;">Day</label>
+                <input type="date" id="cf-date" name="date" value="%s" max="%s" required
+                       style="padding:9px 12px;border-radius:8px;border:1px solid rgba(255,107,26,0.20);background:rgba(255,255,255,0.05);color:#e8f2ff;">
+            </div>
+            <div>
+                <label style="font-size:12px;display:block;margin-bottom:4px;">Clock in</label>
+                <input type="time" id="cf-ci" name="clock_in"
+                       style="padding:9px 12px;border-radius:8px;border:1px solid rgba(255,107,26,0.20);background:rgba(255,255,255,0.05);color:#e8f2ff;">
+            </div>
+            <div>
+                <label style="font-size:12px;display:block;margin-bottom:4px;">Clock out</label>
+                <input type="time" id="cf-co" name="clock_out"
+                       style="padding:9px 12px;border-radius:8px;border:1px solid rgba(255,107,26,0.20);background:rgba(255,255,255,0.05);color:#e8f2ff;">
+            </div>
+            <button type="submit" style="padding:10px 18px;border-radius:8px;font-weight:700;border:none;cursor:pointer;background:linear-gradient(135deg,#ff6d00,#ff9d00);color:#1a1000;">
+                Save
+            </button>
+        </form>
+    </div>
+    <script>
+    function fillClockFix(day, ci, co){
+        var d=document.getElementById('cf-date'), a=document.getElementById('cf-ci'), b=document.getElementById('cf-co');
+        if(d) d.value=day; if(a) a.value=ci||''; if(b) b.value=co||'';
+        var card=document.getElementById('clock-fix');
+        if(card){ card.scrollIntoView({behavior:'smooth', block:'center'}); }
+    }
+    </script>
     """ % (
         e(ptype), e(period_start), e(period_end), payday_note,
         driver_opts,
@@ -19496,6 +19608,12 @@ def driver_hours_page():
         e(start_lbl), e(end_lbl), settings_url,
         e(selected_driver_name),
         activity_html if activity_html else no_activity_row,
+        e(selected_driver_name),
+        url_for("edit_clock_entry"),
+        _csrf_tok,
+        str(selected_driver_id),
+        period_end if period_end <= _company_local_now(co_settings).strftime("%Y-%m-%d") else _company_local_now(co_settings).strftime("%Y-%m-%d"),
+        _company_local_now(co_settings).strftime("%Y-%m-%d"),
     )
     return render_template_string(shell_page("Driver Hours", body))
 
@@ -19534,6 +19652,54 @@ def delete_clock_entry():
     if driver_id and driver_id.isdigit():
         redir_url += "?driver_id=" + driver_id
     return redirect(redir_url)
+
+
+@app.route("/boss/edit-clock-entry", methods=["POST"])
+@boss_required
+def edit_clock_entry():
+    """Management correction: set/fix a driver's clock-in and/or clock-out for a
+    given day (creates the entry if the day has none). Company-scoped; no future
+    dates. This is how a forgotten clock-out on a past day gets fixed."""
+    driver_id = request.form.get("driver_id", "").strip()
+    date_str  = (request.form.get("date") or "").strip()
+    ci        = request.form.get("clock_in", "")
+    co        = request.form.get("clock_out", "")
+
+    def _back():
+        u = url_for("driver_hours_page")
+        return u + ("?driver_id=" + driver_id) if driver_id.isdigit() else u
+
+    if not driver_id.isdigit():
+        flash("Invalid driver.", "error")
+        return redirect(url_for("driver_hours_page"))
+
+    conn = get_db()
+    ok_drv = conn.execute(
+        "SELECT id FROM users WHERE id=? AND company_id=? AND role='driver'",
+        (int(driver_id), cid())
+    ).fetchone()
+    if not ok_drv:
+        conn.close()
+        flash("Driver not found.", "error")
+        return redirect(url_for("driver_hours_page"))
+
+    company = conn.execute("SELECT * FROM companies WHERE id=?", (cid(),)).fetchone()
+    co_settings = {k: company[k] for k in company.keys()} if company else {}
+    today_local = _company_local_now(co_settings).strftime("%Y-%m-%d")
+    if date_str > today_local:
+        conn.close()
+        flash("Can't set hours for a future date.", "error")
+        return redirect(_back())
+
+    ok, err = _apply_clock_correction(
+        conn, cid(), int(driver_id), date_str, ci, co, session["user_id"], "boss")
+    if ok:
+        conn.commit()
+        flash("Hours updated.", "success")
+    else:
+        flash(err or "Could not update.", "error")
+    conn.close()
+    return redirect(_back())
 
 
 # =========================================================
@@ -21033,6 +21199,42 @@ def driver_clock():
         'for your company&rsquo;s current configuration.</p>'
     )
 
+    # ── "Fix a past day" correction card ─────────────────────────────────────
+    # The status card above only ever edits TODAY. A forgotten clock-out on an
+    # earlier day (the ⚠ in the weekly card) is corrected here. Defaults to
+    # yesterday, the common case; capped at today (no future dates).
+    try:
+        _corr_default = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
+    except Exception:
+        _corr_default = today
+    _S_CORR_INPUT = ('width:100%;padding:10px 12px;background:rgba(255,255,255,0.05);'
+                     'border:1px solid rgba(255,107,26,0.20);border-radius:8px;'
+                     'color:#e8f2ff;font-size:15px;font-weight:600;')
+    correction_card_html = (
+        '<div class="card" style="max-width:460px;margin:0 auto 16px;">'
+        '<details>'
+        '<summary style="cursor:pointer;font-weight:700;font-size:15px;color:var(--text);'
+        'list-style:none;">&#128295;&nbsp;Fix a past day</summary>'
+        '<p class="muted small" style="margin:10px 0 12px;">Forgot to clock in or out? '
+        'Set the correct times for any past day. Leave a field blank to keep what&rsquo;s there.</p>'
+        '<form method="POST" action="' + url_for("driver_clock_correct") + '">'
+        '<input type="hidden" name="_csrf_token" value="' + csrf_tok + '">'
+        + LBL + 'Day</div>'
+        '<input type="date" name="date" value="' + _corr_default + '" max="' + today + '" '
+        'required style="' + _S_CORR_INPUT + 'margin-bottom:12px;">'
+        '<div style="display:flex;gap:8px;margin-bottom:14px;">'
+        '<div style="flex:1;">' + LBL + 'Clock in</div>'
+        '<input type="time" name="clock_in" style="' + _S_CORR_INPUT + '"></div>'
+        '<div style="flex:1;">' + LBL + 'Clock out</div>'
+        '<input type="time" name="clock_out" style="' + _S_CORR_INPUT + '"></div>'
+        '</div>'
+        '<button type="submit" style="' + S_UPD + 'width:100%;padding:13px;font-size:15px;">'
+        'Save correction</button>'
+        '</form>'
+        '</details>'
+        '</div>'
+    )
+
     # ── assemble page ────────────────────────────────────────────────────────
     body = (
         '<div class="hero">'
@@ -21069,10 +21271,50 @@ def driver_clock():
         # ── THIS WEEK summary (below today's status) ─────────────────────
         + week_card_html
         + week_tick_js
+        # ── Fix a past day (below the weekly summary that flags ⚠) ────────
+        + correction_card_html
         # ── TIME OFF (below weekly hours) ────────────────────────────────
         + time_off_card_html
     )
     return render_template_string(shell_page("Clock In / Out", body))
+
+
+@app.route("/driver/clock/correct", methods=["POST"])
+@login_required
+def driver_clock_correct():
+    """Driver self-service: fix their OWN clock-in/out on a past (or today's)
+    day — e.g. a forgotten clock-out. Requires the company to run a manual clock
+    rule; no future dates. Always scoped to the logged-in driver."""
+    driver_id = session["user_id"]
+    date_str  = (request.form.get("date") or "").strip()
+    ci        = request.form.get("clock_in", "")
+    co        = request.form.get("clock_out", "")
+
+    conn = get_db()
+    company = conn.execute("SELECT * FROM companies WHERE id=?", (cid(),)).fetchone()
+    co_settings = {k: company[k] for k in company.keys()} if company else {}
+    start_rule = (co_settings.get("driver_day_start_rule") or "first_action").lower()
+    end_rule   = (co_settings.get("driver_day_end_rule")   or "last_action").lower()
+    if start_rule != "manual" and end_rule != "manual":
+        conn.close()
+        flash("Manual clock-in is not enabled for your company.", "error")
+        return redirect(url_for("driver_dashboard"))
+
+    today_local = _company_local_now(co_settings).strftime("%Y-%m-%d")
+    if date_str > today_local:
+        conn.close()
+        flash("Can't set hours for a future date.", "error")
+        return redirect(url_for("driver_clock"))
+
+    ok, err = _apply_clock_correction(
+        conn, cid(), driver_id, date_str, ci, co, driver_id, "driver")
+    if ok:
+        conn.commit()
+        flash("Hours updated.", "success")
+    else:
+        flash(err or "Could not update.", "error")
+    conn.close()
+    return redirect(url_for("driver_clock"))
 
 
 # =========================================================
