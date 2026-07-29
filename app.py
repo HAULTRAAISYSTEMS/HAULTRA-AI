@@ -109,7 +109,71 @@ if not _db_env:
     raise RuntimeError("DATABASE_PATH is not set. Add it as an environment variable.")
 DATABASE = _db_env
 print("Using database:", DATABASE, flush=True)
-UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", os.path.join("static", "uploads"))
+
+
+def _resolve_upload_folder(app_root, database_path, on_render, env_override=None):
+    """Decide where uploaded media (avatars, stop/inspection/receipt photos)
+    physically lives, and return the path save/serve code should use.
+
+    The bug this fixes: on Render the app directory is EPHEMERAL — anything
+    written under static/uploads is wiped on every deploy and on each instance
+    restart/spin-down. The SQLite DB lives on a mounted persistent disk (via
+    DATABASE_PATH), but uploads defaulted into the app tree, so a saved photo's
+    DB row survived while its file vanished — the avatar "deleted" itself back
+    to initials. Fix: when the DB is on a real disk outside the app tree,
+    co-locate uploads there (<db_dir>/uploads) and expose them at the usual
+    static/uploads web path via a symlink, so every existing save/serve path
+    keeps working unchanged and the files actually persist.
+
+    Fully defensive: an explicit UPLOAD_FOLDER env always wins; off Render (or
+    if anything goes wrong) it returns the in-tree default — worst case is the
+    prior behavior, never a regression."""
+    import shutil
+    if env_override:
+        return env_override
+    default_rel = os.path.join("static", "uploads")
+    static_up = os.path.join(app_root, "static", "uploads")
+    db_dir = os.path.dirname(os.path.abspath(database_path)) if database_path else ""
+    app_root_abs = os.path.abspath(app_root) + os.sep
+    off_tree = bool(db_dir) and not (os.path.abspath(db_dir) + os.sep).startswith(app_root_abs)
+    if not (on_render and off_tree):
+        return default_rel
+    persist = os.path.join(db_dir, "uploads")
+    try:
+        os.makedirs(persist, exist_ok=True)
+        if os.path.islink(static_up):
+            if os.path.realpath(static_up) != os.path.realpath(persist):
+                os.unlink(static_up)
+                os.symlink(persist, static_up)
+        else:
+            if os.path.isdir(static_up):
+                # First boot on the persistent volume: migrate any files that
+                # were written to the ephemeral tree before replacing it with
+                # the symlink (best-effort; never lose the new persistent copy).
+                for name in os.listdir(static_up):
+                    src = os.path.join(static_up, name)
+                    dst = os.path.join(persist, name)
+                    if not os.path.exists(dst):
+                        try:
+                            shutil.move(src, dst)
+                        except Exception:
+                            pass
+                shutil.rmtree(static_up, ignore_errors=True)
+            os.makedirs(os.path.dirname(static_up), exist_ok=True)
+            os.symlink(persist, static_up)
+        print("uploads persisted at:", persist, "(served via static/uploads symlink)", flush=True)
+        return static_up
+    except Exception as exc:
+        print("upload persistence setup failed, using ephemeral static/uploads:", exc, flush=True)
+        try:
+            os.makedirs(static_up, exist_ok=True)
+        except Exception:
+            pass
+        return default_rel
+
+
+UPLOAD_FOLDER = _resolve_upload_folder(
+    app.root_path, DATABASE, _on_render, os.environ.get("UPLOAD_FOLDER"))
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "pdf"}
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
@@ -20000,12 +20064,27 @@ def upload_avatar(user_id):
         return jsonify({"error": "no image"}), 400
     old = (target["avatar_path"] or "").strip()
     fname = f"av_{user_id}_{secrets.token_hex(8)}.jpg"
+    dest = os.path.join(AVATAR_FOLDER, fname)
     try:
-        photo.save(os.path.join(AVATAR_FOLDER, fname))
+        photo.save(dest)
     except Exception as exc:
         conn.close()
         app.logger.warning("avatar save failed: %s", exc)
         return jsonify({"error": "could not save"}), 500
+    # Reject an empty / truncated upload BEFORE repointing the DB, so a bad
+    # capture never wipes the driver's existing photo. (The client encodes to
+    # JPEG; a real one is comfortably over 200 bytes.)
+    try:
+        saved_size = os.path.getsize(dest)
+    except OSError:
+        saved_size = 0
+    if saved_size < 200:
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        conn.close()
+        return jsonify({"error": "that image didn't come through — try again"}), 400
     db_path = os.path.join("static", "uploads", "avatars", fname).replace("\\", "/")
     conn.execute("UPDATE users SET avatar_path=? WHERE id=? AND company_id=?",
                  (db_path, user_id, cid()))
@@ -20069,22 +20148,37 @@ _AVATAR_UPLOAD_JS = """
     var file = inp.files && inp.files[0]; if(!file) return;
     var status=document.getElementById('ha-av-status-'+userId);
     if(status){ status.textContent='Saving…'; status.hidden=false; }
+    function setMsg(m){ if(status){ status.textContent=m; } }
+    function upload(blob, filename, type){
+      var fd=new FormData();
+      fd.append('photo', new File([blob], filename, {type:type||'image/jpeg'}));
+      fd.append('_csrf_token', CSRF);
+      return fetch('/api/users/'+userId+'/avatar', {method:'POST', headers:{'X-CSRF-Token':CSRF}, body:fd})
+        .then(function(r){ return r.json().catch(function(){return{};}).then(function(j){return{ok:r.ok,j:j};}); })
+        .then(function(res){ if(res.ok){ location.reload(); } else { setMsg((res.j&&res.j.error)||'Could not save — tap to retry'); } });
+    }
+    function fallback(){
+      // Canvas/encode path failed (unusual format, memory pressure on mobile).
+      // Send the ORIGINAL file so a valid photo still saves rather than silently
+      // failing. allowed_file() on the server rejects anything it can't serve.
+      if(file.size>0 && file.size<=32*1024*1024){
+        upload(file, file.name||'avatar.jpg', file.type).catch(function(){ setMsg('Could not save — tap to retry'); });
+      } else { setMsg('Could not save — tap to retry'); }
+    }
     readFile(file).then(loadImage).then(function(img){
       var cv=squash(img);
       var q=[0.75,0.6,0.5,0.4], i=0;
       function step(){
         return toBlob(cv,q[i]).then(function(b){
-          if(b && (b.size<=150*1024 || i>=q.length-1)){ return b; }
+          if(b && b.size>0 && (b.size<=150*1024 || i>=q.length-1)){ return b; }
+          if(!b && i>=q.length-1){ throw new Error('encode failed'); }
           i++; return step();
         });
       }
       return step();
     }).then(function(blob){
-      var fd=new FormData(); fd.append('photo', new File([blob],'avatar.jpg',{type:'image/jpeg'})); fd.append('_csrf_token', CSRF);
-      return fetch('/api/users/'+userId+'/avatar', {method:'POST', headers:{'X-CSRF-Token':CSRF}, body:fd});
-    }).then(function(r){ return r.json().catch(function(){return{};}).then(function(j){return{ok:r.ok,j:j};}); })
-      .then(function(res){ if(res.ok){ location.reload(); } else { if(status){status.textContent=(res.j&&res.j.error)||'Could not save — tap to retry';} } })
-      .catch(function(){ if(status){status.textContent='Network error — tap to retry';} });
+      return upload(blob, 'avatar.jpg', 'image/jpeg');
+    }).catch(fallback);
   };
   window.haAvatarRemove = function(userId){
     if(!confirm('Remove this photo?')) return;
@@ -20112,7 +20206,10 @@ def _avatar_upload_control_html(user, size=64, show_remove=True, include_js=True
     ctrl = (
         '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'
         f'<span onclick="haAvatarPick({uid})" style="cursor:pointer;">{avatar_html(user, size)}</span>'
-        f'<input id="ha-av-input-{uid}" type="file" accept="image/*" capture="environment" '
+        # NB: no `capture` attribute — that forces the camera and hides the
+        # photo library on mobile. Plain accept="image/*" lets the native
+        # picker offer Camera, Photo Library, and Files.
+        f'<input id="ha-av-input-{uid}" type="file" accept="image/*" '
         f'style="display:none;" onchange="haAvatarChange({uid}, this)">'
         f'<button type="button" onclick="haAvatarPick({uid})" '
         f'style="min-height:36px;padding:5px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.16);'
