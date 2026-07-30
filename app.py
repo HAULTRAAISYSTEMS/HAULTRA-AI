@@ -541,6 +541,10 @@ def _clean_customer_name(name):
 # ── Route text paste parser ───────────────────────────────────────────────────
 # Ordered most-specific → least-specific; first match wins.
 _ACTION_PATTERNS = [
+    # Live Load — deliver a can, wait on-site while it's filled, then haul it.
+    # Checked before the PR/Pull/Delivery patterns so "live load" / "LL" wins
+    # (and before the bare single-letter tokens below).
+    (re.compile(r'\b(?:live\s*load|ll)\b',                              re.I), "Live Load"),
     # Most specific multi-word variants first
     (re.compile(r'\b(?:pickup\s*(?:and|&)\s*return|p\s*[&/]\s*r)\b',    re.I), "Pickup and Return"),
     (re.compile(r'\b(?:pull\s*(?:and|&)\s*return)\b',                    re.I), "Pickup and Return"),
@@ -4014,6 +4018,7 @@ _ACTION_TOKENS = {
     "P":    "Pickup",
     "D":    "Drop",
     "PR":   "Pickup and Return",
+    "LL":   "Live Load",
     "DUMP": "Dump",
     "PULL": "Pull",
 }
@@ -4028,6 +4033,7 @@ def extract_action(line):
 
     lower = line.lower()
     action_map = [
+        ("live load", "Live Load"),
         ("pickup and return", "Pickup and Return"),
         ("swap",     "Swap"),
         ("switch",   "Swap"),
@@ -4468,17 +4474,19 @@ def parse_stop_block(lines, order_num):
 # ─── Work-order format parser (PR / P / D prefix lines) ───────────────────────
 
 # Maps work-order code → dumpster action
-_WO_ACTION = {"PR": "Pickup and Return", "P": "Pull", "D": "Delivery"}
+_WO_ACTION = {"PR": "Pickup and Return", "P": "Pull", "D": "Delivery", "LL": "Live Load"}
 
 
 def _is_wo_line(line):
-    """Return 'PR', 'P', or 'D' if line starts with a work-order prefix, else None.
+    """Return 'PR', 'P', 'D', or 'LL' if line starts with a work-order prefix,
+    else None.
 
     Work-order lines look like: 'P 1233 Westover Ave, Norfolk, VA, ...'
     They do NOT look like dash-delimited: 'P - John Smith' or '4. P - John Smith'.
-    The (?!-) lookahead guards against the dash-delimited case.
+    The (?!-) lookahead guards against the dash-delimited case. LL is matched
+    before the single letters so 'LL 12 Main …' isn't read as a bare token.
     """
-    m = re.match(r"^(PR|P|D)\s+(?!-)", line, re.IGNORECASE)
+    m = re.match(r"^(PR|LL|P|D)\s+(?!-)", line, re.IGNORECASE)
     return m.group(1).upper() if m else None
 
 
@@ -4506,7 +4514,7 @@ def _parse_wo_line(line, order_num):
         return None
 
     # Remove the type prefix
-    body = re.sub(r"^(PR|P|D)\s+", "", line, flags=re.IGNORECASE).strip()
+    body = re.sub(r"^(PR|LL|P|D)\s+", "", line, flags=re.IGNORECASE).strip()
 
     # Split on ", " — up to 3 splits → at most 4 parts
     parts   = body.split(", ", 3)
@@ -4631,17 +4639,20 @@ def _parse_workorder_format(lines):
 
 # Roll-off action prefix → canonical action label
 _ROLLOFF_PREFIXES = {
-    "PR":       "Pickup and Return",
-    "PULL":     "Pull",
-    "DEL":      "Delivery",
-    "DELIVERY": "Delivery",
-    "D":        "Delivery",
-    "P":        "Pull",
-    "RELOCATE": "Relocate",
-    "RELOC":    "Relocate",
-    "R":        "Relocate",
-    "SWAP":     "Swap",
-    "MOVE":     "Move",
+    "PR":         "Pickup and Return",
+    "LL":         "Live Load",
+    "LIVELOAD":   "Live Load",
+    "LIVE LOAD":  "Live Load",
+    "PULL":       "Pull",
+    "DEL":        "Delivery",
+    "DELIVERY":   "Delivery",
+    "D":          "Delivery",
+    "P":          "Pull",
+    "RELOCATE":   "Relocate",
+    "RELOC":      "Relocate",
+    "R":          "Relocate",
+    "SWAP":       "Swap",
+    "MOVE":       "Move",
 }
 
 # City shorthand codes (Hampton Roads / Tidewater Virginia)
@@ -10106,7 +10117,7 @@ def text_to_route():
         )
 
         _STOP_ACTION_OPTS = [
-            "Pull", "Pickup and Return", "Delivery", "Relocate",
+            "Pull", "Pickup and Return", "Live Load", "Delivery", "Relocate",
             "Swap", "Move", "Service", "Dump",
         ]
 
@@ -10392,6 +10403,8 @@ def _board_action_badge(action):
     its own slate 'S' badge distinct from the orange PR badge.
     """
     a = (action or "").strip().lower()
+    if "live load" in a:
+        return "LL", "dropswap"
     if "pickup and return" in a:
         return "PR", "pickup"
     if "pull" in a and "return" not in a:
@@ -12998,6 +13011,7 @@ _PASTE_ROUTE_CSS = """<style>
 .pr-stop.l{background:rgba(255,59,92,.05);border:1px solid rgba(255,59,92,.20)}
 .pr-badge{display:inline-flex;align-items:center;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;letter-spacing:.3px;margin-right:4px}
 .pr-b-pr{background:rgba(255,107,26,.14);color:#FF9D5C}
+.pr-b-ll{background:rgba(0,229,204,.14);color:#00E5CC}
 .pr-b-p{background:rgba(251,191,36,.12);color:#fbbf24}
 .pr-b-d{background:rgba(140,160,179,.16);color:#8CA0B3}
 .pr-b-swap{background:rgba(140,160,179,.16);color:#8CA0B3}
@@ -13154,7 +13168,8 @@ _PASTE_ROUTE_JS = """
   function actionBadge(action, prMode) {
     var a = (action || '').trim().toUpperCase();
     var cls = 'pr-b-other', lbl = a || '?';
-    if (/PICKUP.*RETURN|^PICKUP AND RETURN$/.test(a) || a === 'PR' || /P.*&.*R/.test(a)) {
+    if (/LIVE\s*LOAD|^LL$/.test(a))   { cls = 'pr-b-ll';       lbl = 'Live Load'; }
+    else if (/PICKUP.*RETURN|^PICKUP AND RETURN$/.test(a) || a === 'PR' || /P.*&.*R/.test(a)) {
       cls = 'pr-b-pr';
       lbl = (prMode === 'swap') ? 'PR • Swap' : 'Pickup & Return';
     }
@@ -21887,7 +21902,7 @@ def add_parsed_stops(route_id):
 # labels used everywhere else (is_pull_job, compute_can_flow, Route Board
 # badges), so a dispatched route behaves identically to one created via
 # Create Route / Paste Dispatch Text.
-_PARSER_ACTION_MAP = {"PR": "Pickup and Return", "P": "Pull", "D": "Delivery", "S": "Swap", "R": "Relocate"}
+_PARSER_ACTION_MAP = {"PR": "Pickup and Return", "P": "Pull", "D": "Delivery", "S": "Swap", "R": "Relocate", "LL": "Live Load"}
 
 
 def _validate_parser_stops(stops_in):
