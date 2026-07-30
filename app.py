@@ -2959,6 +2959,10 @@ def init_db():
     # 512px square JPEG on disk; NULL → initials fallback avatar.
     safe_add_column(conn, "users", "avatar_path TEXT")
     safe_add_column(conn, "companies", "closed_at TEXT")
+    # Custom Route Board lane order (feat/board-reorder-lanes): JSON list of lane
+    # keys (driver id as string, or "unassigned") in the boss's chosen display
+    # order. NULL → default alphabetical (unassigned last).
+    safe_add_column(conn, "companies", "board_lane_order TEXT")
 
     # --- Geocoded coordinates for a stop's own address, used by the Bin
     #     Tracker map. NULL until geocoded (or if geocoding failed/was never
@@ -10825,6 +10829,20 @@ def _message_thread_js():
 """
 
 
+_LANE_SORT_CSS = """
+<style>
+  .lane-drag-handle{ cursor:grab; color:#8C8C82; font-size:14px; line-height:1;
+    margin-right:6px; user-select:none; touch-action:none; letter-spacing:-2px; }
+  .lane-driver{ cursor:grab; }
+  .lane-driver:active{ cursor:grabbing; }
+  .lane.sortable-chosen{ opacity:.96; }
+  .lane.sortable-ghost{ opacity:.35; }
+  .lane.sortable-drag{ box-shadow:0 12px 30px rgba(0,0,0,.45);
+    outline:1px solid rgba(255,107,26,.5); }
+</style>
+"""
+
+
 def _build_route_board_html(user):
     """Render the #lane-container contents for the Route Board — one lane per
     driver with stops today, built from real route/stop rows only. Shared by
@@ -10915,11 +10933,36 @@ def _build_route_board_html(user):
             f'<a class="btn gold" href="/parser" style="min-height:48px;display:inline-flex;align-items:center;">+ New Dispatch</a></div>'
         )
 
-    sorted_keys = sorted(lanes.keys(), key=lambda k: (1, "") if k == "__unassigned__" else (0, k.lower()))
+    # Stable lane key for ordering/persistence: driver id (string), or
+    # "unassigned" for the catch-all lane.
+    def _lane_key_of(uname):
+        _lane = lanes[uname]
+        return str(_lane["driver_id"]) if _lane.get("driver_id") else "unassigned"
+
+    # Custom order the boss set by dragging (feat/board-reorder-lanes). Lanes in
+    # the saved order come first (in that order); any new/unsaved lane falls back
+    # to the old alphabetical rule (unassigned last).
+    _saved_order = []
+    try:
+        _saved_order = json.loads((_co["board_lane_order"] if _co and "board_lane_order" in _co.keys() else None) or "[]")
+    except (ValueError, TypeError):
+        _saved_order = []
+    _order_index = {str(k): i for i, k in enumerate(_saved_order)}
+
+    def _lane_sort_key(uname):
+        lk = _lane_key_of(uname)
+        if lk in _order_index:
+            return (0, _order_index[lk], "")
+        if uname == "__unassigned__":
+            return (1, 1, "")
+        return (1, 0, uname.lower())
+
+    sorted_keys = sorted(lanes.keys(), key=_lane_sort_key)
 
     lanes_html = ""
     for key in sorted_keys:
         lane = lanes[key]
+        lane_key = _lane_key_of(key)
         stops = lane["stops"]
         display_name = lane["driver_username"] or "Unassigned"
         total = len(stops)
@@ -11051,10 +11094,13 @@ def _build_route_board_html(user):
                 "id": lane["driver_id"], "full_name": lane.get("driver_full_name"),
                 "username": lane.get("driver_username"), "avatar_path": lane.get("driver_avatar"),
             }, 28)
+        _drag_grip = ('<span class="lane-drag-handle" title="Press &amp; hold to reorder">&#x2833;&#x2833;</span>'
+                      if user["role"] == "boss" else "")
         lanes_html += f"""
-        <div class="lane">
+        <div class="lane" data-lane-key="{e(lane_key)}">
             <div class="lane-driver">
                 <div class="lane-name-row">
+                    {_drag_grip}
                     <span class="lane-status-dot {dot_cls}"></span>
                     {_lane_avatar}
                     <span class="lane-name">{e(display_name)}</span>
@@ -11076,6 +11122,41 @@ def _build_route_board_html(user):
 @login_required
 def route_board_partial():
     return _build_route_board_html(get_current_user())
+
+
+@app.route("/api/board/reorder-lanes", methods=["POST"])
+@boss_required
+def reorder_board_lanes():
+    """Persist the boss's custom Route Board lane order (drag-to-reorder).
+    Body: {"order": ["<driver_id>"|"unassigned", ...]}. Only valid keys for this
+    company are kept; the order is stored on the company and used by
+    _build_route_board_html to sort the lanes."""
+    data = request.get_json(silent=True) or {}
+    raw = data.get("order")
+    if not isinstance(raw, list):
+        return jsonify({"success": False, "error": "order must be a list"}), 400
+
+    conn = get_db()
+    valid_driver_ids = {
+        str(r["id"]) for r in conn.execute(
+            "SELECT id FROM users WHERE company_id=? AND role='driver'", (cid(),)
+        ).fetchall()
+    }
+    clean, seen = [], set()
+    for k in raw:
+        k = str(k)
+        if k in seen:
+            continue
+        if k == "unassigned" or k in valid_driver_ids:
+            clean.append(k)
+            seen.add(k)
+    conn.execute(
+        "UPDATE companies SET board_lane_order=? WHERE id=?",
+        (json.dumps(clean), cid()),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
 
 
 @app.route("/routes")
@@ -11126,6 +11207,44 @@ def routes_page():
 
     if active_tab == "board":
         board_inner = _build_route_board_html(user)
+        # Boss-only: press-and-hold a route lane and drag to reorder the board.
+        # The order persists per company; the 30s poll re-renders in that order,
+        # and re-initialises the drag after replacing the lanes.
+        lane_sort_assets = ""
+        if user["role"] == "boss":
+            lane_sort_assets = f"""
+        <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
+        {_LANE_SORT_CSS}
+        <script>
+        (function() {{
+            window.__laneSort = null;
+            window.initLaneSort = function() {{
+                var el = document.getElementById('lane-container');
+                if (!el || typeof Sortable === 'undefined') return;
+                if (window.__laneSort) {{ try {{ window.__laneSort.destroy(); }} catch (e) {{}} window.__laneSort = null; }}
+                window.__laneSort = new Sortable(el, {{
+                    animation: 150,
+                    draggable: '.lane',
+                    handle: '.lane-driver',
+                    filter: 'a, button, .lane-actions',
+                    preventOnFilter: false,
+                    delay: 180,            // press-and-hold to start (avoids stray drags)
+                    delayOnTouchOnly: true,
+                    onEnd: function() {{
+                        var keys = Array.from(el.querySelectorAll('.lane')).map(function(x) {{ return x.dataset.laneKey; }});
+                        var meta = document.querySelector('meta[name="csrf-token"]');
+                        fetch('{url_for("reorder_board_lanes")}', {{
+                            method: 'POST',
+                            headers: {{ 'Content-Type': 'application/json', 'X-CSRF-Token': meta ? meta.getAttribute('content') : '' }},
+                            body: JSON.stringify({{ order: keys }})
+                        }}).catch(function() {{}});
+                    }}
+                }});
+            }};
+            document.addEventListener('DOMContentLoaded', window.initLaneSort);
+        }})();
+        </script>
+        """
         poll_script = f"""
         <script>
         (function() {{
@@ -11134,13 +11253,18 @@ def routes_page():
             setInterval(function() {{
                 fetch('{url_for("route_board_partial")}', {{credentials: 'same-origin'}})
                     .then(function(r) {{ return r.ok ? r.text() : null; }})
-                    .then(function(html) {{ if (html !== null) container.innerHTML = html; }})
+                    .then(function(html) {{
+                        if (html !== null) {{
+                            container.innerHTML = html;
+                            if (window.initLaneSort) window.initLaneSort();
+                        }}
+                    }})
                     .catch(function() {{}});
             }}, 30000);
         }})();
         </script>
         """
-        main_panel = f'<div id="lane-container">{board_inner}</div>{poll_script}'
+        main_panel = f'<div id="lane-container">{board_inner}</div>{lane_sort_assets}{poll_script}'
     else:
         conn = get_db()
         params = [cid()]
