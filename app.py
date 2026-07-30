@@ -13916,11 +13916,36 @@ def view_route(route_id):
         "SELECT name FROM dump_locations WHERE active=1 AND company_id=? ORDER BY name",
         (cid(),)
     ).fetchall()
+    # Other routes a boss can move loads onto: same day, not completed, this
+    # company. Ordered so the most relevant (same date) are easy to pick.
+    move_targets = []
+    if session.get("role") == "boss":
+        move_targets = conn.execute(
+            """SELECT r.id, r.route_name, r.route_date, u.username AS driver
+                 FROM routes r LEFT JOIN users u ON r.assigned_to = u.id
+                WHERE r.company_id = ? AND r.id != ? AND r.status != 'completed'
+                ORDER BY (r.route_date = ?) DESC, r.route_date DESC, r.id DESC
+                LIMIT 50""",
+            (cid(), route_id, route["route_date"]),
+        ).fetchall()
     conn.close()
 
     completed_count = sum(1 for s in stops if s["status"] == "completed")
     total_count = len(stops)
-    
+
+    # Options for the per-load "Move to route" picker (boss only).
+    move_options_html = "".join(
+        '<option value="%d">%s</option>' % (
+            t["id"],
+            e(" · ".join(p for p in [
+                t["route_name"] or ("Route %d" % t["id"]),
+                t["driver"] or "Unassigned",
+                t["route_date"] or "",
+            ] if p))
+        )
+        for t in move_targets
+    )
+
     route_action_buttons = ""
 
     if route["status"] == "open":
@@ -14000,6 +14025,41 @@ def view_route(route_id):
             }});
         </script>
         """
+    # Client for the per-load "Move to route" pickers (boss only).
+    move_script = ""
+    if session.get("role") == "boss":
+        move_script = f"""
+        <script>
+        function toggleMove(id) {{
+            var p = document.getElementById('move-panel-' + id);
+            if (p) p.hidden = !p.hidden;
+        }}
+        function moveStop(id) {{
+            var t = document.getElementById('move-target-' + id);
+            var pos = document.getElementById('move-pos-' + id);
+            var err = document.getElementById('move-err-' + id);
+            if (!t || !t.value) return;
+            var csrf = document.querySelector('meta[name="csrf-token"]');
+            fetch('/api/stops/' + id + '/move', {{
+                method: 'POST',
+                headers: {{
+                    'Content-Type': 'application/json',
+                    'X-CSRF-Token': csrf ? csrf.getAttribute('content') : ''
+                }},
+                body: JSON.stringify({{
+                    target_route_id: parseInt(t.value, 10),
+                    position: pos ? pos.value : 'bottom'
+                }})
+            }}).then(function(r) {{ return r.json().then(function(j) {{ return {{ok: r.ok, j: j}}; }}); }})
+              .then(function(res) {{
+                  if (res.ok && res.j.success) {{ window.location.reload(); }}
+                  else if (err) {{ err.textContent = (res.j && res.j.error) || 'Could not move.'; err.hidden = false; }}
+              }})
+              .catch(function() {{ if (err) {{ err.textContent = 'Network error — try again.'; err.hidden = false; }} }});
+        }}
+        </script>
+        """
+
     next_open_stop_id = None
     stop_cards = ""
     for s in stops:
@@ -14009,6 +14069,31 @@ def view_route(route_id):
 
         edit_button = f'<a class="btn secondary" href="{url_for("edit_stop", stop_id=s["id"])}">Edit</a>' if session.get("role") == "boss" else ''
         delete_button = f'<form class="inline" method="POST" action="{url_for("delete_stop", stop_id=s["id"])}" onsubmit="return confirm(\'Delete this stop?\')"><button class="btn red" type="submit">Delete</button></form>' if session.get("role") == "boss" else ''
+
+        # Move a load to another route (boss only; not a completed load; needs a
+        # target). Reveals an inline picker that POSTs to /api/stops/<id>/move.
+        move_button = ""
+        move_panel = ""
+        if session.get("role") == "boss" and s["status"] != "completed" and move_options_html:
+            _sid = s["id"]
+            move_button = (f'<button type="button" class="btn secondary" '
+                           f'onclick="toggleMove({_sid})">&#8646; Move</button>')
+            move_panel = f"""
+            <div id="move-panel-{_sid}" class="move-panel" hidden
+                 style="margin-top:10px;padding:12px;border:1px solid rgba(255,107,26,0.2);border-radius:8px;background:rgba(255,255,255,0.03);">
+                <label style="font-size:12px;display:block;margin-bottom:4px;">Move this load to route</label>
+                <select id="move-target-{_sid}" style="width:100%;margin-bottom:8px;">{move_options_html}</select>
+                <label style="font-size:12px;display:block;margin-bottom:4px;">Place at</label>
+                <select id="move-pos-{_sid}" style="width:100%;margin-bottom:10px;">
+                    <option value="bottom">Bottom (last stop)</option>
+                    <option value="top">Top (first stop)</option>
+                </select>
+                <div class="row" style="gap:8px;">
+                    <button type="button" class="btn gold" onclick="moveStop({_sid})">Move load</button>
+                    <button type="button" class="btn secondary" onclick="toggleMove({_sid})">Cancel</button>
+                </div>
+                <div id="move-err-{_sid}" style="color:#FF7A7A;font-size:12px;margin-top:6px;" hidden></div>
+            </div>"""
 
         # Can-state pill — boss view only, shown when compute_can_flow has run
         _csb = dict(s).get("can_state_before") or ""
@@ -14106,6 +14191,7 @@ def view_route(route_id):
                 </div>
                 <div class="row">
                     {edit_button}
+                    {move_button}
                     {delete_button}
                     {_dump_ticket_btn}
                     <form class="inline" method="POST" action="{url_for('toggle_stop_complete', stop_id=s['id'])}">
@@ -14113,6 +14199,7 @@ def view_route(route_id):
                     </form>
                 </div>
             </div>
+            {move_panel}
             <p><strong>Customer:</strong> {e(s['customer_name'] or '')}</p>
             {_addr_block}
             <p><strong>Action:</strong> {e(s['action'] or '')}{_can_pill}{_swap_badge}</p>
@@ -14302,6 +14389,7 @@ def view_route(route_id):
     {paste_panel_block}
     {add_stop_block}
     {reorder_script}
+    {move_script}
 
     <!-- Optimize loading overlay -->
     <div id="optimize-overlay" style="
@@ -15821,6 +15909,93 @@ def reorder_stops(route_id):
     conn.commit()
     conn.close()
 
+    return jsonify({"success": True})
+
+
+@app.route("/api/stops/<int:stop_id>/move", methods=["POST"])
+@boss_required
+def move_stop(stop_id):
+    """Move a load (stop) to a DIFFERENT route, at the top or bottom of that
+    route. Resequences both the source and target routes, and recomputes each
+    route's can-flow. Company-scoped, boss-only. Completed stops can't be moved
+    (their spot in the day is a matter of record).
+
+    JSON: {"target_route_id": int, "position": "top"|"bottom" (default bottom)}"""
+    data = request.get_json(silent=True) or {}
+    try:
+        target_route_id = int(data.get("target_route_id"))
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "error": "target route required"}), 400
+    position = (data.get("position") or "bottom").strip().lower()
+    if position not in ("top", "bottom"):
+        position = "bottom"
+
+    conn = get_db()
+    # The stop, only if it belongs to a route in this company.
+    stop = conn.execute(
+        """SELECT s.id, s.route_id, s.status
+             FROM stops s JOIN routes r ON s.route_id = r.id
+            WHERE s.id = ? AND r.company_id = ?""",
+        (stop_id, cid()),
+    ).fetchone()
+    if not stop:
+        conn.close()
+        return jsonify({"success": False, "error": "stop not found"}), 404
+    if stop["status"] == "completed":
+        conn.close()
+        return jsonify({"success": False, "error": "a completed load can't be moved"}), 400
+    # Target route must also be in this company.
+    target = conn.execute(
+        "SELECT id FROM routes WHERE id = ? AND company_id = ?", (target_route_id, cid())
+    ).fetchone()
+    if not target:
+        conn.close()
+        return jsonify({"success": False, "error": "target route not found"}), 404
+    source_route_id = stop["route_id"]
+    if target_route_id == source_route_id:
+        conn.close()
+        return jsonify({"success": False, "error": "load is already on that route"}), 400
+
+    # Reassign, then compact/resequence BOTH routes so stop_order stays 1..N with
+    # no gaps. Placement: top => before all current target stops; bottom => after.
+    if position == "top":
+        conn.execute(
+            "UPDATE stops SET stop_order = stop_order + 1 WHERE route_id = ?",
+            (target_route_id,),
+        )
+        new_order = 1
+    else:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(stop_order), 0) AS m FROM stops WHERE route_id = ?",
+            (target_route_id,),
+        ).fetchone()
+        new_order = (row["m"] or 0) + 1
+    conn.execute(
+        "UPDATE stops SET route_id = ?, stop_order = ? WHERE id = ?",
+        (target_route_id, new_order, stop_id),
+    )
+    # Compact the source route (close the gap the stop left behind).
+    for i, srow in enumerate(
+        conn.execute(
+            "SELECT id FROM stops WHERE route_id = ? ORDER BY stop_order, id", (source_route_id,)
+        ).fetchall(),
+        start=1,
+    ):
+        conn.execute("UPDATE stops SET stop_order = ? WHERE id = ?", (i, srow["id"]))
+    # Normalize the target route to 1..N as well.
+    for i, trow in enumerate(
+        conn.execute(
+            "SELECT id FROM stops WHERE route_id = ? ORDER BY stop_order, id", (target_route_id,)
+        ).fetchall(),
+        start=1,
+    ):
+        conn.execute("UPDATE stops SET stop_order = ? WHERE id = ?", (i, trow["id"]))
+    conn.commit()
+    # Can-flow depends on order within each route — recompute both.
+    compute_can_flow(conn, source_route_id)
+    compute_can_flow(conn, target_route_id)
+    conn.commit()
+    conn.close()
     return jsonify({"success": True})
 
 
