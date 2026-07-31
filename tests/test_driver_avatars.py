@@ -14,7 +14,8 @@ def ok(c, m):
 # ---- helper unit -----------------------------------------------------------
 h_photo = app.avatar_html({"id": 5, "full_name": "Tim Brown", "username": "tim",
                            "avatar_path": "static/uploads/avatars/av_5_x.jpg"}, 32)
-ok("<img" in h_photo and "av_5_x.jpg" in h_photo, "avatar_html renders <img> when a photo is set")
+ok("<img" in h_photo and 'src="/avatar/5"' in h_photo,
+   "avatar_html renders a protected avatar URL")
 h_init = app.avatar_html({"id": 5, "full_name": "Tim Brown", "username": "tim", "avatar_path": None}, 32)
 ok("ha-avatar-initials" in h_init and ">TB<" in h_init, "no photo → deterministic initials avatar (TB)")
 ok("<img" not in h_init, "initials fallback is never a broken <img>")
@@ -30,6 +31,10 @@ cur.execute("INSERT INTO users (username,password_hash,role,full_name,company_id
             ("atim","x","driver","Tim Brown",co,app.now_ts())); tim=cur.lastrowid
 cur.execute("INSERT INTO users (username,password_hash,role,full_name,company_id,created_at) VALUES (?,?,?,?,?,?)",
             ("amarcus","x","driver","Marcus Lee",co,app.now_ts())); marc=cur.lastrowid
+cur.execute("INSERT INTO companies (name,slug,subscription_plan,subscription_status,max_drivers,created_at) VALUES (?,?,?,?,?,?)",
+            ("OtherCo","otherco","pro","active",10,app.now_ts())); other_co=cur.lastrowid
+cur.execute("INSERT INTO users (username,password_hash,role,full_name,company_id,created_at) VALUES (?,?,?,?,?,?)",
+            ("outsider","x","driver","Other Driver",other_co,app.now_ts())); outsider=cur.lastrowid
 # truck + inspection by tim
 cur.execute("INSERT INTO trucks (company_id,name,created_at) VALUES (?,?,?)",(co,"Truck 7",app.now_ts())); truck=cur.lastrowid
 cur.execute("INSERT INTO inspections (company_id,truck_id,driver_id,type,overall,signature_name,created_at) VALUES (?,?,?,?,?,?,?)",
@@ -60,6 +65,10 @@ ok(r.status_code==200 and r.get_json().get("success"), "driver uploads own avata
 conn=app.get_db(); ap=conn.execute("SELECT avatar_path FROM users WHERE id=?",(tim,)).fetchone()["avatar_path"]; conn.close()
 ok(ap and "avatars/av_%d_" % tim in ap, "avatar_path stored in DB")
 ok(os.path.isfile(os.path.join(app.AVATAR_FOLDER, os.path.basename(ap))), "avatar file written to disk")
+conn=app.get_db(); conn.execute("UPDATE users SET avatar_path=? WHERE id=?", (ap, outsider)); conn.commit(); conn.close()
+ok(cl.get("/" + ap).status_code == 404, "raw static upload URL is blocked")
+ok(cl.get(f"/avatar/{tim}").status_code == 200, "protected same-company avatar URL works")
+ok(cl.get(f"/avatar/{outsider}").status_code == 404, "avatar endpoint does not cross company boundaries")
 
 # ---- driver cannot set another driver's avatar ----------------------------
 r = cl.post(f"/api/users/{marc}/avatar", data={"_csrf_token":"tok","photo":(io.BytesIO(jpg),"a.jpg")},
@@ -74,7 +83,7 @@ ok(r.status_code==200, "boss uploads a driver's avatar")
 
 # ---- displays render the avatar --------------------------------------------
 board = cl.get("/routes/board-partial").get_data(as_text=True)
-ok(("av_%d_" % tim) in board, "Route Board lane shows the driver's photo")
+ok((f'/avatar/{tim}') in board, "Route Board lane shows the driver's protected photo")
 team = cl.get("/team").get_data(as_text=True)
 ok("ha-avatar" in team and ("Add photo" in team or "Change" in team or "Photo" in team),
    "Team page shows avatars + an upload control")
@@ -83,7 +92,7 @@ ok("ha-avatar" in th, "Team Hours rows show avatars")
 tto = cl.get(f"/team-time-off?day={app.today_str()}").get_data(as_text=True)
 ok("ha-avatar" in tto, "Team Time Off day detail shows avatars")
 msgs = cl.get(f"/route/{rt}/messages").get_json()["messages"]
-ok(msgs and msgs[0]["sender_avatar"] and msgs[0]["sender_initial"]=="TB" and msgs[0]["sender_color"],
+ok(msgs and msgs[0]["sender_avatar"] == f"/avatar/{tim}" and msgs[0]["sender_initial"]=="TB" and msgs[0]["sender_color"],
    "message thread JSON carries sender avatar/initial/color")
 truckp = cl.get(f"/trucks/{truck}").get_data(as_text=True)
 ok("ha-avatar" in truckp, "Truck detail shows the inspecting driver's avatar")

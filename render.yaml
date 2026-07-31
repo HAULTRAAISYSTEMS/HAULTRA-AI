@@ -15,6 +15,12 @@ services:
         value: "0"
       - key: DATABASE_PATH
         value: haultra.db
+      - key: PUBLIC_BASE_URL
+        value: https://haultra-systems.com
+      - key: BOOTSTRAP_ADMIN_USERNAME
+        value: boss
+      - key: BOOTSTRAP_ADMIN_PASSWORD
+        sync: false   # required only when the production database has no boss; remove after first login
       - key: UPLOAD_FOLDER
         value: static/uploads
       - key: ANTHROPIC_API_KEY

@@ -256,6 +256,32 @@ def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
+def _managed_upload_full_path(stored_path):
+    """Resolve a DB upload path inside UPLOAD_FOLDER, or return None.
+
+    Older rows store web-looking paths such as ``static/uploads/file.jpg``.
+    Resolving from the configured upload root keeps those rows working when
+    UPLOAD_FOLDER is absolute, while the common-path check prevents a damaged
+    or malicious DB value from escaping the managed upload directory.
+    """
+    raw = str(stored_path or "").strip().replace("\\", "/")
+    if not raw:
+        return None
+    upload_root = os.path.realpath(app.config["UPLOAD_FOLDER"])
+    if os.path.isabs(raw):
+        candidate = os.path.realpath(raw)
+    else:
+        prefix = "static/uploads/"
+        relative = raw[len(prefix):] if raw.startswith(prefix) else raw
+        candidate = os.path.realpath(os.path.join(upload_root, relative))
+    try:
+        if os.path.commonpath([upload_root, candidate]) != upload_root:
+            return None
+    except ValueError:
+        return None
+    return candidate
+
+
 # ── Driver avatars (feat/driver-avatars) ─────────────────────────────────────
 # Uploaded photos live on disk under UPLOAD_FOLDER/avatars (git-ignored); the DB
 # stores only the web-relative path. No photo → a deterministic initials avatar,
@@ -314,7 +340,10 @@ def avatar_html(user, size=32, title=None):
             f'justify-content:center;vertical-align:middle;')
     if path:
         # Cache-bust with the unique filename; the file is already square/resized.
-        return (f'<img class="ha-avatar" src="/{e(path)}" alt="{_title}" title="{_title}" '
+        avatar_url = f"/avatar/{int(uid)}" if str(uid).isdigit() else ""
+        if not avatar_url:
+            return _avatar_initials_html(uid, name, username, s)
+        return (f'<img class="ha-avatar" src="{e(avatar_url)}" alt="{_title}" title="{_title}" '
                 f'loading="lazy" style="{base}border:1px solid rgba(255,255,255,0.14);"'
                 f' onerror="this.style.display=\'none\';if(this.nextElementSibling)this.nextElementSibling.style.display=\'inline-flex\';">'
                 # Hidden initials sibling so a vanished file still shows something.
@@ -947,6 +976,18 @@ def get_csrf_token():
     return session["_csrf_token"]
 
 
+def public_url(endpoint, **values):
+    """Build an absolute URL from the configured canonical public origin.
+
+    Password-recovery links must never trust an attacker-controlled Host
+    header. PUBLIC_BASE_URL is set in production; local tests and development
+    retain Flask's normal request-host behavior.
+    """
+    base = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    path = url_for(endpoint, **values)
+    return base + path if base else url_for(endpoint, _external=True, **values)
+
+
 MIN_PASSWORD_LENGTH = 12
 
 
@@ -1028,13 +1069,9 @@ def send_email(to_email, subject, html_body):
     api_key = os.environ.get("RESEND_API_KEY")
     from_addr = os.environ.get("RESEND_FROM_EMAIL", "HAULTRA AI <onboarding@resend.dev>")
     if not api_key:
-        # Dev/misconfigured fallback: log what would have been sent (including
-        # the body, so a reset link is still recoverable from the server log
-        # while testing locally) instead of silently dropping it.
-        app.logger.warning(
-            "send_email: RESEND_API_KEY not configured — email not sent (to=%s, subject=%r)\n%s",
-            to_email, subject, html_body
-        )
+        # Never log message bodies: password-reset links and customer details
+        # are secrets/PII even when the mail provider is misconfigured.
+        app.logger.warning("send_email: RESEND_API_KEY not configured — message not sent")
         return False
     try:
         resp = requests.post(
@@ -1044,11 +1081,11 @@ def send_email(to_email, subject, html_body):
             timeout=10,
         )
         if resp.status_code >= 400:
-            app.logger.warning("send_email: Resend API error %s: %s", resp.status_code, resp.text[:300])
+            app.logger.warning("send_email: Resend API returned HTTP %s", resp.status_code)
             return False
         return True
     except Exception as exc:
-        app.logger.warning("send_email: failed to send to %s: %s", to_email, exc)
+        app.logger.warning("send_email: provider request failed: %s", type(exc).__name__)
         return False
 
 
@@ -1057,6 +1094,19 @@ def send_email(to_email, subject, html_body):
 # session cookie, so there is no session for CSRF to protect and it must be
 # exempt (same rationale as the Stripe webhook).
 _CSRF_EXEMPT_ENDPOINTS = {"stripe_webhook", "customer_create_request", "customer_rename_bin"}
+
+
+@app.before_request
+def block_raw_upload_urls():
+    """Never let Flask's public static handler bypass upload authorization.
+
+    Uploaded operational records are served only by company-scoped endpoints
+    below.  They remain stored under ``static/uploads`` for compatibility with
+    existing deployments, but the raw URL namespace is intentionally closed.
+    """
+    if request.path == "/static/uploads" or request.path.startswith("/static/uploads/"):
+        abort(404)
+
 
 @app.before_request
 def _stamp_request_start():
@@ -1110,6 +1160,15 @@ def _security_headers(response):
         "Content-Security-Policy",
         "frame-ancestors 'none'; object-src 'none'; base-uri 'self'",
     )
+    # Operational pages and recovery links can contain customer, route, GPS,
+    # payroll, or token data. Keep them out of the browser's ordinary HTTP
+    # cache; the explicit service worker remains the only controlled offline
+    # store and is cleared on logout/account switching.
+    if session.get("user_id") or request.endpoint in {
+        "login", "forgot_password", "reset_password"
+    }:
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["Pragma"] = "no-cache"
     return response
 
 
@@ -1152,7 +1211,7 @@ def csrf_protect():
                          or request.headers.get("X-CSRF-Token")
         else:
             form_token = request.form.get("_csrf_token")
-        if not token or token != form_token:
+        if not token or not form_token or not secrets.compare_digest(str(token), str(form_token)):
             abort(403)
 
 
@@ -3598,11 +3657,25 @@ def init_db():
 
     existing_boss = cur.execute("SELECT id FROM users WHERE role='boss' LIMIT 1").fetchone()
     if not existing_boss:
-        bootstrap_password = secrets.token_urlsafe(16)
+        bootstrap_username = os.environ.get("BOOTSTRAP_ADMIN_USERNAME", "boss").strip() or "boss"
+        bootstrap_password = os.environ.get("BOOTSTRAP_ADMIN_PASSWORD", "").strip()
+        if not bootstrap_password:
+            if _on_render:
+                conn.close()
+                raise RuntimeError(
+                    "Empty production database: set BOOTSTRAP_ADMIN_PASSWORD to a unique "
+                    "12+ character secret for the first deploy. Remove it after the boss "
+                    "account has been created."
+                )
+            bootstrap_password = secrets.token_urlsafe(16)
+        policy_error = password_policy_error(bootstrap_password)
+        if policy_error:
+            conn.close()
+            raise RuntimeError(f"BOOTSTRAP_ADMIN_PASSWORD is invalid: {policy_error}")
         cur.execute(
             """INSERT INTO users (username, password_hash, role, full_name, phone,
                company_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            ("boss", generate_password_hash(bootstrap_password), "boss", "Boss", "", default_co_id, now_ts())
+            (bootstrap_username, generate_password_hash(bootstrap_password), "boss", "Boss", "", default_co_id, now_ts())
         )
         conn.commit()
         # make the default boss the company owner
@@ -3611,12 +3684,10 @@ def init_db():
         conn.commit()
         print(
             "=== BOOTSTRAP: no boss account existed, created one ===\n"
-            "  username: boss\n"
-            f"  password: {bootstrap_password}\n"
-            "  This is logged ONCE, here, and nowhere else — copy it now.\n"
-            "  There is no in-app 'change password' field: log in, go to\n"
-            "  Settings and add an email to this account, then use\n"
-            "  'Forgot password' to set your own password.",
+            f"  username: {bootstrap_username}\n"
+            "  password: [not logged]\n"
+            "  Store the configured bootstrap password securely and remove the\n"
+            "  BOOTSTRAP_ADMIN_PASSWORD environment variable after first login.",
             flush=True
         )
 
@@ -5677,7 +5748,8 @@ def shell_page(title, body, extra_head=""):
                             {more_items}
                             {superadmin_link}
                             <div class="topnav-more-sep"></div>
-                            <form method="POST" action="{url_for('logout')}" style="margin:0;padding:0;">
+                            <form method="POST" action="{url_for('logout')}" style="margin:0;padding:0;"
+                                  onsubmit="if(window.__haultraClearDeviceData)window.__haultraClearDeviceData();">
                                 <button type="submit" class="nav-item nav-logout">⏻ Logout</button>
                             </form>
                         </div>
@@ -7013,7 +7085,38 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
             </main>
         </div>
 
-                <script>
+        <script>
+        /* Remove account-specific offline data before logout/account switching. */
+        window.__haultraClearDeviceData = function() {{
+            try {{
+                var remove = [];
+                for (var i = 0; i < localStorage.length; i++) {{
+                    var key = localStorage.key(i) || '';
+                    if (key.indexOf('haultra:') === 0 ||
+                        key === 'haultra_offline_queue' || key === 'haultra_msg_queue') {{
+                        remove.push(key);
+                    }}
+                }}
+                remove.forEach(function(key) {{ localStorage.removeItem(key); }});
+                sessionStorage.removeItem('haultra_synced_uids');
+            }} catch (e) {{}}
+            try {{
+                if ('caches' in window) {{
+                    caches.keys().then(function(keys) {{
+                        return Promise.all(keys.filter(function(k) {{ return k.indexOf('haultra-') === 0; }})
+                            .map(function(k) {{ return caches.delete(k); }}));
+                    }});
+                }}
+            }} catch (e) {{}}
+            try {{
+                if (navigator.serviceWorker && navigator.serviceWorker.controller) {{
+                    navigator.serviceWorker.controller.postMessage({{type:'CLEAR_USER_DATA'}});
+                }}
+            }} catch (e) {{}}
+        }};
+        </script>
+
+        <script>
         // Auto-inject CSRF token into every POST form
         (function() {{
             var csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
@@ -7686,9 +7789,14 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 # =========================================================
 # AUTH PAGES
 # =========================================================
-@app.route("/init")
-@boss_required
+@app.route("/init", methods=["POST"])
+@superadmin_required
 def init_route():
+    """Explicit emergency migration hook; startup normally handles this.
+
+    POST + superadmin prevents ordinary company owners and cross-site GET
+    navigations from rerunning schema/data migrations in production.
+    """
     init_db()
     flash("Database re-initialized.", "success")
     return redirect(url_for("dashboard"))
@@ -7819,6 +7927,11 @@ def login():
         </div>
       </div>
     </div>
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {{
+        if (window.__haultraClearDeviceData) window.__haultraClearDeviceData();
+    }});
+    </script>
     """
     return render_template_string(shell_page("Login", body))
 @app.route("/logout", methods=["POST"])
@@ -7871,7 +7984,7 @@ def forgot_password():
                         (u["id"], token_hash, now_ts(), expires_at)
                     )
                     conn.commit()
-                    reset_link = url_for("reset_password", token=raw_token, _external=True)
+                    reset_link = public_url("reset_password", token=raw_token)
                     html_body = (
                         f"<p>Hi {e(u['full_name'] or u['username'])},</p>"
                         f"<p>Someone requested a password reset for your HAULTRA account "
@@ -13758,7 +13871,7 @@ def route_messages(route_id):
             "is_me": r["sender_user_id"] == session["user_id"],
             # Avatar for the sender bubble: photo URL if set, else deterministic
             # initials + color so the fallback is never broken.
-            "sender_avatar": ("/" + r["sender_avatar"]) if (r["sender_avatar"] or "").strip() else None,
+            "sender_avatar": (f"/avatar/{r['sender_user_id']}") if (r["sender_avatar"] or "").strip() else None,
             "sender_initial": _avatar_initials(r["sender_full_name"], r["sender_username"]),
             "sender_color": _avatar_color(r["sender_user_id"]),
         }
@@ -16096,8 +16209,8 @@ def serve_stop_photo(photo_id):
     if session.get("role") != "boss" and photo["assigned_to"] != session["user_id"]:
         abort(403)
 
-    full_path = os.path.join(app.root_path, photo["file_path"])
-    if not os.path.isfile(full_path):
+    full_path = _managed_upload_full_path(photo["file_path"])
+    if not full_path or not os.path.isfile(full_path):
         abort(404)
     return send_file(full_path)
 
@@ -17507,8 +17620,8 @@ def create_checkout_session():
     company_dict      = dict(company) if company else {}
     existing_customer = company_dict.get("stripe_customer_id") or None
 
-    success_url = url_for("subscription_success", _external=True) + "?session_id={CHECKOUT_SESSION_ID}"
-    cancel_url  = url_for("billing", _external=True)
+    success_url = public_url("subscription_success") + "?session_id={CHECKOUT_SESSION_ID}"
+    cancel_url  = public_url("billing")
 
     try:
         checkout_kwargs = dict(
@@ -17710,7 +17823,8 @@ def subscription_blocked():
             <p class="muted">{e(action)}</p>
             {sub_link}
             <p style="margin-top:20px;">
-                <form method="POST" action="{url_for('logout')}" style="display:inline;margin:0;padding:0;">
+                <form method="POST" action="{url_for('logout')}" style="display:inline;margin:0;padding:0;"
+                      onsubmit="if(window.__haultraClearDeviceData)window.__haultraClearDeviceData();">
                     <button type="submit" class="muted small" style="background:none;border:none;cursor:pointer;padding:0;font:inherit;color:inherit;">Log out</button>
                 </form>
                 &nbsp;·&nbsp;
@@ -17902,7 +18016,7 @@ def privacy_policy():
         </ul>
 
         <h2>5. Billing and Subscription Data</h2>
-        <p>When you select a paid subscription plan (Starter, Pro, or Fleet), we record your
+        <p>When you select a paid subscription plan (Starter, Pro, or Enterprise), we record your
         plan type, activation date, and plan change history in our systems. This information is
         used to enforce access controls and maintain an audit trail for your account. Billing
         inquiries and disputes should be directed to
@@ -17980,7 +18094,7 @@ def privacy_policy():
         additional rights including portability and the right to object to processing — contact
         us to exercise these rights. You may also request account deletion at any time via our
         account deletion page at
-        <a href="{url_for('delete_account_request', _external=True)}">{url_for('delete_account_request', _external=True)}</a>.</p>
+        <a href="{public_url('delete_account_request')}">{public_url('delete_account_request')}</a>.</p>
 
         <h2>13. Changes to This Policy</h2>
         <p>We will post updates to this page with a revised effective date. For material changes,
@@ -18137,12 +18251,13 @@ def delete_account_request():
 # =========================================================
 @app.route("/terms")
 def terms_of_service():
-    today = datetime.now().strftime("%B %d, %Y")
+    # Legal effective dates change only when the terms change, not on each request.
+    effective_date = "July 20, 2026"
     year  = datetime.now().year
     body = f"""
     <div class="hero">
         <h1>Terms of Service</h1>
-        <p class="muted small">Effective date: <strong style="color:#F5F5F0;">{today}</strong>
+        <p class="muted small">Effective date: <strong style="color:#F5F5F0;">{effective_date}</strong>
         &nbsp;&middot;&nbsp; HAULTRA AI SYSTEMS &nbsp;&middot;&nbsp; Virginia, USA</p>
     </div>
 
@@ -19820,6 +19935,22 @@ def _avatar_target_user(conn, user_id):
     return None
 
 
+@app.route("/avatar/<int:user_id>")
+@login_required
+def serve_avatar(user_id):
+    """Serve a same-company avatar without exposing the upload directory."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT avatar_path FROM users WHERE id=? AND company_id=? AND is_active=1",
+        (user_id, cid()),
+    ).fetchone()
+    conn.close()
+    full = _managed_upload_full_path(row["avatar_path"] if row else None)
+    if not full or not os.path.isfile(full):
+        abort(404)
+    return send_file(full, conditional=True, max_age=3600)
+
+
 @app.route("/api/users/<int:user_id>/avatar", methods=["POST"])
 @login_required
 def upload_avatar(user_id):
@@ -19871,7 +20002,7 @@ def _delete_avatar_file(db_path):
     if not p or "avatars/" not in p:
         return
     try:
-        full = os.path.join(app.root_path, p)
+        full = _managed_upload_full_path(p)
         if os.path.isfile(full):
             os.remove(full)
     except Exception:
@@ -21169,6 +21300,10 @@ self.addEventListener('activate', e => {
 
 // Cache a specific URL on demand (used by driver dashboard prefetch)
 self.addEventListener('message', e => {
+  if (e.data && e.data.type === 'CLEAR_USER_DATA') {
+    e.waitUntil(caches.delete(CACHE));
+    return;
+  }
   if (e.data && e.data.type === 'CACHE_URL') {
     caches.open(CACHE).then(c =>
       fetch(e.data.url, {credentials: 'include'})
@@ -21952,8 +22087,8 @@ def customer_bin_photo(token, bin_id):
     conn.close()
     if not row or not row["drop_photo_path"]:
         abort(404)
-    full = os.path.join(app.root_path, row["drop_photo_path"])
-    if not os.path.isfile(full):
+    full = _managed_upload_full_path(row["drop_photo_path"])
+    if not full or not os.path.isfile(full):
         abort(404)
     return send_file(full)
 
@@ -24940,8 +25075,8 @@ def serve_inspection_photo(item_id):
         abort(404)
     if not _is_management() and row["driver_id"] != session.get("user_id"):
         abort(403)
-    full_path = os.path.join(app.root_path, row["photo_path"])
-    if not os.path.isfile(full_path):
+    full_path = _managed_upload_full_path(row["photo_path"])
+    if not full_path or not os.path.isfile(full_path):
         abort(404)
     return send_file(full_path)
 
@@ -25930,8 +26065,8 @@ def serve_maintenance_photo(photo_id):
     conn.close()
     if not row:
         abort(404)
-    full = os.path.join(app.root_path, row["file_path"])
-    if not os.path.isfile(full):
+    full = _managed_upload_full_path(row["file_path"])
+    if not full or not os.path.isfile(full):
         abort(404)
     return send_file(full)
 
@@ -26678,10 +26813,14 @@ def debug_db():
 # =========================================================
 @app.route('/dispatch')
 def dispatch_view():
+    if os.environ.get("ENABLE_LEGACY_FIREBASE_UI") != "1":
+        abort(404)
     return send_from_directory('static', 'dispatch.html')
 
 @app.route('/route')
 def route_view():
+    if os.environ.get("ENABLE_LEGACY_FIREBASE_UI") != "1":
+        abort(404)
     return send_from_directory('static', 'route.html')
 
 @app.route('/parser')

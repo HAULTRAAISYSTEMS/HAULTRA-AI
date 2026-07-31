@@ -21,6 +21,7 @@ node_modules/
 *.db-wal
 *.db-shm
 scripts/backups/
+.secrets/
 
 # Driver avatar uploads (media on disk; DB stores the path only)
 static/uploads/avatars/

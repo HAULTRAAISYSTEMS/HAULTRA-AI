@@ -5,6 +5,8 @@ import os
 import re
 import sys
 import tempfile
+import io
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -15,6 +17,7 @@ os.environ["SESSION_COOKIE_SECURE"] = "1"
 _tmp = tempfile.TemporaryDirectory()
 os.environ["DATABASE_PATH"] = os.path.join(_tmp.name, "production.db")
 os.environ["UPLOAD_FOLDER"] = os.path.join(_tmp.name, "uploads")
+os.environ["PUBLIC_BASE_URL"] = "https://haultra-systems.com"
 
 from werkzeug.security import generate_password_hash
 
@@ -61,6 +64,34 @@ check(
 conn.close()
 
 client = haultra.app.test_client()
+with haultra.app.test_request_context("/forgot-password", base_url="https://evil.example"):
+    check(
+        haultra.public_url("reset_password", token="safe-token")
+        == "https://haultra-systems.com/reset-password/safe-token",
+        "absolute security links ignore an untrusted Host header",
+    )
+
+os.environ.pop("RESEND_API_KEY", None)
+log_stream = io.StringIO()
+log_handler = logging.StreamHandler(log_stream)
+haultra.app.logger.addHandler(log_handler)
+try:
+    check(
+        haultra.send_email(
+            "private@example.com",
+            "private subject",
+            "reset token TOP-SECRET-TOKEN",
+        ) is False,
+        "missing email provider fails closed",
+    )
+finally:
+    haultra.app.logger.removeHandler(log_handler)
+email_log = log_stream.getvalue()
+check(
+    "TOP-SECRET-TOKEN" not in email_log and "private@example.com" not in email_log,
+    "email failures never log message bodies, tokens, or recipients",
+)
+
 response = client.get("/privacy", base_url="https://haultra-systems.com")
 check(response.status_code == 200, "privacy page renders")
 check(
@@ -71,6 +102,18 @@ check(response.headers.get("X-Frame-Options") == "DENY", "framing is denied")
 cookie = response.headers.get("Set-Cookie", "")
 check("Secure" in cookie and "HttpOnly" in cookie, "session cookie is secure and HttpOnly")
 check("SameSite=Lax" in cookie, "session cookie has SameSite protection")
+login_page = client.get("/login", base_url="https://haultra-systems.com")
+check(
+    b"__haultraClearDeviceData" in login_page.data,
+    "login clears prior-account offline data before account switching",
+)
+check(
+    login_page.headers.get("Cache-Control") == "private, no-store",
+    "authentication pages are not stored in the browser HTTP cache",
+)
+check(client.get("/init").status_code == 405, "database initialization cannot run through GET")
+check(client.get("/dispatch").status_code == 404, "unused legacy Firebase dispatch UI is closed")
+check(client.get("/route").status_code == 404, "unused legacy Firebase driver UI is closed")
 
 page = client.get("/delete-account", base_url="https://haultra-systems.com")
 csrf_match = re.search(
