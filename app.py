@@ -14201,7 +14201,9 @@ def view_route(route_id):
 
     next_open_stop_id = None
     stop_cards = ""
-    for s in stops:
+    # Stop numbers are DISPLAY POSITION (1..N in current order), never the stored
+    # stop_order — so a deleted/reordered stop always renumbers cleanly.
+    for _pos, s in enumerate(stops, start=1):
         if next_open_stop_id is None and s["status"] != "completed":
          next_open_stop_id = s["stop_order"]
         photo_html = build_photo_gallery_html(photos_by_stop.get(s["id"], []))
@@ -14325,7 +14327,7 @@ def view_route(route_id):
             <div class="row between">
                 <div>
                     {'<span class="stop-handle">☰</span>' if session.get('role') == 'boss' else ''}
-                    <strong>Stop #{s['stop_order']}</strong>
+                    <strong>Stop #{_pos}</strong>
                     <span class="badge {e(s['status'])}">{e(s['status'])}</span>
                 </div>
                 <div class="row">
@@ -15090,8 +15092,17 @@ def delete_stop(stop_id):
     conn.execute("DELETE FROM route_photos WHERE stop_id=?", (stop_id,))
     conn.execute("DELETE FROM dump_tickets WHERE stop_id=?", (stop_id,))
     conn.execute("DELETE FROM stops WHERE id=?", (stop_id,))
+    # Close the gap: compact the remaining stops to a clean 1..N so numbers
+    # never skip (a deleted #2 must not leave #3, #4). Mirrors move_stop.
+    for _i, _srow in enumerate(
+        conn.execute(
+            "SELECT id FROM stops WHERE route_id=? ORDER BY stop_order, id", (route_id,)
+        ).fetchall(),
+        start=1,
+    ):
+        conn.execute("UPDATE stops SET stop_order=? WHERE id=?", (_i, _srow["id"]))
     conn.commit()
-    # Recompute can flow with the stop removed
+    # Recompute can flow with the stop removed (order now compacted)
     compute_can_flow(conn, route_id)
     conn.commit()
     conn.close()
@@ -15449,6 +15460,14 @@ def dump_ticket(stop_id):
         return redirect(url_for("dashboard"))
 
     route_id = stop["rid"]
+    # Display position (1..N) of this stop within its route — matches the
+    # ORDER BY stop_order,id used everywhere, so the ticket header never shows a
+    # gapped stored number.
+    _stop_pos = conn.execute(
+        """SELECT COUNT(*) AS n FROM stops
+            WHERE route_id=? AND (stop_order < ? OR (stop_order = ? AND id <= ?))""",
+        (route_id, stop["stop_order"], stop["stop_order"], stop_id),
+    ).fetchone()["n"]
 
     if request.method == "POST":
         def _sf(k):
@@ -15599,7 +15618,7 @@ def dump_ticket(stop_id):
     body = f"""
     <div class="hero">
         <h1>&#x1F9FE; Dump Ticket</h1>
-        <p>Stop #{e(str(stop["stop_order"]))} &mdash; {e(stop["customer_name"] or "")}
+        <p>Stop #{_stop_pos} &mdash; {e(stop["customer_name"] or "")}
            &nbsp;|&nbsp; {e(stop["address"] or "")} {e(stop["city"] or "")}</p>
         <a class="btn secondary" href="javascript:history.back()" style="margin-top:10px;display:inline-block;">&#8592; Back</a>
     </div>
@@ -15915,11 +15934,11 @@ def route_daily_log(route_id):
     total_count = len(stops)
 
     rows = ""
-    for s in stops:
+    for _pos, s in enumerate(stops, start=1):
         _sd = dict(s)
         rows += f"""
         <tr class="{'row-done' if s['status'] == 'completed' else ''}">
-            <td class="col-num">#{e(str(s['stop_order']))}</td>
+            <td class="col-num">#{_pos}</td>
             <td>{e(s['customer_name'] or '')}</td>
             <td class="col-addr">{e(s['address'] or '')} {e(s['city'] or '')}</td>
             <td class="col-center">{e(s['action'] or '')}</td>
@@ -16555,9 +16574,12 @@ def export_day_csv():
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["Route", "Driver", "Stop", "Customer", "Address", "Action", "Container Size", "Status"])
+    _pos_by_route = {}
     for s in stops:
+        # Stop number = 1..N position within its route (not the stored value).
+        _pos_by_route[s["route_id"]] = _pos_by_route.get(s["route_id"], 0) + 1
         writer.writerow([
-            s["route_name"], s["driver_username"] or "Unassigned", s["stop_order"],
+            s["route_name"], s["driver_username"] or "Unassigned", _pos_by_route[s["route_id"]],
             s["customer_name"], s["address"], s["action"], s["container_size"], s["status"]
         ])
     output.seek(0)
@@ -16584,7 +16606,9 @@ def export_route_csv(route_id):
         conn.close()
         flash("Access denied.", "error")
         return redirect(url_for("dashboard"))
-    stops = conn.execute("SELECT * FROM stops WHERE route_id=?", (route_id,)).fetchall()
+    stops = conn.execute(
+        "SELECT * FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC", (route_id,)
+    ).fetchall()
     conn.close()
 
     output = io.StringIO()
@@ -16592,9 +16616,9 @@ def export_route_csv(route_id):
 
     writer.writerow(["Stop", "Customer", "Address", "Action", "Status"])
 
-    for s in stops:
+    for _pos, s in enumerate(stops, start=1):
         writer.writerow([
-            s["stop_order"],
+            _pos,
             s["customer_name"],
             s["address"],
             s["action"],
@@ -19439,6 +19463,12 @@ def _address_book_section_html():
                         if is_hidden else '')
         hide_label = "Unhide" if is_hidden else "Hide"
         row_style = ' style="opacity:.55;"' if is_hidden else ''
+        # Confirm only when hiding (removing from quick-add), not when unhiding.
+        _hide_confirm = ('Remove this location from quick-add? It stays in history '
+                         'and comes back if you dispatch the address again.')
+        _hide_onsubmit = "" if is_hidden else (
+            ' onsubmit="return confirm(&quot;' + _hide_confirm + '&quot;)"')
+        _hide_btn_label = "Unhide" if is_hidden else "&#10005; Remove"
         rows += (
             f'<tr data-search="{e(search)}"{row_style}>'
             f'<td>{name_cell} {hidden_badge}'
@@ -19456,12 +19486,12 @@ def _address_book_section_html():
             f'border:1px solid rgba(255,157,92,0.4);border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer;">Save</button>'
             f'</form></td>'
             f'<td style="text-align:right;white-space:nowrap;">'
-            f'<form method="POST" action="{url_for("update_address_book", sa_id=_a["id"])}" style="display:inline;">'
+            f'<form method="POST" action="{url_for("update_address_book", sa_id=_a["id"])}" style="display:inline;"{_hide_onsubmit}>'
             f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
             f'<input type="hidden" name="action" value="toggle_hide">'
-            f'<button type="submit" style="background:transparent;color:#8CA0B3;'
-            f'border:1px solid rgba(140,160,179,0.4);border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer;">'
-            f'{hide_label}</button></form>'
+            f'<button type="submit" style="min-height:48px;background:transparent;color:#8CA0B3;'
+            f'border:1px solid rgba(140,160,179,0.4);border-radius:8px;padding:4px 14px;font-size:12px;cursor:pointer;">'
+            f'{_hide_btn_label}</button></form>'
             f'</td></tr>'
         )
     return f"""
@@ -22307,7 +22337,8 @@ def api_locations_top():
     conn = get_db()
     _ensure_address_book(conn, cid())
     rows = conn.execute("""
-        SELECT COALESCE(NULLIF(sa.label, ''), sa.customer_name) AS customer_name,
+        SELECT sa.id AS id,
+               COALESCE(NULLIF(sa.label, ''), sa.customer_name) AS customer_name,
                sa.address, sa.city, sa.state, sa.zip, sa.full_address,
                COALESCE(sad.action, '')         AS default_action,
                COALESCE(sad.container_size, '') AS default_container_size,
@@ -22329,6 +22360,26 @@ def api_locations_top():
     """, (cid(), limit)).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/locations/<int:sa_id>/hide", methods=["POST"])
+@boss_required
+def api_location_hide(sa_id):
+    """Hide one saved location from the quick-add chips + autocomplete (sets the
+    address-book `hidden` flag). Company-scoped. Used by the chip ✕/long-press
+    delete affordance. It's a soft hide — the row and its learned defaults stay,
+    so re-dispatching that address brings it back."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id FROM saved_addresses WHERE id=? AND company_id=?", (sa_id, cid())
+    ).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"success": False, "error": "not found"}), 404
+    conn.execute("UPDATE saved_addresses SET hidden=1 WHERE id=? AND company_id=?", (sa_id, cid()))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
 
 
 # =========================================================
