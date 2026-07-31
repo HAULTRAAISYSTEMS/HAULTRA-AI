@@ -10839,7 +10839,99 @@ _LANE_SORT_CSS = """
   .lane.sortable-ghost{ opacity:.35; }
   .lane.sortable-drag{ box-shadow:0 12px 30px rgba(0,0,0,.45);
     outline:1px solid rgba(255,107,26,.5); }
+  /* Stop drag-to-reorder within a lane (feat/route-drag-reorder) */
+  .stop-mini{ -webkit-user-drag:none; }
+  .stop-mini.locked{ cursor:default; }
+  .stop-mini:not(.locked){ cursor:grab; }
+  .stop-mini-lift{ transform:scale(1.04); box-shadow:0 10px 26px rgba(0,0,0,.5);
+    outline:1px solid rgba(255,107,26,.6); z-index:5; }
+  .stop-mini-ghost{ opacity:.35; outline:2px dashed rgba(255,107,26,.7);
+    outline-offset:-2px; background:rgba(255,107,26,.06); }
+  .stop-mini-drag{ opacity:.9; }
+  .stop-mini-moved{ animation:stopMovedFlash 1.6s ease-out 1; }
+  @keyframes stopMovedFlash{ 0%{ box-shadow:0 0 0 2px rgba(0,229,204,.9); background:rgba(0,229,204,.12); }
+    100%{ box-shadow:0 0 0 2px rgba(0,229,204,0); background:transparent; } }
+  .board-toast{ position:fixed; left:50%; bottom:24px; transform:translateX(-50%);
+    background:#1a1206; color:#F5F5F0; border:1px solid rgba(255,107,26,.5);
+    border-radius:10px; padding:11px 16px; font-size:13px; font-weight:600;
+    max-width:88vw; z-index:3000; box-shadow:0 8px 30px rgba(0,0,0,.5); }
 </style>
+"""
+
+
+# Board stop drag-to-reorder client. Plain string (placeholders swapped for
+# url_for values) so the JS braces don't need f-string escaping.
+_STOP_DRAG_JS = """
+<script>
+(function() {
+  function csrf() { var m = document.querySelector('meta[name="csrf-token"]'); return m ? m.getAttribute('content') : ''; }
+  window.boardToast = function(msg) {
+    var t = document.createElement('div'); t.className = 'board-toast'; t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(function() { t.style.transition = 'opacity .3s'; t.style.opacity = '0';
+      setTimeout(function() { if (t.parentNode) t.parentNode.removeChild(t); }, 300); }, 2600);
+  };
+  window.refreshBoard = function(cb) {
+    var c = document.getElementById('lane-container'); if (!c) return;
+    fetch('__BOARD_PARTIAL_URL__', { credentials: 'same-origin' })
+      .then(function(r) { return r.ok ? r.text() : null; })
+      .then(function(html) { if (html !== null) { c.innerHTML = html;
+        if (window.initLaneSort) window.initLaneSort();
+        if (window.initStopSort) window.initStopSort();
+        if (cb) cb(); } })
+      .catch(function() {});
+  };
+  window.__stopSorts = window.__stopSorts || [];
+  window.initStopSort = function() {
+    if (typeof Sortable === 'undefined') return;
+    window.__stopSorts.forEach(function(s) { try { s.destroy(); } catch (e) {} });
+    window.__stopSorts = [];
+    document.querySelectorAll('.lane-track').forEach(function(track) {
+      var s = new Sortable(track, {
+        animation: 160,
+        draggable: '.stop-mini',
+        filter: '.stop-mini.locked',   // done / in-progress / held can't be lifted
+        preventOnFilter: false,         // ...but a tap on them still opens the stop
+        delay: 500,                     // long-press to lift
+        delayOnTouchOnly: true,         // mouse can drag immediately; touch needs the hold
+        chosenClass: 'stop-mini-lift',
+        ghostClass: 'stop-mini-ghost',
+        dragClass: 'stop-mini-drag',
+        onMove: function(evt) {
+          // never displace a locked stop
+          if (evt.related && evt.related.classList && evt.related.classList.contains('locked')) return false;
+          return true;
+        },
+        onEnd: function(evt) {
+          var moved = evt.item;
+          if (!moved || evt.oldIndex === evt.newIndex) return;
+          var routeId = moved.dataset.routeId;
+          var ids = Array.prototype.slice.call(track.querySelectorAll('.stop-mini'))
+            .filter(function(c) { return c.dataset.routeId === routeId; })
+            .map(function(c) { return parseInt(c.dataset.stopId, 10); });
+          fetch('__REORDER_STOPS_URL__', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf() },
+            body: JSON.stringify({ route_id: parseInt(routeId, 10), stop_ids: ids })
+          }).then(function(r) { return r.json().catch(function() { return {}; }).then(function(j) { return { ok: r.ok, j: j }; }); })
+            .then(function(res) {
+              if (!res.ok || !res.j.success) {
+                window.boardToast((res.j && res.j.error) || 'Could not reorder — reverted');
+                window.refreshBoard();
+              } else {
+                moved.classList.add('stop-mini-moved');
+                setTimeout(function() { moved.classList.remove('stop-mini-moved'); }, 1700);
+              }
+            })
+            .catch(function() { window.boardToast('Network error — reverted'); window.refreshBoard(); });
+        }
+      });
+      window.__stopSorts.push(s);
+    });
+  };
+  document.addEventListener('DOMContentLoaded', window.initStopSort);
+})();
+</script>
 """
 
 
@@ -10859,7 +10951,7 @@ def _build_route_board_html(user):
                u.avatar_path AS driver_avatar,
                s.id AS stop_id, s.stop_order, s.customer_name, s.address, s.city,
                s.action, s.container_size, s.status AS stop_status, s.driver_status,
-               s.completed_at, s.held_at, ii.vendor_status AS vendor_status,
+               s.completed_at, s.held_at, s.empty_can_plan, ii.vendor_status AS vendor_status,
                EXISTS(SELECT 1 FROM route_photos rp WHERE rp.stop_id = s.id) AS has_photo
         FROM routes r
         LEFT JOIN users u ON r.assigned_to = u.id
@@ -11008,6 +11100,10 @@ def _build_route_board_html(user):
             driver_status = s["driver_status"] or "pending"
 
             held = bool(dict(s).get("held_at")) and stop_status != "completed"
+            # A stop is LOCKED (not draggable, holds its position) once it's done,
+            # in progress (current/en-route/at-vendor), or held at a vendor. Only
+            # pending stops can be lifted and reordered.
+            locked = (stop_status == "completed") or held or (driver_status != "pending")
             if stop_status == "completed":
                 pill_label, pill_cls, card_cls = "Done", "done", "st-done"
             elif held:
@@ -11048,9 +11144,11 @@ def _build_route_board_html(user):
 
             link = (url_for("edit_stop", stop_id=s["stop_id"]) if user["role"] == "boss"
                     else url_for("view_route", route_id=s["route_id"]))
-
+            _lock_cls = " locked" if locked else ""
             cards_html += f"""
-            <a class="stop-mini {card_cls}{held_cls}" href="{link}">
+            <a class="stop-mini {card_cls}{held_cls}{_lock_cls}" href="{link}"
+               data-stop-id="{s['stop_id']}" data-route-id="{s['route_id']}"
+               data-locked="{1 if locked else 0}" draggable="false">
                 <div class="stop-mini-top">
                     <span class="stop-mini-badge {group}">{e(letter)}</span>
                     {hold_icon}
@@ -11245,6 +11343,11 @@ def routes_page():
         }})();
         </script>
         """
+            lane_sort_assets += (
+                _STOP_DRAG_JS
+                .replace("__REORDER_STOPS_URL__", url_for("board_reorder_stops"))
+                .replace("__BOARD_PARTIAL_URL__", url_for("route_board_partial"))
+            )
         poll_script = f"""
         <script>
         (function() {{
@@ -11257,6 +11360,7 @@ def routes_page():
                         if (html !== null) {{
                             container.innerHTML = html;
                             if (window.initLaneSort) window.initLaneSort();
+                            if (window.initStopSort) window.initStopSort();
                         }}
                     }})
                     .catch(function() {{}});
@@ -16067,6 +16171,73 @@ def reorder_stops(route_id):
     conn.commit()
     conn.close()
 
+    return jsonify({"success": True})
+
+
+@app.route("/api/board/reorder-stops", methods=["POST"])
+@boss_required
+def board_reorder_stops():
+    """Drag-to-reorder pending stops within a driver's lane on the Route Board.
+    Enforces the board's rules SERVER-SIDE (the client also enforces them for
+    feel, but this is the guard):
+      * the posted ids must be exactly this route's current stop set;
+      * a LOCKED stop (done / in-progress / held) may not change position;
+      * a carry-over recipient (the stop after an `empty_can_plan='carry_next'`
+        stop) may not be moved before the stop that loads its can.
+    On success resequences stop_order to 1..N and recomputes can-flow, so every
+    number display (boss view, driver Cab View, exports) renumbers in step."""
+    data = request.get_json(silent=True) or {}
+    try:
+        route_id = int(data.get("route_id"))
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "error": "route required"}), 400
+    ids = [int(x) for x in data.get("stop_ids", []) if str(x).isdigit()]
+
+    conn = get_db()
+    if not conn.execute("SELECT id FROM routes WHERE id=? AND company_id=?",
+                        (route_id, cid())).fetchone():
+        conn.close()
+        return jsonify({"success": False, "error": "route not found"}), 404
+    cur_rows = conn.execute(
+        """SELECT id, status, driver_status, held_at, empty_can_plan
+             FROM stops WHERE route_id=? ORDER BY stop_order, id""",
+        (route_id,),
+    ).fetchall()
+    cur_ids = [r["id"] for r in cur_rows]
+    if sorted(ids) != sorted(cur_ids):
+        conn.close()
+        return jsonify({"success": False, "error": "stop set changed — refresh"}), 409
+
+    def _is_locked(r):
+        return (r["status"] == "completed"
+                or (r["driver_status"] or "pending") != "pending"
+                or bool(r["held_at"]))
+
+    cur_index = {rid: i for i, rid in enumerate(cur_ids)}
+    new_index = {rid: i for i, rid in enumerate(ids)}
+    # Locked stops must not move.
+    for r in cur_rows:
+        if _is_locked(r) and cur_index[r["id"]] != new_index[r["id"]]:
+            conn.close()
+            return jsonify({"success": False,
+                            "error": "A done or in-progress stop can't be moved."}), 409
+    # Carry-over: recipient can't land before its loader.
+    for i, r in enumerate(cur_rows):
+        if (r["empty_can_plan"] or "") == "carry_next" and i + 1 < len(cur_rows):
+            loader = r["id"]
+            recipient = cur_rows[i + 1]["id"]
+            if new_index[recipient] < new_index[loader]:
+                conn.close()
+                return jsonify({"success": False,
+                                "error": "That stop needs the empty can from the stop before it."}), 409
+
+    for i, sid in enumerate(ids, start=1):
+        conn.execute("UPDATE stops SET stop_order=? WHERE id=? AND route_id=?",
+                     (i, sid, route_id))
+    conn.commit()
+    compute_can_flow(conn, route_id)
+    conn.commit()
+    conn.close()
     return jsonify({"success": True})
 
 
