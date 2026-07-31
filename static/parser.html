@@ -261,21 +261,37 @@
 
   .qa-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
   .qa-chip {
-    display: inline-flex; align-items: center; gap: 8px;
-    min-height: 44px;
-    padding: 6px 12px;
+    display: inline-flex; align-items: stretch; gap: 0;
+    min-height: 48px;
     background: var(--bg-2);
     border: 1px solid rgba(255,255,255,0.12);
-    border-radius: 22px;
+    border-radius: 12px;
     color: var(--text);
-    font-family: var(--font-body); font-size: 0.84rem; font-weight: 600;
-    cursor: pointer;
+    overflow: hidden;
   }
-  .qa-chip:hover, .qa-chip:focus { border-color: var(--teal-border); background: var(--teal-dim); outline: none; }
+  .qa-chip:hover, .qa-chip:focus-within { border-color: var(--teal-border); background: var(--teal-dim); }
+  .qa-chip-tap {
+    display: inline-flex; align-items: center; gap: 9px;
+    min-height: 48px; padding: 6px 4px 6px 14px;
+    background: transparent; border: none; color: inherit; cursor: pointer;
+    font-family: var(--font-body); text-align: left;
+  }
   .qa-chip .qa-chip-badge {
     font-family: var(--font-head); font-size: 0.82rem; letter-spacing: 0.5px;
-    color: var(--teal);
+    color: var(--teal); flex: none;
   }
+  .qa-chip-text { display: flex; flex-direction: column; line-height: 1.15; min-width: 0; }
+  .qa-chip-name { font-size: 0.86rem; font-weight: 700; color: var(--text);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 42vw; }
+  .qa-chip-sub { font-size: 0.72rem; font-weight: 500; color: var(--text-dim, #8C8C82);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 42vw; }
+  .qa-chip-x {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 48px; align-self: stretch; padding: 0 6px;
+    background: transparent; border: none; border-left: 1px solid rgba(255,255,255,0.10);
+    color: var(--text-dim, #8C8C82); font-size: 0.9rem; cursor: pointer;
+  }
+  .qa-chip-x:hover, .qa-chip-x:focus { color: var(--red, #FF5252); background: rgba(255,82,82,0.10); outline: none; }
   .qa-chips-empty { display: none; }
 
   .btn {
@@ -367,6 +383,13 @@
     display: flex; align-items: flex-start; justify-content: space-between; gap: 10px;
     margin-bottom: 10px;
   }
+  .stop-card-remove {
+    margin-left: auto; flex: none;
+    min-width: 44px; min-height: 44px; padding: 0 10px;
+    background: transparent; border: 1px solid rgba(255,82,82,0.35); border-radius: 8px;
+    color: var(--red, #FF5252); font-size: 0.95rem; cursor: pointer; line-height: 1;
+  }
+  .stop-card-remove:hover, .stop-card-remove:focus { background: rgba(255,82,82,0.12); outline: none; }
   .ai-tag {
     display: inline-flex; align-items: center; gap: 5px;
     font-size: 0.68rem; font-weight: 800; letter-spacing: 0.8px;
@@ -719,7 +742,16 @@
       reviewTag.textContent = 'NEEDS REVIEW';
       top.appendChild(reviewTag);
     }
+    // Remove this stop from the draft before dispatch (✕ or long-press the card).
+    var rm = document.createElement('button');
+    rm.type = 'button';
+    rm.className = 'stop-card-remove';
+    rm.setAttribute('aria-label', 'Remove this stop from the draft');
+    rm.textContent = '✕';
+    rm.addEventListener('click', function (ev) { ev.stopPropagation(); removeStop(stop.id); });
+    top.appendChild(rm);
     card.appendChild(top);
+    attachLongPress(card, function () { removeStop(stop.id); });
 
     var body = document.createElement('div');
     body.className = 'stop-card-body';
@@ -891,6 +923,16 @@
     stop.reviewed = true;
     renderAllCards();
     updateCounts();
+  }
+
+  function removeStop(id) {
+    var stop = currentStops.find(function (s) { return s.id === id; });
+    var label = stop ? (stop.customer || stop.address || 'this stop') : 'this stop';
+    if (!window.confirm('Remove ' + label + ' from this route?')) return;
+    currentStops = currentStops.filter(function (s) { return s.id !== id; });
+    renderAllCards();   // list re-renders, positions close ranks
+    updateCounts();
+    showToast('Stop removed');
   }
   window.markReviewed = markReviewed;
 
@@ -1164,24 +1206,100 @@
       .catch(function () { /* silent — autocomplete is best-effort */ });
   }
 
+  // Long-press helper (PWA-friendly; swipe is unreliable with gloves). Fires
+  // `fn` after a ~550ms hold; cancels on move/early-release. Touch + mouse.
+  function attachLongPress(elm, fn) {
+    var timer = null, fired = false;
+    function start() { fired = false; timer = setTimeout(function () { fired = true; fn(); }, 550); }
+    function cancel() { if (timer) { clearTimeout(timer); timer = null; } }
+    elm.addEventListener('touchstart', start, { passive: true });
+    elm.addEventListener('touchend', cancel);
+    elm.addEventListener('touchmove', cancel, { passive: true });
+    elm.addEventListener('mousedown', start);
+    elm.addEventListener('mouseup', cancel);
+    elm.addEventListener('mouseleave', cancel);
+    return function didFire() { return fired; };
+  }
+
+  // Dedupe key so two visually identical chips never render (name + street,
+  // case/space-normalized). The DB dedupes on normalized address only, so a
+  // display-level guard is the backstop.
+  function chipKey(loc) {
+    return ((loc.customer_name || '') + '|' + locFullAddress(loc))
+      .toLowerCase().replace(/\s+/g, ' ').trim();
+  }
+
+  // Hide a saved location from the quick-add chips + autocomplete (soft — sets
+  // the address-book `hidden` flag; re-dispatching that address brings it back).
+  function hideLocation(loc, chipEl) {
+    var label = loc.customer_name || locFullAddress(loc) || 'this location';
+    if (!window.confirm('Remove “' + label + '” from quick-add?')) return;
+    if (!loc.id) { if (chipEl) chipEl.remove(); return; }
+    fetch('/api/locations/' + loc.id + '/hide', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN },
+      body: '{}',
+      credentials: 'same-origin'
+    }).then(function (r) {
+      if (r.ok) { if (chipEl) chipEl.remove(); showToast('Removed from quick-add'); }
+      else { showToast('Could not remove'); }
+    }).catch(function () { showToast('Network error — try again'); });
+  }
+
   function renderChips(list) {
     if (!qaChips) return;
     qaChips.innerHTML = '';
     if (!list || !list.length) return;
+    var seen = {};
     list.forEach(function (loc) {
-      var chip = document.createElement('button');
-      chip.type = 'button';
+      var key = chipKey(loc);
+      if (seen[key]) return;   // never render two identical chips
+      seen[key] = 1;
+
+      var chip = document.createElement('div');
       chip.className = 'qa-chip';
+
+      // Tap area: badge + name (bold) + street subtext (small).
+      var tap = document.createElement('button');
+      tap.type = 'button';
+      tap.className = 'qa-chip-tap';
       var b = document.createElement('span');
       b.className = 'qa-chip-badge';
       b.textContent = codeFromAction(loc.default_action);
-      chip.appendChild(b);
-      chip.appendChild(document.createTextNode(
-        loc.customer_name || locFullAddress(loc) || 'Saved'));
-      chip.addEventListener('click', function () {
+      tap.appendChild(b);
+
+      var txt = document.createElement('span');
+      txt.className = 'qa-chip-text';
+      var nm = document.createElement('span');
+      nm.className = 'qa-chip-name';
+      nm.textContent = loc.customer_name || locFullAddress(loc) || 'Saved';
+      txt.appendChild(nm);
+      var street = loc.customer_name ? locFullAddress(loc) : (loc.city || '');
+      if (street) {
+        var sub = document.createElement('span');
+        sub.className = 'qa-chip-sub';
+        sub.textContent = street;
+        txt.appendChild(sub);
+      }
+      tap.appendChild(txt);
+
+      var didLongPress = attachLongPress(tap, function () { hideLocation(loc, chip); });
+      tap.addEventListener('click', function () {
+        if (didLongPress()) return;   // a long-press just removed/asked — don't also add
         addQuickStop(loc);
         qaInput.focus();
       });
+      chip.appendChild(tap);
+
+      // Explicit ✕ (long-press is the alternative). ≥48px touch target.
+      var x = document.createElement('button');
+      x.type = 'button';
+      x.className = 'qa-chip-x';
+      x.setAttribute('aria-label', 'Remove ' + (loc.customer_name || 'location') + ' from quick-add');
+      x.textContent = '✕';
+      x.addEventListener('click', function (ev) { ev.stopPropagation(); hideLocation(loc, chip); });
+      chip.appendChild(x);
+
       qaChips.appendChild(chip);
     });
   }
