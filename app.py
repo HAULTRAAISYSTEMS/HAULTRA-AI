@@ -10840,7 +10840,10 @@ _LANE_SORT_CSS = """
   .lane.sortable-drag{ box-shadow:0 12px 30px rgba(0,0,0,.45);
     outline:1px solid rgba(255,107,26,.5); }
   /* Stop drag-to-reorder within a lane (feat/route-drag-reorder) */
-  .stop-mini{ -webkit-user-drag:none; }
+  /* iOS: kill the long-press link-preview/callout + text selection so the hold
+     starts a drag instead of the system menu. */
+  .stop-mini{ -webkit-user-drag:none; -webkit-touch-callout:none;
+    -webkit-user-select:none; user-select:none; }
   .stop-mini.locked{ cursor:default; }
   .stop-mini:not(.locked){ cursor:grab; }
   .stop-mini-lift{ transform:scale(1.04); box-shadow:0 10px 26px rgba(0,0,0,.5);
@@ -10892,8 +10895,15 @@ _STOP_DRAG_JS = """
         draggable: '.stop-mini',
         filter: '.stop-mini.locked',   // done / in-progress / held can't be lifted
         preventOnFilter: false,         // ...but a tap on them still opens the stop
-        delay: 500,                     // long-press to lift
+        delay: 450,                     // long-press to lift
         delayOnTouchOnly: true,         // mouse can drag immediately; touch needs the hold
+        // iOS: a real finger jitters during the hold — without a threshold the
+        // default (0) cancels the long-press before it arms. Allow ~14px of
+        // movement during the delay so the press actually registers.
+        touchStartThreshold: 14,
+        forceFallback: true,            // SortableJS's own drag impl (consistent on iOS Safari/PWA)
+        supportPointer: false,          // bind touch/mouse directly — most reliable on iPad Safari
+        fallbackTolerance: 4,
         chosenClass: 'stop-mini-lift',
         ghostClass: 'stop-mini-ghost',
         dragClass: 'stop-mini-drag',
