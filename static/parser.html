@@ -455,6 +455,92 @@
     color: var(--orange);
   }
 
+  /* Manual (Quick-Add) stop cards — deliberately NOT teal (teal = AI only). */
+  .stop-card.manual { border-color: var(--orange-border); }
+  .stop-card.manual.editable { cursor: pointer; }
+  .manual-tag {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 0.68rem; font-weight: 800; letter-spacing: 0.8px;
+    color: var(--orange); text-transform: uppercase;
+  }
+
+  /* ── Confirm / Edit Stop bottom sheet ─────────────────────────── */
+  .sheet-backdrop {
+    position: fixed; inset: 0; z-index: 200;
+    background: rgba(0,0,0,0.55);
+    display: none;
+  }
+  .sheet-backdrop.open { display: block; }
+  .sheet {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 201;
+    background: var(--bg-1);
+    border-top-left-radius: var(--radius); border-top-right-radius: var(--radius);
+    border-top: 1px solid rgba(255,255,255,0.08);
+    box-shadow: 0 -12px 40px rgba(0,0,0,0.5);
+    max-height: 92vh; max-height: 92dvh;
+    display: flex; flex-direction: column;
+    transform: translateY(100%);
+    transition: transform 0.22s ease;
+  }
+  .sheet-backdrop.open .sheet { transform: translateY(0); }
+  .sheet-head {
+    flex: none;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 18px 12px;
+    border-bottom: 1px solid rgba(255,255,255,0.07);
+  }
+  .sheet-title { font-family: var(--font-head); font-size: 1.35rem; letter-spacing: 1px; color: var(--text); }
+  .sheet-close {
+    min-width: 48px; min-height: 48px; flex: none;
+    background: transparent; border: none; color: var(--text-dim);
+    font-size: 1.2rem; cursor: pointer; line-height: 1;
+  }
+  .sheet-close:hover, .sheet-close:focus { color: var(--text); outline: none; }
+  .sheet-body {
+    flex: 1 1 auto;
+    padding: 14px 18px;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .sheet-field { margin-bottom: 15px; }
+  .sheet-label {
+    display: block;
+    font-size: 0.72rem; font-weight: 700; letter-spacing: 0.6px;
+    text-transform: uppercase; color: var(--text-dim); margin-bottom: 7px;
+  }
+  /* 16px minimum font-size on inputs prevents iOS Safari auto-zoom on focus. */
+  .sheet-input {
+    width: 100%;
+    background: var(--bg-0);
+    border: 1px solid rgba(255,255,255,0.15);
+    color: var(--text);
+    border-radius: var(--radius-sm);
+    padding: 12px;
+    font-family: var(--font-body);
+    font-size: 16px;
+    min-height: 48px;
+  }
+  .sheet-input:focus { border-color: var(--teal); outline: none; box-shadow: 0 0 0 3px var(--teal-dim); }
+  .sheet-input.invalid { border-color: var(--red); box-shadow: 0 0 0 3px var(--red-dim); }
+  .sheet-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .sheet-chip {
+    min-height: 48px; min-width: 48px; padding: 0 16px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: var(--bg-0); border: 1px solid rgba(255,255,255,0.15);
+    color: var(--text-dim); border-radius: var(--radius-sm);
+    font-size: 15px; font-weight: 700; cursor: pointer; line-height: 1;
+  }
+  .sheet-chip.active { background: var(--orange-dim); border-color: var(--orange-border); color: var(--orange); }
+  .sheet-chip:focus { outline: none; box-shadow: 0 0 0 3px var(--teal-dim); }
+  .sheet-foot {
+    flex: none;
+    display: flex; gap: 10px;
+    padding: 12px 18px;
+    padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+    border-top: 1px solid rgba(255,255,255,0.07);
+  }
+  .sheet-foot .btn { flex: 1; min-height: 52px; }
+
   .stop-raw {
     margin-top: 12px;
     padding-top: 10px;
@@ -582,24 +668,84 @@
 
 <div id="toast" class="toast"></div>
 
+<!-- Confirm / Edit Stop bottom sheet: a Quick-Add suggestion or chip opens this
+     prefilled instead of committing instantly; nothing is added until Add Stop. -->
+<div id="stop-sheet-backdrop" class="sheet-backdrop" aria-hidden="true">
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+    <div class="sheet-head">
+      <div id="sheet-title" class="sheet-title">Confirm Stop</div>
+      <button type="button" id="sheet-close" class="sheet-close" aria-label="Cancel">&times;</button>
+    </div>
+    <div class="sheet-body">
+      <div class="sheet-field">
+        <span class="sheet-label">Action</span>
+        <div id="sheet-actions" class="sheet-chips" role="group" aria-label="Action"></div>
+      </div>
+      <div class="sheet-field">
+        <label class="sheet-label" for="sheet-customer">Customer</label>
+        <input id="sheet-customer" class="sheet-input" type="text" autocomplete="off"
+               autocapitalize="words" spellcheck="false" placeholder="Customer name">
+      </div>
+      <div class="sheet-field">
+        <label class="sheet-label" for="sheet-address">Address</label>
+        <input id="sheet-address" class="sheet-input" type="text" autocomplete="off"
+               autocapitalize="words" spellcheck="false" placeholder="Street address" required>
+      </div>
+      <div class="sheet-field">
+        <span class="sheet-label">Container size</span>
+        <div id="sheet-sizes" class="sheet-chips" role="group" aria-label="Container size"></div>
+      </div>
+      <div class="sheet-field">
+        <label class="sheet-label" for="sheet-dump">Dump at (site)</label>
+        <input id="sheet-dump" class="sheet-input" type="text" autocomplete="off"
+               list="sheet-dump-list" placeholder="e.g. transfer station (optional)">
+        <datalist id="sheet-dump-list"></datalist>
+      </div>
+      <div class="sheet-field">
+        <label class="sheet-label" for="sheet-return">Return to</label>
+        <input id="sheet-return" class="sheet-input" type="text" autocomplete="off"
+               list="sheet-return-list" placeholder="e.g. yard (optional)">
+        <datalist id="sheet-return-list"></datalist>
+      </div>
+      <div class="sheet-field">
+        <label class="sheet-label" for="sheet-note">Note</label>
+        <input id="sheet-note" class="sheet-input" type="text" autocomplete="off"
+               autocapitalize="sentences" placeholder="Anything the driver should know (optional)">
+      </div>
+    </div>
+    <div class="sheet-foot">
+      <button type="button" id="sheet-cancel" class="btn btn-secondary">Cancel</button>
+      <button type="button" id="sheet-add" class="btn btn-orange-solid">Add Stop</button>
+    </div>
+  </div>
+</div>
+
 <script>
 (function () {
   'use strict';
 
   var ACTION_META = {
-    PR: { full: 'Pull & Return', group: 'pickup' },
-    P:  { full: 'Pickup',        group: 'pickup' },
-    D:  { full: 'Drop',          group: 'dropswap' },
-    S:  { full: 'Swap',          group: 'dropswap' },
-    R:  { full: 'Relocate',      group: 'dropswap' },
+    PR:   { full: 'Pull & Return', group: 'pickup' },
+    P:    { full: 'Pickup',        group: 'pickup' },
+    D:    { full: 'Drop',          group: 'dropswap' },
+    S:    { full: 'Swap',          group: 'dropswap' },
+    R:    { full: 'Relocate',      group: 'dropswap' },
+    YARD: { full: 'Yard',          group: 'dropswap' },
   };
   var ACTION_CODES = Object.keys(ACTION_META);
+  // Order of the action chips in the Confirm-Stop sheet.
+  var SHEET_ACTIONS = ['P', 'D', 'S', 'PR', 'R', 'YARD'];
 
   var currentStops = [];
   var editMode = false;
   var toastTimer = null;
   var CSRF_TOKEN = (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
   var ROUTE_MODE = __ROUTE_MODE_JSON__;
+  // Company data injected by parser_view() for the Confirm-Stop sheet — real
+  // dump sites / yard / container sizes, never hardcoded.
+  var DUMP_SITES      = __DUMP_SITES_JSON__;
+  var RETURN_SITES    = __RETURN_SITES_JSON__;
+  var CONTAINER_SIZES = __CONTAINER_SIZES_JSON__;
 
   function el(id) { return document.getElementById(id); }
 
@@ -625,11 +771,16 @@
     var action = (raw && raw.action ? String(raw.action) : '').trim().toUpperCase();
     if (ACTION_CODES.indexOf(action) === -1) action = action || 'P';
     var confidence = (raw && raw.confidence === 'low') ? 'low' : 'high';
+    // Provenance: 'manual' = hand-entered via the Confirm-Stop sheet (never teal,
+    // dispatch-ready); 'ai' = returned by the model; 'parsed' = legacy default.
+    // Legacy 'quickadd' maps to 'manual'.
+    var rawSrc = raw && raw.source;
+    var source = (rawSrc === 'manual' || rawSrc === 'quickadd') ? 'manual'
+               : (rawSrc === 'ai') ? 'ai' : 'parsed';
+    var isManual = source === 'manual';
     return {
       id: 'stop-' + (stopSeq++),
-      // 'parsed' cards are replaced on every re-parse; 'quickadd' cards (chip /
-      // autocomplete) are preserved in place across re-parses.
-      source: (raw && raw.source === 'quickadd') ? 'quickadd' : 'parsed',
+      source: source,
       action: action,
       address: (raw && raw.address) ? String(raw.address) : '',
       customer: (raw && raw.customer) ? String(raw.customer) : '',
@@ -639,7 +790,9 @@
       raw: (raw && raw.raw) ? String(raw.raw) : '',
       confidence: confidence,
       notes: (raw && raw.notes) ? String(raw.notes) : '',
-      reviewed: false,
+      // Manual stops came from a saved location / explicit entry — trusted, so
+      // they're never flagged for review.
+      reviewed: isManual ? true : false,
       insert_before: 'end',
     };
   }
@@ -652,10 +805,17 @@
     btn.textContent = 'Parsing...';
     dismissError();
 
+    // Hand-entered stops ride along so the server places them FIRST and never
+    // runs them through the model. They stay in currentStops if the request
+    // fails, so a network error never loses them.
+    var manualStops = currentStops
+      .filter(function (s) { return s.source === 'manual'; })
+      .map(serializeManualStop);
+
     fetch('/api/parse', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN },
-      body: JSON.stringify({ text: text }),
+      body: JSON.stringify({ text: text, manual_stops: manualStops }),
     })
       .then(function (r) {
         return r.json().catch(function () { return null; }).then(function (data) {
@@ -667,6 +827,11 @@
           throw new Error((res.data && res.data.error) || 'Parser returned an unexpected response — try again.');
         }
         renderStopCards(res.data.stops);
+        if (res.data.partial_failure) {
+          // The AI leg failed but the server returned the hand-entered stops —
+          // surface the reason without discarding that work.
+          showError(res.data.warning || 'AI parsing is unavailable right now — your Quick-Add stops are kept. Try re-parsing the dispatch text again.');
+        }
       })
       .catch(function (err) {
         showError(err.message || 'Network error — try again.');
@@ -679,32 +844,13 @@
   window.reparse = reparse;
 
   function renderStopCards(stops) {
-    // Re-parse REPLACES only the text-parsed cards. Quick-added cards
-    // (chip / autocomplete) are preserved in place: we drop the old parsed
-    // block and splice the freshly parsed one in at the same position, so
-    // re-parsing the same text twice never duplicates parsed stops and never
-    // deletes quick-added ones.
-    var newParsed = stops.map(function (raw) {
-      var s = normalizeStop(raw);
-      s.source = 'parsed';
-      return s;
-    });
-    var result = [];
-    var spliced = false;
-    currentStops.forEach(function (s) {
-      if (s.source === 'quickadd') {
-        result.push(s);                 // keep quick-added cards in place
-      } else if (!spliced) {
-        newParsed.forEach(function (p) { result.push(p); });  // new parsed block
-        spliced = true;
-      }
-      // old parsed cards are dropped (replaced by the block above)
-    });
-    if (!spliced) {
-      // No prior parsed cards — append the parsed block after existing quick-adds.
-      newParsed.forEach(function (p) { result.push(p); });
-    }
-    currentStops = result;
+    // The server returns the full ordered draft: hand-entered (manual) stops
+    // FIRST, then AI-parsed stops — each already tagged with its source. We
+    // rebuild currentStops from that response verbatim (respecting source), so
+    // manual stops keep their non-teal treatment and the model never rewrites
+    // them. Re-parsing the same text twice can't duplicate or drop stops because
+    // the client's manual stops were sent along and echoed back in place.
+    currentStops = (stops || []).map(function (raw) { return normalizeStop(raw); });
     renderAllCards();
     updateCounts();
   }
@@ -723,19 +869,26 @@
   }
 
   function buildCard(stop) {
+    var isManual = stop.source === 'manual';
     var flagged = stop.confidence === 'low' && !stop.reviewed;
     var card = document.createElement('div');
-    card.className = 'stop-card' + (flagged ? ' flagged' : '');
+    card.className = 'stop-card' + (flagged ? ' flagged' : '') + (isManual ? ' manual editable' : '');
     card.id = stop.id;
 
     var meta = ACTION_META[stop.action] || ACTION_META.P;
 
     var top = document.createElement('div');
     top.className = 'stop-card-top';
-    var aiTag = document.createElement('span');
-    aiTag.className = 'ai-tag';
-    aiTag.textContent = '✦ AI PARSED';
-    top.appendChild(aiTag);
+    // Teal "AI PARSED" tag is AI-only; manual stops get a neutral orange tag.
+    var tag = document.createElement('span');
+    if (isManual) {
+      tag.className = 'manual-tag';
+      tag.textContent = '✎ QUICK ADD';
+    } else {
+      tag.className = 'ai-tag';
+      tag.textContent = '✦ AI PARSED';
+    }
+    top.appendChild(tag);
     if (flagged) {
       var reviewTag = document.createElement('span');
       reviewTag.className = 'review-tag';
@@ -751,7 +904,16 @@
     rm.addEventListener('click', function (ev) { ev.stopPropagation(); removeStop(stop.id); });
     top.appendChild(rm);
     card.appendChild(top);
-    attachLongPress(card, function () { removeStop(stop.id); });
+    var cardDidLongPress = attachLongPress(card, function () { removeStop(stop.id); });
+    if (isManual) {
+      // Tapping an already-added Quick-Add stop reopens the sheet in Edit mode
+      // and saves in place — no duplicate. A long-press still removes it.
+      card.addEventListener('click', function (ev) {
+        if (cardDidLongPress && cardDidLongPress()) return;   // long-press handled it
+        if (ev.target && ev.target.closest && ev.target.closest('.stop-card-remove')) return;
+        openStopSheet(stopToPrefill(stop), stop.id);
+      });
+    }
 
     var body = document.createElement('div');
     body.className = 'stop-card-body';
@@ -765,7 +927,9 @@
     var main = document.createElement('div');
     main.className = 'stop-main';
 
-    if (editMode) {
+    // Manual stops are edited through the sheet (tap the card), never inline —
+    // so they always render as read-only display rows.
+    if (editMode && !isManual) {
       var actionSel = document.createElement('div');
       actionSel.className = 'stop-action';
       var sel = document.createElement('select');
@@ -1082,6 +1246,202 @@
   }
   window.confirmDispatch = confirmDispatch;
 
+  // ── Confirm / Edit Stop bottom sheet ────────────────────────────
+  // A Quick-Add suggestion/chip (or tapping a pending manual card) opens this
+  // sheet prefilled; nothing is committed until "Add Stop"/"Save". Editing the
+  // sheet only mutates a local draft object — it never writes the address book,
+  // so changing a size for today leaves the saved default untouched.
+  var sheetMode   = 'add';    // 'add' | 'edit'
+  var sheetEditId = null;     // stop id when editing an existing pending stop
+  var sheetAction = 'P';
+  var sheetSize   = '';
+
+  function serializeManualStop(s) {
+    return {
+      action: s.action, address: s.address, customer: s.customer,
+      container_size: s.container_size, dump_leg: s.dump_leg,
+      return_leg: s.return_leg, notes: s.notes,
+    };
+  }
+
+  function prefillFromLoc(loc) {
+    // Copy-on-write: values are READ off the saved location into a plain object.
+    return {
+      action: codeFromAction(loc.default_action),
+      customer: loc.customer_name || '',
+      address: locFullAddress(loc),
+      container_size: loc.default_container_size || '',
+      dump_leg: loc.default_dump_location || '',
+      return_leg: '',
+      notes: '',
+    };
+  }
+
+  function stopToPrefill(stop) {
+    return {
+      action: stop.action, customer: stop.customer, address: stop.address,
+      container_size: stop.container_size, dump_leg: stop.dump_leg,
+      return_leg: stop.return_leg, notes: stop.notes,
+    };
+  }
+
+  function fillDatalist(id, values) {
+    var dl = el(id);
+    if (!dl) return;
+    dl.innerHTML = '';
+    (values || []).forEach(function (v) {
+      if (!v) return;
+      var o = document.createElement('option');
+      o.value = v;
+      dl.appendChild(o);
+    });
+  }
+
+  function renderSheetActionChips() {
+    var wrap = el('sheet-actions');
+    if (!wrap) return;
+    wrap.innerHTML = '';
+    SHEET_ACTIONS.forEach(function (code) {
+      var meta = ACTION_META[code] || ACTION_META.P;
+      var chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'sheet-chip' + (code === sheetAction ? ' active' : '');
+      chip.textContent = code;
+      chip.title = meta.full;
+      chip.setAttribute('aria-pressed', code === sheetAction ? 'true' : 'false');
+      chip.addEventListener('click', function () { sheetAction = code; renderSheetActionChips(); });
+      wrap.appendChild(chip);
+    });
+  }
+
+  function renderSheetSizeChips() {
+    var wrap = el('sheet-sizes');
+    if (!wrap) return;
+    wrap.innerHTML = '';
+    CONTAINER_SIZES.forEach(function (sz) {
+      var chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'sheet-chip' + (sz === sheetSize ? ' active' : '');
+      chip.textContent = sz;
+      chip.setAttribute('aria-pressed', sz === sheetSize ? 'true' : 'false');
+      // Tap the active size again to clear it (size is optional).
+      chip.addEventListener('click', function () {
+        sheetSize = (sheetSize === sz) ? '' : sz;
+        renderSheetSizeChips();
+      });
+      wrap.appendChild(chip);
+    });
+  }
+
+  function openStopSheet(prefill, editId) {
+    prefill = prefill || {};
+    sheetMode = editId ? 'edit' : 'add';
+    sheetEditId = editId || null;
+    var pa = (prefill.action || '').toUpperCase();
+    sheetAction = (ACTION_CODES.indexOf(pa) !== -1) ? pa : 'P';
+    sheetSize = (CONTAINER_SIZES.indexOf(prefill.container_size) !== -1) ? prefill.container_size : '';
+    el('sheet-title').textContent = editId ? 'Edit Stop' : 'Confirm Stop';
+    el('sheet-add').textContent = editId ? 'Save' : 'Add Stop';
+    el('sheet-customer').value = prefill.customer || '';
+    var addrEl = el('sheet-address');
+    addrEl.value = prefill.address || '';
+    addrEl.classList.remove('invalid');
+    el('sheet-dump').value = prefill.dump_leg || '';
+    el('sheet-return').value = prefill.return_leg || '';
+    el('sheet-note').value = prefill.notes || '';
+    renderSheetActionChips();
+    renderSheetSizeChips();
+    var bd = el('stop-sheet-backdrop');
+    bd.classList.add('open');
+    bd.setAttribute('aria-hidden', 'false');
+    var body = bd.querySelector('.sheet-body');
+    if (body) body.scrollTop = 0;
+  }
+  window.openStopSheet = openStopSheet;
+
+  function closeStopSheet(refocusQa) {
+    var bd = el('stop-sheet-backdrop');
+    bd.classList.remove('open');
+    bd.setAttribute('aria-hidden', 'true');
+    sheetEditId = null;
+    if (refocusQa && qaInput) qaInput.focus();
+  }
+
+  function commitSheet() {
+    var addrEl = el('sheet-address');
+    var address = addrEl.value.trim();
+    if (!address) {
+      // Blank address blocks the commit and focuses the field.
+      addrEl.classList.add('invalid');
+      addrEl.focus();
+      showToast('Address is required');
+      return;
+    }
+    addrEl.classList.remove('invalid');
+    var fields = {
+      source: 'manual',
+      action: sheetAction,
+      address: address,
+      customer: el('sheet-customer').value.trim(),
+      container_size: sheetSize,
+      dump_leg: el('sheet-dump').value.trim(),
+      return_leg: el('sheet-return').value.trim(),
+      notes: el('sheet-note').value.trim(),
+    };
+
+    if (sheetMode === 'edit' && sheetEditId) {
+      // Save in place — same card, no duplicate.
+      var existing = currentStops.find(function (s) { return s.id === sheetEditId; });
+      if (existing) {
+        existing.action = fields.action;
+        existing.address = fields.address;
+        existing.customer = fields.customer;
+        existing.container_size = fields.container_size;
+        existing.dump_leg = fields.dump_leg;
+        existing.return_leg = fields.return_leg;
+        existing.notes = fields.notes;
+      }
+      closeStopSheet(false);
+      renderAllCards();
+      updateCounts();
+      showToast('Stop updated');
+      return;
+    }
+
+    // Add mode: insert grouped with the other manual stops so manual stays first.
+    var stop = normalizeStop(fields);
+    var insertAt = 0;
+    currentStops.forEach(function (s, i) { if (s.source === 'manual') insertAt = i + 1; });
+    currentStops.splice(insertAt, 0, stop);
+    closeStopSheet(false);
+    renderAllCards();
+    updateCounts();
+    // Keep rapid-fire alive: clear the Quick-Add box and refocus it so the
+    // keyboard stays up for the next entry.
+    if (qaInput) { qaInput.value = ''; hideSuggest(); qaInput.focus(); }
+    showToast('Added ' + (fields.customer || fields.address || 'stop'));
+  }
+
+  (function initStopSheet() {
+    fillDatalist('sheet-dump-list', DUMP_SITES);
+    fillDatalist('sheet-return-list', RETURN_SITES);
+    var addBtn = el('sheet-add');
+    if (addBtn) addBtn.addEventListener('click', commitSheet);
+    var cancelBtn = el('sheet-cancel');
+    if (cancelBtn) cancelBtn.addEventListener('click', function () { closeStopSheet(sheetMode === 'add'); });
+    var closeBtn = el('sheet-close');
+    if (closeBtn) closeBtn.addEventListener('click', function () { closeStopSheet(sheetMode === 'add'); });
+    var bd = el('stop-sheet-backdrop');
+    if (bd) bd.addEventListener('click', function (ev) {
+      if (ev.target === bd) closeStopSheet(sheetMode === 'add');   // backdrop tap = cancel
+    });
+    document.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape' && bd && bd.classList.contains('open')) {
+        closeStopSheet(sheetMode === 'add');
+      }
+    });
+  })();
+
   // ── Quick add + live autocomplete ───────────────────────────────
   // A persistent lane above the raw-text box: type 2+ chars → live saved-
   // location suggestions; tap a suggestion (or a recent/frequent chip) to add
@@ -1115,28 +1475,6 @@
 
   function hideSuggest() { if (qaSuggest) { qaSuggest.hidden = true; qaSuggest.innerHTML = ''; } }
 
-  function addQuickStop(loc) {
-    var code = codeFromAction(loc.default_action);
-    var stop = normalizeStop({
-      source: 'quickadd',   // preserved in place across re-parses
-      action: code,
-      address: locFullAddress(loc),
-      customer: loc.customer_name || '',
-      container_size: loc.default_container_size || '',
-      dump_leg: loc.default_dump_location || '',
-      return_leg: '',
-      confidence: 'high',
-      notes: '',
-    });
-    // Quick-add stops are trusted (came from a saved location) so they're
-    // dispatch-ready immediately — never flagged for review.
-    stop.reviewed = true;
-    currentStops.push(stop);
-    renderAllCards();
-    updateCounts();
-    showToast('Added ' + (loc.customer_name || locFullAddress(loc) || 'stop'));
-  }
-
   function buildQaRow(loc) {
     var meta = ACTION_META[codeFromAction(loc.default_action)] || ACTION_META.P;
     var row = document.createElement('button');
@@ -1168,14 +1506,14 @@
       row.appendChild(size);
     }
 
-    // mousedown (not click) so we act before the input's blur hides the list;
-    // then refocus the input so the mobile keyboard stays up.
+    // mousedown (not click) so we act before the input's blur hides the list.
+    // Instead of committing instantly, open the Confirm-Stop sheet prefilled;
+    // drop the keyboard so the sheet is fully visible (it comes back on commit).
     row.addEventListener('mousedown', function (ev) {
       ev.preventDefault();
-      addQuickStop(loc);
-      qaInput.value = '';
       hideSuggest();
-      qaInput.focus();
+      if (qaInput) qaInput.blur();
+      openStopSheet(prefillFromLoc(loc), null);
     });
     return row;
   }
@@ -1285,9 +1623,8 @@
 
       var didLongPress = attachLongPress(tap, function () { hideLocation(loc, chip); });
       tap.addEventListener('click', function () {
-        if (didLongPress()) return;   // a long-press just removed/asked — don't also add
-        addQuickStop(loc);
-        qaInput.focus();
+        if (didLongPress()) return;   // a long-press just removed/asked — don't also open
+        openStopSheet(prefillFromLoc(loc), null);
       });
       chip.appendChild(tap);
 

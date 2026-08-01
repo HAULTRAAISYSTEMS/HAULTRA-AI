@@ -493,6 +493,34 @@ def _normalize_addr(text):
     return key.strip()
 
 
+def _normalize_name(text):
+    """Collapse a customer/company name to a stable matching token (lowercase,
+    alphanumeric-only, single-spaced). Returns '' for empty input. Used only as
+    part of the address-book dedupe key — never displayed."""
+    if not text:
+        return ""
+    s = re.sub(r"[^a-z0-9]+", " ", str(text).lower())
+    return " ".join(s.split()).strip()
+
+
+# Delimiter that cannot appear in either normalized component, so a name+address
+# key can never collide with a differently-split name/address pair.
+_ADDR_BOOK_KEY_SEP = "\x1f"
+
+
+def _address_book_key(customer_name, address):
+    """Dedupe key for the address book: normalized customer NAME + normalized
+    street ADDRESS. Two rows collapse only when BOTH the name and the street
+    address match, so 'Recovery'/'recovery' at one address merge while two
+    DIFFERENT customers who share a building stay distinct. Deliberately keyed on
+    the street address ALONE (not city/state/zip): those fields are captured
+    inconsistently, so folding them in would leave the same place with a zip and
+    without a zip as un-merged twins — the exact bug this replaces. Kept
+    identical between the startup backfill and learn_location."""
+    return (_normalize_name(customer_name) + _ADDR_BOOK_KEY_SEP
+            + _normalize_addr(address))
+
+
 # Words that signal a dispatch INSTRUCTION has leaked into a customer name
 # (e.g. "Gc Com , Set 30 To The Side While You Do This"). If one appears after
 # the first token, the name is cut there and the rest becomes an overflow note.
@@ -3595,6 +3623,9 @@ def init_db():
     # historical stops the first time the company's parser/quick-add loads.
     safe_add_column(conn, "companies", "address_book_seeded INTEGER NOT NULL DEFAULT 0")
     # Speeds up the normalized dedupe lookup that runs on every learned stop.
+    # (Non-unique here; a UNIQUE index is created AFTER the merge below, once
+    # duplicates have been collapsed — constraining before merging is what caused
+    # the earlier parse_vocab UNIQUE outage.)
     try:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_saved_addr_normkey "
@@ -3603,16 +3634,36 @@ def init_db():
         conn.commit()
     except sqlite3.OperationalError:
         pass
-    # Backfill norm_key for any pre-existing rows so old saves dedupe too.
+    # Drop the normalized UNIQUE index (if a prior boot created it) BEFORE
+    # recomputing keys and merging. Recomputing can transiently produce duplicate
+    # keys for twins that haven't been merged yet; with the unique index still in
+    # place those UPDATEs would fail. It is recreated at the very end, after the
+    # merge has collapsed the duplicates.
     try:
-        _sa_missing = conn.execute(
-            "SELECT id, address, city FROM saved_addresses WHERE norm_key IS NULL OR norm_key=''"
+        conn.execute("DROP INDEX IF EXISTS uq_saved_addr_normkey")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    # (Re)compute norm_key for EVERY row using the current name+address recipe so
+    # legacy rows keyed by an older/inconsistent recipe collapse correctly. Only
+    # rows whose key actually changes are written, so this is a no-op on repeat
+    # boots (idempotent) and never churns the DB once settled.
+    try:
+        _sa_all = conn.execute(
+            "SELECT id, customer_name, address, full_address, norm_key "
+            "FROM saved_addresses"
         ).fetchall()
-        for _r in _sa_missing:
-            _nk = _normalize_addr(", ".join(
-                p for p in [(_r["address"] or ""), (_r["city"] or "")] if p.strip()))
-            conn.execute("UPDATE saved_addresses SET norm_key=? WHERE id=?", (_nk, _r["id"]))
-        if _sa_missing:
+        _sa_changed = False
+        for _r in _sa_all:
+            # Key on the street address alone. Fall back to full_address only when
+            # the street field is blank (legacy rows that stored the whole line in
+            # full_address), so those still get a stable key.
+            _addr = (_r["address"] or "").strip() or (_r["full_address"] or "").strip()
+            _nk = _address_book_key(_r["customer_name"], _addr)
+            if _nk != (_r["norm_key"] or ""):
+                conn.execute("UPDATE saved_addresses SET norm_key=? WHERE id=?", (_nk, _r["id"]))
+                _sa_changed = True
+        if _sa_changed:
             conn.commit()
     except sqlite3.OperationalError:
         pass
@@ -3683,6 +3734,22 @@ def init_db():
         conn.commit()
     except sqlite3.OperationalError:
         pass
+
+    # Now that duplicates are collapsed, enforce it at the schema level so
+    # learn_location's ON CONFLICT upsert has a constraint to target and no new
+    # twins can be inserted. IF NOT EXISTS keeps this safe to run every boot; if
+    # a stray duplicate somehow survived the merge the CREATE raises and we leave
+    # the non-unique index in place rather than crashing startup.
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_saved_addr_normkey "
+            "ON saved_addresses(company_id, norm_key)"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        # Duplicates still present (or index busy) — dispatch stays functional
+        # via learn_location's fallback path; the merge will retry next boot.
+        conn.rollback()
 
     # One-time cleanup: collapse any duplicate OPEN routes for the same
     # driver+date into a single lane (from the api_dispatch duplicate-route bug).
@@ -13628,9 +13695,10 @@ _PASTE_ROUTE_JS = """
 def learn_location(conn, company_id, address, city="", state="", zip_code="",
                    customer_name="", action="", container_size="", dump_location=""):
     """Self-building address book: upsert a dispatched/inserted location keyed on
-    its NORMALIZED address so the same place collapses to one entry no matter how
-    it was typed. Unlike the old behavior, a customer name is NOT required — an
-    address alone is enough to learn it. On a repeat, usage is incremented,
+    its NORMALIZED name+address so the same place collapses to one entry no
+    matter how it was typed, while two different customers sharing a building
+    stay distinct. An address alone is enough to learn it (blank name is fine).
+    On a repeat, usage is incremented,
     recency refreshed, and any newly-learned field (customer, city/state/zip)
     is filled in if it was previously blank. Each (action, container_size,
     dump_location) combination is tracked in saved_address_details for
@@ -13647,48 +13715,72 @@ def learn_location(conn, company_id, address, city="", state="", zip_code="",
         return
     ts   = now_ts()
     full = ", ".join(p for p in [addr, city or "", state or "", zip_code or ""] if p.strip())
-    norm = _normalize_addr(full)
-    if not norm:
+    # Dedupe on the same name+street-address key the startup migration uses, so a
+    # place collapses to one row no matter how it was typed (or whether a zip was
+    # captured) and different customers at one building stay distinct.
+    norm = _address_book_key(cname, addr)
+    if not _normalize_addr(addr):
         return
     try:
-        existing = conn.execute(
-            "SELECT * FROM saved_addresses WHERE company_id=? AND norm_key=? "
-            "ORDER BY times_used DESC, id ASC LIMIT 1",
-            (company_id, norm)
-        ).fetchone()
-        if existing:
-            sa_id = existing["id"]
-            # Fill newly-learned fields only when they were previously blank —
-            # keep the existing value whenever we already have one so a later,
-            # sparser/abbreviated entry never clobbers a richer earlier one.
-            new_cname = (existing["customer_name"] or "").strip() or cname
-            new_city  = (existing["city"]  or "").strip() or (city  or "").strip()
-            new_state = (existing["state"] or "").strip() or (state or "").strip()
-            new_zip   = (existing["zip"]   or "").strip() or (zip_code or "").strip()
-            new_full  = (existing["full_address"] or "").strip() or full
-            conn.execute("""
-                UPDATE saved_addresses SET
-                    customer_name=?, city=?, state=?, zip=?, full_address=?,
-                    times_used=times_used+1, last_used_at=?
-                WHERE id=?
-            """, (new_cname, new_city, new_state, new_zip, new_full, ts, sa_id))
-        else:
+        # Upsert against the unique (company_id, norm_key) index. On a repeat the
+        # DO UPDATE fills only previously-blank fields (COALESCE(NULLIF(...))) so a
+        # later sparser entry never clobbers a richer earlier one, bumps usage,
+        # and refreshes recency. This replaces the old SELECT-then-branch with a
+        # single atomic write and cannot create a twin.
+        try:
             conn.execute("""
                 INSERT INTO saved_addresses
                     (company_id, customer_name, address, city, state, zip, full_address,
                      default_action, default_container_size, default_dump_location,
                      norm_key, hidden, times_used, last_used_at, created_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,0,1,?,?)
+                ON CONFLICT(company_id, norm_key) DO UPDATE SET
+                    customer_name = COALESCE(NULLIF(saved_addresses.customer_name,''), excluded.customer_name),
+                    city          = COALESCE(NULLIF(saved_addresses.city,''),          excluded.city),
+                    state         = COALESCE(NULLIF(saved_addresses.state,''),         excluded.state),
+                    zip           = COALESCE(NULLIF(saved_addresses.zip,''),           excluded.zip),
+                    full_address  = COALESCE(NULLIF(saved_addresses.full_address,''),  excluded.full_address),
+                    times_used    = saved_addresses.times_used + 1,
+                    last_used_at  = excluded.last_used_at
             """, (company_id, cname, addr, city or "", state or "", zip_code or "", full,
                   action or "", container_size or "", dump_location or "", norm, ts, ts))
-            _sarow = conn.execute(
-                "SELECT id FROM saved_addresses WHERE company_id=? AND norm_key=? "
-                "ORDER BY id DESC LIMIT 1",
+        except sqlite3.OperationalError:
+            # Unique index not present yet (e.g. duplicates survived the merge and
+            # the CREATE was skipped) — fall back to the SELECT-then-branch upsert
+            # so learning still works until the next boot rebuilds the index.
+            existing = conn.execute(
+                "SELECT * FROM saved_addresses WHERE company_id=? AND norm_key=? "
+                "ORDER BY times_used DESC, id ASC LIMIT 1",
                 (company_id, norm)
             ).fetchone()
-            if not _sarow:
-                return
-            sa_id = _sarow["id"]
+            if existing:
+                conn.execute("""
+                    UPDATE saved_addresses SET
+                        customer_name = CASE WHEN TRIM(COALESCE(customer_name,''))='' THEN ? ELSE customer_name END,
+                        city  = CASE WHEN TRIM(COALESCE(city,''))=''  THEN ? ELSE city  END,
+                        state = CASE WHEN TRIM(COALESCE(state,''))=''  THEN ? ELSE state END,
+                        zip   = CASE WHEN TRIM(COALESCE(zip,''))=''    THEN ? ELSE zip   END,
+                        full_address = CASE WHEN TRIM(COALESCE(full_address,''))='' THEN ? ELSE full_address END,
+                        times_used=times_used+1, last_used_at=?
+                    WHERE id=?
+                """, (cname, city or "", state or "", zip_code or "", full, ts, existing["id"]))
+            else:
+                conn.execute("""
+                    INSERT INTO saved_addresses
+                        (company_id, customer_name, address, city, state, zip, full_address,
+                         default_action, default_container_size, default_dump_location,
+                         norm_key, hidden, times_used, last_used_at, created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,0,1,?,?)
+                """, (company_id, cname, addr, city or "", state or "", zip_code or "", full,
+                      action or "", container_size or "", dump_location or "", norm, ts, ts))
+        _sarow = conn.execute(
+            "SELECT id FROM saved_addresses WHERE company_id=? AND norm_key=? "
+            "ORDER BY times_used DESC, id ASC LIMIT 1",
+            (company_id, norm)
+        ).fetchone()
+        if not _sarow:
+            return
+        sa_id = _sarow["id"]
 
         # Track this specific combination for frequency-based smart defaults
         act = (action or "").strip()
@@ -17059,6 +17151,51 @@ def _build_parse_system_prompt(conn, company_id):
     return _PARSE_SYSTEM_PROMPT_BASE + _parse_vocab_context(conn, company_id)
 
 
+# Generous per-field cap for hand-entered stop text — long enough for a real
+# address/note, short enough to reject a paste-bomb into a sheet field.
+_MANUAL_STOP_STR_CAP = 300
+
+
+def _normalize_manual_stops(stops_in):
+    """Normalize hand-entered Quick-Add stops that came from the confirm sheet.
+    These are ALREADY structured (action picked from a fixed chip set, size from
+    a fixed list), so they are validated and length-capped here and NEVER routed
+    through the AI. Values are only trimmed and capped — deliberately NOT run
+    through expand_abbrev/_clean_customer_name — so a field stays byte-identical
+    to what the dispatcher typed. Invalid actions/sizes are dropped/blanked
+    rather than trusted. Returns a list in the same shape the client renders
+    AI stops, tagged source='manual' so it never gets the teal AI treatment."""
+    out = []
+    if not isinstance(stops_in, list):
+        return out
+    def _cap(v):
+        return (v or "").strip()[:_MANUAL_STOP_STR_CAP] if isinstance(v, str) else ""
+    for s in stops_in:
+        if not isinstance(s, dict):
+            continue
+        action = (s.get("action") or "").strip().upper()
+        if action not in _PARSER_ACTION_MAP:   # whitelist actions
+            continue
+        address = _cap(s.get("address"))
+        if not address:                          # a stop with no address is unusable
+            continue
+        size = (s.get("container_size") or "").strip()
+        if size not in REQUEST_SIZES:            # whitelist sizes
+            size = ""
+        out.append({
+            "action": action,
+            "address": address,
+            "customer": _cap(s.get("customer")),
+            "container_size": size,
+            "dump_leg": _cap(s.get("dump_leg")),
+            "return_leg": _cap(s.get("return_leg")),
+            "notes": _cap(s.get("notes")),
+            "confidence": "high",
+            "source": "manual",
+        })
+    return out
+
+
 @app.route("/api/parse", methods=["POST"])
 @roles_required("dispatcher", api=True)
 def api_parse_dispatch():
@@ -17066,17 +17203,34 @@ def api_parse_dispatch():
 
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()
-    if not text:
+    # Hand-entered stops from the confirm sheet ride alongside the raw text.
+    manual_stops = _normalize_manual_stops(data.get("manual_stops"))
+
+    if not text and not manual_stops:
         return jsonify({"error": "No dispatch text provided"}), 400
+
+    # Nothing to parse — the operator only sent structured manual stops. Skip the
+    # Anthropic call entirely (it would add nothing and cost a round-trip).
+    if not text:
+        return jsonify({"stops": manual_stops})
+
+    def _ai_unavailable(msg, status):
+        # Never lose hand-entered work to an AI hiccup: if the operator also sent
+        # manual stops, return them with a partial-failure flag (HTTP 200) instead
+        # of an error the client would treat as a total loss.
+        if manual_stops:
+            return jsonify({"stops": manual_stops, "partial_failure": True,
+                            "warning": msg}), 200
+        return jsonify({"error": msg}), status
 
     try:
         import anthropic
     except ImportError:
-        return jsonify({"error": "AI package not installed. Add anthropic to requirements.txt."}), 500
+        return _ai_unavailable("AI package not installed. Add anthropic to requirements.txt.", 500)
 
     api_key = _os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        return jsonify({"error": "ANTHROPIC_API_KEY not configured on server."}), 500
+        return _ai_unavailable("ANTHROPIC_API_KEY not configured on server.", 500)
 
     # Inject this company's vocabulary (dump sites, yard, customers, shorthand)
     # so the model resolves local shorthand and recognizes dump/return legs.
@@ -17098,17 +17252,17 @@ def api_parse_dispatch():
             block.text for block in resp.content if getattr(block, "type", None) == "text"
         ).strip()
     except anthropic.APITimeoutError:
-        return jsonify({"error": "The AI parser took too long to respond — try again."}), 504
+        return _ai_unavailable("The AI parser took too long to respond — try again.", 504)
     except anthropic.APIConnectionError:
-        return jsonify({"error": "Couldn't reach the AI parser — check your connection and try again."}), 502
+        return _ai_unavailable("Couldn't reach the AI parser — check your connection and try again.", 502)
     except anthropic.RateLimitError:
-        return jsonify({"error": "The AI parser is rate-limited right now — wait a moment and try again."}), 429
+        return _ai_unavailable("The AI parser is rate-limited right now — wait a moment and try again.", 429)
     except anthropic.APIStatusError as ex:
         app.logger.warning("api_parse_dispatch: Anthropic API error: %s", ex)
-        return jsonify({"error": "The AI parser is temporarily unavailable — try again shortly."}), 502
+        return _ai_unavailable("The AI parser is temporarily unavailable — try again shortly.", 502)
     except Exception as ex:
         app.logger.warning("api_parse_dispatch: unexpected error: %s", ex)
-        return jsonify({"error": "Something went wrong parsing that text — try again."}), 500
+        return _ai_unavailable("Something went wrong parsing that text — try again.", 500)
 
     cleaned = raw_reply.strip()
     if cleaned.startswith("```"):
@@ -17118,13 +17272,21 @@ def api_parse_dispatch():
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError:
-        return jsonify({"error": "Parser returned invalid format — try re-parsing"}), 502
+        return _ai_unavailable("Parser returned invalid format — try re-parsing", 502)
 
     stops = parsed.get("stops") if isinstance(parsed, dict) else None
     if not isinstance(stops, list):
-        return jsonify({"error": "Parser returned invalid format — try re-parsing"}), 502
+        return _ai_unavailable("Parser returned invalid format — try re-parsing", 502)
 
-    return jsonify({"stops": stops})
+    # Tag provenance so the client renders AI stops with the teal treatment and
+    # manual ones without it. Manual stops always come FIRST, AI stops after.
+    ai_stops = []
+    for s in stops:
+        if isinstance(s, dict):
+            s["source"] = "ai"
+            ai_stops.append(s)
+
+    return jsonify({"stops": manual_stops + ai_stops})
 
 
 # =========================================================
@@ -22237,7 +22399,7 @@ def add_parsed_stops(route_id):
 # labels used everywhere else (is_pull_job, compute_can_flow, Route Board
 # badges), so a dispatched route behaves identically to one created via
 # Create Route / Paste Dispatch Text.
-_PARSER_ACTION_MAP = {"PR": "Pickup and Return", "P": "Pull", "D": "Delivery", "S": "Swap", "R": "Relocate", "LL": "Live Load"}
+_PARSER_ACTION_MAP = {"PR": "Pickup and Return", "P": "Pull", "D": "Delivery", "S": "Swap", "R": "Relocate", "LL": "Live Load", "YARD": "Yard"}
 
 
 def _validate_parser_stops(stops_in):
@@ -28357,6 +28519,35 @@ def parser_view():
                 f'<a href="{url_for("team_page")}">add one in Team</a>.</div>'
             )
 
+    # Dump sites, yard, and container sizes for the Confirm-Stop sheet's chips
+    # and dropdowns — sourced from this company's real data, never hardcoded.
+    _pc = get_db()
+    try:
+        _dump_rows = _pc.execute(
+            "SELECT name FROM dump_locations WHERE active=1 AND company_id=? ORDER BY name",
+            (cid(),)
+        ).fetchall()
+        dump_sites = [ (r["name"] or "").strip() for r in _dump_rows if (r["name"] or "").strip() ]
+        _co = _pc.execute(
+            "SELECT yard_address, yard_city, yard_state, yard_zip FROM companies WHERE id=?",
+            (cid(),)
+        ).fetchone()
+    finally:
+        _pc.close()
+    yard_label = ""
+    if _co:
+        yard_label = ", ".join(p for p in [
+            (_co["yard_address"] or "").strip(), (_co["yard_city"] or "").strip(),
+            (_co["yard_state"] or "").strip(), (_co["yard_zip"] or "").strip()] if p)
+    # Return-to options: the yard first (the usual empty-can destination), then
+    # every dump site (a can can also be returned to a transfer station).
+    return_sites = ([yard_label] if yard_label else []) + dump_sites
+
+    def _js(v):
+        # Safe to embed inside a <script> tag: escape any literal </ so a site
+        # name can't break out of the script element.
+        return json.dumps(v).replace("</", "<\\/")
+
     path = os.path.join(app.root_path, 'static', 'parser.html')
     with open(path, encoding='utf-8') as f:
         html = f.read()
@@ -28364,6 +28555,9 @@ def parser_view():
     html = html.replace('<!--ASSIGN_SLOT-->', assign_html)
     html = html.replace('<!--ROUTE_SEQ_SLOT-->', route_seq_html)
     html = html.replace('__ROUTE_MODE_JSON__', route_mode_js)
+    html = html.replace('__DUMP_SITES_JSON__', _js(dump_sites))
+    html = html.replace('__RETURN_SITES_JSON__', _js(return_sites))
+    html = html.replace('__CONTAINER_SIZES_JSON__', _js(REQUEST_SIZES))
     return html
 
 # =========================================================
