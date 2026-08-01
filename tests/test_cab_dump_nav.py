@@ -53,12 +53,17 @@ with cl.session_transaction() as s:
     s.update(user_id=drv, company_id=co, role="driver", _csrf_token="tok")
 def cab(rid): return cl.get("/driver/route/%d" % rid).get_data(as_text=True)
 
-# 1) FK site with address → Google + Apple Maps links to that address
+# 1) FK site with address → the dump address drives navigation.
+# The Google/Apple maps button PAIR was removed in the Cab View restructure
+# (feat/cab-view-v2 §6): navigation now goes through ONE preference-aware
+# "Tap to Navigate" (openNavStop), whose default href is still the Google URL.
+# The dump address must be wired into that nav.
 h = cab(r_fk)
 enc = urllib.parse.quote_plus("55 Landfill Way Norfolk VA 23502")
 ok(("destination=" + enc) in h, "dump-site address (via FK) wired into Google Maps nav")
-ok(("maps.apple.com/?daddr=" + enc) in h, "dump-site address wired into Apple Maps nav")
-ok("Go To Dump" not in h or "Google Maps" in h, "nav buttons render in going_to_dump state")
+ok("openNavStop" in h and "55 Landfill Way Norfolk VA 23502" in h,
+   "dump-site address wired into the preference-based Navigate")
+ok('id="cab-maps-row"' not in h, "duplicate Google/Apple maps button row removed (§6)")
 
 # 2) No FK but a matching dump_locations row → legacy fallback still navigates
 h = cab(r_dl)

@@ -6499,7 +6499,7 @@ a:hover {{ color: #FF9D5C; }}
    BUTTONS
    ══════════════════════════════════════════════════════════*/
 .btn,
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn) {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-issue-btn):not(.cab-leg-chip) {{
     display: inline-block;
     border: none;
     cursor: pointer;
@@ -6517,7 +6517,7 @@ button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact
 }}
 
 .btn:hover,
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):hover {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-issue-btn):not(.cab-leg-chip):hover {{
     filter: brightness(1.1);
     transform: translateY(-1px);
     text-decoration: none;
@@ -6922,7 +6922,7 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
    CAB VIEW — single-stop mobile-first driver flow
    ══════════════════════════════════════════════════════════*/
 .cab-wrap {{ max-width: 560px; margin: 0 auto; }}
-.cab-header {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }}
+.cab-header {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }}
 .cab-title {{ font-family: var(--font-head); font-size: 26px; letter-spacing: 1px; color: #F5F5F0; }}
 .cab-online-badge {{
     display: inline-flex; align-items: center; gap: 6px;
@@ -6955,7 +6955,7 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 }}
 
 .cab-progress-label {{ font-size: 12px; font-weight: 700; letter-spacing: 1px; color: var(--text-muted); text-transform: uppercase; margin-bottom: 6px; }}
-.cab-progress-track {{ height: 8px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; margin-bottom: 22px; }}
+.cab-progress-track {{ height: 8px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; margin-bottom: 12px; }}
 .cab-progress-fill {{ height: 100%; background: linear-gradient(90deg, #FF8A42, #FF6B1A); border-radius: 4px; transition: width .4s; }}
 
 .route-updated-banner {{
@@ -6984,12 +6984,12 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     border: 1px solid rgba(255,107,26,0.16);
     border-radius: var(--radius-lg);
     padding: 24px 22px;
-    margin-bottom: 18px;
+    margin-bottom: 14px;
 }}
-.cab-action-row {{ display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }}
+.cab-action-row {{ display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }}
 .cab-action-badge {{
-    min-width: 56px; min-height: 56px; display: flex; align-items: center; justify-content: center;
-    font-family: var(--font-head); font-size: 22px; border-radius: 12px; flex-shrink: 0;
+    min-width: 50px; min-height: 50px; display: flex; align-items: center; justify-content: center;
+    font-family: var(--font-head); font-size: 20px; border-radius: 12px; flex-shrink: 0;
 }}
 .cab-action-badge.pickup {{ background: var(--cyan-dim); color: var(--cyan); border: 1px solid rgba(255,107,26,0.5); }}
 .cab-action-badge.dropswap {{ background: rgba(140,160,179,0.16); color: #8CA0B3; border: 1px solid rgba(140,160,179,0.45); }}
@@ -7016,7 +7016,7 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 
 .cab-address {{
     font-family: var(--font-mono); font-size: 26px; font-weight: 700;
-    color: #F5F5F0; line-height: 1.3; word-break: break-word; margin-bottom: 10px;
+    color: #F5F5F0; line-height: 1.25; word-break: break-word; margin-bottom: 6px;
 }}
 .cab-meta-line {{ font-size: 14px; color: var(--text-muted); margin-bottom: 4px; }}
 .cab-legs {{
@@ -7055,9 +7055,9 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 /* Driver-initiated breakdown — always-visible ⚠ Truck Issue button. */
 .cab-issue-btn {{
     display: flex; align-items: center; justify-content: center; gap: 8px;
-    width: 100%; min-height: 52px; margin-bottom: 18px;
-    background: rgba(255,82,82,0.12); border: 1px solid rgba(255,82,82,0.55);
-    color: #FF7A7A; font-weight: 800; font-size: 15px; letter-spacing: .3px;
+    width: 100%; min-height: 48px; margin-top: 12px;
+    background: rgba(255,82,82,0.10); border: 1px solid rgba(255,82,82,0.40);
+    color: #FF7A7A; font-weight: 700; font-size: 14px; letter-spacing: .3px;
     border-radius: 12px; cursor: pointer;
 }}
 .cab-issue-btn:hover {{ background: rgba(255,82,82,0.2); }}
@@ -7352,7 +7352,7 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     .topnav-brand-sub {{ display: none; }}
     .logo-h, .logo-rest {{ font-size: 16px; }}
     .cab-address {{ font-size: 21px; }}
-    .cab-card {{ padding: 18px 16px; }}
+    .cab-card {{ padding: 14px 15px; }}
 }}
 </style>
     </head>
@@ -7983,7 +7983,7 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
       var html = (
         '<div style="font-size:14px;font-weight:700;color:#3DDC84;margin-bottom:10px;">' +
         '&#128203; HAULTRA Debug' +
-        '<button onclick="document.getElementById(\'haul-debug-panel\').style.display=\'none\'" ' +
+        '<button onclick="document.getElementById(\\'haul-debug-panel\\').style.display=\\'none\\'" ' +
         'style="float:right;background:none;border:none;color:#B8B8AE;cursor:pointer;font-size:16px;">&#10005;</button>' +
         '</div>' +
         '<b>Online:</b> ' + navigator.onLine + '<br>' +
@@ -8011,8 +8011,8 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
           );
         }});
         html += (
-          '<button onclick="if(confirm(\'Clear all queued actions?\')){{' +
-          'localStorage.setItem(\'haultra_offline_queue\',\'[]\');' +
+          '<button onclick="if(confirm(\\'Clear all queued actions?\\')){{' +
+          'localStorage.setItem(\\'haultra_offline_queue\\',\\'[]\\');' +
           'window.__haultraSync&&window.__haultraSync();}}" ' +
           'style="margin-top:8px;background:rgba(255,60,60,.15);border:1px solid rgba(255,60,60,.3);' +
           'border-radius:6px;padding:4px 10px;color:#ff9a9a;cursor:pointer;font-size:11px;">' +
@@ -10632,6 +10632,29 @@ def text_to_route():
 # =========================================================
 # ROUTES / STOPS
 # =========================================================
+def _action_badge_code(action):
+    """Map a stop's raw action text to its badge PALETTE code (pr/p/d/s/r/yard/ll)
+    — the class that colors the badge the same way everywhere it renders. Shared
+    by the Cab View, Route Board and parser stop cards so the color→action
+    mapping is learnable and consistent."""
+    a = (action or "").strip().lower()
+    if "pickup and return" in a:
+        return "pr"
+    if "live load" in a:
+        return "ll"
+    if "pull" in a and "return" not in a:
+        return "p"
+    if "swap" in a:
+        return "s"
+    if "yard" in a:
+        return "yard"
+    if "relocate" in a or "move" in a:
+        return "r"
+    if "delivery" in a or "drop" in a:
+        return "d"
+    return "d"
+
+
 def _board_action_badge(action):
     """Map a stop's raw action text to the mockup's P/PR/D/S/R card badge.
 
@@ -11394,7 +11417,7 @@ def _build_route_board_html(user):
                data-stop-id="{s['stop_id']}" data-route-id="{s['route_id']}"
                data-locked="{1 if locked else 0}" draggable="false">
                 <div class="stop-mini-top">
-                    <span class="stop-mini-badge {group}">{e(letter)}</span>
+                    <span class="stop-mini-badge {group} badge-{_action_badge_code(s["action"])}">{e(letter)}</span>
                     {hold_icon}
                     {vendor_pill}
                     {urgent_html}
@@ -12123,6 +12146,7 @@ _CAB_LEG_SWITCH_JS = """
   function paint(key){
     var r = legByKey(key), leg = r.leg;
     cur.key = key; cur.addr = leg.address || '';
+    window.__cabNavAddr = cur.addr;   // long-press alternate-app nav reads this
     for (var i=0;i<chips.length;i++){
       var on = chips[i].getAttribute('data-leg') === key;
       chips[i].classList.toggle('active', on);
@@ -12216,6 +12240,13 @@ def _cab_stop_legs(s, full_address, site_addr_by_id, dump_loc_by_name):
         legs.append({"key": "return", "label": "RETURN", "name": nm, "address": addr})
 
     want = (s.get("active_leg") or "primary") if "active_leg" in s.keys() else "primary"
+    # When the driver is dump-bound and hasn't explicitly switched legs (still the
+    # 'primary' default), navigation follows them to the dump leg — preserving the
+    # pre-restructure behavior where "Go To Dump" pointed Maps at the dump site.
+    # An explicit tap on any leg chip persists active_leg and wins over this.
+    _ds = (s.get("driver_status") or "") if "driver_status" in s.keys() else ""
+    if want == "primary" and _ds == "going_to_dump" and any(l["key"] == "dump" for l in legs):
+        want = "dump"
     active = next((l for l in legs if l["key"] == want), legs[0])
     return legs, active
 
@@ -12510,6 +12541,12 @@ def driver_route_detail(route_id):
     _nav_pref_js = e(json.dumps(_nav_pref))
     _full_addr_js = e(json.dumps(nav_addr))
     _legs_js = e(json.dumps(_legs))
+    # Script-context variants: JSON is already valid JS, but must NOT be
+    # HTML-escaped when embedded directly inside a <script> block (the browser
+    # does not HTML-decode script content, so e()'s &quot; would be a syntax
+    # error). Only guard against a literal </ closing the script element early.
+    _nav_pref_sjs = json.dumps(_nav_pref).replace("</", "<\\/")
+    _full_addr_sjs = json.dumps(nav_addr).replace("</", "<\\/")
 
     action_lower = (s["action"] or "").lower()
     # Vendor-visit stop (inserted by the vendor-dispatch alert) — read-only,
@@ -13004,7 +13041,7 @@ def driver_route_detail(route_id):
     if is_vendor:
         cab_action_badge = '<div class="cab-action-badge vendor">&#128295; VENDOR</div>'
     else:
-        cab_action_badge = f'<div class="cab-action-badge {badge_group}">{e(s["action"] or "STOP")}</div>'
+        cab_action_badge = f'<div class="cab-action-badge badge-{_action_badge_code(s["action"])}">{e(s["action"] or "STOP")}</div>'
     phone_line = f'<div class="cab-meta-line"><strong>Phone:</strong> <a href="tel:{e(_s["phone"])}" style="color:#3DDC84;">{e(_s["phone"])}</a></div>' if _s.get("phone") else ""
 
     # Driver-initiated breakdown: always-visible ⚠ Truck Issue button + modal.
@@ -13024,6 +13061,8 @@ def driver_route_detail(route_id):
             f'<div class="cab-leg-head" id="cab-leg-head">LEG {_active_idx + 1} OF {len(_legs)} '
             f'&middot; {e(_curleg["label"])}</div>'
         )
+        # Label and value are SEPARATE spans; the "·" separator + spacing are
+        # CSS-owned (see .cab-leg-chip-sub::before), never a literal space.
         _chip_btns = ""
         for l in _legs:
             _sub = l["name"] or (l["address"].split(",")[0].strip() if l["address"] else "") or "—"
@@ -13039,43 +13078,87 @@ def driver_route_detail(route_id):
             f'data-stop="{stop_id}" data-csrf="{_csrf}" data-active="{e(_curleg["key"])}" '
             f'data-navpref="{e(_nav_pref)}" data-legs="{e(json.dumps(_legs))}">{_chip_btns}</div>'
         )
-        _maps_row_html = (
-            f'<div class="cab-maps-row" id="cab-maps-row"{"" if nav_has_addr else " style=display:none"}>'
-            f'<a class="cab-maps-btn" id="cab-gmaps" target="_blank" rel="noopener" href="{nav_google_web}">&#128205; Google Maps</a>'
-            f'<a class="cab-maps-btn" id="cab-amaps" target="_blank" rel="noopener" href="{nav_apple_web}">&#63743; Apple Maps</a>'
-            f'</div>'
-        )
         _noaddr_html = (
             f'<div class="cab-noaddr" id="cab-noaddr"{"" if not nav_has_addr else " hidden"}>'
             f'&#9888;&#65039; No address saved for <span id="cab-noaddr-site">{e(_curleg["name"] or "this site")}</span> '
             f'&mdash; add it in Settings &rarr; Dump Sites &amp; Yards.</div>'
         )
-        _nav_cluster_html = (
-            f'<a class="cab-nav-btn{"" if nav_has_addr else " is-disabled"}" id="cab-nav-btn" href="{nav_google_web}" '
-            f'aria-disabled="{"false" if nav_has_addr else "true"}" onclick="return cabNavigate(event)">'
-            f'&#128205; Tap to Navigate</a>'
-            f'{_maps_row_html}'
-            f'<button type="button" class="cab-copy-btn" id="cab-copy-btn" onclick="cabCopy(this)"'
-            f'{"" if nav_has_addr else " disabled"}>&#128203; Copy Address</button>'
-            f'{_noaddr_html}'
-        )
         _leg_switch_js = _CAB_LEG_SWITCH_JS
+        _nav_onclick = "return cabNavigate(event)"
+        _copy_onclick = "cabCopy(this)"
     else:
-        _leg_head_html = _leg_switch_html = _leg_switch_js = ""
-        _nav_cluster_html = (
-            f'<a class="cab-nav-btn" href="{nav_google_web}" '
-            f'onclick="return openNavStop(event, {_nav_pref_js}, {_full_addr_js})">'
-            f'&#128205; Tap to Navigate</a>'
-            f'<button type="button" class="cab-copy-btn" onclick="copyStopAddress(this, {_full_addr_js})">'
-            f'&#128203; Copy Address</button>'
-        )
+        _leg_head_html = _leg_switch_html = _leg_switch_js = _noaddr_html = ""
+        _nav_onclick = f"return openNavStop(event, {_nav_pref_js}, {_full_addr_js})"
+        _copy_onclick = f"copyStopAddress(this, {_full_addr_js})"
+
+    # ══ Two-phase card ══════════════════════════════════════════════════════
+    # Phase 1 (en route): badge, name, leg chips, big address, ONE primary
+    # "Tap to Navigate", Message Boss, Arrived — fits an iPhone SE with no
+    # scroll. Phase 2 (on site, after Arrived): navigation collapses to a thin
+    # strip and the work actions appear, with "Complete Stop" the only orange
+    # element. Keyed off arrived_at, which persists server-side — a force-quit
+    # on site reopens in phase 2, not back at navigation.
+    _arrived = bool((_s.get("arrived_at") or "").strip())
+    _dis = "" if nav_has_addr else " is-disabled"
+    _dis_aria = "false" if nav_has_addr else "true"
+    _copy_dis = "" if nav_has_addr else " disabled"
+    _msg_boss_html = (
+        f'<button type="button" class="cab-neutral" id="msg-boss-btn" onclick="openMessageThread({route_id}, \'Boss\')">'
+        f'&#128172; Message Boss<span id="msg-boss-badge" class="lane-msg-badge" '
+        f'{"hidden" if not unread_messages else ""}>{unread_messages or ""}</span></button>'
+    )
+    _arrive_action = url_for('stop_driver_action', stop_id=stop_id)
+    if _arrived:
+        _phase_body = f"""
+        <div class="cab-navstrip">
+            <span class="cab-navstrip-addr" id="cab-address">{e(_addr_display)}</span>
+            <a class="cab-navstrip-go{_dis}" id="cab-nav-btn" href="{nav_google_web}"
+               aria-disabled="{_dis_aria}" onclick="{_nav_onclick}">&#128205; Navigate</a>
+            <button type="button" class="cab-navstrip-copy" id="cab-copy-btn" onclick="{_copy_onclick}"{_copy_dis}>&#128203;</button>
+        </div>
+        {_noaddr_html}
+        <form method="POST" action="{_arrive_action}" class="inline" style="margin:6px 0 0;">
+            <input type="hidden" name="_csrf_token" value="{_csrf}">
+            <input type="hidden" name="action" value="unarrive">
+            <button type="submit" class="cab-neutral cab-unarrive">&#8592; Not here yet</button>
+        </form>
+        {can_on_board_html}
+        {f'<div class="cab-meta-line">{meta_line}</div>' if meta_line else ''}
+        {ticket_line}
+        {phone_line}
+        {_msg_boss_html}
+        <div class="cab-workzone">
+            {workflow_btn_html}
+            {empty_can_picker_html}
+            {upload_widget}
+            {after_dump_summary_html}
+        </div>
+        <div class="cab-primary-zone">{complete_section}</div>
+        """
+    else:
+        _phase_body = f"""
+        <div class="cab-address" id="cab-address">{e(_addr_display)}</div>
+        {can_on_board_html}
+        {f'<div class="cab-meta-line">{meta_line}</div>' if meta_line else ''}
+        {ticket_line}
+        {phone_line}
+        {_noaddr_html}
+        <a class="cab-primary{_dis}" id="cab-nav-btn" href="{nav_google_web}"
+           aria-disabled="{_dis_aria}" onclick="{_nav_onclick}">&#128205; Tap to Navigate</a>
+        {_msg_boss_html}
+        <form method="POST" action="{_arrive_action}" class="inline" style="margin:0;">
+            <input type="hidden" name="_csrf_token" value="{_csrf}">
+            <input type="hidden" name="action" value="arrived">
+            <button type="submit" class="cab-neutral cab-arrived-btn" id="cab-arrived-btn">&#9989; Arrived at Stop</button>
+        </form>
+        """
 
     body = f"""
 <style>
   /* Running-state sticky bar: keeps progress + END ROUTE pinned so nothing
      important sits below the fold while the driver works a stop. */
   .cab-sticky-bar {{ position: sticky; top: 0; z-index: 50; display:flex; align-items:center;
-      justify-content:space-between; gap:10px; padding:10px 14px; margin-bottom:12px;
+      justify-content:space-between; gap:10px; padding:8px 14px; margin-bottom:8px;
       background: var(--bg-0, #121212); border-bottom:1px solid rgba(255,255,255,0.08); }}
   .cab-sticky-progress {{ font-weight:800; letter-spacing:1px; font-size:.98rem; }}
   .cab-sticky-end {{ min-height:44px; padding:0 16px; border:1px solid var(--red, #FF5252);
@@ -13084,24 +13167,67 @@ def driver_route_detail(route_id):
   .cab-sticky-end:active {{ background: rgba(255,82,82,0.12); }}
 
   /* Active-leg switcher: which leg (customer / dump / return) drives navigation. */
-  .cab-leg-head {{ font-weight:800; letter-spacing:1px; font-size:.8rem; color: var(--text-muted);
-      margin:2px 0 8px; }}
-  .cab-legs-switch {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }}
-  .cab-leg-chip {{ flex:1 1 auto; min-height:48px; min-width:96px; padding:8px 12px; cursor:pointer;
-      display:flex; flex-direction:column; align-items:flex-start; justify-content:center; gap:2px;
-      background: var(--bg-0, #121212); border:1px solid rgba(255,255,255,0.14); border-radius:12px;
-      color: var(--text-muted); text-align:left; }}
+  .cab-leg-head {{ font-weight:800; letter-spacing:1px; font-size:.78rem; color: var(--text-muted);
+      margin:0 0 4px; }}
+  /* Leg chips are CONTEXT, not primary actions: compact ~48px strips, subtle
+     fill. They stay on ONE row (horizontal scroll if they overflow) so the
+     switcher never balloons to two rows and pushes the card below the fold.
+     Label + value are separate spans; the "·" separator and its spacing are
+     CSS-owned (never a literal space) so label and value never run together. */
+  .cab-legs-switch {{ display:flex; gap:8px; flex-wrap:nowrap; margin-bottom:10px;
+      overflow-x:auto; -webkit-overflow-scrolling:touch; scrollbar-width:none; }}
+  .cab-legs-switch::-webkit-scrollbar {{ display:none; }}
+  .cab-leg-chip {{ flex:0 0 auto; min-height:48px; padding:0 12px; cursor:pointer;
+      display:inline-flex; align-items:center;
+      background: var(--bg-0, #121212); border:1px solid var(--cab-neutral-border, #2A2A2A); border-radius:10px;
+      color: var(--text-dim, #A6A69E); }}
   .cab-leg-chip.active {{ background: rgba(255,107,26,0.14); border-color: var(--orange, #FF6B1A); color: var(--text, #F5F5F0); }}
   .cab-leg-chip-lbl {{ font-weight:800; letter-spacing:.6px; font-size:.72rem; text-transform:uppercase; }}
   .cab-leg-chip.active .cab-leg-chip-lbl {{ color: var(--orange, #FF6B1A); }}
-  .cab-leg-chip-sub {{ font-size:.82rem; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }}
-  .cab-maps-row {{ display:flex; gap:8px; margin:10px 0 0; }}
-  .cab-maps-btn {{ flex:1; min-height:48px; display:flex; align-items:center; justify-content:center;
-      text-decoration:none; border-radius:12px; font-weight:700; padding:0 12px;
-      background: rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.14); color: var(--text, #F5F5F0); }}
-  .cab-nav-btn.is-disabled, .cab-copy-btn:disabled {{ opacity:.45; pointer-events:none; }}
+  .cab-leg-chip-sub {{ font-size:.85rem; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:130px; }}
+  .cab-leg-chip-sub::before {{ content:'\\00B7'; margin:0 7px; opacity:.55; font-weight:700; }}
   .cab-noaddr {{ margin-top:10px; padding:10px 12px; border-radius:10px; font-size:.85rem;
       color: var(--text-muted); background: rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.12); }}
+
+  /* ── Two-phase card: exactly ONE orange button visible at a time. ── */
+  .cab-primary {{ display:flex; align-items:center; justify-content:center; width:100%;
+      min-height:64px; margin-top:10px; padding:0 16px; border:none; border-radius:14px;
+      background: var(--orange, #FF6B1A); color:#0A0A0A; font-size:1.15rem; font-weight:800;
+      letter-spacing:.4px; text-decoration:none; box-shadow:none; cursor:pointer; }}
+  .cab-primary.is-disabled {{ opacity:.45; pointer-events:none; }}
+  /* Neutral: dark fill, light text, hairline border, NO orange, NO glow. */
+  .cab-neutral {{ display:flex; align-items:center; justify-content:center; width:100%;
+      min-height:52px; margin-top:8px; padding:0 16px; border:1px solid var(--cab-neutral-border, #2A2A2A);
+      border-radius:12px; background: var(--cab-neutral-bg, #161616); color: var(--text, #F5F5F0);
+      font-size:1rem; font-weight:700; text-decoration:none; box-shadow:none; cursor:pointer; }}
+  .cab-neutral:active {{ background:#1c1c1c; }}
+  .cab-unarrive {{ min-height:44px; font-size:.9rem; color: var(--text-dim, #A6A69E); font-weight:600; }}
+  /* Phase-2 thin nav strip: one line — address + small Navigate + Copy. */
+  .cab-navstrip {{ display:flex; align-items:center; gap:10px; margin-top:10px; padding:10px 12px;
+      background: var(--bg-0, #121212); border:1px solid var(--cab-neutral-border, #2A2A2A); border-radius:12px; }}
+  .cab-navstrip-addr {{ flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+      font-weight:600; color: var(--text, #F5F5F0); font-size:.95rem; }}
+  .cab-navstrip-go, .cab-navstrip-copy {{ flex:none; min-height:44px; display:inline-flex; align-items:center;
+      justify-content:center; padding:0 14px; border-radius:10px; background: var(--cab-neutral-bg, #161616);
+      border:1px solid var(--cab-neutral-border, #2A2A2A); color: var(--text, #F5F5F0); font-weight:700;
+      text-decoration:none; cursor:pointer; }}
+  .cab-navstrip-copy {{ min-width:44px; padding:0 10px; }}
+  .cab-navstrip-go.is-disabled {{ opacity:.45; pointer-events:none; }}
+  .cab-navstrip-copy:disabled {{ opacity:.45; }}
+  /* Phase-2 work actions: every button neutral (dark fill, no orange, no glow).
+     The empty-can disposition pills keep their own segmented-control styling. */
+  .cab-workzone {{ margin-top:14px; }}
+  .cab-workzone .btn, .cab-workzone .btn-driver, .cab-workzone .cab-copy-btn {{
+      background: var(--cab-neutral-bg, #161616) !important; color: var(--text, #F5F5F0) !important;
+      border:1px solid var(--cab-neutral-border, #2A2A2A) !important; box-shadow:none !important; text-shadow:none !important; }}
+  .cab-workzone .btn, .cab-workzone .btn-driver {{ min-height:52px; }}
+  /* The one orange button in phase 2 — Complete Stop. */
+  .cab-primary-zone {{ margin-top:14px; }}
+  .cab-primary-zone .btn, .cab-primary-zone button, .cab-primary-zone form button {{
+      background: var(--orange, #FF6B1A) !important; color:#0A0A0A !important; border:none !important;
+      box-shadow:none !important; min-height:64px !important; font-weight:800 !important; font-size:1.12rem !important; }}
+  .cab-primary-zone button:disabled, .cab-primary-zone .btn:disabled {{ opacity:.5; }}
+  .cab-nav-btn.is-disabled, .cab-copy-btn:disabled {{ opacity:.45; pointer-events:none; }}
 </style>
 <div class="cab-wrap">
     <div class="cab-sticky-bar">
@@ -13128,20 +13254,17 @@ def driver_route_detail(route_id):
         <button type="button" onclick="document.getElementById('route-updated-banner').hidden=true;" aria-label="Dismiss">&times;</button>
     </div>
 
-    <div class="cab-progress-label" id="cab-progress-label">STOP {current_stop_num} OF {total_count}</div>
     <div class="cab-progress-track"><div class="cab-progress-fill" id="cab-progress-fill" style="width:{pct}%;"></div></div>
-
-    <button type="button" id="cab-issue-btn" class="cab-issue-btn" onclick="openTruckIssue()">&#9888; Truck Issue</button>
 
     {f'''
     <form method="POST" action="{url_for('toggle_stop_complete', stop_id=prev_stop['id'])}" style="margin-bottom:14px;"
           onsubmit="return confirm('Reopen the previous stop? Its progress will reset and it will become your current stop again.');">
         <input type="hidden" name="_csrf_token" value="{_csrf}">
-        <button type="submit" class="btn secondary" style="min-height:48px;">&#8592; Previous Stop</button>
+        <button type="submit" class="cab-neutral" style="min-height:48px;margin-top:0;">&#8592; Previous Stop</button>
     </form>
     ''' if prev_stop else ''}
 
-    <div class="cab-card">
+    <div class="cab-card cab-phase-{"2" if _arrived else "1"}">
         <div class="cab-action-row">
             {cab_action_badge}
             <div class="cab-action-name">{e(s['customer_name'] or ('Stop ' + str(current_stop_num)))}</div>
@@ -13149,33 +13272,15 @@ def driver_route_detail(route_id):
 
         {_leg_head_html}
         {_leg_switch_html or legs_html}
-        <div class="cab-address" id="cab-address">{e(_addr_display)}</div>
-        {can_on_board_html}
-        {f'<div class="cab-meta-line">{meta_line}</div>' if meta_line else ''}
-        {ticket_line}
-        {phone_line}
-
-        {_nav_cluster_html}
-        <div id="cab-copy-hint" class="cab-copy-hint" hidden>
-            Using a Garmin or in-dash GPS? Copy the address and enter it on your unit.
-        </div>
-        <button type="button" class="cab-copy-btn" id="msg-boss-btn" onclick="openMessageThread({route_id}, 'Boss')">
-            &#128172; Message Boss<span id="msg-boss-badge" class="lane-msg-badge" {"hidden" if not unread_messages else ""}>{unread_messages or ""}</span>
-        </button>
-
-        <div style="margin-top:20px;">
-            {workflow_btn_html}
-            {empty_can_picker_html}
-            {upload_widget}
-            {complete_section}
-            {after_dump_summary_html}
-        </div>
+        {_phase_body}
     </div>
 
     <div style="display:flex;gap:10px;flex-wrap:wrap;">
         {route_action_buttons}
         <a class="btn secondary" href="{url_for('driver_dashboard')}">&#8592; My Routes</a>
     </div>
+
+    <button type="button" id="cab-issue-btn" class="cab-issue-btn" onclick="openTruckIssue()">&#9888; Truck Issue</button>
 </div>
 {cab_map_panel}
 
@@ -13197,6 +13302,32 @@ def driver_route_detail(route_id):
 <script>{_gps_settings_js()}</script>
 <script>{_gps_capture_js()}</script>
 {_leg_switch_js}
+<script>
+// "Tap to Navigate" uses the driver's preferred maps app (default Google).
+// Long-press offers the OTHER app as a fallback — replaces the old duplicate
+// Google/Apple maps button row.
+(function() {{
+    window.__cabNavAddr = window.__cabNavAddr || {_full_addr_sjs};
+    window.__navPref = ({_nav_pref_sjs} || 'google');
+    window.cabNavAlt = function(ev) {{
+        var alt = (window.__navPref === 'apple') ? 'google' : 'apple';
+        return openNavStop(ev, alt, window.__cabNavAddr || '');
+    }};
+    var b = document.getElementById('cab-nav-btn');
+    if (!b) return;
+    var t = null, fired = false;
+    function start(e) {{ fired = false; t = setTimeout(function() {{ fired = true; window.cabNavAlt(e); }}, 550); }}
+    function cancel() {{ if (t) {{ clearTimeout(t); t = null; }} }}
+    b.addEventListener('touchstart', start, {{ passive: true }});
+    b.addEventListener('touchend', cancel);
+    b.addEventListener('touchmove', cancel, {{ passive: true }});
+    b.addEventListener('mousedown', start);
+    b.addEventListener('mouseup', cancel);
+    b.addEventListener('mouseleave', cancel);
+    // Swallow the click that follows a long-press so it doesn't ALSO open the primary app.
+    b.addEventListener('click', function(e) {{ if (fired) {{ e.preventDefault(); e.stopPropagation(); fired = false; }} }}, true);
+}})();
+</script>
 <script>
 (function() {{
     var badge = document.getElementById('online-badge');
@@ -16266,7 +16397,7 @@ def set_active_leg(stop_id):
 @login_required
 def stop_driver_action(stop_id):
     action = request.form.get("action", "").strip()
-    valid_actions = {"arrived", "box_in", "box_out", "going_to_dump", "need_box_in", "skip_to_box_in"}
+    valid_actions = {"arrived", "box_in", "box_out", "going_to_dump", "need_box_in", "skip_to_box_in", "unarrive"}
     if action not in valid_actions:
         flash("Invalid action.", "error")
         return redirect(url_for("dashboard"))
@@ -16304,14 +16435,16 @@ def stop_driver_action(stop_id):
     # full, so they still need to dump it (see driver_route_detail's
     # is_swap_pr wf_map, which already offers this exact button — this
     # guard just has to allow the transition it triggers).
+    # 'unarrive' is the driver's "Not here yet" undo (mis-tap / wrong-site
+    # arrival): from any in-progress state it resets the stop to phase 1.
     _VALID_TRANSITIONS = {
         None:            {"arrived"},
         "pending":       {"arrived"},
-        "arrived":       {"box_out", "going_to_dump", "need_box_in", "skip_to_box_in"},
-        "box_out":       {"going_to_dump", "need_box_in", "skip_to_box_in"},
-        "going_to_dump": {"need_box_in", "skip_to_box_in"},
-        "need_box_in":   {"box_in", "skip_to_box_in"},
-        "box_in":        {"going_to_dump"},
+        "arrived":       {"box_out", "going_to_dump", "need_box_in", "skip_to_box_in", "unarrive"},
+        "box_out":       {"going_to_dump", "need_box_in", "skip_to_box_in", "unarrive"},
+        "going_to_dump": {"need_box_in", "skip_to_box_in", "unarrive"},
+        "need_box_in":   {"box_in", "skip_to_box_in", "unarrive"},
+        "box_in":        {"going_to_dump", "unarrive"},
     }
     current_status = stop["driver_status"]
     allowed = _VALID_TRANSITIONS.get(current_status, set())
@@ -16324,7 +16457,15 @@ def stop_driver_action(stop_id):
 
     ts = now_ts()
 
-    if action in ("need_box_in", "skip_to_box_in"):
+    if action == "unarrive":
+        # Undo arrival — back to phase 1 (en route). Clear arrival + the
+        # container-workflow timestamps so the stop starts clean.
+        conn.execute(
+            "UPDATE stops SET driver_status='pending', arrived_at=NULL, box_out_at=NULL, "
+            "box_in_at=NULL, go_to_dump_at=NULL WHERE id=? AND driver_status=?",
+            (stop_id, current_status)
+        )
+    elif action in ("need_box_in", "skip_to_box_in"):
         conn.execute(
             "UPDATE stops SET driver_status='need_box_in' WHERE id=? AND driver_status=?",
             (stop_id, current_status)
@@ -29716,7 +29857,7 @@ def parser_view():
                 state_label, state_cls = "Pending", "seq-pending"
             seq_rows_html += (
                 f'<div class="seq-row {state_cls}">'
-                f'<span class="stop-mini-badge {group}">{e(letter)}</span>'
+                f'<span class="stop-mini-badge {group} badge-{_action_badge_code(s["action"])}">{e(letter)}</span>'
                 f'<span class="seq-addr">{e(addr_text)}</span>'
                 f'<span class="seq-state">{state_label}</span>'
                 f'</div>'

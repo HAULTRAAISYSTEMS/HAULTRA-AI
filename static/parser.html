@@ -246,6 +246,13 @@
   }
   .qa-badge.pickup { background: var(--orange-dim); color: var(--orange); border: 1px solid var(--orange-border); }
   .qa-badge.dropswap { background: var(--slate-dim); color: var(--slate); border: 1px solid var(--slate-border); }
+  /* Action-badge palette — solid fill + near-black ink (matches haultra-theme.css). */
+  .badge-pr,.badge-p,.badge-d,.badge-s,.badge-r,.badge-yard,.badge-ll {
+    color:#0A0A0A !important; border:none !important; box-shadow:none !important; text-shadow:none !important; }
+  .badge-pr{background:#FF6B1A !important;} .badge-p{background:#FFC53D !important;}
+  .badge-d{background:#4DA3FF !important;} .badge-s{background:#A78BFA !important;}
+  .badge-r{background:#7C8CA1 !important;} .badge-yard{background:#E5E5E5 !important;}
+  .badge-ll{background:#FFC53D !important;}
   .qa-text { flex: 1; min-width: 0; }
   .qa-label { font-size: 0.98rem; font-weight: 700; line-height: 1.25; word-break: break-word; }
   .qa-sub {
@@ -919,7 +926,7 @@
     body.className = 'stop-card-body';
 
     var badge = document.createElement('div');
-    badge.className = 'action-badge ' + meta.group;
+    badge.className = 'action-badge badge-' + String(stop.action || 'D').toLowerCase();
     badge.title = meta.full;
     badge.textContent = stop.action;
     body.appendChild(badge);
@@ -1483,7 +1490,7 @@
     row.setAttribute('role', 'option');
 
     var badge = document.createElement('span');
-    badge.className = 'qa-badge ' + meta.group;
+    badge.className = 'qa-badge badge-' + String(codeFromAction(loc.default_action) || 'D').toLowerCase();
     badge.textContent = codeFromAction(loc.default_action);
     row.appendChild(badge);
 
