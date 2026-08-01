@@ -12113,6 +12113,27 @@ def driver_route_detail(route_id):
     ).fetchall()
     _dump_loc_by_name = {r["name"].lower(): dict(r) for r in _dump_loc_rows}
 
+    # Promoted dump/yard site records (feat/dump-site-locations) keyed by id, so a
+    # stop's dump_site_id resolves to the boss-maintained address for navigation.
+    # This is the primary nav source; the legacy dump_locations map above is the
+    # fallback for stops whose FK is null or whose site has no address yet.
+    _site_addr_by_id = {}
+    _site_ids = [s["dump_site_id"] for s in stops
+                 if "dump_site_id" in s.keys() and s["dump_site_id"]]
+    if _site_ids:
+        _ph = ",".join("?" * len(_site_ids))
+        for _sr in conn.execute(
+            "SELECT id, customer_name, label, address, city, state, zip, full_address "
+            "FROM saved_addresses WHERE id IN (%s)" % _ph, _site_ids
+        ).fetchall():
+            _addr = (" ".join(p for p in [(_sr["address"] or ""), (_sr["city"] or ""),
+                     (_sr["state"] or ""), (_sr["zip"] or "")] if p and str(p).strip()).strip()
+                     or (_sr["full_address"] or "").strip())
+            _site_addr_by_id[_sr["id"]] = {
+                "name": (_sr["label"] or _sr["customer_name"] or "").strip(),
+                "address": _addr,
+            }
+
     photo_proof_mode = (conn.execute(
         "SELECT photo_proof_mode FROM companies WHERE id=?", (session["company_id"],)
     ).fetchone() or {"photo_proof_mode": "encouraged"})["photo_proof_mode"] or "encouraged"
@@ -12395,11 +12416,21 @@ def driver_route_detail(route_id):
             f'style="display:block;text-align:center;text-decoration:none;padding:14px 16px;'
             f'border-radius:12px;font-weight:700;margin-bottom:10px;min-height:52px;">{dump_label}</a>'
         )
-        dl_rec = _dump_loc_by_name.get(dump_loc_text.strip().lower()) if dump_loc_text else None
+        # Resolve the dump address for navigation. Primary source: the stop's
+        # promoted dump-site record (dump_site_id → boss-maintained address).
+        # Fallback: the legacy dump_locations table matched by name. Either way a
+        # missing address degrades to a clear "add an address" nudge.
         dl_addr = ""
-        if dl_rec:
-            dl_addr = " ".join(p for p in [dl_rec.get("address") or "", dl_rec.get("city") or "",
-                                            dl_rec.get("state") or "", dl_rec.get("zip_code") or ""] if p).strip()
+        _site_id = _s.get("dump_site_id") if "dump_site_id" in _s.keys() else None
+        if _site_id and _site_addr_by_id.get(_site_id):
+            dl_addr = (_site_addr_by_id[_site_id].get("address") or "").strip()
+            if not dump_loc_text:
+                dump_loc_text = _site_addr_by_id[_site_id].get("name") or ""
+        if not dl_addr:
+            dl_rec = _dump_loc_by_name.get(dump_loc_text.strip().lower()) if dump_loc_text else None
+            if dl_rec:
+                dl_addr = " ".join(p for p in [dl_rec.get("address") or "", dl_rec.get("city") or "",
+                                                dl_rec.get("state") or "", dl_rec.get("zip_code") or ""] if p).strip()
         if dl_addr:
             dl_enc = urllib.parse.quote_plus(dl_addr)
             nav_html = (
@@ -12411,9 +12442,12 @@ def driver_route_detail(route_id):
                 f'</div>'
             )
         elif dump_loc_text:
+            # The site exists but has no address yet — point the driver's boss at
+            # the editor that fills it in (Settings → Yard Setup → Dump Sites).
             nav_html = (f'<div class="small muted" style="margin-bottom:10px;padding:8px;'
                         f'background:rgba(255,255,255,0.06);border-radius:8px;">'
-                        f'&#9888;&#65039; Dump location &ldquo;{e(dump_loc_text)}&rdquo; not found &mdash; update in Dump Locations.</div>')
+                        f'&#9888;&#65039; No address saved for &ldquo;{e(dump_loc_text)}&rdquo; yet &mdash; '
+                        f'add one in Yard Setup &rarr; Dump Sites &amp; Yards to enable navigation.</div>')
         else:
             nav_html = (f'<div class="small muted" style="margin-bottom:10px;padding:8px;'
                         f'background:rgba(255,255,255,0.06);border-radius:8px;">Dump location not set for this stop.</div>')
