@@ -3755,6 +3755,44 @@ def init_db():
     # driver+date into a single lane (from the api_dispatch duplicate-route bug).
     _merge_duplicate_open_routes(conn)
 
+    # --- Cab View pre-flight gate backfill (feat/cab-preflight) ---
+    # The driver's Cab View now shows a full-screen pre-flight card for routes in
+    # the not-started state before the stop list renders. The DB's existing
+    # 'open' status IS that not-started state (a new CHECK value like
+    # 'not_started' would require rebuilding a core table with many FK
+    # dependents, so we reuse 'open'). A route already in flight when this ships
+    # must NOT suddenly demand a Start tap, so any 'open' route showing evidence
+    # of activity is promoted to 'in_progress'. Evidence = a start/complete
+    # timestamp, or any stop that has moved off its initial pending state.
+    # started_at is filled from created_at when missing so the running view
+    # always has a value. Idempotent: after the first pass those rows are
+    # 'in_progress' and no longer match, so re-running is a no-op.
+    try:
+        conn.execute("""
+            UPDATE routes
+               SET status='in_progress',
+                   started_at=COALESCE(started_at, created_at)
+             WHERE status='open'
+               AND (
+                     started_at IS NOT NULL
+                  OR completed_at IS NOT NULL
+                  OR id IN (
+                        SELECT DISTINCT route_id FROM stops
+                         WHERE status='completed'
+                            OR (driver_status IS NOT NULL AND driver_status != 'pending')
+                            OR held_at IS NOT NULL
+                            OR arrived_at IS NOT NULL
+                            OR box_out_at IS NOT NULL
+                     )
+                   )
+        """)
+        conn.commit()
+    except sqlite3.OperationalError:
+        # A pre-migration DB missing one of the referenced columns — the columns
+        # above are all ensured earlier in init_db, so this only guards a partial
+        # older schema; the backfill retries cleanly on the next boot.
+        conn.rollback()
+
     # --- default company bootstrap ---
     default_co = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()
     if not default_co:
@@ -11821,6 +11859,105 @@ def _breakdown_driver_ui_html(route_id, container_prefill, csrf):
     return modal
 
 
+def _cab_preflight_body(route, stops, total_count, csrf):
+    """Full-screen Cab View pre-flight card shown before a route is started.
+    Summary only — no stop list, no map, no scrolling required — with big
+    glove-sized START ROUTE button and a reserved slot above it for the pre-trip
+    / container-securement checklist to be gated here later. Safe with 0 stops
+    (the stat tiles show zeroes and the first-stop preview says so)."""
+    # Stat tiles: stop count, total yards (sum of the leading number in each
+    # container_size like "20yd"), and how many stops include a dump leg.
+    total_yards = 0
+    dump_count = 0
+    for s in stops:
+        m = re.match(r"\s*(\d+)", (s["container_size"] or ""))
+        if m:
+            total_yards += int(m.group(1))
+        if (s["dump_location"] or "").strip():
+            dump_count += 1
+
+    first = stops[0] if stops else None
+    if first:
+        first_addr = ", ".join(p for p in [
+            (first["address"] or ""), (first["city"] or ""), (first["state"] or "")
+        ] if p) or "No address on file"
+        first_cust = (first["customer_name"] or "").strip()
+        first_html = (
+            '<div class="pf-first">'
+            '<div class="pf-first-label">First stop</div>'
+            '<div class="pf-first-action">' + e(first["action"] or "Stop") + '</div>'
+            + ('<div class="pf-first-cust">' + e(first_cust) + '</div>' if first_cust else '')
+            + '<div class="pf-first-addr">' + e(first_addr) + '</div>'
+            '</div>'
+        )
+    else:
+        first_html = '<div class="pf-first pf-first-empty">No stops on this route yet.</div>'
+
+    start_action = url_for('mark_route_in_progress', route_id=route["id"])
+    back_href = url_for('driver_dashboard')
+
+    return f"""
+<style>
+  .pf-wrap {{ max-width: 560px; margin: 0 auto; padding: 16px 16px calc(16px + env(safe-area-inset-bottom, 0px)); }}
+  .pf-topbar {{ display:flex; align-items:center; justify-content:space-between; margin-bottom:14px; }}
+  .pf-back {{ color: var(--text-muted); text-decoration:none; font-weight:600; min-height:48px; display:flex; align-items:center; }}
+  .pf-topttl {{ font-weight:800; letter-spacing:1px; color: var(--text-muted); font-size:.8rem; }}
+  .pf-card {{ background: var(--card-bg, #171717); border:1px solid rgba(255,255,255,0.08); border-radius:16px; padding:18px; }}
+  .pf-date {{ color: var(--text-muted); font-size:.9rem; }}
+  .pf-name {{ font-size:1.5rem; font-weight:800; margin:2px 0 2px; word-break:break-word; }}
+  .pf-driver {{ color: var(--text-muted); font-size:.92rem; }}
+  .pf-tiles {{ display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; margin:16px 0; }}
+  .pf-tile {{ background: rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.07); border-radius:12px; padding:14px 8px; text-align:center; }}
+  .pf-tile-num {{ font-size:1.8rem; font-weight:800; line-height:1; }}
+  .pf-tile-lbl {{ margin-top:6px; font-size:.72rem; letter-spacing:.4px; text-transform:uppercase; color: var(--text-muted); }}
+  .pf-first {{ border-top:1px solid rgba(255,255,255,0.08); padding-top:14px; }}
+  .pf-first-label {{ font-size:.7rem; letter-spacing:.5px; text-transform:uppercase; color: var(--text-muted); }}
+  .pf-first-action {{ display:inline-block; margin-top:6px; font-weight:800; color: var(--orange, #FF6B1A); text-transform:uppercase; font-size:.86rem; }}
+  .pf-first-cust {{ font-weight:700; font-size:1.05rem; margin-top:2px; }}
+  .pf-first-addr {{ color: var(--text-muted); margin-top:2px; }}
+  .pf-first-empty {{ color: var(--text-muted); }}
+  /* Reserved slot for the pre-trip / container-securement checklist (gated here
+     later). Intentionally a placeholder — the checklist is NOT built yet. */
+  .pf-checklist-slot {{ margin-top:16px; border:1px dashed rgba(255,255,255,0.18); border-radius:12px; padding:14px; background: rgba(255,255,255,0.02); }}
+  .pf-slot-label {{ font-weight:700; font-size:.9rem; }}
+  .pf-slot-hint {{ color: var(--text-muted); font-size:.8rem; margin-top:4px; }}
+  .pf-start-btn {{ width:100%; min-height:64px; margin-top:18px; border:none; border-radius:14px;
+                   background: var(--orange, #FF6B1A); color:#111; font-size:1.3rem; font-weight:800;
+                   letter-spacing:1px; cursor:pointer; }}
+  .pf-start-btn:active {{ filter:brightness(0.92); }}
+</style>
+<div class="pf-wrap">
+  <div class="pf-topbar">
+    <a class="pf-back" href="{back_href}">&#8592; My Routes</a>
+    <span class="pf-topttl">PRE-FLIGHT</span>
+  </div>
+  <div class="pf-card">
+    <div class="pf-date">{e(route['route_date'])}</div>
+    <div class="pf-name">{e(route['route_name'])}</div>
+    <div class="pf-driver">Driver: {e(route['assigned_username'] or 'You')}</div>
+
+    <div class="pf-tiles">
+      <div class="pf-tile"><div class="pf-tile-num">{total_count}</div><div class="pf-tile-lbl">Stops</div></div>
+      <div class="pf-tile"><div class="pf-tile-num">{total_yards}</div><div class="pf-tile-lbl">Total Yards</div></div>
+      <div class="pf-tile"><div class="pf-tile-num">{dump_count}</div><div class="pf-tile-lbl">Dumps</div></div>
+    </div>
+
+    {first_html}
+
+    <div class="pf-checklist-slot" data-slot="pretrip-checklist" aria-hidden="true">
+      <div class="pf-slot-label">Pre-trip &amp; container securement</div>
+      <div class="pf-slot-hint">Coming soon &mdash; the pre-trip inspection checklist will be required here before you can start.</div>
+    </div>
+
+    <form method="POST" action="{start_action}">
+      <input type="hidden" name="_csrf_token" value="{csrf}">
+      <button class="pf-start-btn" type="submit">START ROUTE</button>
+    </form>
+  </div>
+</div>
+"""
+
+
 @app.route("/driver/route/<int:route_id>")
 @driver_required
 def driver_route_detail(route_id):
@@ -11933,13 +12070,19 @@ def driver_route_detail(route_id):
     prev_stop = stops[current_stop_num - 2] if current_stop_num and current_stop_num > 1 else None
     _csrf = get_csrf_token()
 
-    route_action_buttons = ""
+    # ══════════════════════════════════════════════════════════
+    # PRE-FLIGHT GATE — route not started yet ('open' == not_started)
+    # Render ONLY a full-screen pre-flight card: no stop list, no map,
+    # no scrolling. The driver reviews the route summary and taps START
+    # ROUTE (which POSTs to mark_route_in_progress) to begin.
+    # ══════════════════════════════════════════════════════════
     if route["status"] == "open":
-        route_action_buttons = f"""
-        <form class="inline" method="POST" action="{url_for('mark_route_in_progress', route_id=route_id)}">
-            <button class="btn orange" style="min-height:44px;">Start Route</button>
-        </form>"""
-    elif route["status"] == "in_progress" and not current_stop:
+        return render_template_string(
+            shell_page("Cab View", _cab_preflight_body(route, stops, total_count, _csrf))
+        )
+
+    route_action_buttons = ""
+    if route["status"] == "in_progress" and not current_stop:
         route_action_buttons = f"""
         <form class="inline" method="POST" action="{url_for('mark_route_completed', route_id=route_id)}">
             <button class="btn green" style="min-height:44px;">Finish Route</button>
@@ -12562,7 +12705,27 @@ def driver_route_detail(route_id):
     breakdown_ui_html = _breakdown_driver_ui_html(route_id, _bk_container, _csrf)
 
     body = f"""
+<style>
+  /* Running-state sticky bar: keeps progress + END ROUTE pinned so nothing
+     important sits below the fold while the driver works a stop. */
+  .cab-sticky-bar {{ position: sticky; top: 0; z-index: 50; display:flex; align-items:center;
+      justify-content:space-between; gap:10px; padding:10px 14px; margin-bottom:12px;
+      background: var(--bg-0, #121212); border-bottom:1px solid rgba(255,255,255,0.08); }}
+  .cab-sticky-progress {{ font-weight:800; letter-spacing:1px; font-size:.98rem; }}
+  .cab-sticky-end {{ min-height:44px; padding:0 16px; border:1px solid var(--red, #FF5252);
+      background:transparent; color: var(--red, #FF5252); border-radius:10px; font-weight:800;
+      letter-spacing:.5px; cursor:pointer; }}
+  .cab-sticky-end:active {{ background: rgba(255,82,82,0.12); }}
+</style>
 <div class="cab-wrap">
+    <div class="cab-sticky-bar">
+        <span class="cab-sticky-progress" id="cab-sticky-progress">STOP {current_stop_num} OF {total_count}</span>
+        <form method="POST" action="{url_for('mark_route_completed', route_id=route_id)}" class="inline"
+              onsubmit="return confirm('End this route now? Any stops not marked done will stay incomplete.');">
+            <input type="hidden" name="_csrf_token" value="{_csrf}">
+            <button type="submit" class="cab-sticky-end">END ROUTE</button>
+        </form>
+    </div>
     <div class="cab-header">
         <div class="cab-title">MY ROUTE</div>
         <div style="display:flex;align-items:center;gap:10px;">
@@ -12706,6 +12869,10 @@ def driver_route_detail(route_id):
             var label = document.getElementById('cab-progress-label');
             if (label && data.current_stop_num) {{
                 label.textContent = 'STOP ' + data.current_stop_num + ' OF ' + data.total;
+            }}
+            var sticky = document.getElementById('cab-sticky-progress');
+            if (sticky && data.current_stop_num) {{
+                sticky.textContent = 'STOP ' + data.current_stop_num + ' OF ' + data.total;
             }}
             var fill = document.getElementById('cab-progress-fill');
             if (fill && data.total > 0) {{
@@ -14804,9 +14971,12 @@ def mark_route_in_progress(route_id):
         flash("Access denied.", "error")
         return redirect(url_for("dashboard"))
 
+    # Idempotent start: only the first tap (status still 'open') sets started_at.
+    # A fast double-tap or a re-POST while already in_progress is a no-op, so the
+    # recorded start time can never be reset.
     conn.execute("""
         UPDATE routes SET status='in_progress', started_at=?
-        WHERE id=? AND company_id=?
+        WHERE id=? AND company_id=? AND status='open'
     """, (now_ts(), route_id, cid()))
 
     conn.commit()
