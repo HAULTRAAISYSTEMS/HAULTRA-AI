@@ -508,16 +508,19 @@ def _normalize_name(text):
 _ADDR_BOOK_KEY_SEP = "\x1f"
 
 
-def _address_book_key(customer_name, address):
-    """Dedupe key for the address book: normalized customer NAME + normalized
-    street ADDRESS. Two rows collapse only when BOTH the name and the street
-    address match, so 'Recovery'/'recovery' at one address merge while two
-    DIFFERENT customers who share a building stay distinct. Deliberately keyed on
-    the street address ALONE (not city/state/zip): those fields are captured
-    inconsistently, so folding them in would leave the same place with a zip and
-    without a zip as un-merged twins — the exact bug this replaces. Kept
-    identical between the startup backfill and learn_location."""
-    return (_normalize_name(customer_name) + _ADDR_BOOK_KEY_SEP
+def _address_book_key(customer_name, address, kind="customer"):
+    """Dedupe key for the address book: KIND + normalized customer NAME +
+    normalized street ADDRESS. Two rows collapse only when the kind, name and
+    street address all match, so 'Recovery'/'recovery' at one address merge while
+    two DIFFERENT customers who share a building stay distinct. Keyed on the
+    street address ALONE (not city/state/zip): those are captured inconsistently,
+    so folding them in would leave the same place with/without a zip as un-merged
+    twins. The kind prefix keeps a dump/yard site named 'Holland' distinct from a
+    customer named 'Holland' even when the dump site has no address yet. Kept
+    identical between the startup backfill, learn_location and the site
+    resolver."""
+    return (_normalize_name(kind or "customer") + _ADDR_BOOK_KEY_SEP
+            + _normalize_name(customer_name) + _ADDR_BOOK_KEY_SEP
             + _normalize_addr(address))
 
 
@@ -2958,6 +2961,11 @@ def init_db():
     safe_add_column(conn, "stops", "relocate_to_address TEXT")
     safe_add_column(conn, "stops", "relocate_to_city TEXT")
     safe_add_column(conn, "stops", "return_destination TEXT")
+    # FK to the promoted dump/yard location record in saved_addresses. The name
+    # string columns (dump_location / return_destination) stay populated; readers
+    # prefer the FK's record and fall back to the string when the FK is null.
+    safe_add_column(conn, "stops", "dump_site_id INTEGER")
+    safe_add_column(conn, "stops", "return_site_id INTEGER")
     safe_add_column(conn, "stops", "pr_mode TEXT")
 
     # --- Phase 5B: company work hours / pay cycle ---
@@ -3616,9 +3624,23 @@ def init_db():
     # hidden: boss can hide a location from the quick-add suggestions/chips
     #   without deleting its history.
     # label: boss-set display name overriding the learned customer_name.
+    # kind: what this location IS — 'customer' (default), 'dump' or 'yard'. Dump
+    #   sites and yards are promoted into the address book so a stop can FK to a
+    #   real record with an address, instead of only a bare name string. The kind
+    #   is part of the dedupe key, so a dump site 'Holland' never collides with a
+    #   customer 'Holland'.
     safe_add_column(conn, "saved_addresses", "norm_key TEXT")
     safe_add_column(conn, "saved_addresses", "hidden INTEGER NOT NULL DEFAULT 0")
     safe_add_column(conn, "saved_addresses", "label TEXT")
+    safe_add_column(conn, "saved_addresses", "kind TEXT NOT NULL DEFAULT 'customer'")
+    # Any pre-existing row with a NULL/blank kind is a legacy customer entry.
+    try:
+        conn.execute(
+            "UPDATE saved_addresses SET kind='customer' WHERE kind IS NULL OR TRIM(kind)=''"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     # Per-company one-time backfill flag: seeds the address book from all
     # historical stops the first time the company's parser/quick-add loads.
     safe_add_column(conn, "companies", "address_book_seeded INTEGER NOT NULL DEFAULT 0")
@@ -3650,7 +3672,7 @@ def init_db():
     # boots (idempotent) and never churns the DB once settled.
     try:
         _sa_all = conn.execute(
-            "SELECT id, customer_name, address, full_address, norm_key "
+            "SELECT id, customer_name, address, full_address, norm_key, kind "
             "FROM saved_addresses"
         ).fetchall()
         _sa_changed = False
@@ -3659,7 +3681,7 @@ def init_db():
             # the street field is blank (legacy rows that stored the whole line in
             # full_address), so those still get a stable key.
             _addr = (_r["address"] or "").strip() or (_r["full_address"] or "").strip()
-            _nk = _address_book_key(_r["customer_name"], _addr)
+            _nk = _address_book_key(_r["customer_name"], _addr, _r["kind"] or "customer")
             if _nk != (_r["norm_key"] or ""):
                 conn.execute("UPDATE saved_addresses SET norm_key=? WHERE id=?", (_nk, _r["id"]))
                 _sa_changed = True
@@ -3791,6 +3813,95 @@ def init_db():
         # A pre-migration DB missing one of the referenced columns — the columns
         # above are all ensured earlier in init_db, so this only guards a partial
         # older schema; the backfill retries cleanly on the next boot.
+        conn.rollback()
+
+    # --- Promote dump/return site name strings to location records (feat/dump-site-locations) ---
+    # Dump and return sites used to live only as bare NAME strings on stops
+    # (stops.dump_location / stops.return_destination). Promote every distinct
+    # name in use to a real saved_addresses record (kind='dump') so a stop can FK
+    # to it and, once the boss adds an address, navigation + fee reporting have a
+    # stable key. Addresses are opportunistically enriched from any matching
+    # dump_locations row so the boss's "needs address" list starts as short as
+    # possible. The name columns stay populated and readers fall back to them, so
+    # nothing breaks if the FK is null. Fully idempotent: _resolve_site reuses an
+    # existing site by normalized name, and the FK backfill only fills nulls, so
+    # re-running creates no duplicates and changes nothing once settled. Runs
+    # after the unique index + stop FK columns exist above.
+    try:
+        _co_rows = conn.execute("SELECT id FROM companies").fetchall()
+        for _cor in _co_rows:
+            _co = _cor["id"]
+            # Address lookup from the legacy dump_locations table, by normalized
+            # name, to enrich promoted sites that would otherwise be address-less.
+            _dl_addr = {}
+            try:
+                for _dl in conn.execute(
+                    "SELECT name, address, city, state, zip_code FROM dump_locations WHERE company_id=?",
+                    (_co,)
+                ).fetchall():
+                    _k = _normalize_name(_dl["name"] or "")
+                    if not _k or _k in _dl_addr:
+                        continue
+                    _street = (_dl["address"] or "").strip()
+                    _full = ", ".join(p for p in [
+                        _street, (_dl["city"] or "").strip(),
+                        (_dl["state"] or "").strip(), (_dl["zip_code"] or "").strip()
+                    ] if p)
+                    if _street or _full:
+                        _dl_addr[_k] = (_street, (_dl["city"] or "").strip(),
+                                        (_dl["state"] or "").strip(),
+                                        (_dl["zip_code"] or "").strip(), _full)
+            except sqlite3.OperationalError:
+                pass
+
+            # Distinct dump + return site names in use by this company's stops.
+            _names = set()
+            for _col in ("dump_location", "return_destination"):
+                for _nr in conn.execute(
+                    "SELECT DISTINCT s.%s AS nm FROM stops s "
+                    "JOIN routes r ON s.route_id=r.id "
+                    "WHERE r.company_id=? AND TRIM(COALESCE(s.%s,'')) != ''" % (_col, _col),
+                    (_co,)
+                ).fetchall():
+                    _names.add((_nr["nm"] or "").strip())
+
+            for _nm in _names:
+                _sid = _resolve_site(conn, _co, _nm, "dump")
+                if not _sid:
+                    continue
+                # Enrich a still-address-less site from dump_locations by name.
+                _enr = _dl_addr.get(_normalize_name(_nm))
+                if _enr:
+                    _cur = conn.execute(
+                        "SELECT address, full_address FROM saved_addresses WHERE id=?", (_sid,)
+                    ).fetchone()
+                    if _cur and not (_cur["address"] or "").strip() and not (_cur["full_address"] or "").strip():
+                        _st, _ci, _stt, _zp, _fl = _enr
+                        _nk = _address_book_key(_nm, _st, "dump")
+                        conn.execute(
+                            "UPDATE saved_addresses SET address=?, city=?, state=?, zip=?, "
+                            "full_address=?, norm_key=? WHERE id=?",
+                            (_st, _ci, _stt, _zp, _fl, _nk, _sid))
+
+            # Backfill the stop FKs from the name strings (only where still null).
+            for _srow in conn.execute(
+                "SELECT s.id AS sid, s.dump_location AS dl, s.return_destination AS rd "
+                "FROM stops s JOIN routes r ON s.route_id=r.id "
+                "WHERE r.company_id=? AND ("
+                "  (s.dump_site_id IS NULL AND TRIM(COALESCE(s.dump_location,'')) != '') OR "
+                "  (s.return_site_id IS NULL AND TRIM(COALESCE(s.return_destination,'')) != ''))",
+                (_co,)
+            ).fetchall():
+                _did = _resolve_site(conn, _co, _srow["dl"], "dump") if (_srow["dl"] or "").strip() else None
+                _rid = _resolve_site(conn, _co, _srow["rd"], "dump") if (_srow["rd"] or "").strip() else None
+                if _did is not None:
+                    conn.execute("UPDATE stops SET dump_site_id=? WHERE id=? AND dump_site_id IS NULL",
+                                 (_did, _srow["sid"]))
+                if _rid is not None:
+                    conn.execute("UPDATE stops SET return_site_id=? WHERE id=? AND return_site_id IS NULL",
+                                 (_rid, _srow["sid"]))
+        conn.commit()
+    except sqlite3.OperationalError:
         conn.rollback()
 
     # --- default company bootstrap ---
@@ -13983,6 +14094,118 @@ def upsert_saved_address(conn, company_id, customer_name, address,
                    customer_name, action, container_size, dump_location)
 
 
+def _resolve_site(conn, company_id, name, kind="dump"):
+    """Find-or-create a dump/yard LOCATION record by normalized name and return
+    its saved_addresses id (or None for a blank name / missing company).
+
+    A dump or return site is usually just a bare name ("Holland", "Dominion")
+    with no address yet, so matching is by NORMALIZED NAME across this company's
+    dump+yard sites — independent of address, so it keeps matching after the boss
+    fills an address in. An unknown name creates a new record with the given kind
+    and NO address (that's expected — the boss fills it in later); it never
+    fails the parse. Idempotent: the same name always resolves to the same row.
+    Never raises fatally."""
+    nm = (name or "").strip()
+    if not company_id or not nm:
+        return None
+    key = _normalize_name(nm)
+    if not key:
+        return None
+    try:
+        # Prefer an existing dump/yard site whose display name matches. Match on
+        # label first (boss override) then the stored name.
+        for r in conn.execute(
+            "SELECT id, customer_name, label FROM saved_addresses "
+            "WHERE company_id=? AND kind IN ('dump','yard')", (company_id,)
+        ).fetchall():
+            cand = (r["label"] or "").strip() or (r["customer_name"] or "").strip()
+            if _normalize_name(cand) == key:
+                return r["id"]
+        # None found → create a name-only record (no address).
+        ts = now_ts()
+        norm = _address_book_key(nm, "", kind)
+        try:
+            conn.execute(
+                """INSERT INTO saved_addresses
+                       (company_id, customer_name, address, full_address, kind,
+                        norm_key, hidden, times_used, last_used_at, created_at)
+                   VALUES (?,?,?,?,?,?,0,1,?,?)
+                   ON CONFLICT(company_id, norm_key) DO UPDATE SET
+                       last_used_at=excluded.last_used_at""",
+                (company_id, nm, "", "", kind, norm, ts, ts))
+        except sqlite3.OperationalError:
+            # Unique index absent — fall back to a guarded insert.
+            if not conn.execute(
+                "SELECT 1 FROM saved_addresses WHERE company_id=? AND norm_key=? LIMIT 1",
+                (company_id, norm)
+            ).fetchone():
+                conn.execute(
+                    """INSERT INTO saved_addresses
+                           (company_id, customer_name, address, full_address, kind,
+                            norm_key, hidden, times_used, last_used_at, created_at)
+                       VALUES (?,?,?,?,?,?,0,1,?,?)""",
+                    (company_id, nm, "", "", kind, norm, ts, ts))
+        row = conn.execute(
+            "SELECT id FROM saved_addresses WHERE company_id=? AND norm_key=? LIMIT 1",
+            (company_id, norm)
+        ).fetchone()
+        return row["id"] if row else None
+    except Exception as exc:
+        app.logger.warning("_resolve_site failed for %r (%s): %s", nm, kind, exc)
+        return None
+
+
+def _link_stop_sites(conn, company_id, stop_id, dump_name, return_name):
+    """Resolve a stop's dump/return site NAME strings to location records and set
+    the dump_site_id / return_site_id FKs. Only touches the FK for a non-blank
+    name, so it never clears a link. Safe to call after any stop insert/update."""
+    if not company_id or not stop_id:
+        return
+    dump_id = _resolve_site(conn, company_id, dump_name, "dump") if (dump_name or "").strip() else None
+    ret_id  = _resolve_site(conn, company_id, return_name, "dump") if (return_name or "").strip() else None
+    try:
+        if dump_id is not None:
+            conn.execute("UPDATE stops SET dump_site_id=? WHERE id=?", (dump_id, stop_id))
+        if ret_id is not None:
+            conn.execute("UPDATE stops SET return_site_id=? WHERE id=?", (ret_id, stop_id))
+    except sqlite3.OperationalError:
+        pass
+
+
+def _stop_site(conn, site_id):
+    """Load a promoted dump/yard location record by id, or None. This is the
+    'read from the FK' path: callers use it for the site's authoritative name +
+    address, falling back to the stop's name string when the FK (or this result)
+    is null. The address may legitimately be empty — callers must handle that."""
+    if not site_id:
+        return None
+    try:
+        return conn.execute(
+            "SELECT id, customer_name, label, address, city, state, zip, full_address, kind "
+            "FROM saved_addresses WHERE id=?", (site_id,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+
+def _stop_dump_display(conn, stop):
+    """(name, address_or_None) for a stop's dump leg, reading the FK first and
+    falling back to the dump_location name string when the FK is null. The name
+    is what renders on cards (identical to the old string when unchanged); the
+    address is None when the site has none yet (expected — the boss fills it in).
+    Address is handled null-safely everywhere it's consumed."""
+    try:
+        site = _stop_site(conn, stop["dump_site_id"]) if ("dump_site_id" in stop.keys()) else None
+    except Exception:
+        site = None
+    if site:
+        name = (site["label"] or "").strip() or (site["customer_name"] or "").strip()
+        addr = (site["address"] or "").strip() or (site["full_address"] or "").strip() or None
+        if name:
+            return name, addr
+    return (stop["dump_location"] or "").strip() or None, None
+
+
 def _ensure_address_book(conn, company_id):
     """One-time per-company backfill: seed the address book from ALL existing
     historical stops so quick-add/autocomplete start full, not empty. Guarded
@@ -15068,7 +15291,7 @@ def add_stop(route_id):
         (route_id,)
     ).fetchone()["m"] or 0
 
-    conn.execute("""
+    _add_cur = conn.execute("""
         INSERT INTO stops (
             route_id, stop_order, customer_name, address, city, state, zip_code,
             action, container_size, ticket_number, reference_number, dump_location, notes,
@@ -15090,6 +15313,8 @@ def add_stop(route_id):
         request.form.get("notes"),
         now_ts()
     ))
+    _link_stop_sites(conn, cid(), _add_cur.lastrowid,
+                     expand_abbrev(request.form.get("dump_location", "")), "")
 
     conn.commit()
     # Recompute can flow so the new stop gets swap_with_prev_pull derived from sequence
@@ -15147,6 +15372,9 @@ def edit_stop(stop_id):
         ))
         conn.commit()
         route_id = ownership["route_id"]
+        # Re-resolve the (possibly changed) dump site name to its location FK.
+        _link_stop_sites(conn, cid(), stop_id,
+                         expand_abbrev(request.form.get("dump_location", "")), "")
         # Recompute can flow and derive swap_with_prev_pull from sequence
         compute_can_flow(conn, route_id)
         conn.commit()
@@ -19837,6 +20065,7 @@ def yard_setup_page():
         <p>Dump locations and your container fleet, in one place.</p>
     </div>
     {_dump_locations_section_html()}
+    {_site_locations_section_html()}
     {_parse_vocab_section_html()}
     {_address_book_section_html()}
     {_containers_section_html()}
@@ -20031,6 +20260,98 @@ def _address_book_section_html():
     """
 
 
+def _site_locations_section_html():
+    """Boss editor for promoted DUMP SITES and YARDS (address-book rows with
+    kind='dump'/'yard'). Unlike the customer address book, these are surfaced
+    even when they have no address — a blank address is a red 'needs address'
+    to-do the boss clears by filling it in, which is what makes Cab View
+    navigation and dump-fee reporting work. Filter chips switch between All /
+    Dump / Yard client-side."""
+    conn = get_db()
+    rows_db = conn.execute(
+        """SELECT id, customer_name, label, address, city, state, zip, full_address, kind, times_used
+             FROM saved_addresses
+            WHERE company_id=? AND kind IN ('dump','yard')
+            ORDER BY (TRIM(COALESCE(address,''))='' AND TRIM(COALESCE(full_address,''))='') DESC,
+                     kind ASC, times_used DESC""",
+        (cid(),)
+    ).fetchall()
+    conn.close()
+    _csrf = get_csrf_token()
+    need_count = sum(1 for a in rows_db
+                     if not (a["address"] or "").strip() and not (a["full_address"] or "").strip())
+    rows = ""
+    for a in rows_db:
+        _a = dict(a)
+        name = (_a["label"] or _a["customer_name"] or "").strip() or "(unnamed site)"
+        kind = (_a["kind"] or "dump")
+        has_addr = bool((_a["address"] or "").strip() or (_a["full_address"] or "").strip())
+        kind_badge = (f'<span class="badge" style="background:rgba(140,160,179,0.18);color:#8CA0B3;">'
+                      f'{"Yard" if kind == "yard" else "Dump"}</span>')
+        need_badge = ('' if has_addr else
+                      '<span class="badge" style="background:rgba(255,82,82,0.16);color:#FF5252;">'
+                      '&#9888; needs address</span>')
+        search = " ".join(p for p in [name, _a["address"] or "", _a["city"] or ""] if p).lower()
+        rows += (
+            f'<tr data-search="{e(search)}" data-kind="{e(kind)}">'
+            f'<td><strong>{e(name)}</strong> {kind_badge} {need_badge}</td>'
+            f'<td>'
+            f'<form method="POST" action="{url_for("update_address_book", sa_id=_a["id"])}" '
+            f'style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">'
+            f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
+            f'<input type="hidden" name="action" value="address">'
+            f'<input name="address" value="{e(_a["address"] or "")}" placeholder="Street address" '
+            f'style="flex:2;min-width:150px;min-height:40px;padding:6px 10px;background:var(--bg-0);'
+            f'border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);font-size:13px;">'
+            f'<input name="city" value="{e(_a["city"] or "")}" placeholder="City" '
+            f'style="flex:1;min-width:90px;min-height:40px;padding:6px 10px;background:var(--bg-0);'
+            f'border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);font-size:13px;">'
+            f'<input name="state" value="{e(_a["state"] or "")}" placeholder="ST" size="3" '
+            f'style="width:56px;min-height:40px;padding:6px 8px;background:var(--bg-0);'
+            f'border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);font-size:13px;">'
+            f'<input name="zip" value="{e(_a["zip"] or "")}" placeholder="Zip" size="6" '
+            f'style="width:74px;min-height:40px;padding:6px 8px;background:var(--bg-0);'
+            f'border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);font-size:13px;">'
+            f'<button type="submit" style="min-height:40px;background:transparent;color:#FF9D5C;'
+            f'border:1px solid rgba(255,157,92,0.4);border-radius:6px;padding:4px 14px;font-size:12px;cursor:pointer;">Save</button>'
+            f'</form></td></tr>'
+        )
+    _need_line = (f'<span class="badge" style="background:rgba(255,82,82,0.16);color:#FF5252;">'
+                  f'{need_count} need address</span>' if need_count else
+                  '<span class="muted small">all have addresses &#10003;</span>')
+    return f"""
+    <div class="card" id="site-locations">
+        <div class="row between" style="margin-bottom:12px;">
+            <h2 style="margin:0;">&#128678; Dump Sites &amp; Yards</h2>
+            <span>{_need_line}</span>
+        </div>
+        <p class="muted small" style="margin-bottom:12px;">Dump and return sites the parser has seen are promoted here as real
+        locations. Add an address to each so the driver can navigate to it and dump fees have a reliable key. Sites without an
+        address still work everywhere &mdash; they just can&rsquo;t be navigated to yet.</p>
+        <div style="display:flex;gap:8px;margin-bottom:12px;" id="site-kind-filter">
+            <button type="button" class="btn secondary" data-kf="all" style="min-height:40px;" onclick="siteFilter('all',this)">All</button>
+            <button type="button" class="btn secondary" data-kf="dump" style="min-height:40px;" onclick="siteFilter('dump',this)">Dump</button>
+            <button type="button" class="btn secondary" data-kf="yard" style="min-height:40px;" onclick="siteFilter('yard',this)">Yard</button>
+        </div>
+        <div class="table-wrap">
+            <table>
+                <thead><tr><th style="width:260px;">Site</th><th>Address</th></tr></thead>
+                <tbody>{rows or '<tr><td colspan="2" class="muted">No dump sites or yards yet — parse a dispatch that names one and it&rsquo;ll appear here.</td></tr>'}</tbody>
+            </table>
+        </div>
+    </div>
+    <script>
+    function siteFilter(kind, btn) {{
+        document.querySelectorAll('#site-locations tbody tr[data-kind]').forEach(function(r) {{
+            r.style.display = (kind === 'all' || r.getAttribute('data-kind') === kind) ? '' : 'none';
+        }});
+        document.querySelectorAll('#site-kind-filter button').forEach(function(b) {{ b.classList.remove('active'); }});
+        if (btn) btn.classList.add('active');
+    }}
+    </script>
+    """
+
+
 @app.route("/address-book/<int:sa_id>/update", methods=["POST"])
 @boss_required
 def update_address_book(sa_id):
@@ -20039,13 +20360,37 @@ def update_address_book(sa_id):
     action = (request.form.get("action") or "").strip()
     conn = get_db()
     owned = conn.execute(
-        "SELECT id, hidden FROM saved_addresses WHERE id=? AND company_id=?",
+        "SELECT id, hidden, customer_name, label, kind FROM saved_addresses WHERE id=? AND company_id=?",
         (sa_id, cid())
     ).fetchone()
     if not owned:
         conn.close()
         flash("Location not found.", "error")
         return redirect(url_for("yard_setup_page") + "#address-book")
+    if action == "address":
+        # Boss fills in / edits a dump-site or yard address so the stop card and
+        # navigation have a real destination. Recompute norm_key from the new
+        # street so dedupe stays consistent (kind is part of the key).
+        street = expand_abbrev((request.form.get("address") or "").strip())[:200]
+        city   = (request.form.get("city")  or "").strip()[:80]
+        state  = (request.form.get("state") or "").strip()[:40]
+        zipc   = (request.form.get("zip")   or "").strip()[:20]
+        full   = ", ".join(p for p in [street, city, state, zipc] if p)
+        name   = (owned["label"] or "").strip() or (owned["customer_name"] or "").strip()
+        new_key = _address_book_key(name, street, owned["kind"] or "customer")
+        try:
+            conn.execute(
+                "UPDATE saved_addresses SET address=?, city=?, state=?, zip=?, full_address=?, norm_key=? "
+                "WHERE id=? AND company_id=?",
+                (street, city, state, zipc, full, new_key, sa_id, cid()))
+            conn.commit()
+            flash("Address saved." if street else "Address cleared.", "success")
+        except sqlite3.IntegrityError:
+            # Another site of the same kind already has this exact name+street.
+            conn.rollback()
+            flash("A location with that name and address already exists.", "error")
+        conn.close()
+        return redirect(url_for("yard_setup_page") + "#site-locations")
     if action == "label":
         label = (request.form.get("label") or "").strip()[:120]
         conn.execute("UPDATE saved_addresses SET label=? WHERE id=? AND company_id=?",
@@ -22529,7 +22874,7 @@ def add_parsed_stops(route_id):
         pr_mode            = (stop.get("pr_mode") or "").strip()
         swap_flag          = 1 if stop.get("swap_with_previous_empty") or stop.get("swap_with_prev_pull") else 0
         try:
-            conn.execute("""
+            _cur = conn.execute("""
                 INSERT INTO stops (
                     route_id, stop_order, customer_name, address, city, state, zip_code,
                     action, container_size, dump_location,
@@ -22543,6 +22888,7 @@ def add_parsed_stops(route_id):
                   return_destination, pr_mode,
                   swap_flag, now_ts()))
             added += 1
+            _link_stop_sites(conn, cid(), _cur.lastrowid, dump_location, return_destination)
             upsert_saved_address(conn, cid(),
                 customer_name, address, city, state, zip_code,
                 action, container_size, dump_location)
@@ -22680,6 +23026,8 @@ def api_dispatch():
         """, (route_id, next_order, s.get("customer") or "", s["address"], s["action"],
               s["container_size"], s.get("dump_leg") or "", s.get("return_leg") or "",
               s["notes"], s.get("empty_can_plan") or "", s.get("carry_can_ref") or "", now_ts()))
+        # Resolve the dump/return site names to location records + set the FKs.
+        _link_stop_sites(conn, cid(), cur.lastrowid, s.get("dump_leg") or "", s.get("return_leg") or "")
         # Self-building address book: learn every dispatched stop's address.
         learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
                        action=s["action"], container_size=s["container_size"],
@@ -22757,6 +23105,8 @@ def api_insert_stops(route_id):
               s.get("dump_leg") or "", s.get("return_leg") or "", s["notes"],
               s.get("empty_can_plan") or "", s.get("carry_can_ref") or "", now_ts()))
         new_stops.append((cur.lastrowid, s["insert_before"]))
+        # Resolve the dump/return site names to location records + set the FKs.
+        _link_stop_sites(conn, cid(), cur.lastrowid, s.get("dump_leg") or "", s.get("return_leg") or "")
         # Self-building address book: learn every inserted stop's address.
         learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
                        action=s["action"], container_size=s["container_size"],
