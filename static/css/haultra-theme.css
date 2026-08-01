@@ -13,6 +13,20 @@
    - --slate = drop/swap badges + other neutral status (the only place
      "blue" survives in this app).
    - --green = success / completed only.
+
+   ACTION BADGE PALETTE (learnable color→action mapping, applied everywhere a
+   stop's action badge renders — Cab View, Route Board, parser stop cards).
+   Every badge is a SOLID saturated fill with near-black ink (#0A0A0A) — the
+   same bright-fill/dark-ink formula as the primary orange button — for maximum
+   contrast in a moving truck. Two hard reservations are respected: RED is
+   urgent/overdue ONLY and TEAL is AI-parsed ONLY, so neither appears in this set.
+       PR   #FF6B1A safety orange (brand primary, most common action)
+       P    #FFC53D amber
+       D    #4DA3FF steel blue
+       S    #A78BFA violet
+       R    #7C8CA1 slate
+       YARD #E5E5E5 light gray
+       LL   #FFC53D amber (Live Load rides with Pull/amber; not in the core six)
    ═══════════════════════════════════════════════════════════════════════ */
 
 @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
@@ -43,6 +57,21 @@
   --slate: #8CA0B3;
   --slate-dim: rgba(140, 160, 179, 0.16);
   --slate-border: rgba(140, 160, 179, 0.45);
+
+  /* Action-badge palette — solid fills, shared near-black ink. */
+  --badge-ink: #0A0A0A;
+  --badge-pr:   #FF6B1A;
+  --badge-p:    #FFC53D;
+  --badge-d:    #4DA3FF;
+  --badge-s:    #A78BFA;
+  --badge-r:    #7C8CA1;
+  --badge-yard: #E5E5E5;
+  --badge-ll:   #FFC53D;
+
+  /* Neutral (non-primary) button surface for the Cab View: dark fill, light
+     text, hairline border, NO orange and NO glow. */
+  --cab-neutral-bg: #161616;
+  --cab-neutral-border: #2A2A2A;
 
   --radius: 14px;
   --radius-sm: 9px;
@@ -78,7 +107,25 @@
   box-shadow: 0 0 8px var(--teal);
 }
 
-/* ── Drop/swap badges — the one place "blue" survives, as slate ── */
+/* ── Action badge palette — solid fill + near-black ink, applied wherever a
+   stop badge renders (.action-badge / .cab-action-badge / .stop-mini-badge /
+   .qa-badge). One color per action so the mapping is learnable. ── */
+.badge-pr, .badge-p, .badge-d, .badge-s, .badge-r, .badge-yard, .badge-ll {
+  color: var(--badge-ink) !important;
+  border: none !important;
+  box-shadow: none !important;
+  text-shadow: none !important;
+}
+.badge-pr   { background: var(--badge-pr)   !important; }
+.badge-p    { background: var(--badge-p)    !important; }
+.badge-d    { background: var(--badge-d)    !important; }
+.badge-s    { background: var(--badge-s)    !important; }
+.badge-r    { background: var(--badge-r)    !important; }
+.badge-yard { background: var(--badge-yard) !important; }
+.badge-ll   { background: var(--badge-ll)   !important; }
+
+/* Legacy group classes retained for any element not yet migrated to a code
+   class; the per-code classes above win via !important where both are present. */
 .badge-dropswap, .action-badge.dropswap {
   background: var(--slate-dim);
   border: 1px solid var(--slate-border);
