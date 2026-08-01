@@ -2972,6 +2972,20 @@ def init_db():
     safe_add_column(conn, "stops", "active_leg TEXT NOT NULL DEFAULT 'primary'")
     safe_add_column(conn, "stops", "pr_mode TEXT")
 
+    # --- Scale-ticket OCR assist (feat/ticket-ocr) ---
+    # fee_usd/material: fields a scale ticket carries that the form didn't store.
+    # needs_review: a photo was captured but its OCR is still queued/unprocessed
+    #   (offline) — a boss-facing "double-check the numbers" flag, cleared when
+    #   the OCR runs or the driver saves a confirmed ticket.
+    # ai_prefilled: OCR successfully read this ticket's photo (informational).
+    safe_add_column(conn, "dump_tickets", "fee_usd REAL")
+    safe_add_column(conn, "dump_tickets", "material TEXT")
+    safe_add_column(conn, "dump_tickets", "needs_review INTEGER NOT NULL DEFAULT 0")
+    safe_add_column(conn, "dump_tickets", "ai_prefilled INTEGER NOT NULL DEFAULT 0")
+    # Per-company daily cap on scale-ticket OCR calls — a stuck retry loop must
+    # not run up an API bill. NULL means use the generous default.
+    safe_add_column(conn, "companies", "ocr_daily_cap INTEGER")
+
     # --- Phase 5B: company work hours / pay cycle ---
     safe_add_column(conn, "companies", "timezone TEXT")
     safe_add_column(conn, "companies", "workweek_start_day TEXT")
@@ -16350,6 +16364,229 @@ def stop_driver_action(stop_id):
 # =========================================================
 # DUMP TICKET  (enter landfill scale ticket per stop)
 # =========================================================
+_DUMP_TICKET_OCR_DEFAULT_CAP = 100   # generous per-company daily OCR ceiling
+_DUMP_TICKET_OCR_MAX_BYTES = 8 * 1024 * 1024
+_DUMP_TICKET_OCR_TYPES = {"image/jpeg": "jpeg", "image/png": "png"}
+
+_DUMP_TICKET_OCR_PROMPT = """You read landfill / transfer-station SCALE TICKETS from a photo and return ONLY a JSON object — no prose, no markdown fences.
+
+This is billing data. NEVER guess a number. If a field is not clearly legible, return null for it. It is far better to leave a field null than to invent a digit.
+
+Return exactly this shape:
+{
+  "ticket_number": string|null,
+  "site_name": string|null,
+  "date": string|null,
+  "gross_lbs": number|null,
+  "tare_lbs": number|null,
+  "net_lbs": number|null,
+  "net_tons": number|null,
+  "fee_usd": number|null,
+  "material": string|null,
+  "confidence": { "<field>": "high"|"medium"|"low" },
+  "unreadable": boolean
+}
+
+Rules:
+- Weights are in POUNDS unless the ticket clearly says tons; put pounds in the *_lbs fields and tons in net_tons.
+- If BOTH gross_lbs and tare_lbs are present, compute gross - tare and compare to the printed net. If the printed net disagrees with gross - tare, set confidence.net_lbs (and net_tons) to "low" — do not silently correct it, return what is printed.
+- fee_usd is the disposal charge / amount due, a plain number (no $).
+- Include a confidence entry for every non-null field.
+- Set "unreadable": true only when the image is not a scale ticket or no field could be read at all.
+"""
+
+
+def _dump_ticket_ocr_cap(conn, company_id):
+    row = conn.execute("SELECT ocr_daily_cap FROM companies WHERE id=?", (company_id,)).fetchone()
+    cap = row["ocr_daily_cap"] if row else None
+    try:
+        cap = int(cap)
+    except (TypeError, ValueError):
+        cap = _DUMP_TICKET_OCR_DEFAULT_CAP
+    return cap if cap > 0 else _DUMP_TICKET_OCR_DEFAULT_CAP
+
+
+def _save_dump_ticket_photo(conn, stop_id, route_id, company_id, raw, ext):
+    """Persist the ticket photo and attach it to the dump_ticket row IMMEDIATELY,
+    creating a stub row if none exists. The image is the record — this runs
+    before any OCR call so the photo survives even if OCR (or the whole request)
+    fails afterward. Returns the stored db path."""
+    uid = secrets.token_hex(8)
+    fname = f"dt_{stop_id}_{uid}.{ext}"
+    with open(os.path.join(app.config["UPLOAD_FOLDER"], fname), "wb") as fh:
+        fh.write(raw)
+    db_path = os.path.join("static", "uploads", fname)
+    if conn.execute("SELECT id FROM dump_tickets WHERE stop_id=?", (stop_id,)).fetchone():
+        conn.execute("UPDATE dump_tickets SET photo_path=?, needs_review=1 WHERE stop_id=?",
+                     (db_path, stop_id))
+    else:
+        conn.execute(
+            """INSERT INTO dump_tickets (stop_id, route_id, company_id, photo_path,
+                   needs_review, created_at, created_by) VALUES (?,?,?,?,1,?,?)""",
+            (stop_id, route_id, company_id, db_path, now_ts(), session["user_id"]))
+    conn.commit()
+    return db_path
+
+
+@app.route("/api/dump-ticket/ocr", methods=["POST"])
+@login_required
+def api_dump_ticket_ocr():
+    """ASSIST — read a photographed scale ticket and return prefill values for the
+    driver to CONFIRM. Never auto-submits. The photo is saved FIRST and always;
+    OCR is best-effort. Any failure (no key, over cap, model error, bad image,
+    unreadable) returns HTTP 200 with ok:false so the client quietly falls back
+    to the blank form with the photo attached — never a red error at a landfill."""
+    import os as _os
+    import base64 as _b64
+
+    stop_id_raw = (request.form.get("stop_id") or "").strip()
+    if not stop_id_raw.isdigit():
+        return jsonify({"ok": False, "reason": "bad_request"}), 400
+    stop_id = int(stop_id_raw)
+
+    conn = get_db()
+    stop = conn.execute(
+        """SELECT s.id, r.assigned_to, r.id AS rid FROM stops s JOIN routes r ON s.route_id=r.id
+            WHERE s.id=? AND r.company_id=?""",
+        (stop_id, cid())
+    ).fetchone()
+    if not stop:
+        conn.close()
+        return jsonify({"ok": False, "reason": "not_found"}), 404
+    if session.get("role") != "boss" and stop["assigned_to"] != session["user_id"]:
+        conn.close()
+        return jsonify({"ok": False, "reason": "forbidden"}), 403
+
+    photo = request.files.get("photo")
+    if not photo or not photo.filename:
+        conn.close()
+        return jsonify({"ok": False, "reason": "no_photo"}), 400
+    raw = photo.read()
+    if not raw:
+        conn.close()
+        return jsonify({"ok": False, "reason": "empty"}), 400
+    if len(raw) > _DUMP_TICKET_OCR_MAX_BYTES:
+        conn.close()
+        return jsonify({"ok": False, "reason": "too_large"}), 413
+    media_type = (photo.mimetype or "").lower()
+    if media_type not in _DUMP_TICKET_OCR_TYPES:
+        conn.close()
+        return jsonify({"ok": False, "reason": "bad_type"}), 415
+    ext = _DUMP_TICKET_OCR_TYPES[media_type]
+
+    # SAVE THE PHOTO FIRST — before any API call, regardless of OCR outcome.
+    photo_path = _save_dump_ticket_photo(conn, stop_id, stop["rid"], cid(), raw, ext)
+
+    def _fallback(reason):
+        # Photo is already saved + attached; the client opens the blank form.
+        conn.close()
+        return jsonify({"ok": False, "reason": reason, "photo_path": photo_path})
+
+    # Cost guard: one call per photo, hard per-company daily ceiling. Over cap →
+    # skip OCR entirely (blank form) so a retry loop can't run up an API bill.
+    cap = _dump_ticket_ocr_cap(conn, cid())
+    allowed, _retry = rate_limit_allow("dump_ticket_ocr", str(cid()), cap, 86400)
+    if not allowed:
+        app.logger.info("dump_ticket_ocr: daily cap %s reached for company %s", cap, cid())
+        return _fallback("cap")
+
+    try:
+        import anthropic
+    except ImportError:
+        return _fallback("no_ai")
+    api_key = _os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return _fallback("no_ai")
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key, timeout=25.0)
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            system=_DUMP_TICKET_OCR_PROMPT,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media_type,
+                                             "data": _b64.b64encode(raw).decode("ascii")}},
+                {"type": "text", "text": "Read this scale ticket. Return only the JSON."},
+            ]}],
+        )
+        raw_reply = "".join(
+            b.text for b in resp.content if getattr(b, "type", None) == "text"
+        ).strip()
+    except Exception as ex:
+        app.logger.warning("dump_ticket_ocr: model error: %s", ex)
+        return _fallback("error")
+
+    cleaned = raw_reply.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+    try:
+        parsed = json.loads(cleaned)
+    except (json.JSONDecodeError, ValueError):
+        return _fallback("parse")
+    if not isinstance(parsed, dict):
+        return _fallback("parse")
+
+    fields, conf = _normalize_ocr_ticket(parsed)
+    unreadable = bool(parsed.get("unreadable")) or not any(v is not None for v in fields.values())
+
+    # Mark the row as AI-read (needs_review cleared — the OCR has now run; the
+    # driver still confirms before the values are saved).
+    try:
+        conn.execute("UPDATE dump_tickets SET ai_prefilled=1, needs_review=0 WHERE stop_id=?", (stop_id,))
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    conn.close()
+    return jsonify({"ok": True, "unreadable": unreadable, "fields": fields,
+                    "confidence": conf, "photo_path": photo_path})
+
+
+def _normalize_ocr_ticket(parsed):
+    """Coerce the model's JSON into (fields, confidence) with defensive typing and
+    a gross-tare-net sanity check. Never raises."""
+    def _num(v):
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+    def _str(v):
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s[:200] or None
+    fields = {
+        "ticket_number": _str(parsed.get("ticket_number")),
+        "site_name":     _str(parsed.get("site_name")),
+        "date":          _str(parsed.get("date")),
+        "gross_lbs":     _num(parsed.get("gross_lbs")),
+        "tare_lbs":      _num(parsed.get("tare_lbs")),
+        "net_lbs":       _num(parsed.get("net_lbs")),
+        "net_tons":      _num(parsed.get("net_tons")),
+        "fee_usd":       _num(parsed.get("fee_usd")),
+        "material":      _str(parsed.get("material")),
+    }
+    raw_conf = parsed.get("confidence") if isinstance(parsed.get("confidence"), dict) else {}
+    conf = {}
+    for k, v in fields.items():
+        if v is None:
+            continue
+        c = str(raw_conf.get(k, "medium")).lower()
+        conf[k] = c if c in ("high", "medium", "low") else "medium"
+    # Server-side sanity: if gross & tare are both present, net must reconcile.
+    g, t, n = fields["gross_lbs"], fields["tare_lbs"], fields["net_lbs"]
+    if g is not None and t is not None:
+        expected = g - t
+        if n is not None and abs(n - expected) > max(20.0, 0.02 * abs(expected)):
+            conf["net_lbs"] = "low"
+            if fields["net_tons"] is not None:
+                conf["net_tons"] = "low"
+    return fields, conf
+
+
 @app.route("/stop/<int:stop_id>/dump-ticket", methods=["GET", "POST"])
 @login_required
 def dump_ticket(stop_id):
@@ -16394,8 +16631,13 @@ def dump_ticket(stop_id):
         scale_in       = _sf("scale_in_weight")
         scale_out      = _sf("scale_out_weight")
         net_tons       = _sf("net_tons")
+        fee_usd        = _sf("fee_usd")
+        material       = request.form.get("material", "").strip()
         ticket_number  = request.form.get("ticket_number", "").strip()
         notes          = request.form.get("notes", "").strip()
+        # needs_review = 1 only when a photo's OCR is still queued (captured
+        # offline, not yet read). A normal human-confirmed save clears it.
+        needs_review   = 1 if request.form.get("ocr_queued") == "1" else 0
 
         existing = conn.execute(
             "SELECT id FROM dump_tickets WHERE stop_id=?", (stop_id,)
@@ -16404,20 +16646,21 @@ def dump_ticket(stop_id):
             conn.execute(
                 """UPDATE dump_tickets SET dump_site=?, arrival_time=?, departure_time=?,
                    can_number=?, scale_in_weight=?, scale_out_weight=?, net_tons=?,
-                   ticket_number=?, notes=? WHERE stop_id=?""",
+                   fee_usd=?, material=?, ticket_number=?, notes=?, needs_review=? WHERE stop_id=?""",
                 (dump_site, arrival_time, departure_time, can_number,
-                 scale_in, scale_out, net_tons, ticket_number, notes, stop_id)
+                 scale_in, scale_out, net_tons, fee_usd, material,
+                 ticket_number, notes, needs_review, stop_id)
             )
         else:
             conn.execute(
                 """INSERT INTO dump_tickets
                    (stop_id, route_id, company_id, dump_site, arrival_time, departure_time,
-                    can_number, scale_in_weight, scale_out_weight, net_tons, ticket_number,
-                    notes, created_at, created_by)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    can_number, scale_in_weight, scale_out_weight, net_tons, fee_usd, material,
+                    ticket_number, notes, needs_review, created_at, created_by)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (stop_id, route_id, cid(), dump_site, arrival_time, departure_time,
-                 can_number, scale_in, scale_out, net_tons, ticket_number,
-                 notes, now_ts(), session["user_id"])
+                 can_number, scale_in, scale_out, net_tons, fee_usd, material,
+                 ticket_number, notes, needs_review, now_ts(), session["user_id"])
             )
 
         # Optional ticket photo
@@ -16574,16 +16817,40 @@ def dump_ticket(stop_id):
                     <label>Ticket Number</label>
                     <input name="ticket_number" id="f-ticket" value="{_fv("ticket_number")}" placeholder="Landfill ticket #">
                 </div>
+                <div>
+                    <label>Disposal Fee ($)</label>
+                    <input name="fee_usd" id="f-fee" type="number" step="0.01"
+                           value="{_fv("fee_usd")}" placeholder="0.00">
+                </div>
+                <div>
+                    <label>Material</label>
+                    <input name="material" id="f-material" value="{_fv("material")}" placeholder="e.g. C&amp;D, MSW">
+                </div>
             </div>
             <label>Notes</label>
             <textarea name="notes" placeholder="Issues, observations, gate info...">{_fv("notes")}</textarea>
             <label>Ticket Photo / Scan</label>
+            <!-- Camera-first capture: opens the camera on iOS (capture=environment).
+                 Photographing reads the ticket and PREFILLS the fields above for
+                 the driver to confirm — it never auto-saves. -->
+            <input type="file" id="f-ocr-photo" accept="image/*" capture="environment" style="display:none;">
+            <button type="button" class="btn" id="dt-ocr-btn"
+                    style="width:100%;min-height:52px;margin-bottom:8px;background:var(--teal-dim,rgba(0,229,204,0.12));
+                           border:1px solid var(--teal-border,rgba(0,229,204,0.45));color:var(--teal,#00E5CC);font-weight:700;">
+                &#128247; Photo of Ticket &mdash; auto-fill
+            </button>
+            <div id="dt-ocr-status" class="muted" style="font-size:13px;margin-bottom:8px;min-height:16px;"></div>
+            <!-- Manual attach still available (also accepts PDF). -->
             <input type="file" name="ticket_photo" id="f-photo" accept=".png,.jpg,.jpeg,.webp,.pdf"
                    style="margin-bottom:6px;">
             <div id="dt-photo-note" class="muted" style="font-size:12px;margin-bottom:16px;min-height:16px;"></div>
             <div id="dt-error" role="alert" style="display:none;margin-bottom:12px;padding:12px 14px;
                  border-radius:10px;background:var(--red-dim);border:1px solid rgba(255,82,82,0.40);
                  color:var(--red);font-size:14px;font-weight:600;"></div>
+            <input type="hidden" name="ocr_queued" id="f-ocr-queued" value="0">
+            <div id="dt-review-line" style="display:none;margin:4px 0 10px;font-weight:700;color:var(--orange,#FF6B1A);">
+                &#9998; Check the numbers before saving &mdash; these were read from the photo.
+            </div>
             <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px;">
                 <button class="btn green" type="submit" id="dt-save"
                         style="flex:1;min-width:160px;min-height:48px;">
@@ -16603,6 +16870,13 @@ def dump_ticket(stop_id):
                 border-top-color:#fff;border-radius:50%;animation:dtspin .7s linear infinite; }}
     @keyframes dtspin {{ to {{ transform:rotate(360deg); }} }}
     .dt-invalid {{ outline:2px solid var(--red) !important; outline-offset:1px; }}
+    /* AI-read fields: clearly marked, fully editable. Low-confidence gets a flag. */
+    .dt-ai {{ outline:2px solid var(--teal-border,rgba(0,229,204,0.45)); outline-offset:1px; }}
+    .dt-ai-low {{ outline:2px solid var(--orange,#FF6B1A) !important; outline-offset:1px; }}
+    .dt-tag {{ font-size:11px;font-weight:800;letter-spacing:.4px;text-transform:uppercase;
+               margin-left:6px;padding:1px 6px;border-radius:6px;
+               background:var(--teal-dim,rgba(0,229,204,0.12));color:var(--teal,#00E5CC); }}
+    .dt-tag-low {{ background:var(--orange-dim,rgba(255,107,26,0.14));color:var(--orange,#FF6B1A); }}
     </style>
     <script>
     (function() {{
@@ -16723,6 +16997,149 @@ def dump_ticket(stop_id):
                     ? ('Selected: ' + f.name + ' (' + Math.round(f.size / 1024) + ' KB) — will be compressed before upload')
                     : '';
             }});
+        }}
+
+        // ── Photo-of-ticket OCR assist ───────────────────────────────────
+        // Photograph the scale ticket → prefill the fields for the driver to
+        // CONFIRM. Never auto-saves. The photo is saved first, server-side, and
+        // OCR failure falls back QUIETLY to the blank form (no red banner).
+        var STOP_ID    = {stop_id};
+        var CSRF       = (document.querySelector('input[name=_csrf_token]') || {{}}).value || '';
+        var ocrBtn     = document.getElementById('dt-ocr-btn');
+        var ocrInput   = document.getElementById('f-ocr-photo');
+        var ocrStatus  = document.getElementById('dt-ocr-status');
+        var reviewLine = document.getElementById('dt-review-line');
+        var ocrQueued  = document.getElementById('f-ocr-queued');
+        var OCR_MAX_EDGE = 1600;                 // ~1600px long edge — bad landfill signal
+        var OCR_QKEY   = 'haultra_ticket_ocr_queue';
+
+        async function downscaleForOcr(file) {{
+            try {{
+                var img = await loadImage(await readFile(file));
+                var w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+                if (!w || !h) return file;
+                var scale = Math.min(1, OCR_MAX_EDGE / Math.max(w, h));
+                var cw = Math.round(w * scale), ch = Math.round(h * scale);
+                var cv = document.createElement('canvas'); cv.width = cw; cv.height = ch;
+                cv.getContext('2d').drawImage(img, 0, 0, cw, ch);
+                var blob = await canvasToBlob(cv, 0.72);
+                return blob ? new File([blob], 'ticket.jpg', {{ type: 'image/jpeg' }}) : file;
+            }} catch (e) {{ return file; }}
+        }}
+        function toTons(lbs) {{ return (lbs === null || lbs === undefined) ? null : Math.round(lbs / 2000 * 1000) / 1000; }}
+        function setAiField(id, value, conf) {{
+            var el = document.getElementById(id);
+            if (!el || value === null || value === undefined || value === '') return false;
+            el.value = value;
+            el.classList.remove('dt-ai', 'dt-ai-low');
+            var low = (conf === 'low');
+            el.classList.add(low ? 'dt-ai-low' : 'dt-ai');
+            var tagId = 'aitag-' + id, tag = document.getElementById(tagId);
+            if (!tag) {{ tag = document.createElement('span'); tag.id = tagId; if (el.parentNode) el.parentNode.appendChild(tag); }}
+            tag.className = 'dt-tag' + (low ? ' dt-tag-low' : '');
+            tag.textContent = low ? '\\u26A0 check this' : '\\u2726 AI';
+            return true;
+        }}
+        function applyPrefill(d) {{
+            var f = d.fields || {{}}, c = d.confidence || {{}}, any = false;
+            if (setAiField('f-ticket', f.ticket_number, c.ticket_number)) any = true;
+            if (f.site_name) {{
+                var sel = document.getElementById('f-site');
+                if (sel) {{ for (var i = 0; i < sel.options.length; i++) {{
+                    if (sel.options[i].value.toLowerCase() === String(f.site_name).toLowerCase()) {{
+                        sel.selectedIndex = i; sel.classList.add('dt-ai'); any = true; break;
+                    }}
+                }} }}
+            }}
+            if (setAiField('f-sin', toTons(f.gross_lbs), c.gross_lbs)) any = true;
+            if (setAiField('f-sout', toTons(f.tare_lbs), c.tare_lbs)) any = true;
+            var nt = (f.net_tons !== null && f.net_tons !== undefined) ? f.net_tons : toTons(f.net_lbs);
+            if (setAiField('f-net', nt, c.net_tons || c.net_lbs)) any = true;
+            if (setAiField('f-fee', f.fee_usd, c.fee_usd)) any = true;
+            if (setAiField('f-material', f.material, c.material)) any = true;
+            if (any && reviewLine) reviewLine.style.display = 'block';
+            return any;
+        }}
+        function attachToForm(file) {{
+            try {{ var dt = new DataTransfer(); dt.items.add(file); photoInput.files = dt.files; }} catch (e) {{}}
+        }}
+        // localStorage OCR queue — survives no-signal, flushed on reconnect.
+        function readQ() {{ try {{ return JSON.parse(localStorage.getItem(OCR_QKEY) || '{{}}'); }} catch (e) {{ return {{}}; }} }}
+        function writeQ(q) {{ try {{ localStorage.setItem(OCR_QKEY, JSON.stringify(q)); }} catch (e) {{}} }}
+        function queueOcr(file) {{
+            var r = new FileReader();
+            r.onload = function() {{ var q = readQ(); q[STOP_ID] = r.result;
+                var ks = Object.keys(q); while (ks.length > 5) {{ delete q[ks.shift()]; }}
+                writeQ(q); }};
+            r.readAsDataURL(file);
+        }}
+        function dataURLtoBlob(u) {{
+            var a = u.split(','), m = (a[0].match(/:(.*?);/) || [])[1] || 'image/jpeg';
+            var b = atob(a[1]), n = b.length, arr = new Uint8Array(n);
+            while (n--) {{ arr[n] = b.charCodeAt(n); }}
+            return new Blob([arr], {{ type: m }});
+        }}
+        function postOcr(sid, blob) {{
+            var fd = new FormData();
+            fd.append('_csrf_token', CSRF); fd.append('stop_id', sid); fd.append('photo', blob, 'ticket.jpg');
+            return fetch('/api/dump-ticket/ocr', {{ method: 'POST', credentials: 'same-origin', body: fd }})
+                .then(function(r) {{ return r.json().catch(function() {{ return null; }}); }});
+        }}
+        function flushOcr() {{
+            var q = readQ(), ks = Object.keys(q); if (!ks.length) return;
+            ks.forEach(function(sid) {{
+                var blob; try {{ blob = dataURLtoBlob(q[sid]); }} catch (e) {{ var qq = readQ(); delete qq[sid]; writeQ(qq); return; }}
+                postOcr(sid, blob).then(function(d) {{
+                    if (!d) return;                       // still offline — keep queued
+                    var qq = readQ(); delete qq[sid]; writeQ(qq);
+                    if (String(sid) === String(STOP_ID) && d.ok && !d.unreadable && applyPrefill(d)) {{
+                        if (ocrStatus) ocrStatus.textContent = 'Read from the photo (synced) — check the numbers below.';
+                        if (ocrQueued) ocrQueued.value = '0';
+                    }}
+                }}).catch(function() {{}});
+            }});
+        }}
+        function runOcr(file) {{
+            if (ocrStatus) ocrStatus.textContent = 'Reading ticket…';
+            if (ocrBtn) ocrBtn.disabled = true;
+            downscaleForOcr(file).then(function(small) {{
+                attachToForm(small);                       // save with the ticket regardless of OCR
+                if (photoNote) photoNote.textContent = 'Ticket photo attached.';
+                var ctrl = new AbortController();
+                var to = setTimeout(function() {{ ctrl.abort(); }}, 25000);
+                var fd = new FormData();
+                fd.append('_csrf_token', CSRF); fd.append('stop_id', STOP_ID); fd.append('photo', small, 'ticket.jpg');
+                fetch('/api/dump-ticket/ocr', {{ method: 'POST', credentials: 'same-origin', body: fd, signal: ctrl.signal }})
+                    .then(function(r) {{ return r.json().catch(function() {{ return null; }}); }})
+                    .then(function(d) {{
+                        clearTimeout(to); if (ocrBtn) ocrBtn.disabled = false;
+                        if (d && d.ok && !d.unreadable && applyPrefill(d)) {{
+                            ocrStatus.textContent = 'Read from the photo — check the numbers below.';
+                            try {{ photoInput.value = ''; }} catch (e) {{}}   // saved server-side; avoid re-upload
+                            if (photoNote) photoNote.textContent = 'Ticket photo saved.';
+                            if (ocrQueued) ocrQueued.value = '0';
+                        }} else {{
+                            // Failure is NORMAL — quiet fallback, photo stays attached.
+                            ocrStatus.textContent = 'Couldn\\u2019t read this one — enter the numbers below (photo is saved).';
+                            if (ocrQueued) ocrQueued.value = '0';
+                        }}
+                    }})
+                    .catch(function() {{
+                        clearTimeout(to); if (ocrBtn) ocrBtn.disabled = false;
+                        queueOcr(small);                    // no signal → queue, keep photo on the form
+                        if (ocrQueued) ocrQueued.value = '1';
+                        ocrStatus.textContent = 'No signal — photo saved with the ticket; it\\u2019ll read when you\\u2019re back online.';
+                    }});
+            }});
+        }}
+        if (ocrBtn && ocrInput) {{
+            ocrBtn.addEventListener('click', function() {{ ocrInput.click(); }});
+            ocrInput.addEventListener('change', function() {{
+                var f = ocrInput.files && ocrInput.files[0];
+                if (f) runOcr(f);
+            }});
+            window.addEventListener('online', flushOcr);
+            flushOcr();     // process anything queued while offline last time
         }}
 
         var submitting = false;
