@@ -37,9 +37,16 @@ for _ in range(14):
 cur.execute("INSERT INTO parse_vocab (company_id,term,expansion,kind,created_at) VALUES (?,?,?,'shorthand',?)",
             (co,"HAMP","hampton",app.now_ts()))  # case variant of same mapping
 
-# item 3: seed dup address-book rows (Recovery / recovery same address) + Serv Pro two sites + instruction name + no-name
+# item 3: seed dup address-book rows (Recovery / recovery same address) + Serv Pro two sites + instruction name + no-name.
+# Real-world duplicates arise when the same place was saved under keys computed
+# by an OLDER/inconsistent recipe (address-only, with/without city, etc.), so we
+# seed each row a DISTINCT placeholder norm_key here. The startup migration
+# recomputes every key with the current name+street recipe and then merges the
+# collisions — which is exactly what we're verifying.
+_sa_seed = [0]
 def sa(name, addr, city, used):
-    nk = app._normalize_addr(", ".join(p for p in [addr, city] if p))
+    _sa_seed[0] += 1
+    nk = "legacy_seed_%d" % _sa_seed[0]
     cur.execute("""INSERT INTO saved_addresses (company_id,customer_name,address,city,full_address,norm_key,
                    hidden,times_used,last_used_at,created_at) VALUES (?,?,?,?,?,?,0,?,?,?)""",
                 (co,name,addr,city,(addr+", "+city),nk,used,app.now_ts(),app.now_ts()))
@@ -61,7 +68,7 @@ hamp = conn.execute("SELECT COUNT(*) n FROM parse_vocab WHERE company_id=? AND L
 ok(hamp == 1, "duplicate 'hamp' shorthand collapsed to a single row")
 # item 3: Recovery/recovery merged; Serv Pro two sites intact
 rec = conn.execute("SELECT COUNT(*) n, SUM(times_used) t FROM saved_addresses WHERE company_id=? AND norm_key=?",
-                   (co, app._normalize_addr("6403 Granby St, Norfolk"))).fetchone()
+                   (co, app._address_book_key("Recovery", "6403 Granby St"))).fetchone()
 ok(rec["n"] == 1, "Recovery + recovery merged to one row")
 ok(rec["t"] == 8, "merged usage summed (3+5=8)")
 serv = conn.execute("SELECT COUNT(*) n FROM saved_addresses WHERE company_id=? AND customer_name='Serv Pro'",(co,)).fetchone()["n"]
