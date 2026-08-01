@@ -2966,6 +2966,10 @@ def init_db():
     # prefer the FK's record and fall back to the string when the FK is null.
     safe_add_column(conn, "stops", "dump_site_id INTEGER")
     safe_add_column(conn, "stops", "return_site_id INTEGER")
+    # Which leg of a multi-leg stop currently drives the Cab View navigation:
+    # 'primary' (the customer, default) | 'dump' | 'return'. Reversible — the
+    # driver taps back and forth. New/next stops always start on 'primary'.
+    safe_add_column(conn, "stops", "active_leg TEXT NOT NULL DEFAULT 'primary'")
     safe_add_column(conn, "stops", "pr_mode TEXT")
 
     # --- Phase 5B: company work hours / pay cycle ---
@@ -12069,6 +12073,139 @@ def _cab_preflight_body(route, stops, total_count, csrf):
 """
 
 
+_CAB_LEG_LABELS = {"primary": "STOP", "dump": "DUMP", "return": "RETURN"}
+
+# Active-leg switcher: taps repaint every nav consumer from the chosen leg, then
+# persist. Offline-first — the UI switches instantly and, if the POST fails, the
+# choice is queued in localStorage and flushed on reconnect, so a driver with no
+# bars can still switch legs. Reversible: tapping back to any leg just works.
+_CAB_LEG_SWITCH_JS = """
+<script>
+(function(){
+  var sw = document.getElementById('cab-legs-switch');
+  if (!sw || sw._wired) return; sw._wired = true;
+  var LEGS, ACTIVE, STOP_ID, CSRF, NAV_PREF;
+  try { LEGS = JSON.parse(sw.getAttribute('data-legs') || '[]'); } catch(e){ LEGS = []; }
+  ACTIVE   = sw.getAttribute('data-active') || 'primary';
+  STOP_ID  = sw.getAttribute('data-stop');
+  CSRF     = sw.getAttribute('data-csrf') || '';
+  NAV_PREF = sw.getAttribute('data-navpref') || '';
+  var head    = document.getElementById('cab-leg-head');
+  var addrEl  = document.getElementById('cab-address');
+  var navBtn  = document.getElementById('cab-nav-btn');
+  var copyBtn = document.getElementById('cab-copy-btn');
+  var gmaps   = document.getElementById('cab-gmaps');
+  var amaps   = document.getElementById('cab-amaps');
+  var mapsRow = document.getElementById('cab-maps-row');
+  var noaddr  = document.getElementById('cab-noaddr');
+  var noaddrSite = document.getElementById('cab-noaddr-site');
+  var chips = sw.querySelectorAll('.cab-leg-chip');
+  var cur = { key: ACTIVE, addr: '' };
+  var QKEY = 'haultra_leg_queue';
+  function enc(a){ return encodeURIComponent(a); }
+  function readQ(){ try { return JSON.parse(localStorage.getItem(QKEY) || '{}'); } catch(e){ return {}; } }
+  function writeQ(q){ try { localStorage.setItem(QKEY, JSON.stringify(q)); } catch(e){} }
+  function legByKey(k){ for (var i=0;i<LEGS.length;i++){ if (LEGS[i].key===k) return {leg:LEGS[i], idx:i}; } return {leg:LEGS[0]||{}, idx:0}; }
+  function paint(key){
+    var r = legByKey(key), leg = r.leg;
+    cur.key = key; cur.addr = leg.address || '';
+    for (var i=0;i<chips.length;i++){
+      var on = chips[i].getAttribute('data-leg') === key;
+      chips[i].classList.toggle('active', on);
+      chips[i].setAttribute('aria-pressed', on ? 'true' : 'false');
+    }
+    if (head) head.textContent = 'LEG ' + (r.idx+1) + ' OF ' + LEGS.length + ' \\u00b7 ' + (leg.label || '');
+    if (addrEl) addrEl.textContent = leg.address || leg.name || 'No address on file';
+    var has = !!leg.address;
+    var gurl = has ? 'https://www.google.com/maps/dir/?api=1&destination=' + enc(leg.address) : '#';
+    var aurl = has ? 'http://maps.apple.com/?daddr=' + enc(leg.address) + '&dirflg=d' : '#';
+    if (navBtn){ navBtn.setAttribute('href', gurl); navBtn.classList.toggle('is-disabled', !has); navBtn.setAttribute('aria-disabled', has ? 'false' : 'true'); }
+    if (gmaps) gmaps.setAttribute('href', gurl);
+    if (amaps) amaps.setAttribute('href', aurl);
+    if (mapsRow) mapsRow.style.display = has ? '' : 'none';
+    if (copyBtn) copyBtn.disabled = !has;
+    if (noaddr){ noaddr.hidden = has; if (!has && noaddrSite) noaddrSite.textContent = leg.name || 'this site'; }
+  }
+  function persistTo(sid, key){
+    return fetch('/stop/' + sid + '/active-leg', { method:'POST', credentials:'same-origin',
+      headers:{'Content-Type':'application/x-www-form-urlencoded','X-Requested-With':'fetch'},
+      body:'_csrf_token=' + enc(CSRF) + '&leg=' + enc(key) })
+      .then(function(r){ if(!r.ok) throw new Error('bad'); return r.json(); });
+  }
+  function flush(){
+    var q = readQ(), sids = Object.keys(q); if (!sids.length) return;
+    sids.forEach(function(sid){
+      persistTo(sid, q[sid]).then(function(){ var qq=readQ(); delete qq[sid]; writeQ(qq); }).catch(function(){});
+    });
+  }
+  for (var i=0;i<chips.length;i++){
+    chips[i].addEventListener('click', function(){
+      var key = this.getAttribute('data-leg');
+      if (key === cur.key) return;
+      paint(key);                                   // instant, works offline
+      persistTo(STOP_ID, key)
+        .then(function(){ var q=readQ(); delete q[STOP_ID]; writeQ(q); })
+        .catch(function(){ var q=readQ(); q[STOP_ID]=key; writeQ(q); });   // keep switched, retry on reconnect
+    });
+  }
+  window.addEventListener('online', flush);
+  window.cabNavigate = function(ev){ if(!cur.addr) return false; return openNavStop(ev, NAV_PREF, cur.addr); };
+  window.cabCopy = function(btn){ if(!cur.addr) return; copyStopAddress(btn, cur.addr); };
+  paint(ACTIVE);
+  flush();
+})();
+</script>
+"""
+
+
+def _cab_stop_legs(s, full_address, site_addr_by_id, dump_loc_by_name):
+    """THE single source of navigation truth for a Cab View stop card. Returns
+    (legs, active) where each leg is {key,label,name,address} and `active` is the
+    leg the driver is currently navigating (stop.active_leg, default 'primary').
+
+    Every nav consumer — the address block, Copy Address, Tap to Navigate, the
+    Google/Apple Maps links and the dump-ticket button — reads `active` from
+    here instead of stop.address, so switching the leg moves them all together.
+    The primary leg is always present; dump/return legs appear only when the stop
+    has them. A leg's address may be '' (site with no address yet) — callers must
+    guard Maps/Copy on that."""
+    def _resolve(site_id, name_str):
+        # FK site record first (boss-maintained address), then the legacy
+        # dump_locations table by name, matching the #84 nav resolution order.
+        if site_id and site_addr_by_id.get(site_id):
+            rec = site_addr_by_id[site_id]
+            return (rec.get("name") or (name_str or "").strip()), (rec.get("address") or "").strip()
+        nm = (name_str or "").strip()
+        if nm:
+            dl = dump_loc_by_name.get(nm.lower())
+            if dl:
+                addr = " ".join(p for p in [dl.get("address") or "", dl.get("city") or "",
+                                            dl.get("state") or "", dl.get("zip_code") or ""] if p).strip()
+                return nm, addr
+        return nm, ""
+
+    legs = [{
+        "key": "primary",
+        "label": (s.get("action") or "Stop").upper(),
+        "name": (s.get("customer_name") or "").strip(),
+        "address": (full_address or "").strip(),
+    }]
+    _dump_name = (s.get("dump_location") or "").strip()
+    _dump_id = s.get("dump_site_id") if "dump_site_id" in s.keys() else None
+    if _dump_name or _dump_id:
+        nm, addr = _resolve(_dump_id, _dump_name)
+        legs.append({"key": "dump", "label": "DUMP", "name": nm, "address": addr})
+    _ret_name = (s.get("return_destination") or "").strip()
+    _ret_id = s.get("return_site_id") if "return_site_id" in s.keys() else None
+    if _ret_name or _ret_id:
+        nm, addr = _resolve(_ret_id, _ret_name)
+        legs.append({"key": "return", "label": "RETURN", "name": nm, "address": addr})
+
+    want = (s.get("active_leg") or "primary") if "active_leg" in s.keys() else "primary"
+    active = next((l for l in legs if l["key"] == want), legs[0])
+    return legs, active
+
+
 @app.route("/driver/route/<int:route_id>")
 @driver_required
 def driver_route_detail(route_id):
@@ -12118,8 +12255,8 @@ def driver_route_detail(route_id):
     # This is the primary nav source; the legacy dump_locations map above is the
     # fallback for stops whose FK is null or whose site has no address yet.
     _site_addr_by_id = {}
-    _site_ids = [s["dump_site_id"] for s in stops
-                 if "dump_site_id" in s.keys() and s["dump_site_id"]]
+    _site_ids = list({s[c] for s in stops for c in ("dump_site_id", "return_site_id")
+                      if c in s.keys() and s[c]})
     if _site_ids:
         _ph = ",".join("?" * len(_site_ids))
         for _sr in conn.execute(
@@ -12337,14 +12474,28 @@ def driver_route_detail(route_id):
     full_address = " ".join(filter(None, [
         s["address"] or "", s["city"] or "", s["state"] or "", s["zip_code"] or "",
     ])).strip()
-    _enc_addr = urllib.parse.quote_plus(full_address)
-    nav_google_web = "https://www.google.com/maps/dir/?api=1&destination=" + _enc_addr
+
+    # Active-leg navigation. One helper resolves which leg (customer / dump /
+    # return) currently drives the card; every nav button below reads its address
+    # instead of stop.address, so switching legs moves them all together. For a
+    # single-leg stop `active` is the customer leg → the card renders exactly as
+    # it did before this feature.
+    _legs, _curleg = _cab_stop_legs(_s, full_address, _site_addr_by_id, _dump_loc_by_name)
+    _multileg = len(_legs) > 1
+    nav_addr = (_curleg["address"] or "").strip()
+    nav_has_addr = bool(nav_addr)
+    _enc_addr = urllib.parse.quote_plus(nav_addr)
+    # Never launch Maps with an empty query — the guard below disables the
+    # buttons when the active leg has no address.
+    nav_google_web = ("https://www.google.com/maps/dir/?api=1&destination=" + _enc_addr) if nav_has_addr else "#"
     nav_google_app = "comgooglemaps://?daddr=" + _enc_addr + "&directionsmode=driving"
+    nav_apple_web = ("http://maps.apple.com/?daddr=" + _enc_addr + "&dirflg=d") if nav_has_addr else "#"
     # HTML-escaped so the JSON-quoted JS string literal (which itself uses
     # double quotes, and may contain an apostrophe from the address) can't
     # collide with the double-quoted HTML attribute it's embedded in below.
     _nav_pref_js = e(json.dumps(_nav_pref))
-    _full_addr_js = e(json.dumps(full_address))
+    _full_addr_js = e(json.dumps(nav_addr))
+    _legs_js = e(json.dumps(_legs))
 
     action_lower = (s["action"] or "").lower()
     # Vendor-visit stop (inserted by the vendor-dispatch alert) — read-only,
@@ -12849,6 +13000,62 @@ def driver_route_detail(route_id):
         _bk_container = ""
     breakdown_ui_html = _breakdown_driver_ui_html(route_id, _bk_container, _csrf)
 
+    # ── Active-leg switcher (multi-leg stops only) ──────────────────────────
+    # Single-leg stops render exactly as before: no header, no chips, no maps
+    # row — just the customer address block + Tap to Navigate + Copy Address.
+    _addr_display = nav_addr or (_curleg["name"] or "") or "No address on file"
+    if _multileg:
+        _active_idx = next((i for i, l in enumerate(_legs) if l["key"] == _curleg["key"]), 0)
+        _leg_head_html = (
+            f'<div class="cab-leg-head" id="cab-leg-head">LEG {_active_idx + 1} OF {len(_legs)} '
+            f'&middot; {e(_curleg["label"])}</div>'
+        )
+        _chip_btns = ""
+        for l in _legs:
+            _sub = l["name"] or (l["address"].split(",")[0].strip() if l["address"] else "") or "—"
+            _on = (l["key"] == _curleg["key"])
+            _chip_btns += (
+                f'<button type="button" class="cab-leg-chip{" active" if _on else ""}" '
+                f'data-leg="{l["key"]}" aria-pressed="{"true" if _on else "false"}">'
+                f'<span class="cab-leg-chip-lbl">{e(l["label"])}</span>'
+                f'<span class="cab-leg-chip-sub">{e(_sub)}</span></button>'
+            )
+        _leg_switch_html = (
+            f'<div class="cab-legs-switch" id="cab-legs-switch" role="group" aria-label="Active leg" '
+            f'data-stop="{stop_id}" data-csrf="{_csrf}" data-active="{e(_curleg["key"])}" '
+            f'data-navpref="{e(_nav_pref)}" data-legs="{e(json.dumps(_legs))}">{_chip_btns}</div>'
+        )
+        _maps_row_html = (
+            f'<div class="cab-maps-row" id="cab-maps-row"{"" if nav_has_addr else " style=display:none"}>'
+            f'<a class="cab-maps-btn" id="cab-gmaps" target="_blank" rel="noopener" href="{nav_google_web}">&#128205; Google Maps</a>'
+            f'<a class="cab-maps-btn" id="cab-amaps" target="_blank" rel="noopener" href="{nav_apple_web}">&#63743; Apple Maps</a>'
+            f'</div>'
+        )
+        _noaddr_html = (
+            f'<div class="cab-noaddr" id="cab-noaddr"{"" if not nav_has_addr else " hidden"}>'
+            f'&#9888;&#65039; No address saved for <span id="cab-noaddr-site">{e(_curleg["name"] or "this site")}</span> '
+            f'&mdash; add it in Settings &rarr; Dump Sites &amp; Yards.</div>'
+        )
+        _nav_cluster_html = (
+            f'<a class="cab-nav-btn{"" if nav_has_addr else " is-disabled"}" id="cab-nav-btn" href="{nav_google_web}" '
+            f'aria-disabled="{"false" if nav_has_addr else "true"}" onclick="return cabNavigate(event)">'
+            f'&#128205; Tap to Navigate</a>'
+            f'{_maps_row_html}'
+            f'<button type="button" class="cab-copy-btn" id="cab-copy-btn" onclick="cabCopy(this)"'
+            f'{"" if nav_has_addr else " disabled"}>&#128203; Copy Address</button>'
+            f'{_noaddr_html}'
+        )
+        _leg_switch_js = _CAB_LEG_SWITCH_JS
+    else:
+        _leg_head_html = _leg_switch_html = _leg_switch_js = ""
+        _nav_cluster_html = (
+            f'<a class="cab-nav-btn" href="{nav_google_web}" '
+            f'onclick="return openNavStop(event, {_nav_pref_js}, {_full_addr_js})">'
+            f'&#128205; Tap to Navigate</a>'
+            f'<button type="button" class="cab-copy-btn" onclick="copyStopAddress(this, {_full_addr_js})">'
+            f'&#128203; Copy Address</button>'
+        )
+
     body = f"""
 <style>
   /* Running-state sticky bar: keeps progress + END ROUTE pinned so nothing
@@ -12861,6 +13068,26 @@ def driver_route_detail(route_id):
       background:transparent; color: var(--red, #FF5252); border-radius:10px; font-weight:800;
       letter-spacing:.5px; cursor:pointer; }}
   .cab-sticky-end:active {{ background: rgba(255,82,82,0.12); }}
+
+  /* Active-leg switcher: which leg (customer / dump / return) drives navigation. */
+  .cab-leg-head {{ font-weight:800; letter-spacing:1px; font-size:.8rem; color: var(--text-muted);
+      margin:2px 0 8px; }}
+  .cab-legs-switch {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }}
+  .cab-leg-chip {{ flex:1 1 auto; min-height:48px; min-width:96px; padding:8px 12px; cursor:pointer;
+      display:flex; flex-direction:column; align-items:flex-start; justify-content:center; gap:2px;
+      background: var(--bg-0, #121212); border:1px solid rgba(255,255,255,0.14); border-radius:12px;
+      color: var(--text-muted); text-align:left; }}
+  .cab-leg-chip.active {{ background: rgba(255,107,26,0.14); border-color: var(--orange, #FF6B1A); color: var(--text, #F5F5F0); }}
+  .cab-leg-chip-lbl {{ font-weight:800; letter-spacing:.6px; font-size:.72rem; text-transform:uppercase; }}
+  .cab-leg-chip.active .cab-leg-chip-lbl {{ color: var(--orange, #FF6B1A); }}
+  .cab-leg-chip-sub {{ font-size:.82rem; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }}
+  .cab-maps-row {{ display:flex; gap:8px; margin:10px 0 0; }}
+  .cab-maps-btn {{ flex:1; min-height:48px; display:flex; align-items:center; justify-content:center;
+      text-decoration:none; border-radius:12px; font-weight:700; padding:0 12px;
+      background: rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.14); color: var(--text, #F5F5F0); }}
+  .cab-nav-btn.is-disabled, .cab-copy-btn:disabled {{ opacity:.45; pointer-events:none; }}
+  .cab-noaddr {{ margin-top:10px; padding:10px 12px; border-radius:10px; font-size:.85rem;
+      color: var(--text-muted); background: rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.12); }}
 </style>
 <div class="cab-wrap">
     <div class="cab-sticky-bar">
@@ -12906,20 +13133,15 @@ def driver_route_detail(route_id):
             <div class="cab-action-name">{e(s['customer_name'] or ('Stop ' + str(current_stop_num)))}</div>
         </div>
 
-        <div class="cab-address">{e(full_address or 'No address on file')}</div>
+        {_leg_head_html}
+        {_leg_switch_html or legs_html}
+        <div class="cab-address" id="cab-address">{e(_addr_display)}</div>
         {can_on_board_html}
-        {legs_html}
         {f'<div class="cab-meta-line">{meta_line}</div>' if meta_line else ''}
         {ticket_line}
         {phone_line}
 
-        <a class="cab-nav-btn" href="{nav_google_web}"
-           onclick="return openNavStop(event, {_nav_pref_js}, {_full_addr_js})">
-            &#128205; Tap to Navigate
-        </a>
-        <button type="button" class="cab-copy-btn" onclick="copyStopAddress(this, {_full_addr_js})">
-            &#128203; Copy Address
-        </button>
+        {_nav_cluster_html}
         <div id="cab-copy-hint" class="cab-copy-hint" hidden>
             Using a Garmin or in-dash GPS? Copy the address and enter it on your unit.
         </div>
@@ -12960,6 +13182,7 @@ def driver_route_detail(route_id):
 
 <script>{_gps_settings_js()}</script>
 <script>{_gps_capture_js()}</script>
+{_leg_switch_js}
 <script>
 (function() {{
     var badge = document.getElementById('online-badge');
@@ -15968,6 +16191,55 @@ def set_empty_can_plan(stop_id):
 
     if wants_json:
         return jsonify({"ok": True, "plan": plan, "changed": changed})
+    if session.get("role") != "boss":
+        return redirect(url_for("driver_route_detail", route_id=stop["rid"]))
+    return redirect(url_for("view_route", route_id=stop["rid"]))
+
+
+_ACTIVE_LEG_VALUES = ("primary", "dump", "return")
+
+
+@app.route("/stop/<int:stop_id>/active-leg", methods=["POST"])
+@login_required
+def set_active_leg(stop_id):
+    """Persist which leg (customer / dump / return) drives the Cab View card's
+    navigation. Reversible — the driver flips back and forth. The client applies
+    the switch optimistically and only calls this to persist, queuing offline and
+    retrying on reconnect, so this endpoint just validates + stores. Returns JSON
+    to fetch callers; redirects for a plain form."""
+    wants_json = (request.headers.get("X-Requested-With") == "fetch"
+                  or "application/json" in (request.headers.get("Accept") or ""))
+    leg = (request.form.get("leg") or "").strip().lower()
+    if leg not in _ACTIVE_LEG_VALUES:
+        if wants_json:
+            return jsonify({"error": "unknown leg"}), 400
+        abort(400)
+
+    conn = get_db()
+    stop = conn.execute(
+        """SELECT s.id, r.assigned_to, r.id AS rid
+             FROM stops s JOIN routes r ON s.route_id = r.id
+            WHERE s.id=? AND r.company_id=?""",
+        (stop_id, cid())
+    ).fetchone()
+    if not stop:
+        conn.close()
+        if wants_json:
+            return jsonify({"error": "not found"}), 404
+        abort(404)
+    if session.get("role") != "boss" and stop["assigned_to"] != session["user_id"]:
+        conn.close()
+        if wants_json:
+            return jsonify({"error": "forbidden"}), 403
+        flash("Access denied.", "error")
+        return redirect(url_for("dashboard"))
+
+    conn.execute("UPDATE stops SET active_leg=? WHERE id=?", (leg, stop_id))
+    conn.commit()
+    conn.close()
+
+    if wants_json:
+        return jsonify({"ok": True, "leg": leg})
     if session.get("role") != "boss":
         return redirect(url_for("driver_route_detail", route_id=stop["rid"]))
     return redirect(url_for("view_route", route_id=stop["rid"]))
