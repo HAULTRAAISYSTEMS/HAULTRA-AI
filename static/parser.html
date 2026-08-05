@@ -794,6 +794,8 @@
       container_size: (raw && raw.container_size) ? String(raw.container_size) : '',
       dump_leg: (raw && raw.dump_leg) ? String(raw.dump_leg) : '',
       return_leg: (raw && raw.return_leg) ? String(raw.return_leg) : '',
+      // Verbatim can-swap hint from the parser; the server resolves the link.
+      chain_hint: (raw && raw.chain_hint) ? raw.chain_hint : null,
       raw: (raw && raw.raw) ? String(raw.raw) : '',
       confidence: confidence,
       notes: (raw && raw.notes) ? String(raw.notes) : '',
@@ -1185,6 +1187,7 @@
             notes: s.notes,
             confidence: s.confidence,
             reviewed: s.reviewed,
+            chain_hint: s.chain_hint || null,
             insert_before: s.insert_before || 'end',
           };
         }),
@@ -1208,6 +1211,7 @@
             notes: s.notes,
             confidence: s.confidence,
             reviewed: s.reviewed,
+            chain_hint: s.chain_hint || null,
           };
         }),
       };
