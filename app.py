@@ -35,6 +35,7 @@ from datetime import datetime, date, timedelta
 from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
+import chain_resolver
 
 # Optional PDF export
 PDF_ENABLED = True
@@ -1372,6 +1373,28 @@ def safe_add_column(conn, table_name, ddl):
         conn.commit()
     except sqlite3.OperationalError:
         pass
+
+
+def _column_exists(conn, table_name, column_name):
+    """True if `column_name` is already a column of `table_name`. Reads
+    PRAGMA table_info rather than trusting a blanket try/except, so a real DDL
+    error (typo, locked db) is never silently swallowed as 'already present'."""
+    return any(
+        row[1] == column_name
+        for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    )
+
+
+def _add_column_if_missing(conn, table_name, column_name, ddl):
+    """Idempotent ADD COLUMN gated on PRAGMA table_info(). SQLite has no
+    ADD COLUMN IF NOT EXISTS, and this must be safe to re-run against the live
+    /data volume on every boot — a non-idempotent migration caused a prod
+    outage before. Checking the column list first means a second run is a true
+    no-op and any genuine ALTER error still surfaces."""
+    if _column_exists(conn, table_name, column_name):
+        return
+    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {ddl}")
+    conn.commit()
 
 
 def _migrate_parse_vocab(conn, default_co_id):
@@ -2972,6 +2995,27 @@ def init_db():
     safe_add_column(conn, "stops", "active_leg TEXT NOT NULL DEFAULT 'primary'")
     safe_add_column(conn, "stops", "pr_mode TEXT")
 
+    # --- Chained can-swap (feat/chained-swaps-and-optional-tickets) ---
+    # A can pulled at one stop ("supplies") can become the empty set off at
+    # another ("receives"). The boss writes this as a note ("use to swap 5125
+    # ballahack rd"); the deterministic resolver links the two stops in-batch.
+    # These are METADATA layered on the existing PR action — no new action code,
+    # and compute_can_flow()/swap_with_prev_pull are left fully intact. An
+    # explicit chain always wins over the positional swap inference.
+    #   chain_group_id     shared UUID across both linked stops (NULL = legacy/no chain)
+    #   chain_role         'supplies' (can leaves here) | 'receives' (can arrives here)
+    #   chain_target_ref   the boss's verbatim target text, kept even when unmatched
+    #   chain_linked_stop_id  the resolved partner stop id, or NULL when unmatched
+    _add_column_if_missing(conn, "stops", "chain_group_id", "chain_group_id TEXT")
+    _add_column_if_missing(conn, "stops", "chain_role", "chain_role TEXT")
+    _add_column_if_missing(conn, "stops", "chain_target_ref", "chain_target_ref TEXT")
+    _add_column_if_missing(conn, "stops", "chain_linked_stop_id", "chain_linked_stop_id INTEGER")
+    # How this stop's dump ticket is satisfied:
+    #   'pending'  not yet completed
+    #   'site'     a real site-issued ticket number/photo was recorded
+    #   'internal' the site issues no tickets — an HT-… reference was auto-generated
+    _add_column_if_missing(conn, "stops", "ticket_source", "ticket_source TEXT DEFAULT 'pending'")
+
     # --- Scale-ticket OCR assist (feat/ticket-ocr) ---
     # fee_usd/material: fields a scale ticket carries that the form didn't store.
     # needs_review: a photo was captured but its OCR is still queued/unprocessed
@@ -3651,6 +3695,12 @@ def init_db():
     safe_add_column(conn, "saved_addresses", "hidden INTEGER NOT NULL DEFAULT 0")
     safe_add_column(conn, "saved_addresses", "label TEXT")
     safe_add_column(conn, "saved_addresses", "kind TEXT NOT NULL DEFAULT 'customer'")
+    # Does this dump site issue its own scale/weigh tickets? Default 1 (yes) is the
+    # fail-safe: an unlinked or unknown site demands a real ticket rather than
+    # silently auto-generating an internal reference. Boss-editable per site.
+    # Only meaningful for kind='dump' rows; harmless on others.
+    _add_column_if_missing(conn, "saved_addresses", "issues_tickets",
+                           "issues_tickets INTEGER NOT NULL DEFAULT 1")
     # Any pre-existing row with a NULL/blank kind is a legacy customer entry.
     try:
         conn.execute(
@@ -11218,7 +11268,9 @@ def _build_route_board_html(user):
                u.avatar_path AS driver_avatar,
                s.id AS stop_id, s.stop_order, s.customer_name, s.address, s.city,
                s.action, s.container_size, s.status AS stop_status, s.driver_status,
-               s.completed_at, s.held_at, s.empty_can_plan, ii.vendor_status AS vendor_status,
+               s.completed_at, s.held_at, s.empty_can_plan,
+               s.chain_group_id, s.chain_role, s.chain_target_ref, s.chain_linked_stop_id,
+               ii.vendor_status AS vendor_status,
                EXISTS(SELECT 1 FROM route_photos rp WHERE rp.stop_id = s.id) AS has_photo
         FROM routes r
         LEFT JOIN users u ON r.assigned_to = u.id
@@ -11232,6 +11284,13 @@ def _build_route_board_html(user):
     sql += " ORDER BY r.id, s.stop_order, s.id"
 
     board_rows = conn.execute(sql, tuple(params)).fetchall()
+    # Short label for each stop, so a chained receiver can name its source stop
+    # ("CAN FROM …") without another query. Built from the same rows.
+    _chain_label_by_id = {}
+    for _r in board_rows:
+        _sid = dict(_r).get("stop_id")
+        if _sid is not None:
+            _chain_label_by_id[_sid] = (dict(_r).get("address") or dict(_r).get("customer_name") or "").strip()
 
     # Real, derived "urgent" signal: a pending Pull/PR stop whose container has
     # already been sitting overdue at that address (from compute_containers_out,
@@ -11386,6 +11445,26 @@ def _build_route_board_html(user):
             addr_cls = "stop-mini-addr done" if stop_status == "completed" else "stop-mini-addr"
             size_label = size_bucket(s["container_size"]) or (s["container_size"] or "")
 
+            # Chained can-swap badge. Explicit chain is the ONLY "where does this
+            # can go / come from" indicator shown — the positional swap inference
+            # is never badged here, so a stop never tells two stories. Slate pill,
+            # reusing the board's existing neutral tone (no new color system).
+            chain_badge = ""
+            _sd = dict(s)
+            if _sd.get("chain_group_id"):
+                _crole = (_sd.get("chain_role") or "").strip()
+                _cpill = ('display:inline-block;margin-top:5px;padding:2px 7px;border-radius:999px;'
+                          'font-size:9px;font-weight:800;letter-spacing:.4px;white-space:nowrap;'
+                          'overflow:hidden;text-overflow:ellipsis;max-width:100%;'
+                          'background:rgba(140,160,179,0.16);color:#B8C6D4;border:1px solid rgba(140,160,179,0.5);')
+                if _crole == "supplies":
+                    _tgt = (_sd.get("chain_target_ref")
+                            or _chain_label_by_id.get(_sd.get("chain_linked_stop_id"), "") or "next stop").strip()
+                    chain_badge = f'<div><span class="stop-mini-chain" title="Feeds another stop" style="{_cpill}">&rarr; FEEDS {e(_tgt)}</span></div>'
+                elif _crole == "receives":
+                    _src = (_chain_label_by_id.get(_sd.get("chain_linked_stop_id"), "") or "prior stop").strip()
+                    chain_badge = f'<div><span class="stop-mini-chain" title="Empty can comes from another stop" style="{_cpill}">&larr; CAN FROM {e(_src)}</span></div>'
+
             time_html = ""
             if stop_status == "completed" and s["completed_at"]:
                 t = _fmt_12h(s["completed_at"])
@@ -11424,6 +11503,7 @@ def _build_route_board_html(user):
                     {photo_html}
                 </div>
                 <div class="{addr_cls}">{e(addr_text)}</div>
+                {chain_badge}
                 <div class="stop-mini-bottom">
                     <span class="stop-mini-size">{e(size_label) if size_label else '&mdash;'}</span>
                     <span class="stop-mini-pill {pill_cls}">{e(pill_label)}</span>
@@ -12562,11 +12642,42 @@ def driver_route_detail(route_id):
 
     driver_status = _s.get("driver_status") or "pending"
 
+    # ── Chained can-swap: the full pulled here feeds another stop, or the empty
+    #    set off here came from another stop. Explicit chain ALWAYS wins over the
+    #    positional swap inference (swap_with_prev_pull), so we branch on it first
+    #    and never let both drive the card. A stop with a null chain_group_id
+    #    falls through to the unchanged legacy logic below. ──────────────────
+    _chained    = bool(_s.get("chain_group_id"))
+    _chain_role = (_s.get("chain_role") or "").strip() if _chained else ""
+    _chain_target = (_s.get("chain_target_ref") or "").strip()
+
     # ── Reuse the exact existing workflow state machine (arrived / box out /
     #    go to dump / dump ticket / box in) — same _wf_map + same POST target
     #    as before, just rendered inside the new single-stop card. ──────────
     workflow_btn_html = ""
-    if is_swap_pr:
+    if _chained and _chain_role == "supplies":
+        # The full is dumped, then the now-empty can is delivered to the target
+        # stop instead of returned to this customer. Only the post-dump step
+        # differs from a normal PR: "Deliver Empty to {target}".
+        _tgt = e(_chain_target) if _chain_target else "the next stop"
+        _deliver_step = ("box_in", f"&#128666; Deliver Empty to {_tgt}", "btn-driver btn-driver-complete")
+        wf_map = {
+            "pending":     ("arrived",       "&#128666; Arrived at Stop",                    "btn-driver btn-driver-complete"),
+            "arrived":     ("box_out",       "&#128230; Box Out &mdash; Remove Container",   "btn-driver btn-driver-complete"),
+            "box_out":     ("going_to_dump", "&#128465;&#65039; Go To Dump",                 "btn-driver btn-driver-dump"),
+            "need_box_in": _deliver_step,
+        }
+    elif _chained and _chain_role == "receives":
+        # Arrive carrying the empty supplied by the source stop: set it off, box
+        # out the full that's here, haul the full to the dump, done. Physically
+        # correct order for a one-can truck bed.
+        wf_map = {
+            "pending":     ("arrived",       "&#128666; Arrived at Stop",              "btn-driver btn-driver-complete"),
+            "arrived":     ("need_box_in",   "&#128230; Set Off Empty",                "btn-driver btn-driver-complete"),
+            "need_box_in": ("box_in",        "&#128230; Box Out Full",                 "btn-driver btn-driver-complete"),
+            "box_in":      ("going_to_dump", "&#128465;&#65039; Go To Dump",           "btn-driver btn-driver-dump"),
+        }
+    elif is_swap_pr:
         wf_map = {
             "pending":     ("arrived",       "&#128666; Arrived at Stop",               "btn-driver btn-driver-complete"),
             "arrived":     ("box_out",       "&#128230; Box Out &mdash; Remove Old Container", "btn-driver btn-driver-complete"),
@@ -13890,8 +14001,15 @@ _STOP_WARNINGS_JS = """
 
     /* 4 — Invalid service flow: consecutive pickups */
     if (action && existingStops.length > 0) {
-      var lastA = (existingStops[existingStops.length - 1].action || '').toLowerCase();
-      if (has(action, PICKUP_TYPES) && has(lastA, PICKUP_TYPES)) {
+      var prev  = existingStops[existingStops.length - 1];
+      var lastA = (prev.action || '').toLowerCase();
+      /* Suppress ONLY when this stop and the previous one are two ends of the
+         SAME can-swap chain (shared non-null chain_group_id) \u2014 the boss wrote
+         "use to swap ..." on purpose. Two UNRELATED consecutive pickups still error. */
+      var curChain  = (typeof _HAULTRA_CURRENT_CHAIN !== 'undefined') ? _HAULTRA_CURRENT_CHAIN : null;
+      var prevChain = prev.chain_group_id || null;
+      var sameChain = !!(curChain && prevChain && curChain === prevChain);
+      if (!sameChain && has(action, PICKUP_TYPES) && has(lastA, PICKUP_TYPES)) {
         warns.push({ level: 'red',
           msg: 'Service flow issue \u2014 consecutive pickup actions (' +
                lastA + ' \u2192 ' + action + '). Verify route logic.' });
@@ -15475,7 +15593,8 @@ def view_route(route_id):
     add_stop_block = ""
     if session.get("role") == "boss":
         _existing_stops_json = json.dumps([
-            {"customer_name": s["customer_name"] or "", "address": s["address"] or "", "action": s["action"] or ""}
+            {"customer_name": s["customer_name"] or "", "address": s["address"] or "", "action": s["action"] or "",
+             "chain_group_id": (s["chain_group_id"] if "chain_group_id" in s.keys() else None)}
             for s in stops
         ])
         add_stop_block = f"""
@@ -15779,6 +15898,10 @@ def edit_stop(stop_id):
                          expand_abbrev(request.form.get("dump_location", "")), "")
         # Recompute can flow and derive swap_with_prev_pull from sequence
         compute_can_flow(conn, route_id)
+        # An address/target edit can move this stop into or out of a chain; the
+        # edit UPDATEs in place, so re-resolve links from the persisted breadcrumbs.
+        _reresolve_route_chains(conn, route_id)
+        _log_chain_conflicts(conn, route_id)
         conn.commit()
         upsert_saved_address(conn, cid(),
             expand_abbrev(request.form.get("customer_name")), expand_abbrev(request.form.get("address")),
@@ -15797,17 +15920,33 @@ def edit_stop(stop_id):
         (cid(),)
     ).fetchall()
     _sibling_stops = conn.execute(
-        "SELECT customer_name, address, action FROM stops WHERE route_id=? AND id!=? ORDER BY stop_order",
+        "SELECT customer_name, address, action, chain_group_id FROM stops WHERE route_id=? AND id!=? ORDER BY stop_order",
         (ownership["route_id"], stop_id)
     ).fetchall()
     _edit_photo_count = conn.execute(
         "SELECT COUNT(*) n FROM route_photos WHERE stop_id=?", (stop_id,)
     ).fetchone()["n"]
+    # Optional tickets: if this stop's dump site issues none, the Ticket Number
+    # field becomes a read-only "Internal Dump Ref" — auto-filled, never hidden,
+    # so the record is always visible. issues_tickets=1 (or unlinked) keeps the
+    # normal editable Ticket Number field.
+    _edit_issues_tickets, _ = _site_issues_tickets(conn, cid(), _stop)
     conn.close()
+    _edit_ticket_optional = (not _edit_issues_tickets)
+    _edit_ticket_label = "Internal Dump Ref" if _edit_ticket_optional else "Ticket Number"
+    _edit_ticket_ro = " readonly" if _edit_ticket_optional else ""
+    _edit_ticket_val = _stop.get("ticket_number") or ("" if not _edit_ticket_optional else "(auto-generated at dump: HT-…)")
+    _edit_ticket_hint = ('<div class="small muted" style="margin-top:3px;font-size:10px;">This dump site issues no ticket — '
+                         'an internal reference is generated automatically at dump time.</div>') if _edit_ticket_optional else ""
     _sibling_json = json.dumps([
-        {"customer_name": s["customer_name"] or "", "address": s["address"] or "", "action": s["action"] or ""}
+        {"customer_name": s["customer_name"] or "", "address": s["address"] or "", "action": s["action"] or "",
+         "chain_group_id": (s["chain_group_id"] if "chain_group_id" in s.keys() else None)}
         for s in _sibling_stops
     ])
+    # The stop being edited may itself be one end of a can-swap chain; expose its
+    # group so the consecutive-pickup warning can be suppressed against its partner.
+    _edit_chain_group_json = json.dumps(
+        _stop.get("chain_group_id") if isinstance(_stop, dict) else None)
 
     # Derive swap display for read-only info panel
     _csb_edit   = _stop.get("can_state_before") or ""
@@ -15907,8 +16046,9 @@ def edit_stop(stop_id):
                     <input name="container_size" value="{e(_stop['container_size'])}">
                 </div>
                 <div>
-                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Ticket Number</label>
-                    <input name="ticket_number" value="{e(_stop['ticket_number'])}">
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">{_edit_ticket_label}</label>
+                    <input name="ticket_number" value="{e(_edit_ticket_val)}"{_edit_ticket_ro}>
+                    {_edit_ticket_hint}
                 </div>
                 <div>
                     <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Reference Number</label>
@@ -15935,6 +16075,7 @@ def edit_stop(stop_id):
     """
     body += "<script>" + _AUTOCOMPLETE_JS + "</script>"
     body += '<script>var _HAULTRA_STOPS = ' + _sibling_json + ';</script>'
+    body += '<script>var _HAULTRA_CURRENT_CHAIN = ' + _edit_chain_group_json + ';</script>'
     body += '<script>' + _STOP_WARNINGS_JS + '</script>'
     return render_template_string(shell_page("Edit Stop", body))
 
@@ -16728,6 +16869,39 @@ def _normalize_ocr_ticket(parsed):
     return fields, conf
 
 
+def _site_issues_tickets(conn, company_id, stop):
+    """(issues_tickets, is_linked) for the dump site this stop resolves to.
+    The canonical site record is saved_addresses via stops.dump_site_id. An
+    unlinked stop (name only, no FK) fails safe to issues_tickets=True so it
+    still demands a real ticket rather than silently auto-generating one; the
+    caller soft-logs the unlinked case so the site can be linked later."""
+    sid = dict(stop).get("dump_site_id")
+    if sid:
+        row = conn.execute(
+            "SELECT issues_tickets FROM saved_addresses WHERE id=? AND company_id=?",
+            (sid, company_id)
+        ).fetchone()
+        if row is not None:
+            return bool(row["issues_tickets"]), True
+    return True, False
+
+
+def _gen_internal_dump_ref(conn, company_id, user_id):
+    """Auto reference for a dump site that issues no ticket:
+    HT-YYYYMMDD-{driver initials}-{seq}. seq is the company's internal-ticket
+    count for the day + 1, so refs are unique and sortable. The photo + timestamp
+    (+ GPS when captured) are the verifiable record in place of a site ticket."""
+    day = datetime.now().strftime("%Y%m%d")
+    u = conn.execute("SELECT full_name, username FROM users WHERE id=?", (user_id,)).fetchone()
+    name = ((u["full_name"] if u else "") or (u["username"] if u else "") or "").strip()
+    initials = "".join(p[0] for p in name.split()[:2]).upper() or "XX"
+    seq = conn.execute(
+        "SELECT COUNT(*) c FROM dump_tickets WHERE company_id=? AND ticket_number LIKE ?",
+        (company_id, f"HT-{day}-%")
+    ).fetchone()["c"] + 1
+    return f"HT-{day}-{initials}-{seq:03d}"
+
+
 @app.route("/stop/<int:stop_id>/dump-ticket", methods=["GET", "POST"])
 @login_required
 def dump_ticket(stop_id):
@@ -16780,6 +16954,59 @@ def dump_ticket(stop_id):
         # offline, not yet read). A normal human-confirmed save clears it.
         needs_review   = 1 if request.form.get("ocr_queued") == "1" else 0
 
+        # ── Optional tickets ────────────────────────────────────────────────
+        # Every dump event must leave a verifiable record — but NOT every site
+        # issues one. Sites that DO: completion needs a ticket number OR a photo.
+        # Sites that DON'T: a photo (the record) is required and an internal
+        # HT-… reference is auto-generated. The gate only blocks the completion
+        # save (going_to_dump); re-editing an existing ticket is never blocked.
+        _dt_prev = conn.execute(
+            "SELECT ticket_number, photo_path FROM dump_tickets WHERE stop_id=?", (stop_id,)
+        ).fetchone()
+        _new_photo = request.files.get("ticket_photo")
+        _has_new_photo = bool(_new_photo and _new_photo.filename and allowed_file(_new_photo.filename))
+        _has_photo = _has_new_photo or bool(_dt_prev and (_dt_prev["photo_path"] or "").strip())
+        _has_ticket = bool(ticket_number)
+        _issues_tickets, _site_linked = _site_issues_tickets(conn, cid(), stop)
+        _completing = (dict(stop).get("driver_status") or "") == "going_to_dump"
+
+        if _completing and not _site_linked and (dict(stop).get("dump_location") or "").strip():
+            # Completed against a name-only dump site — surface it (never block) so
+            # the boss can link it to a real record and set its ticket policy.
+            app.logger.info(
+                "dump completion on unlinked site '%s' (stop %s, company %s) — link it to a "
+                "saved dump site to control its ticket policy.",
+                (dict(stop).get("dump_location") or "").strip(), stop_id, cid())
+
+        _ticket_source = "site"
+        if _completing:
+            if _issues_tickets:
+                if not _has_ticket and not _has_photo:
+                    msg = "This dump site issues tickets — enter the ticket number or add a photo of it to complete."
+                    if request.headers.get("X-Requested-With") == "fetch":
+                        conn.close()
+                        return jsonify({"ok": False, "error": msg}), 400
+                    conn.close()
+                    flash(msg, "error")
+                    return redirect(url_for("dump_ticket", stop_id=stop_id))
+                _ticket_source = "site"
+            else:
+                # Site issues no ticket: the photo IS the record. Require it.
+                if not _has_photo:
+                    msg = "This dump site issues no ticket — add a photo of the dump so there's a verifiable record."
+                    if request.headers.get("X-Requested-With") == "fetch":
+                        conn.close()
+                        return jsonify({"ok": False, "error": msg}), 400
+                    conn.close()
+                    flash(msg, "error")
+                    return redirect(url_for("dump_ticket", stop_id=stop_id))
+                if not _has_ticket:
+                    ticket_number = _gen_internal_dump_ref(conn, cid(), session["user_id"])
+                    _ticket_source = "internal"
+                else:
+                    _ticket_source = "site"
+        conn.execute("UPDATE stops SET ticket_source=? WHERE id=?", (_ticket_source, stop_id))
+
         existing = conn.execute(
             "SELECT id FROM dump_tickets WHERE stop_id=?", (stop_id,)
         ).fetchone()
@@ -16827,20 +17054,26 @@ def dump_ticket(stop_id):
             or ("swap" in _stop_action and "pull" not in _stop_action)
         )
         _is_swap_pr_dump = _is_pr_action and bool(dict(stop).get("swap_with_prev_pull"))
+        # Explicit chain wins over the positional swap inference when deciding the
+        # post-dump state, exactly as it does for the workflow buttons.
+        _srow = dict(stop)
+        _chain_role_dump = (_srow.get("chain_role") or "").strip() if _srow.get("chain_group_id") else ""
         if _ds == "going_to_dump":
-            if _is_pr_action and not _is_swap_pr_dump:
-                # Normal PR: driver still needs to drop off an empty can at the customer
-                conn.execute(
-                    "UPDATE stops SET driver_status='need_box_in' WHERE id=?",
-                    (stop_id,)
-                )
-            else:
-                # Swap PR (box_in already done), Pull, Dump, or other — complete after dump
+            if _chain_role_dump == "supplies":
+                # Supplier: after dumping the full, still must deliver the empty to
+                # the target stop → one more step (relabeled "Deliver Empty to …").
+                conn.execute("UPDATE stops SET driver_status='need_box_in' WHERE id=?", (stop_id,))
+            elif _chain_role_dump == "receives" or (_is_pr_action and _is_swap_pr_dump) or not _is_pr_action:
+                # Receiver (empty was set off + full boxed out before the dump run),
+                # positional swap PR, Pull, Dump, or other — complete after dump.
                 conn.execute(
                     "UPDATE stops SET driver_status='completed', status='completed', completed_at=? WHERE id=?",
                     (now_ts(), stop_id)
                 )
                 update_container_flow(conn, stop_id)
+            else:
+                # Normal PR: driver still needs to drop off an empty can at the customer
+                conn.execute("UPDATE stops SET driver_status='need_box_in' WHERE id=?", (stop_id,))
 
         # Customer Request System: keep a linked request in sync if this dump
         # step just completed the stop (no-op for normal stops).
@@ -18277,6 +18510,7 @@ For every stop extract:
   dump_leg        the dump/landfill SITE NAME to haul to, or null (match KNOWN DUMP SITES)
   return_leg      the yard/site to return the empty container to, or null
   empty_can_plan  what to do with the EMPTY can after dumping (see rule below), or null
+  chain_hint      a can-swap chain link, or null (see CHAIN HINT rule below)
   raw             the original text for this stop, verbatim
   confidence      "low" or "high"
   notes           any extra detail worth surfacing, or ""
@@ -18291,8 +18525,19 @@ Rules:
   returns the empty to this customer by default — do NOT set "return_here" explicitly).
 - Set confidence "low" ONLY when the action or address is genuinely ambiguous or missing —
   not merely because a dump/return leg or a preamble is present.
+- CHAIN HINT: sometimes the can pulled at THIS stop becomes the empty that gets set off at
+  ANOTHER stop, or the empty set off HERE comes from another stop. Trigger phrases:
+  "use to swap X", "use for X", "swap with X", "take to X", "this can goes to X",
+  "empty for X", "use on X". When you see one, set:
+    chain_hint = {"direction":"supplies","target_text":"<X, copied VERBATIM from the text>"}
+  on the stop that PRODUCES the can ("supplies"), OR {"direction":"receives", ...} on the stop
+  that RECEIVES it, whichever the sentence describes. Otherwise chain_hint = null.
+  CRITICAL: copy target_text EXACTLY as written — do NOT guess a stop number, do NOT invent or
+  look up an ID, and do NOT normalize/expand/complete the address. "5125 ballahack" stays
+  "5125 ballahack". Matching two stops together is done later in code, not by you. A chain hint
+  does NOT change the action — a PR stays PR. Never emit a new action code for a swap.
 - Respond with ONLY valid JSON — no markdown, no commentary — in exactly this shape:
-  {"stops":[{"action":"","address":"","customer":"","container_size":null,"dump_leg":null,"return_leg":null,"empty_can_plan":null,"raw":"","confidence":"","notes":""}]}
+  {"stops":[{"action":"","address":"","customer":"","container_size":null,"dump_leg":null,"return_leg":null,"empty_can_plan":null,"chain_hint":null,"raw":"","confidence":"","notes":""}]}
 
 WORKED EXAMPLE
 Input:
@@ -18305,7 +18550,14 @@ WORKED EXAMPLE (carry the empty to the next stop)
 Input:
   PR 1013 Paragon Way Napo can 3085 dump holland — don't return the can, carry the empty to the next stop
 Output:
-  {"stops":[{"action":"PR","address":"1013 Paragon Way","customer":"Napo","container_size":null,"dump_leg":"Holland","return_leg":null,"empty_can_plan":"carry_next","carry_can_ref":"3085","raw":"PR 1013 Paragon Way Napo can 3085 dump holland — don't return the can, carry the empty to the next stop","confidence":"high","notes":""}]}
+  {"stops":[{"action":"PR","address":"1013 Paragon Way","customer":"Napo","container_size":null,"dump_leg":"Holland","return_leg":null,"empty_can_plan":"carry_next","carry_can_ref":"3085","chain_hint":null,"raw":"PR 1013 Paragon Way Napo can 3085 dump holland — don't return the can, carry the empty to the next stop","confidence":"high","notes":""}]}
+
+WORKED EXAMPLE (chained can-swap — the pulled can feeds another address)
+Input:
+  1351 VB Blvd PR 30yd use to swap 5125 ballahack
+  5125 Ballahack Rd PR 30yd
+Output:
+  {"stops":[{"action":"PR","address":"1351 VB Blvd","customer":"","container_size":"30yd","dump_leg":null,"return_leg":null,"empty_can_plan":null,"chain_hint":{"direction":"supplies","target_text":"5125 ballahack"},"raw":"1351 VB Blvd PR 30yd use to swap 5125 ballahack","confidence":"high","notes":""},{"action":"PR","address":"5125 Ballahack Rd","customer":"","container_size":"30yd","dump_leg":null,"return_leg":null,"empty_can_plan":null,"chain_hint":null,"raw":"5125 Ballahack Rd PR 30yd","confidence":"high","notes":""}]}
 """
 
 
@@ -21133,7 +21385,8 @@ def _site_locations_section_html():
     Dump / Yard client-side."""
     conn = get_db()
     rows_db = conn.execute(
-        """SELECT id, customer_name, label, address, city, state, zip, full_address, kind, times_used
+        """SELECT id, customer_name, label, address, city, state, zip, full_address, kind, times_used,
+                  issues_tickets
              FROM saved_addresses
             WHERE company_id=? AND kind IN ('dump','yard')
             ORDER BY (TRIM(COALESCE(address,''))='' AND TRIM(COALESCE(full_address,''))='') DESC,
@@ -21155,10 +21408,28 @@ def _site_locations_section_html():
         need_badge = ('' if has_addr else
                       '<span class="badge" style="background:rgba(255,82,82,0.16);color:#FF5252;">'
                       '&#9888; needs address</span>')
+        # Per-site ticket policy (dump sites only): a one-tap toggle for whether
+        # this site issues its own scale ticket. issues_tickets=0 sites accept a
+        # photo + auto internal reference at completion instead of a typed ticket.
+        tickets_toggle = ""
+        if kind == "dump":
+            _it = int(_a.get("issues_tickets") if _a.get("issues_tickets") is not None else 1)
+            _tt_style = ("background:rgba(140,160,179,0.18);color:#8CA0B3;border:1px solid rgba(140,160,179,0.4);"
+                         if _it else
+                         "background:rgba(245,180,60,0.16);color:#F5B43C;border:1px solid rgba(245,180,60,0.45);")
+            _tt_label = "Issues tickets" if _it else "No ticket — photo + ref"
+            tickets_toggle = (
+                f'<form method="POST" action="{url_for("update_address_book", sa_id=_a["id"])}" style="display:inline;">'
+                f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
+                f'<input type="hidden" name="action" value="toggle_tickets">'
+                f'<button type="submit" title="Toggle whether this dump site issues its own scale ticket" '
+                f'style="{_tt_style}border-radius:999px;padding:2px 9px;font-size:10px;font-weight:700;'
+                f'cursor:pointer;margin-left:4px;">&#127903; {_tt_label}</button>'
+                f'</form>')
         search = " ".join(p for p in [name, _a["address"] or "", _a["city"] or ""] if p).lower()
         rows += (
             f'<tr data-search="{e(search)}" data-kind="{e(kind)}">'
-            f'<td><strong>{e(name)}</strong> {kind_badge} {need_badge}</td>'
+            f'<td><strong>{e(name)}</strong> {kind_badge} {need_badge} {tickets_toggle}</td>'
             f'<td>'
             f'<form method="POST" action="{url_for("update_address_book", sa_id=_a["id"])}" '
             f'style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">'
@@ -21267,6 +21538,21 @@ def update_address_book(sa_id):
                      (new_hidden, sa_id, cid()))
         conn.commit()
         flash("Location hidden from quick add." if new_hidden else "Location back in quick add.", "success")
+    elif action == "toggle_tickets":
+        # Boss flips whether this dump site issues its own scale/weigh tickets.
+        cur_it = conn.execute(
+            "SELECT issues_tickets FROM saved_addresses WHERE id=? AND company_id=?", (sa_id, cid())
+        ).fetchone()
+        new_it = 0 if (cur_it and cur_it["issues_tickets"]) else 1
+        conn.execute("UPDATE saved_addresses SET issues_tickets=? WHERE id=? AND company_id=?",
+                     (new_it, sa_id, cid()))
+        conn.commit()
+        flash("Site issues tickets — a ticket number or photo is required to complete a dump."
+              if new_it else
+              "Site issues no ticket — dumps here record a photo + auto internal reference instead.",
+              "success")
+        conn.close()
+        return redirect(url_for("yard_setup_page") + "#site-locations")
     conn.close()
     return redirect(url_for("yard_setup_page") + "#address-book")
 
@@ -23716,6 +24002,7 @@ def add_parsed_stops(route_id):
     ).fetchone()["m"] or 0
 
     added = 0
+    _chain_batch = []
     for stop in stops:
         if not isinstance(stop, dict):
             continue
@@ -23752,6 +24039,8 @@ def add_parsed_stops(route_id):
                   return_destination, pr_mode,
                   swap_flag, now_ts()))
             added += 1
+            _chain_batch.append((_cur.lastrowid, {"address": address,
+                                                  "chain_hint": _sanitize_chain_hint(stop.get("chain_hint"))}))
             _link_stop_sites(conn, cid(), _cur.lastrowid, dump_location, return_destination)
             upsert_saved_address(conn, cid(),
                 customer_name, address, city, state, zip_code,
@@ -23761,9 +24050,11 @@ def add_parsed_stops(route_id):
             last -= 1  # reclaim the order slot so next stop doesn't skip a number
 
     if added:
+        _apply_chain_links(conn, _chain_batch)
         conn.commit()
         try:
             compute_can_flow(conn, route_id)
+            _log_chain_conflicts(conn, route_id)
             conn.commit()
         except Exception as exc:
             app.logger.warning("add_parsed_stops: compute_can_flow error: %s", exc)
@@ -23780,6 +24071,94 @@ def add_parsed_stops(route_id):
 # badges), so a dispatched route behaves identically to one created via
 # Create Route / Paste Dispatch Text.
 _PARSER_ACTION_MAP = {"PR": "Pickup and Return", "P": "Pull", "D": "Delivery", "S": "Swap", "R": "Relocate", "LL": "Live Load", "YARD": "Yard"}
+
+
+def _apply_chain_links(conn, inserted):
+    """Resolve can-swap chains for a freshly-inserted batch and write the chain
+    columns — all inside the caller's open transaction (before commit), so a
+    half-linked chain is never persisted.
+
+    `inserted` is a list of (stop_id, stop_dict) in insert order; each stop_dict
+    supplies at least `address` and (optionally) `chain_hint`. The deterministic
+    matcher assigns groups/roles; here we map the partner's batch index to its
+    real stop id and UPDATE both rows. Legacy/unchained stops get NULLs written,
+    which is a no-op relative to their existing NULL state.
+    """
+    if not inserted:
+        return []
+    stop_ids = [sid for sid, _ in inserted]
+    dicts = [dict(d or {}) for _, d in inserted]
+    links = chain_resolver.resolve_chains(dicts)
+    for i, d in enumerate(dicts):
+        partner_idx = d.get("_chain_partner_index")
+        linked_id = stop_ids[partner_idx] if partner_idx is not None else None
+        conn.execute(
+            "UPDATE stops SET chain_group_id=?, chain_role=?, chain_target_ref=?, "
+            "chain_linked_stop_id=? WHERE id=?",
+            (d.get("_chain_group_id"), d.get("_chain_role"),
+             d.get("_chain_target_ref"), linked_id, stop_ids[i]),
+        )
+    return links
+
+
+def _log_chain_conflicts(conn, route_id):
+    """Explicit chain wins over positional inference. When they name DIFFERENT
+    sources for a receiver's empty — the chain link skips over an adjacent
+    can-producer that swap_with_prev_pull would otherwise pair it with — log a
+    single diagnostic line. Never surfaced to the user: the boss wrote the swap
+    note on purpose. Call after compute_can_flow, when both signals exist.
+    """
+    rows = conn.execute(
+        "SELECT id, chain_group_id, chain_role, chain_linked_stop_id, swap_with_prev_pull "
+        "FROM stops WHERE route_id=? ORDER BY stop_order, id", (route_id,)
+    ).fetchall()
+    for i, r in enumerate(rows):
+        if r["chain_group_id"] and (r["chain_role"] or "") == "receives" and int(r["swap_with_prev_pull"] or 0):
+            prev_id = rows[i - 1]["id"] if i > 0 else None
+            if prev_id is not None and prev_id != r["chain_linked_stop_id"]:
+                app.logger.warning(
+                    "chain/positional source conflict: route %s stop %s takes its empty from chained "
+                    "stop %s, but positional inference points at adjacent stop %s — chain wins.",
+                    route_id, r["id"], r["chain_linked_stop_id"], prev_id)
+
+
+def _reresolve_route_chains(conn, route_id):
+    """Recompute this route's can-swap links from the persisted breadcrumbs.
+    Runs after a Save Stop edit (in the same transaction) because editing an
+    address or a target can move a stop into or out of a valid chain — and the
+    edit path UPDATEs in place, so nothing else would refresh the link.
+
+    Only stops that carry a hint (non-null chain_target_ref + chain_role) drive
+    the match; the reconstructed hint is fed back through the same resolver, so
+    a now-mismatched pair cleanly drops its group/link while keeping the raw
+    breadcrumb, and a newly-matching pair links up.
+    """
+    rows = conn.execute(
+        "SELECT id, address, chain_role, chain_target_ref FROM stops "
+        "WHERE route_id=? ORDER BY stop_order, id", (route_id,)
+    ).fetchall()
+    if not rows:
+        return
+    inserted = []
+    for r in rows:
+        ref = (r["chain_target_ref"] or "").strip()
+        role = (r["chain_role"] or "").strip()
+        hint = {"direction": role, "target_text": ref} if (ref and role in ("supplies", "receives")) else None
+        inserted.append((r["id"], {"address": r["address"] or "", "chain_hint": hint}))
+    _apply_chain_links(conn, inserted)
+
+
+def _sanitize_chain_hint(raw):
+    """Accept a chain_hint only in the exact {direction, target_text} shape the
+    resolver understands; anything else becomes None. Target text is capped and
+    kept verbatim (never normalized here — the resolver owns matching)."""
+    if not isinstance(raw, dict):
+        return None
+    direction = (raw.get("direction") or "").strip().lower()
+    target_text = (raw.get("target_text") or "").strip()[:200]
+    if direction not in ("supplies", "receives") or not target_text:
+        return None
+    return {"direction": direction, "target_text": target_text}
 
 
 def _validate_parser_stops(stops_in):
@@ -23824,6 +24203,8 @@ def _validate_parser_stops(stops_in):
             "empty_can_plan": (s.get("empty_can_plan") or "").strip()
                               if (s.get("empty_can_plan") or "").strip() in _EMPTY_CAN_PLANS else "",
             "carry_can_ref": (str(s.get("carry_can_ref") or "").strip()[:40]),
+            # Verbatim can-swap hint; the deterministic resolver links it at insert.
+            "chain_hint": _sanitize_chain_hint(s.get("chain_hint")),
         })
     return clean_stops, None
 
@@ -23880,6 +24261,7 @@ def api_dispatch():
     next_order = conn.execute(
         "SELECT COALESCE(MAX(stop_order), 0) AS m FROM stops WHERE route_id=?", (route_id,)
     ).fetchone()["m"]
+    _chain_batch = []
     for s in clean_stops:
         next_order += 1
         cur.execute("""
@@ -23890,6 +24272,7 @@ def api_dispatch():
         """, (route_id, next_order, s.get("customer") or "", s["address"], s["action"],
               s["container_size"], s.get("dump_leg") or "", s.get("return_leg") or "",
               s["notes"], s.get("empty_can_plan") or "", s.get("carry_can_ref") or "", now_ts()))
+        _chain_batch.append((cur.lastrowid, {"address": s["address"], "chain_hint": s.get("chain_hint")}))
         # Resolve the dump/return site names to location records + set the FKs.
         _link_stop_sites(conn, cid(), cur.lastrowid, s.get("dump_leg") or "", s.get("return_leg") or "")
         # Self-building address book: learn every dispatched stop's address.
@@ -23897,9 +24280,12 @@ def api_dispatch():
                        action=s["action"], container_size=s["container_size"],
                        dump_location=s.get("dump_leg") or "")
 
+    # Link can-swap chains before commit, so a chain is never half-persisted.
+    _apply_chain_links(conn, _chain_batch)
     conn.commit()
     try:
         compute_can_flow(conn, route_id)
+        _log_chain_conflicts(conn, route_id)
         conn.commit()
     except Exception as exc:
         app.logger.warning("api_dispatch: compute_can_flow error: %s", exc)
@@ -23959,6 +24345,7 @@ def api_insert_stops(route_id):
 
     cur = conn.cursor()
     new_stops = []
+    _chain_batch = []
     for s in clean_stops:
         cur.execute("""
             INSERT INTO stops (route_id, stop_order, customer_name, address, action, container_size,
@@ -23969,12 +24356,16 @@ def api_insert_stops(route_id):
               s.get("dump_leg") or "", s.get("return_leg") or "", s["notes"],
               s.get("empty_can_plan") or "", s.get("carry_can_ref") or "", now_ts()))
         new_stops.append((cur.lastrowid, s["insert_before"]))
+        _chain_batch.append((cur.lastrowid, {"address": s["address"], "chain_hint": s.get("chain_hint")}))
         # Resolve the dump/return site names to location records + set the FKs.
         _link_stop_sites(conn, cid(), cur.lastrowid, s.get("dump_leg") or "", s.get("return_leg") or "")
         # Self-building address book: learn every inserted stop's address.
         learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
                        action=s["action"], container_size=s["container_size"],
                        dump_location=s.get("dump_leg") or "")
+
+    # Link can-swap chains within this inserted batch, before commit.
+    _apply_chain_links(conn, _chain_batch)
 
     # Merge new stops into the insertable (unlocked) sequence at their chosen position.
     # Multiple stops targeting the same anchor stack in submission order, immediately
@@ -23993,6 +24384,7 @@ def api_insert_stops(route_id):
     conn.commit()
     try:
         compute_can_flow(conn, route_id)
+        _log_chain_conflicts(conn, route_id)
         conn.commit()
     except Exception as exc:
         app.logger.warning("api_insert_stops: compute_can_flow error: %s", exc)
