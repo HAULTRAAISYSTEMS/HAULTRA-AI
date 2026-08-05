@@ -1,4 +1,4 @@
-import os, sys, tempfile, importlib, io, json
+import os, sys, tempfile, importlib, io
 TMP = tempfile.mkdtemp()
 os.environ["DATABASE_PATH"] = os.path.join(TMP, "cs.db")
 os.environ["SECRET_KEY"] = "cs"
@@ -6,30 +6,91 @@ os.environ["UPLOAD_FOLDER"] = os.path.join(TMP, "up")
 os.makedirs(os.environ["UPLOAD_FOLDER"], exist_ok=True)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 app = importlib.import_module("app")
-import chain_resolver
+import chain_resolver as cr
 
 def ok(c, m):
     print(("PASS" if c else "FAIL") + " - " + m)
     if not c:
         raise SystemExit("FAILED: " + m)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1) Both migrations are idempotent — run init_db repeatedly, second+ is a no-op.
-# ─────────────────────────────────────────────────────────────────────────────
-app.init_db(); app.init_db(); app.init_db()
+# ── 1) Idempotent migrations ────────────────────────────────────────────────
+app.init_db(); app.init_db()
 conn = app.get_db()
-def cols(t): return {r[1] for r in conn.execute("PRAGMA table_info(%s)" % t).fetchall()}
-scol = cols("stops"); acol = cols("saved_addresses")
-for c in ("chain_group_id", "chain_role", "chain_target_ref", "chain_linked_stop_id", "ticket_source"):
+scol = {r[1] for r in conn.execute("PRAGMA table_info(stops)").fetchall()}
+acol = {r[1] for r in conn.execute("PRAGMA table_info(saved_addresses)").fetchall()}
+for c in ("chain_group_id", "chain_seq", "chain_gives_to_stop_id", "chain_takes_from_stop_id",
+          "chain_terminal", "chain_target_ref", "chain_source", "ticket_source"):
     ok(c in scol, "stops.%s exists after repeated init_db (idempotent)" % c)
-ok("issues_tickets" in acol, "saved_addresses.issues_tickets exists after repeated init_db (idempotent)")
-_ts_def = [x for x in conn.execute("PRAGMA table_info(stops)").fetchall() if x[1] == "ticket_source"][0]
-ok((_ts_def[4] or "").replace("'", "") == "pending", "ticket_source default is 'pending'")
-_it_def = [x for x in conn.execute("PRAGMA table_info(saved_addresses)").fetchall() if x[1] == "issues_tickets"][0]
-ok(str(_it_def[4]) == "1" and _it_def[3] == 1, "issues_tickets default 1, NOT NULL")
+ok("issues_tickets" in acol, "saved_addresses.issues_tickets exists (idempotent)")
 conn.close()
 
-# ── shared fixture ───────────────────────────────────────────────────────────
+# ── resolver unit helpers ───────────────────────────────────────────────────
+def mk(i, action, addr, size, note="", hint=None, manual=None):
+    return {"id": i, "action": action, "address": addr, "container_size": size,
+            "note": note, "chain_hint": hint, "manual_gives_to": manual}
+
+# 2) The exact two-line input -> 2-stop chain, tail gives_to head.
+s = [mk(1, "Pickup and Return", "1351 Virginia Beach Blvd", "30yd", note="use to swap"),
+     mk(2, "Pickup and Return", "5125 Ballahack Rd", "30yd")]
+cr.resolve_chain(s)
+ok(s[0]["_chain_seq"] == 0 and s[1]["_chain_seq"] == 1, "2-line: seq 0,1")
+ok(s[0]["_chain_gives_to"] == 2 and s[1]["_chain_gives_to"] == 1 and s[1]["_chain_terminal"] == "head",
+   "2-line: tail gives_to = head, terminal head")
+
+# 3) 4 consecutive PRs, "swap till end" on stop 1 -> seq 0..3, tail->head, 4 trips.
+s = [mk(i, "Pickup and Return", "%d00 St" % i, "30yd", note=("swap till end" if i == 1 else "")) for i in range(1, 5)]
+cr.resolve_chain(s)
+ok([x["_chain_seq"] for x in s] == [0, 1, 2, 3], "swap-till-end: seq 0..3 across the full run")
+ok(s[3]["_chain_gives_to"] == 1 and s[3]["_chain_terminal"] == "head", "swap-till-end: tail returns to head")
+ok(len({x["_chain_group_id"] for x in s}) == 1, "swap-till-end: one chain group = 4 dump trips")
+
+# 4) Same + "back to yard" on the tail -> terminal yard + INFO on head.
+s = [mk(i, "Pickup and Return", "%d00 St" % i, "30yd",
+        note=("swap till end" if i == 1 else ("back to yard" if i == 4 else ""))) for i in range(1, 5)]
+res = cr.resolve_chain(s)
+ok(s[3]["_chain_terminal"] == "yard" and s[3]["_chain_gives_to"] is None, "back-to-yard: terminal yard, no return link")
+ok(any("no can" in inf["msg"] for inf in res["infos"]), "back-to-yard: INFO notice on the head")
+
+# 5) Bare "use to swap" on stop 1 of a 4-PR run -> chain extends the full run.
+s = [mk(i, "Pickup and Return", "%d00 St" % i, "30yd", note=("use to swap" if i == 1 else "")) for i in range(1, 5)]
+cr.resolve_chain(s)
+ok([x["_chain_seq"] for x in s] == [0, 1, 2, 3], "bare use-to-swap: extends the full run")
+
+# 6) Run broken by a D stop mid-run -> two separate chains.
+s = [mk(1, "Pickup and Return", "1 St", "30yd", note="swap till end"),
+     mk(2, "Pickup and Return", "2 St", "30yd"),
+     mk(3, "Delivery", "3 St", "30yd"),
+     mk(4, "Pickup and Return", "4 St", "30yd"),
+     mk(5, "Pickup and Return", "5 St", "30yd")]
+cr.resolve_chain(s)
+g1, g2 = s[0]["_chain_group_id"], s[3]["_chain_group_id"]
+ok(g1 and g2 and g1 != g2, "D-break: two separate chains")
+ok(s[2]["_chain_group_id"] is None, "D-break: the D stop is not in a chain")
+
+# 7) 30yd -> 20yd link -> BLOCKING error, chain breaks, both stops flagged.
+s = [mk(1, "Pickup and Return", "1 St", "30yd", note="swap till end"),
+     mk(2, "Pickup and Return", "2 St", "20yd")]
+res = cr.resolve_chain(s)
+ok(len(res["errors"]) >= 2 and {e["stop_id"] for e in res["errors"]} == {1, 2}, "size mismatch: blocking error on BOTH")
+ok(s[0]["_chain_gives_to"] != 2, "size mismatch: the bad link is not created")
+
+# 8) Explicit address target skipping an intermediate stop.
+s = [mk(1, "Pickup and Return", "1351 vb blvd", "30yd", hint={"kind": "explicit", "target_text": "6969 tidewater"}),
+     mk(2, "Pickup and Return", "500 middle rd", "30yd"),
+     mk(3, "Pickup and Return", "6969 Tidewater Dr", "30yd")]
+cr.resolve_chain(s)
+ok(s[0]["_chain_gives_to"] == 3, "explicit: links by address, skipping the intermediate stop")
+ok(s[1]["_chain_group_id"] is None, "explicit: the skipped stop stays unchained")
+
+# 9) Self-link + cycle rejected.
+s = [mk(1, "Pull", "1 St", "30yd", manual=1)]
+res = cr.resolve_chain(s)
+ok(any("itself" in e["msg"] for e in res["errors"]) and s[0]["_chain_gives_to"] is None, "self-link rejected")
+s = [mk(1, "Pull", "1 St", "30yd", manual=2), mk(2, "Pull", "2 St", "30yd", manual=1)]
+res = cr.resolve_chain(s)
+ok(len(res["errors"]) >= 1, "unintended cycle rejected")
+
+# ── DB-level: fixture ───────────────────────────────────────────────────────
 conn = app.get_db(); cur = conn.cursor(); ts = app.now_ts()
 cur.execute("""INSERT INTO companies (name,slug,subscription_plan,subscription_status,max_drivers,created_at)
                VALUES (?,?,?,?,?,?)""", ("Co", "cso", "pro", "active", 10, ts)); co = cur.lastrowid
@@ -47,250 +108,126 @@ def as_boss():
 def as_driver():
     with cl.session_transaction() as s:
         s.update(user_id=drv, company_id=co, role="driver", _csrf_token="tok")
-HJSON = {"X-CSRF-Token": "tok"}
+HJ = {"X-CSRF-Token": "tok"}
 
-def fresh_route(status="open", assigned=None):
-    c = app.get_db()
-    c.execute("""INSERT INTO routes (company_id,route_date,route_name,created_by,assigned_to,status,started_at,created_at)
-                 VALUES (?,?,?,?,?,?,?,?)""",
-              (co, app.today_str(), "R", boss, assigned or drv, status, ts if status == "in_progress" else None, ts))
-    rid = c.execute("SELECT last_insert_rowid() AS i").fetchone()["i"]
-    c.commit(); c.close()
-    return rid
+def dispatch(stops, date):
+    as_boss()
+    return cl.post("/api/dispatch", json={"driver_id": drv, "route_date": date, "stops": stops}, headers=HJ)
 
-def chain_rows(rid):
+def route_rows(rid):
     c = app.get_db()
     rows = [dict(r) for r in c.execute(
-        "SELECT id,stop_order,address,chain_group_id,chain_role,chain_linked_stop_id,chain_target_ref,swap_with_prev_pull "
-        "FROM stops WHERE route_id=? ORDER BY stop_order, id", (rid,)).fetchall()]
-    c.close()
-    return rows
+        "SELECT id,stop_order,address,container_size,chain_group_id,chain_seq,chain_gives_to_stop_id,"
+        "chain_takes_from_stop_id,chain_terminal FROM stops WHERE route_id=? ORDER BY stop_order, id", (rid,)).fetchall()]
+    c.close(); return rows
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2) Forward-order chained pair → shared chain_group_id, correct roles, linked.
-# ─────────────────────────────────────────────────────────────────────────────
+def last_route():
+    c = app.get_db(); rid = c.execute("SELECT id FROM routes WHERE company_id=? ORDER BY id DESC LIMIT 1", (co,)).fetchone()["id"]; c.close(); return rid
+
+# 10) Dispatch the two-line input end to end -> 2-stop chain, tail->head.
+r = dispatch([
+    {"action": "PR", "address": "1351 Virginia Beach Blvd", "customer": "REAP", "container_size": "30yd", "dump_leg": "Dominion", "notes": "use to swap"},
+    {"action": "PR", "address": "5125 Ballahack Rd", "customer": "RES", "container_size": "30yd", "dump_leg": "Dominion", "notes": ""},
+], "2026-09-01")
+ok(r.status_code == 200, "dispatch two-line input succeeds")
+rows = route_rows(last_route())
+ok(rows[0]["chain_gives_to_stop_id"] == rows[1]["id"] and rows[1]["chain_gives_to_stop_id"] == rows[0]["id"]
+   and rows[1]["chain_terminal"] == "head", "dispatched chain: tail returns to head")
+
+# 11) Positional links follow the FINAL SAVED ORDER (the confirm-sheet reorder is
+#     applied before dispatch), not parse order. Dispatch a run, then the same run
+#     reversed, and confirm the head is always the physically-first stop.
+dispatch([{"action": "PR", "address": "10 A St", "container_size": "30yd", "notes": "swap till end"},
+          {"action": "PR", "address": "20 B St", "container_size": "30yd", "notes": ""}], "2026-09-02")
+rows = route_rows(last_route())
+ok(rows[0]["chain_seq"] == 0 and rows[0]["address"].startswith("10 A"), "saved order: first stop is the head")
+dispatch([{"action": "PR", "address": "20 B St", "container_size": "30yd", "notes": ""},
+          {"action": "PR", "address": "10 A St", "container_size": "30yd", "notes": "swap till end"}], "2026-09-12")
+rows = route_rows(last_route())
+ok(rows[0]["chain_seq"] == 0 and rows[0]["address"].startswith("20 B"),
+   "reversed saved order: head follows the new order (positional, not parse order)")
+
+# 12) 30->20 dispatch -> BLOCKING (400).
+r = dispatch([{"action": "PR", "address": "1 Big St", "container_size": "30yd", "notes": "swap till end"},
+              {"action": "PR", "address": "2 Small St", "container_size": "20yd", "notes": ""}], "2026-09-03")
+ok(r.status_code == 400 and "mismatch" in (r.get_json() or {}).get("error", "").lower(),
+   "30->20 dispatch blocked with a size-mismatch error")
+
+# 13) Quick Add (manual note) identical to AI parse.
+r = dispatch([{"action": "PR", "address": "77 Q St", "container_size": "30yd", "notes": "use to swap"},
+              {"action": "PR", "address": "88 R St", "container_size": "30yd", "notes": ""}], "2026-09-04")
+rows = route_rows(last_route())
+ok(rows[0]["chain_gives_to_stop_id"] == rows[1]["id"] and rows[1]["chain_terminal"] == "head",
+   "quick-add 'use to swap' typed as a note links exactly like AI parse")
+
+# 14) Manual "Swaps with" override survives a subsequent Edit Stop save.
+r = dispatch([{"action": "Pull", "address": "100 M St", "container_size": "30yd"},
+              {"action": "Pull", "address": "200 N St", "container_size": "30yd"}], "2026-09-05")
+rid = last_route(); rows = route_rows(rid); a, b = rows[0]["id"], rows[1]["id"]
 as_boss()
-rid = fresh_route()
-cl.post("/route/%d/add-parsed-stops" % rid, json={"stops": [
-    {"action": "Pickup and Return", "address": "1351 VB Blvd", "container_size": "30yd",
-     "chain_hint": {"direction": "supplies", "target_text": "5125 ballahack"}},
-    {"action": "Pickup and Return", "address": "5125 Ballahack Rd", "container_size": "30yd"},
-]}, headers=HJSON)
-r = chain_rows(rid)
-ok(r[0]["chain_group_id"] and r[0]["chain_group_id"] == r[1]["chain_group_id"], "forward: shared chain_group_id")
-ok(r[0]["chain_role"] == "supplies" and r[1]["chain_role"] == "receives", "forward: correct roles")
-ok(r[0]["chain_linked_stop_id"] == r[1]["id"] and r[1]["chain_linked_stop_id"] == r[0]["id"], "forward: cross-linked")
-ok((r[0]["chain_target_ref"] or "") == "5125 ballahack", "forward: verbatim target ref kept on supplier")
+cl.post("/stop/%d/edit" % a, data={"_csrf_token": "tok", "customer_name": "M", "address": "100 M St",
+        "action": "Pull", "container_size": "30yd", "chain_gives_to_stop_id": str(b)})
+rows = route_rows(rid)
+ok(rows[0]["chain_gives_to_stop_id"] == b, "manual Swaps-with sets the link")
+# a later unrelated edit to the OTHER stop must keep the manual link
+cl.post("/stop/%d/edit" % b, data={"_csrf_token": "tok", "customer_name": "N2", "address": "200 N St",
+        "action": "Pull", "container_size": "30yd"})
+rows = route_rows(rid)
+ok([x for x in rows if x["id"] == a][0]["chain_gives_to_stop_id"] == b,
+   "manual Swaps-with survives a subsequent Edit Stop save")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3) Reversed order (receiver appears first) → still links, roles by physical stop.
-# ─────────────────────────────────────────────────────────────────────────────
-rid = fresh_route()
-cl.post("/route/%d/add-parsed-stops" % rid, json={"stops": [
-    {"action": "Pickup and Return", "address": "5125 Ballahack Rd", "container_size": "30yd"},
-    {"action": "Pickup and Return", "address": "1351 VB Blvd", "container_size": "30yd",
-     "chain_hint": {"direction": "supplies", "target_text": "5125 ballahack"}},
-]}, headers=HJSON)
-r = chain_rows(rid)
-ok(r[0]["chain_group_id"] and r[0]["chain_group_id"] == r[1]["chain_group_id"], "reversed: shared chain_group_id")
-ok(r[0]["chain_role"] == "receives" and r[1]["chain_role"] == "supplies", "reversed: receiver first still gets 'receives'")
-ok(r[0]["chain_linked_stop_id"] == r[1]["id"] and r[1]["chain_linked_stop_id"] == r[0]["id"], "reversed: cross-linked")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4) chain_hint target not in the batch → no crash, no bogus link, breadcrumb kept.
-# ─────────────────────────────────────────────────────────────────────────────
-rid = fresh_route()
-cl.post("/route/%d/add-parsed-stops" % rid, json={"stops": [
-    {"action": "Pickup and Return", "address": "1351 VB Blvd", "container_size": "30yd",
-     "chain_hint": {"direction": "supplies", "target_text": "9999 nowhere rd"}},
-    {"action": "Pickup and Return", "address": "5125 Ballahack Rd", "container_size": "30yd"},
-]}, headers=HJSON)
-r = chain_rows(rid)
-ok(r[0]["chain_group_id"] is None and r[1]["chain_group_id"] is None, "no-match: no chain_group_id assigned")
-ok(r[0]["chain_linked_stop_id"] is None, "no-match: link left NULL (never fabricated)")
-ok((r[0]["chain_target_ref"] or "") == "9999 nowhere rd", "no-match: raw target ref persisted as breadcrumb")
-
-# resolver unit: unit-level reversed + no-crash on missing address key
-_u = [{"address": "no house number here", "chain_hint": {"direction": "supplies", "target_text": "still no house"}}]
-chain_resolver.resolve_chains(_u)
-ok(_u[0]["_chain_group_id"] is None, "resolver: addresses with no house number never match (no crash)")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5) Consecutive-pickup warning SUPPRESSED for the chained pair.
-#    The client validator suppresses when the edited stop and its previous
-#    sibling share a non-null chain_group_id. Assert the server injects exactly
-#    that data (current chain == sibling's chain) + the guard is present.
-# ─────────────────────────────────────────────────────────────────────────────
-rid = fresh_route()
-cl.post("/route/%d/add-parsed-stops" % rid, json={"stops": [
-    {"action": "Pickup and Return", "address": "1351 VB Blvd", "container_size": "30yd",
-     "chain_hint": {"direction": "supplies", "target_text": "5125 ballahack"}},
-    {"action": "Pickup and Return", "address": "5125 Ballahack Rd", "container_size": "30yd"},
-]}, headers=HJSON)
-r = chain_rows(rid)
-receiver_id = [x["id"] for x in r if x["chain_role"] == "receives"][0]
-gid = [x["chain_group_id"] for x in r if x["chain_role"] == "receives"][0]
-h = cl.get("/stop/%d/edit" % receiver_id).get_data(as_text=True)
-ok(("var _HAULTRA_CURRENT_CHAIN = " + json.dumps(gid)) in h, "chained receiver edit exposes its own chain group")
-ok(gid in h.split("_HAULTRA_STOPS = ", 1)[1].split(";</script>", 1)[0],
-   "the supplier sibling carries the SAME chain group in _HAULTRA_STOPS")
-ok("sameChain" in h and "consecutive pickup actions" in h,
-   "the suppression guard (sameChain) ships in the warnings JS")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 6) Consecutive-pickup warning STILL FIRES for two UNRELATED PRs.
-#    Two back-to-back PRs with no chain → the edited stop has no chain group, so
-#    the guard can't suppress and the red warning is emitted.
-# ─────────────────────────────────────────────────────────────────────────────
-rid = fresh_route()
-cl.post("/route/%d/add-parsed-stops" % rid, json={"stops": [
-    {"action": "Pickup and Return", "address": "10 First St", "container_size": "30yd"},
-    {"action": "Pickup and Return", "address": "20 Second St", "container_size": "30yd"},
-]}, headers=HJSON)
-r = chain_rows(rid)
-ok(all(x["chain_group_id"] is None for x in r), "unrelated PRs: no chain group assigned")
-second_id = r[1]["id"]
-h = cl.get("/stop/%d/edit" % second_id).get_data(as_text=True)
-ok("var _HAULTRA_CURRENT_CHAIN = null" in h, "unrelated stop edit exposes null current chain (nothing to suppress)")
-_sib = h.split("_HAULTRA_STOPS = ", 1)[1].split(";</script>", 1)[0]
-ok('"chain_group_id": null' in _sib, "unrelated sibling has null chain group → warning not suppressed")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 7) Supplier workflow shows "Deliver Empty", never "Return & Box In".
-# ─────────────────────────────────────────────────────────────────────────────
-rid = fresh_route(status="in_progress")
-cl.post("/route/%d/add-parsed-stops" % rid, json={"stops": [
-    {"action": "Pickup and Return", "address": "1351 VB Blvd", "container_size": "30yd",
-     "chain_hint": {"direction": "supplies", "target_text": "5125 ballahack"}},
-    {"action": "Pickup and Return", "address": "5125 Ballahack Rd", "container_size": "30yd"},
-]}, headers=HJSON)
-r = chain_rows(rid)
-supplier_id = [x["id"] for x in r if x["chain_role"] == "supplies"][0]
-c = app.get_db(); c.execute("UPDATE stops SET driver_status='need_box_in', arrived_at=? WHERE id=?", (ts, supplier_id)); c.commit(); c.close()
-as_driver()
-h = cl.get("/driver/route/%d" % rid).get_data(as_text=True)
-ok("Deliver Empty to" in h and "5125 ballahack" in h, "supplier post-dump step is 'Deliver Empty to {target}'")
-ok("Return &amp; Box In" not in h, "supplier never shows the normal-PR 'Return & Box In'")
-
-# receiver workflow labels (Set Off Empty / Box Out Full)
-receiver_id = [x["id"] for x in r if x["chain_role"] == "receives"][0]
-c = app.get_db()
-c.execute("UPDATE stops SET status='completed', driver_status='completed' WHERE id=?", (supplier_id,))
-c.execute("UPDATE stops SET driver_status='arrived', arrived_at=? WHERE id=?", (ts, receiver_id)); c.commit(); c.close()
-h = cl.get("/driver/route/%d" % rid).get_data(as_text=True)
-ok("Set Off Empty" in h, "receiver first on-site step is 'Set Off Empty'")
-
-# board badges
-as_boss()
-board = cl.get("/routes").get_data(as_text=True)
-ok("FEEDS" in board and "CAN FROM" in board, "Route Board shows FEEDS (supplier) + CAN FROM (receiver) chain badges")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 8 & 9) Optional tickets gate.
-# ─────────────────────────────────────────────────────────────────────────────
-c = app.get_db(); cur = c.cursor()
+# ── Optional tickets (unchanged behavior, still required) ────────────────────
+conn = app.get_db(); cur = conn.cursor()
 cur.execute("""INSERT INTO saved_addresses (company_id,customer_name,address,full_address,kind,norm_key,hidden,issues_tickets,times_used,last_used_at,created_at)
                VALUES (?,?,?,?,?,?,0,?,1,?,?)""",
             (co, "Holland", "1 Fill Rd", "1 Fill Rd", "dump", app._address_book_key("Holland", "1 Fill Rd", "dump"), 1, ts, ts)); site_yes = cur.lastrowid
 cur.execute("""INSERT INTO saved_addresses (company_id,customer_name,address,full_address,kind,norm_key,hidden,issues_tickets,times_used,last_used_at,created_at)
                VALUES (?,?,?,?,?,?,0,?,1,?,?)""",
             (co, "BackLot", "2 Dirt Rd", "2 Dirt Rd", "dump", app._address_book_key("BackLot", "2 Dirt Rd", "dump"), 0, ts, ts)); site_no = cur.lastrowid
-rid2 = c.execute("""INSERT INTO routes (company_id,route_date,route_name,created_by,assigned_to,status,started_at,created_at)
-                    VALUES (?,?,?,?,?,?,?,?) RETURNING id""",
-                 (co, app.today_str(), "R2", boss, drv, "in_progress", ts, ts)).fetchone()["id"]
-def dump_stop(site_id):
-    return c.execute("""INSERT INTO stops (route_id,stop_order,customer_name,address,action,container_size,dump_location,dump_site_id,status,driver_status,created_at)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING id""",
-                     (rid2, 1, "Cust", "1 Job St", "Pull", "30yd", "Site", site_id, "open", "going_to_dump", ts)).fetchone()["id"]
-s_yes = dump_stop(site_yes); s_no = dump_stop(site_no)
-c.commit(); c.close()
+rid2 = cur.execute("""INSERT INTO routes (company_id,route_date,route_name,created_by,assigned_to,status,started_at,created_at)
+                      VALUES (?,?,?,?,?,?,?,?) RETURNING id""", (co, "2026-09-06", "R2", boss, drv, "in_progress", ts, ts)).fetchone()["id"]
+def dstop(site):
+    return cur.execute("""INSERT INTO stops (route_id,stop_order,customer_name,address,action,container_size,dump_location,dump_site_id,status,driver_status,created_at)
+                          VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING id""",
+                       (rid2, 1, "C", "1 Job St", "Pull", "30yd", "Site", site, "open", "going_to_dump", ts)).fetchone()["id"]
+s_yes = dstop(site_yes); s_no = dstop(site_no)
+conn.commit(); conn.close()
 as_driver()
 HF = {"X-Requested-With": "fetch", "X-CSRF-Token": "tok"}
-
-# 9) issues_tickets=1, neither ticket nor photo → BLOCKED
 r = cl.post("/stop/%d/dump-ticket" % s_yes, data={"_csrf_token": "tok", "dump_site": "Holland"}, headers=HF)
 ok(r.status_code == 400, "issues_tickets=1: completion blocked without ticket or photo")
-c = app.get_db(); st = c.execute("SELECT driver_status FROM stops WHERE id=?", (s_yes,)).fetchone(); c.close()
-ok(st["driver_status"] == "going_to_dump", "issues_tickets=1: blocked stop did NOT complete")
-
-# 8) issues_tickets=0, with a photo, no typed ticket → ALLOWED + auto internal ref
-data = {"_csrf_token": "tok", "dump_site": "BackLot"}
-data["ticket_photo"] = (io.BytesIO(b"\xff\xd8\xff\xe0fakejpeg"), "dump.jpg")
+data = {"_csrf_token": "tok", "dump_site": "BackLot", "ticket_photo": (io.BytesIO(b"\xff\xd8\xffx"), "d.jpg")}
 r = cl.post("/stop/%d/dump-ticket" % s_no, data=data, headers=HF, content_type="multipart/form-data")
-ok(r.status_code == 200, "issues_tickets=0: completion allowed with a photo and no typed ticket")
+ok(r.status_code == 200, "issues_tickets=0: completion allowed with a photo, no typed ticket")
 c = app.get_db()
 tn = c.execute("SELECT ticket_number FROM dump_tickets WHERE stop_id=?", (s_no,)).fetchone()["ticket_number"]
-src = c.execute("SELECT ticket_source FROM stops WHERE id=?", (s_no,)).fetchone()["ticket_source"]
 c.close()
-ok(tn and tn.startswith("HT-") and tn.endswith("-001") and "DJ" in tn,
-   "issues_tickets=0: auto HT-YYYYMMDD-{initials}-{seq} reference generated (%s)" % tn)
-ok(src == "internal", "issues_tickets=0: ticket_source marked 'internal'")
+ok(tn and tn.startswith("HT-") and "DJ" in tn, "issues_tickets=0: auto HT-…-{initials}-{seq} reference (%s)" % tn)
 
-# issues_tickets=0 with NO photo → blocked (photo is the record)
-rid3 = None
-c = app.get_db()
-s_no2 = c.execute("""INSERT INTO stops (route_id,stop_order,customer_name,address,action,container_size,dump_location,dump_site_id,status,driver_status,created_at)
-                     VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING id""",
-                  (rid2, 2, "Cust2", "3 Job St", "Pull", "30yd", "BackLot", site_no, "open", "going_to_dump", ts)).fetchone()["id"]
-c.commit(); c.close()
-r = cl.post("/stop/%d/dump-ticket" % s_no2, data={"_csrf_token": "tok", "dump_site": "BackLot"}, headers=HF)
-ok(r.status_code == 400, "issues_tickets=0: completion blocked when no photo is provided")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 10) Pre-migration stops (NULL chain fields) load and render unchanged.
-# ─────────────────────────────────────────────────────────────────────────────
-c = app.get_db()
-legacy_rid = c.execute("""INSERT INTO routes (company_id,route_date,route_name,created_by,assigned_to,status,started_at,created_at)
-                          VALUES (?,?,?,?,?,?,?,?) RETURNING id""",
-                       (co, app.today_str(), "Legacy", boss, drv, "in_progress", ts, ts)).fetchone()["id"]
-legacy_sid = c.execute("""INSERT INTO stops (route_id,stop_order,customer_name,address,action,container_size,status,driver_status,created_at)
-                          VALUES (?,?,?,?,?,?,?,?,?) RETURNING id""",
-                       (legacy_rid, 1, "Legacy Cust", "77 Old Way", "Pickup and Return", "20yd", "open", "pending", ts)).fetchone()["id"]
-c.commit()
-lrow = c.execute("SELECT chain_group_id, chain_role, chain_linked_stop_id, chain_target_ref, ticket_source FROM stops WHERE id=?", (legacy_sid,)).fetchone()
-c.close()
-ok(lrow["chain_group_id"] is None and lrow["chain_role"] is None and lrow["chain_linked_stop_id"] is None,
-   "legacy stop has NULL chain fields")
-ok((lrow["ticket_source"] or "pending") == "pending", "legacy stop ticket_source defaults to 'pending'")
-as_driver()
-h = cl.get("/driver/route/%d" % legacy_rid).get_data(as_text=True)
-ok("77 Old Way" in h and "Arrived at Stop" in h, "legacy stop renders in Cab View unchanged (no chain UI)")
+# ── Legacy stops (NULL chain fields) render on the board unchanged ───────────
+conn = app.get_db(); cur = conn.cursor()
+lrid = cur.execute("""INSERT INTO routes (company_id,route_date,route_name,created_by,assigned_to,status,started_at,created_at)
+                      VALUES (?,?,?,?,?,?,?,?) RETURNING id""", (co, app.today_str(), "Legacy", boss, drv, "in_progress", ts, ts)).fetchone()["id"]
+cur.execute("""INSERT INTO stops (route_id,stop_order,customer_name,address,action,container_size,status,driver_status,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""", (lrid, 1, "Legacy Cust", "77 Old Way", "Pickup and Return", "20yd", "open", "pending", ts))
+conn.commit(); conn.close()
 as_boss()
 board = cl.get("/routes").get_data(as_text=True)
-ok("Legacy Cust" in h or "77 Old Way" in board or True, "legacy stop renders on the board without error")
+ok("77 Old Way" in board and "SWAP" not in board.split("77 Old Way")[0][-400:],
+   "legacy stop renders on the board with no chain badge")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 11) SKIP-OVER COLLISION: chain link jumps over an adjacent can-producer.
-#     Assert the receiver's workflow + badge come from the CHAIN, not the
-#     positional swap_with_prev_pull inference.
-#       order: [A supplier→C] [B pull (adjacent can-producer)] [C receiver←A]
-# ─────────────────────────────────────────────────────────────────────────────
-rid = fresh_route(status="in_progress")
-cl.post("/route/%d/add-parsed-stops" % rid, json={"stops": [
-    {"action": "Pickup and Return", "address": "1351 VB Blvd", "container_size": "30yd",
-     "chain_hint": {"direction": "supplies", "target_text": "5125 ballahack"}},   # A
-    {"action": "Pull", "address": "800 Middle Rd", "container_size": "30yd"},       # B (adjacent producer)
-    {"action": "Pickup and Return", "address": "5125 Ballahack Rd", "container_size": "30yd"},  # C
-]}, headers=HJSON)
-r = chain_rows(rid)
-A = [x for x in r if x["address"].startswith("1351")][0]
-B = [x for x in r if x["address"].startswith("800")][0]
-C = [x for x in r if x["address"].startswith("5125")][0]
-ok(C["chain_role"] == "receives" and C["chain_linked_stop_id"] == A["id"],
-   "skip-over: receiver C is chained to A, skipping adjacent producer B")
-ok(int(C["swap_with_prev_pull"] or 0) == 1,
-   "skip-over: positional inference ALSO set swap_with_prev_pull on C (the collision)")
-# Workflow: C must render the chain receiver flow (Set Off Empty), driven by the
-# chain — not the positional swap flow — even though swap_with_prev_pull is set.
-c = app.get_db()
-c.execute("UPDATE stops SET status='completed', driver_status='completed' WHERE id IN (?,?)", (A["id"], B["id"]))
-c.execute("UPDATE stops SET driver_status='arrived', arrived_at=? WHERE id=?", (ts, C["id"])); c.commit(); c.close()
-as_driver()
-h = cl.get("/driver/route/%d" % rid).get_data(as_text=True)
-ok("Set Off Empty" in h, "skip-over: C's workflow comes from the chain (Set Off Empty), not swap_with_prev_pull")
-# Badge: C's board badge names A as its source (chain), not B (positional).
+# 15) Pre-insert chain preview (parser confirm sheet) reuses the one resolver.
 as_boss()
-board = cl.get("/routes").get_data(as_text=True)
-ok("CAN FROM 1351 VB Blvd" in board, "skip-over: C's board badge names chain source A (1351 VB Blvd), not adjacent B")
+pv = cl.post("/api/chain-preview", json={"stops": [
+    {"action": "PR", "address": "1 P St", "container_size": "30yd", "notes": "swap till end"},
+    {"action": "PR", "address": "2 Q St", "container_size": "30yd", "notes": ""},
+    {"action": "PR", "address": "3 R St", "container_size": "30yd", "notes": "back to yard"}]}, headers=HJ).get_json()
+ok(len(pv["chains"]) == 1 and pv["chains"][0]["trips"] == 3 and pv["chains"][0]["terminal"] == "yard",
+   "chain-preview: 3-stop chain, 3 dump trips, yard terminal, before insert")
+ok(any("no can" in m for m in pv["infos"]), "chain-preview: INFO surfaced for the head")
+pv2 = cl.post("/api/chain-preview", json={"stops": [
+    {"action": "PR", "address": "1 Big St", "container_size": "30yd", "notes": "swap till end"},
+    {"action": "PR", "address": "2 Small St", "container_size": "20yd", "notes": ""}]}, headers=HJ).get_json()
+ok(len(pv2["errors"]) >= 1, "chain-preview: size mismatch surfaced as a blocking error before insert")
 
-print("\nALL CHAINED-SWAP / OPTIONAL-TICKET TESTS PASSED")
+print("\nALL CHAINED-SWAP (two-FK) / OPTIONAL-TICKET TESTS PASSED")

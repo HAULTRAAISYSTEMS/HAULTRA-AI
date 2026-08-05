@@ -870,11 +870,71 @@
     container.innerHTML = '';
     if (!currentStops.length) {
       container.innerHTML = '<div class="empty-state">No stops detected. Check the dispatch text and re-parse.</div>';
+      refreshChainPreview();
       return;
     }
     currentStops.forEach(function (stop) {
       container.appendChild(buildCard(stop));
     });
+    refreshChainPreview();
+  }
+
+  // Pre-insert can-swap preview: the server runs the SAME resolver over the
+  // confirm-sheet order and returns the whole chain(s) + any BLOCKING size
+  // mismatch, so the boss sees the chain at a glance before dispatching. The
+  // summary card renders above the stop list; the chain is editable in Edit Stop
+  // after dispatch (the "Swaps with" picker).
+  function refreshChainPreview() {
+    var host = el('chain-summary');
+    if (!host) {
+      var cards = el('stop-cards');
+      host = document.createElement('div');
+      host.id = 'chain-summary';
+      cards.parentNode.insertBefore(host, cards);
+    }
+    if (!currentStops.length) { host.innerHTML = ''; return; }
+    var payload = { stops: currentStops.map(function (s) {
+      return { action: s.action, address: s.address, container_size: s.container_size, notes: s.notes };
+    }) };
+    fetch('/api/chain-preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN },
+      body: JSON.stringify(payload)
+    }).then(function (r) { return r.json(); }).then(function (data) {
+      host.innerHTML = renderChainSummary(data);
+    }).catch(function () { host.innerHTML = ''; });
+  }
+
+  function _esc2(s) { return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+  function renderChainSummary(data) {
+    var html = '';
+    (data.errors || []).forEach(function (m) {
+      html += '<div style="margin:8px 0;padding:10px 13px;border-radius:8px;background:rgba(255,59,92,.12);' +
+              'border:1px solid rgba(255,59,92,.4);color:#ff8099;font-size:13px;font-weight:600;">&#9888; ' + _esc2(m) + '</div>';
+    });
+    (data.chains || []).forEach(function (c) {
+      var term = c.terminal === 'yard' ? 'Final empty &rarr; back to the yard'
+               : c.terminal === 'none' ? 'Final can just gets dumped (no return)'
+               : 'Final empty &rarr; back to ' + _esc2((c.stops[0] || {}).address || 'the first stop');
+      var lines = c.stops.map(function (st) {
+        return '<div style="display:flex;gap:8px;font-size:13px;padding:2px 0;">' +
+               '<span style="opacity:.6;min-width:20px;">' + (st.seq + 1) + '.</span>' +
+               '<span style="flex:1;">' + _esc2(st.address || '') + '</span>' +
+               '<span style="opacity:.7;">' + _esc2(st.size || '') + '</span></div>';
+      }).join('');
+      html += '<div style="margin:10px 0;padding:12px 14px;border-radius:10px;background:rgba(140,160,179,.10);' +
+              'border:1px solid rgba(140,160,179,.35);">' +
+              '<div style="font-weight:800;letter-spacing:.4px;font-size:12px;text-transform:uppercase;color:#B8C6D4;margin-bottom:8px;">' +
+              '&#128257; Swap chain &mdash; ' + c.trips + ' stops, ' + c.trips + ' dump trips</div>' +
+              lines +
+              '<div style="margin-top:8px;font-size:12px;color:#9fb0c0;">' + term + '</div></div>';
+    });
+    (data.infos || []).forEach(function (m) {
+      html += '<div style="margin:6px 0;padding:8px 12px;border-radius:8px;background:rgba(255,157,0,.09);' +
+              'border:1px solid rgba(255,157,0,.3);color:#fbbf24;font-size:12px;">' + _esc2(m) + '</div>';
+    });
+    return html;
   }
 
   function buildCard(stop) {
