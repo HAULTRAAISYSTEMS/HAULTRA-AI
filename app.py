@@ -2996,19 +2996,32 @@ def init_db():
     safe_add_column(conn, "stops", "pr_mode TEXT")
 
     # --- Chained can-swap (feat/chained-swaps-and-optional-tickets) ---
-    # A can pulled at one stop ("supplies") can become the empty set off at
-    # another ("receives"). The boss writes this as a note ("use to swap 5125
-    # ballahack rd"); the deterministic resolver links the two stops in-batch.
-    # These are METADATA layered on the existing PR action — no new action code,
-    # and compute_can_flow()/swap_with_prev_pull are left fully intact. An
-    # explicit chain always wins over the positional swap inference.
-    #   chain_group_id     shared UUID across both linked stops (NULL = legacy/no chain)
-    #   chain_role         'supplies' (can leaves here) | 'receives' (can arrives here)
-    #   chain_target_ref   the boss's verbatim target text, kept even when unmatched
-    #   chain_linked_stop_id  the resolved partner stop id, or NULL when unmatched
+    # One can rides the truck through an ARBITRARY-LENGTH run of can-producing
+    # stops (P/PR/S): box out full → dump → the resulting empty is set off at the
+    # next stop, whose full is boxed out and dumped, and so on. The chain is
+    # modelled by two directional FKs per stop (no enum — a middle stop both
+    # gives and takes), plus a 0-based sequence and a tail terminal. The boss
+    # annotates ONE stop; the run itself is the chain. Metadata only — no new
+    # action code; compute_can_flow()/swap_with_prev_pull stay intact and a
+    # non-null chain_group_id makes the chain win over positional inference.
+    #   chain_group_id            shared id across the whole chain (NULL = normal stop)
+    #   chain_seq                 0-based position within the chain
+    #   chain_gives_to_stop_id    my dumped can becomes the empty set off HERE
+    #   chain_takes_from_stop_id  my empty arrives FROM here
+    #   chain_terminal            tail only: 'head' (default) | 'yard' | 'none'
+    #   chain_target_ref          raw unresolved boss text (kept when unmatched)
+    #   chain_source              'manual' | 'explicit' | 'positional' (precedence high→low)
     _add_column_if_missing(conn, "stops", "chain_group_id", "chain_group_id TEXT")
-    _add_column_if_missing(conn, "stops", "chain_role", "chain_role TEXT")
+    _add_column_if_missing(conn, "stops", "chain_seq", "chain_seq INTEGER")
+    _add_column_if_missing(conn, "stops", "chain_gives_to_stop_id", "chain_gives_to_stop_id INTEGER")
+    _add_column_if_missing(conn, "stops", "chain_takes_from_stop_id", "chain_takes_from_stop_id INTEGER")
+    _add_column_if_missing(conn, "stops", "chain_terminal", "chain_terminal TEXT")
     _add_column_if_missing(conn, "stops", "chain_target_ref", "chain_target_ref TEXT")
+    _add_column_if_missing(conn, "stops", "chain_source", "chain_source TEXT")
+    # Retired two-role columns from the earlier pair-only model (#88). Kept as
+    # inert/nullable so the live /data volume needs no risky table rebuild; the
+    # two-FK columns above supersede them and nothing reads chain_role now.
+    _add_column_if_missing(conn, "stops", "chain_role", "chain_role TEXT")
     _add_column_if_missing(conn, "stops", "chain_linked_stop_id", "chain_linked_stop_id INTEGER")
     # How this stop's dump ticket is satisfied:
     #   'pending'  not yet completed
@@ -11269,7 +11282,7 @@ def _build_route_board_html(user):
                s.id AS stop_id, s.stop_order, s.customer_name, s.address, s.city,
                s.action, s.container_size, s.status AS stop_status, s.driver_status,
                s.completed_at, s.held_at, s.empty_can_plan,
-               s.chain_group_id, s.chain_role, s.chain_target_ref, s.chain_linked_stop_id,
+               s.chain_group_id, s.chain_seq, s.chain_gives_to_stop_id, s.chain_takes_from_stop_id, s.chain_terminal,
                ii.vendor_status AS vendor_status,
                EXISTS(SELECT 1 FROM route_photos rp WHERE rp.stop_id = s.id) AS has_photo
         FROM routes r
@@ -11284,13 +11297,18 @@ def _build_route_board_html(user):
     sql += " ORDER BY r.id, s.stop_order, s.id"
 
     board_rows = conn.execute(sql, tuple(params)).fetchall()
-    # Short label for each stop, so a chained receiver can name its source stop
-    # ("CAN FROM …") without another query. Built from the same rows.
+    # Short label per stop (so a chain card can name its neighbor without another
+    # query) and the size of each chain group (for the "SWAP n of m" badge).
     _chain_label_by_id = {}
+    _chain_len_by_group = {}
     for _r in board_rows:
-        _sid = dict(_r).get("stop_id")
+        _d = dict(_r)
+        _sid = _d.get("stop_id")
         if _sid is not None:
-            _chain_label_by_id[_sid] = (dict(_r).get("address") or dict(_r).get("customer_name") or "").strip()
+            _chain_label_by_id[_sid] = (_d.get("address") or _d.get("customer_name") or "").strip()
+        _cg = _d.get("chain_group_id")
+        if _cg:
+            _chain_len_by_group[_cg] = _chain_len_by_group.get(_cg, 0) + 1
 
     # Real, derived "urgent" signal: a pending Pull/PR stop whose container has
     # already been sitting overdue at that address (from compute_containers_out,
@@ -11445,25 +11463,31 @@ def _build_route_board_html(user):
             addr_cls = "stop-mini-addr done" if stop_status == "completed" else "stop-mini-addr"
             size_label = size_bucket(s["container_size"]) or (s["container_size"] or "")
 
-            # Chained can-swap badge. Explicit chain is the ONLY "where does this
-            # can go / come from" indicator shown — the positional swap inference
-            # is never badged here, so a stop never tells two stories. Slate pill,
-            # reusing the board's existing neutral tone (no new color system).
+            # Chained can-swap badge: "SWAP n of m" + the neighbor this can moves
+            # to/from. The chain is the ONLY "where does the can go" story shown —
+            # the positional swap inference is never badged, so one card, one
+            # story. Slate pill, existing neutral tone (no new color system).
             chain_badge = ""
             _sd = dict(s)
-            if _sd.get("chain_group_id"):
-                _crole = (_sd.get("chain_role") or "").strip()
+            _cg = _sd.get("chain_group_id")
+            if _cg:
+                _clen = _chain_len_by_group.get(_cg, 1)
+                _cseq = (_sd.get("chain_seq") or 0) + 1
+                _term = (_sd.get("chain_terminal") or "").strip()
+                # Neighbor: the stop this one hands its empty to (mid/head) or, for
+                # a tail returning home, the head address.
+                _giv = _sd.get("chain_gives_to_stop_id")
+                if _term in ("yard", "none"):
+                    _nbr = "yard" if _term == "yard" else "done"
+                else:
+                    _nbr = _chain_label_by_id.get(_giv, "") or "next"
+                _arrow = "&#8594;"  # →
                 _cpill = ('display:inline-block;margin-top:5px;padding:2px 7px;border-radius:999px;'
                           'font-size:9px;font-weight:800;letter-spacing:.4px;white-space:nowrap;'
                           'overflow:hidden;text-overflow:ellipsis;max-width:100%;'
                           'background:rgba(140,160,179,0.16);color:#B8C6D4;border:1px solid rgba(140,160,179,0.5);')
-                if _crole == "supplies":
-                    _tgt = (_sd.get("chain_target_ref")
-                            or _chain_label_by_id.get(_sd.get("chain_linked_stop_id"), "") or "next stop").strip()
-                    chain_badge = f'<div><span class="stop-mini-chain" title="Feeds another stop" style="{_cpill}">&rarr; FEEDS {e(_tgt)}</span></div>'
-                elif _crole == "receives":
-                    _src = (_chain_label_by_id.get(_sd.get("chain_linked_stop_id"), "") or "prior stop").strip()
-                    chain_badge = f'<div><span class="stop-mini-chain" title="Empty can comes from another stop" style="{_cpill}">&larr; CAN FROM {e(_src)}</span></div>'
+                chain_badge = (f'<div><span class="stop-mini-chain" title="Can-swap chain" style="{_cpill}">'
+                               f'&#128257; SWAP {_cseq} of {_clen} {_arrow} {e(_nbr)}</span></div>')
 
             time_html = ""
             if stop_status == "completed" and s["completed_at"]:
@@ -12642,41 +12666,51 @@ def driver_route_detail(route_id):
 
     driver_status = _s.get("driver_status") or "pending"
 
-    # ── Chained can-swap: the full pulled here feeds another stop, or the empty
-    #    set off here came from another stop. Explicit chain ALWAYS wins over the
-    #    positional swap inference (swap_with_prev_pull), so we branch on it first
-    #    and never let both drive the card. A stop with a null chain_group_id
-    #    falls through to the unchanged legacy logic below. ──────────────────
-    _chained    = bool(_s.get("chain_group_id"))
-    _chain_role = (_s.get("chain_role") or "").strip() if _chained else ""
-    _chain_target = (_s.get("chain_target_ref") or "").strip()
+    # ── Chained can-swap (two-FK model). The driver's steps are DERIVED from the
+    #    directional FKs + terminal, never an enum: head (gives only), middle
+    #    (both), tail (terminal set). Explicit chain ALWAYS wins over the
+    #    positional swap inference — we branch on chain_group_id first and never
+    #    let both drive the card. Null chain_group_id → unchanged legacy logic. ─
+    _chained  = bool(_s.get("chain_group_id"))
+    _c_gives  = _s.get("chain_gives_to_stop_id") if _chained else None
+    _c_takes  = _s.get("chain_takes_from_stop_id") if _chained else None
+    _c_term   = (_s.get("chain_terminal") or "").strip() if _chained else ""
+    # Neighbor addresses come from the already-loaded route stops (conn is closed
+    # by now) so the chain workflow can name where the empty goes.
+    _c_nbr = {}
+    if _chained:
+        for _row in stops:
+            _rid = _row["id"]
+            if _rid in (_c_gives, _c_takes):
+                _c_nbr[_rid] = ((_row["address"] or _row["customer_name"] or "the stop") or "").strip()
 
     # ── Reuse the exact existing workflow state machine (arrived / box out /
     #    go to dump / dump ticket / box in) — same _wf_map + same POST target
     #    as before, just rendered inside the new single-stop card. ──────────
     workflow_btn_html = ""
-    if _chained and _chain_role == "supplies":
-        # The full is dumped, then the now-empty can is delivered to the target
-        # stop instead of returned to this customer. Only the post-dump step
-        # differs from a normal PR: "Deliver Empty to {target}".
-        _tgt = e(_chain_target) if _chain_target else "the next stop"
-        _deliver_step = ("box_in", f"&#128666; Deliver Empty to {_tgt}", "btn-driver btn-driver-complete")
+    if _chained:
+        _gives_addr = e(_c_nbr.get(_c_gives, "the next stop"))
+        # First on-site step: the head has no incoming empty (just box out its
+        # full); every other chain member arrives carrying an empty to set off.
+        _first_step = ("box_out", "&#128230; Box Out &mdash; Remove Container", "btn-driver btn-driver-complete") \
+            if _c_takes is None else \
+            ("box_out", "&#128230; Set Off Empty &amp; Box Out Full", "btn-driver btn-driver-complete")
+        # Post-dump delivery of the now-empty can, from the terminal / FKs.
+        if _c_term == "none":
+            _deliver_step = None
+        elif _c_term == "yard":
+            _deliver_step = ("box_in", "&#128666; Empty to Yard", "btn-driver btn-driver-complete")
+        elif _c_term == "head":
+            _deliver_step = ("box_in", f"&#128666; Return Empty to {_gives_addr}", "btn-driver btn-driver-complete")
+        else:  # head or middle — deliver the empty to the next chain stop
+            _deliver_step = ("box_in", f"&#128666; Deliver Empty to {_gives_addr}", "btn-driver btn-driver-complete")
         wf_map = {
-            "pending":     ("arrived",       "&#128666; Arrived at Stop",                    "btn-driver btn-driver-complete"),
-            "arrived":     ("box_out",       "&#128230; Box Out &mdash; Remove Container",   "btn-driver btn-driver-complete"),
-            "box_out":     ("going_to_dump", "&#128465;&#65039; Go To Dump",                 "btn-driver btn-driver-dump"),
-            "need_box_in": _deliver_step,
+            "pending":  ("arrived",       "&#128666; Arrived at Stop",    "btn-driver btn-driver-complete"),
+            "arrived":  _first_step,
+            "box_out":  ("going_to_dump", "&#128465;&#65039; Go To Dump", "btn-driver btn-driver-dump"),
         }
-    elif _chained and _chain_role == "receives":
-        # Arrive carrying the empty supplied by the source stop: set it off, box
-        # out the full that's here, haul the full to the dump, done. Physically
-        # correct order for a one-can truck bed.
-        wf_map = {
-            "pending":     ("arrived",       "&#128666; Arrived at Stop",              "btn-driver btn-driver-complete"),
-            "arrived":     ("need_box_in",   "&#128230; Set Off Empty",                "btn-driver btn-driver-complete"),
-            "need_box_in": ("box_in",        "&#128230; Box Out Full",                 "btn-driver btn-driver-complete"),
-            "box_in":      ("going_to_dump", "&#128465;&#65039; Go To Dump",           "btn-driver btn-driver-dump"),
-        }
+        if _deliver_step:
+            wf_map["need_box_in"] = _deliver_step
     elif is_swap_pr:
         wf_map = {
             "pending":     ("arrived",       "&#128666; Arrived at Stop",               "btn-driver btn-driver-complete"),
@@ -15898,11 +15932,22 @@ def edit_stop(stop_id):
                          expand_abbrev(request.form.get("dump_location", "")), "")
         # Recompute can flow and derive swap_with_prev_pull from sequence
         compute_can_flow(conn, route_id)
-        # An address/target edit can move this stop into or out of a chain; the
-        # edit UPDATEs in place, so re-resolve links from the persisted breadcrumbs.
-        _reresolve_route_chains(conn, route_id)
-        _log_chain_conflicts(conn, route_id)
+        # An address/action/size edit can move this stop into or out of a chain;
+        # the edit UPDATEs in place, so re-run the one resolver over the route.
+        # A manual "Swaps with" pick submitted on the form is stored first so the
+        # resolver preserves it (manual > explicit > positional).
+        _mgt = request.form.get("chain_gives_to_stop_id", "").strip()
+        if _mgt == "":
+            pass  # left blank on the form -> leave any existing link as-is
+        elif _mgt == "none":
+            conn.execute("UPDATE stops SET chain_source=NULL, chain_gives_to_stop_id=NULL WHERE id=?", (stop_id,))
+        elif _mgt.isdigit() and conn.execute(
+                "SELECT 1 FROM stops WHERE id=? AND route_id=?", (int(_mgt), route_id)).fetchone():
+            conn.execute("UPDATE stops SET chain_source='manual', chain_gives_to_stop_id=? WHERE id=?",
+                         (int(_mgt), stop_id))
+        _chain_res = _apply_route_chains(conn, route_id)
         conn.commit()
+        _flash_chain_result(_chain_res)
         upsert_saved_address(conn, cid(),
             expand_abbrev(request.form.get("customer_name")), expand_abbrev(request.form.get("address")),
             expand_abbrev(request.form.get("city")), expand_abbrev(request.form.get("state")),
@@ -15926,6 +15971,14 @@ def edit_stop(stop_id):
     _edit_photo_count = conn.execute(
         "SELECT COUNT(*) n FROM route_photos WHERE stop_id=?", (stop_id,)
     ).fetchone()["n"]
+    # "Swaps with" picker candidates: the other can-producing stops on the route.
+    # The boss can point this stop's dumped can at any of them (chain_source manual).
+    _swap_cands = conn.execute(
+        "SELECT id, customer_name, address FROM stops WHERE route_id=? AND id!=? "
+        "AND (LOWER(action) LIKE '%pull%' OR LOWER(action) LIKE '%pickup and return%' OR LOWER(action) LIKE '%swap%') "
+        "ORDER BY stop_order, id", (ownership["route_id"], stop_id)
+    ).fetchall()
+    _cur_gives = _stop.get("chain_gives_to_stop_id")
     # Optional tickets: if this stop's dump site issues none, the Ticket Number
     # field becomes a read-only "Internal Dump Ref" — auto-filled, never hidden,
     # so the record is always visible. issues_tickets=1 (or unlinked) keeps the
@@ -15938,6 +15991,20 @@ def edit_stop(stop_id):
     _edit_ticket_val = _stop.get("ticket_number") or ("" if not _edit_ticket_optional else "(auto-generated at dump: HT-…)")
     _edit_ticket_hint = ('<div class="small muted" style="margin-top:3px;font-size:10px;">This dump site issues no ticket — '
                          'an internal reference is generated automatically at dump time.</div>') if _edit_ticket_optional else ""
+    # "Swaps with" picker — a manual chain override that always beats inference.
+    _swap_opts = ['<option value="none"%s>&mdash; no swap &mdash;</option>' % ("" if _cur_gives else " selected")]
+    for _cc in _swap_cands:
+        _lbl = (_cc["address"] or _cc["customer_name"] or ("Stop %d" % _cc["id"])).strip()
+        _swap_opts.append('<option value="%d"%s>%s</option>' % (
+            _cc["id"], (" selected" if _cur_gives == _cc["id"] else ""), e(_lbl)))
+    _swaps_with_field = (
+        '<div style="grid-column:1/-1;">'
+        '<label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;'
+        'text-transform:uppercase;letter-spacing:.5px;">Swaps with (can-swap chain)</label>'
+        '<select name="chain_gives_to_stop_id" style="width:100%;min-height:44px;">' + "".join(_swap_opts) + '</select>'
+        '<div class="small muted" style="margin-top:3px;font-size:10px;">This stop’s dumped can becomes the '
+        'empty set off at the chosen stop. Overrides automatic chain detection.</div></div>'
+    ) if _swap_cands else ""
     _sibling_json = json.dumps([
         {"customer_name": s["customer_name"] or "", "address": s["address"] or "", "action": s["action"] or "",
          "chain_group_id": (s["chain_group_id"] if "chain_group_id" in s.keys() else None)}
@@ -16062,6 +16129,7 @@ def edit_stop(stop_id):
                     <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Notes</label>
                     <textarea name="notes" rows="3">{e(_stop['notes'])}</textarea>
                 </div>
+                {_swaps_with_field}
             </div>
 
             {_swap_info_block}
@@ -17055,17 +17123,19 @@ def dump_ticket(stop_id):
         )
         _is_swap_pr_dump = _is_pr_action and bool(dict(stop).get("swap_with_prev_pull"))
         # Explicit chain wins over the positional swap inference when deciding the
-        # post-dump state, exactly as it does for the workflow buttons.
+        # post-dump state, exactly as it does for the workflow buttons. A chained
+        # stop still has an empty to deliver after the dump UNLESS its terminal is
+        # 'none' (the last can just gets dumped).
         _srow = dict(stop)
-        _chain_role_dump = (_srow.get("chain_role") or "").strip() if _srow.get("chain_group_id") else ""
+        _chained_dump = bool(_srow.get("chain_group_id"))
+        _term_dump = (_srow.get("chain_terminal") or "").strip()
         if _ds == "going_to_dump":
-            if _chain_role_dump == "supplies":
-                # Supplier: after dumping the full, still must deliver the empty to
-                # the target stop → one more step (relabeled "Deliver Empty to …").
+            if _chained_dump and _term_dump != "none":
+                # Head/middle/tail(head|yard): one more step to deliver the empty.
                 conn.execute("UPDATE stops SET driver_status='need_box_in' WHERE id=?", (stop_id,))
-            elif _chain_role_dump == "receives" or (_is_pr_action and _is_swap_pr_dump) or not _is_pr_action:
-                # Receiver (empty was set off + full boxed out before the dump run),
-                # positional swap PR, Pull, Dump, or other — complete after dump.
+            elif _chained_dump or (_is_pr_action and _is_swap_pr_dump) or not _is_pr_action:
+                # Chain tail 'none', positional swap PR, Pull, Dump, or other —
+                # complete after dump (nothing left to deliver / set off already).
                 conn.execute(
                     "UPDATE stops SET driver_status='completed', status='completed', completed_at=? WHERE id=?",
                     (now_ts(), stop_id)
@@ -18510,10 +18580,9 @@ For every stop extract:
   dump_leg        the dump/landfill SITE NAME to haul to, or null (match KNOWN DUMP SITES)
   return_leg      the yard/site to return the empty container to, or null
   empty_can_plan  what to do with the EMPTY can after dumping (see rule below), or null
-  chain_hint      a can-swap chain link, or null (see CHAIN HINT rule below)
   raw             the original text for this stop, verbatim
   confidence      "low" or "high"
-  notes           any extra detail worth surfacing, or ""
+  notes           any extra detail worth surfacing (see SWAP NOTES rule), or ""
 
 Rules:
 - Use the KNOWN LOCATIONS & VOCABULARY to expand shorthand (e.g. "newpt" → "Newport News"),
@@ -18525,19 +18594,15 @@ Rules:
   returns the empty to this customer by default — do NOT set "return_here" explicitly).
 - Set confidence "low" ONLY when the action or address is genuinely ambiguous or missing —
   not merely because a dump/return leg or a preamble is present.
-- CHAIN HINT: sometimes the can pulled at THIS stop becomes the empty that gets set off at
-  ANOTHER stop, or the empty set off HERE comes from another stop. Trigger phrases:
-  "use to swap X", "use for X", "swap with X", "take to X", "this can goes to X",
-  "empty for X", "use on X". When you see one, set:
-    chain_hint = {"direction":"supplies","target_text":"<X, copied VERBATIM from the text>"}
-  on the stop that PRODUCES the can ("supplies"), OR {"direction":"receives", ...} on the stop
-  that RECEIVES it, whichever the sentence describes. Otherwise chain_hint = null.
-  CRITICAL: copy target_text EXACTLY as written — do NOT guess a stop number, do NOT invent or
-  look up an ID, and do NOT normalize/expand/complete the address. "5125 ballahack" stays
-  "5125 ballahack". Matching two stops together is done later in code, not by you. A chain hint
-  does NOT change the action — a PR stays PR. Never emit a new action code for a swap.
+- SWAP NOTES: sometimes the can pulled here rides on to become the empty set off at a later
+  stop (a "can-swap chain"). Trigger phrases: "use to swap X", "use for X", "swap with X",
+  "take to X", "this can goes to X", "swap till end", "keep swapping", "back to yard",
+  "no return", "last one dumps". When you see any of these, keep that phrase VERBATIM in the
+  stop's `notes` field — do NOT drop it, do NOT resolve it, do NOT guess a stop or normalize an
+  address ("5125 ballahack" stays "5125 ballahack"). The chain is linked later in code from the
+  note text. A swap note NEVER changes the action — a PR stays PR; never invent a new action code.
 - Respond with ONLY valid JSON — no markdown, no commentary — in exactly this shape:
-  {"stops":[{"action":"","address":"","customer":"","container_size":null,"dump_leg":null,"return_leg":null,"empty_can_plan":null,"chain_hint":null,"raw":"","confidence":"","notes":""}]}
+  {"stops":[{"action":"","address":"","customer":"","container_size":null,"dump_leg":null,"return_leg":null,"empty_can_plan":null,"raw":"","confidence":"","notes":""}]}
 
 WORKED EXAMPLE
 Input:
@@ -18550,14 +18615,14 @@ WORKED EXAMPLE (carry the empty to the next stop)
 Input:
   PR 1013 Paragon Way Napo can 3085 dump holland — don't return the can, carry the empty to the next stop
 Output:
-  {"stops":[{"action":"PR","address":"1013 Paragon Way","customer":"Napo","container_size":null,"dump_leg":"Holland","return_leg":null,"empty_can_plan":"carry_next","carry_can_ref":"3085","chain_hint":null,"raw":"PR 1013 Paragon Way Napo can 3085 dump holland — don't return the can, carry the empty to the next stop","confidence":"high","notes":""}]}
+  {"stops":[{"action":"PR","address":"1013 Paragon Way","customer":"Napo","container_size":null,"dump_leg":"Holland","return_leg":null,"empty_can_plan":"carry_next","carry_can_ref":"3085","raw":"PR 1013 Paragon Way Napo can 3085 dump holland — don't return the can, carry the empty to the next stop","confidence":"high","notes":""}]}
 
-WORKED EXAMPLE (chained can-swap — the pulled can feeds another address)
+WORKED EXAMPLE (can-swap chain — keep the swap phrase verbatim in notes)
 Input:
-  1351 VB Blvd PR 30yd use to swap 5125 ballahack
-  5125 Ballahack Rd PR 30yd
+  PR 1351 Virginia Beach blvd, VB, REAP 30yd dump dominion note use to swap
+  PR 5125 ballahack rd,ches, RES 30yd dump dominion
 Output:
-  {"stops":[{"action":"PR","address":"1351 VB Blvd","customer":"","container_size":"30yd","dump_leg":null,"return_leg":null,"empty_can_plan":null,"chain_hint":{"direction":"supplies","target_text":"5125 ballahack"},"raw":"1351 VB Blvd PR 30yd use to swap 5125 ballahack","confidence":"high","notes":""},{"action":"PR","address":"5125 Ballahack Rd","customer":"","container_size":"30yd","dump_leg":null,"return_leg":null,"empty_can_plan":null,"chain_hint":null,"raw":"5125 Ballahack Rd PR 30yd","confidence":"high","notes":""}]}
+  {"stops":[{"action":"PR","address":"1351 Virginia Beach Blvd","customer":"REAP","container_size":"30yd","dump_leg":"Dominion","return_leg":null,"empty_can_plan":null,"raw":"PR 1351 Virginia Beach blvd, VB, REAP 30yd dump dominion note use to swap","confidence":"high","notes":"use to swap"},{"action":"PR","address":"5125 Ballahack Rd","customer":"RES","container_size":"30yd","dump_leg":"Dominion","return_leg":null,"empty_can_plan":null,"raw":"PR 5125 ballahack rd,ches, RES 30yd dump dominion","confidence":"high","notes":""}]}
 """
 
 
@@ -24002,7 +24067,6 @@ def add_parsed_stops(route_id):
     ).fetchone()["m"] or 0
 
     added = 0
-    _chain_batch = []
     for stop in stops:
         if not isinstance(stop, dict):
             continue
@@ -24023,6 +24087,9 @@ def add_parsed_stops(route_id):
                                            stop.get("to_city")              or "")
         return_destination = expand_abbrev(stop.get("return_destination")  or "")
         pr_mode            = (stop.get("pr_mode") or "").strip()
+        # Keep the note verbatim — the swap phrase lives here and the chain
+        # resolver scans it (the same way every entry path does).
+        notes              = (stop.get("notes") or "").strip()
         swap_flag          = 1 if stop.get("swap_with_previous_empty") or stop.get("swap_with_prev_pull") else 0
         try:
             _cur = conn.execute("""
@@ -24030,17 +24097,15 @@ def add_parsed_stops(route_id):
                     route_id, stop_order, customer_name, address, city, state, zip_code,
                     action, container_size, dump_location,
                     placement_note, relocate_to_address, relocate_to_city,
-                    return_destination, pr_mode,
+                    return_destination, pr_mode, notes,
                     swap_with_prev_pull, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
             """, (route_id, last, customer_name, address, city, state, zip_code,
                   action, container_size, dump_location,
                   placement_note, relocate_to_addr, relocate_to_city,
-                  return_destination, pr_mode,
+                  return_destination, pr_mode, notes,
                   swap_flag, now_ts()))
             added += 1
-            _chain_batch.append((_cur.lastrowid, {"address": address,
-                                                  "chain_hint": _sanitize_chain_hint(stop.get("chain_hint"))}))
             _link_stop_sites(conn, cid(), _cur.lastrowid, dump_location, return_destination)
             upsert_saved_address(conn, cid(),
                 customer_name, address, city, state, zip_code,
@@ -24050,14 +24115,15 @@ def add_parsed_stops(route_id):
             last -= 1  # reclaim the order slot so next stop doesn't skip a number
 
     if added:
-        _apply_chain_links(conn, _chain_batch)
         conn.commit()
         try:
             compute_can_flow(conn, route_id)
-            _log_chain_conflicts(conn, route_id)
+            # Resolve can-swap chains over the route's FINAL order (one resolver,
+            # all paths). Blocking errors are flashed on the next page load.
+            _flash_chain_result(_apply_route_chains(conn, route_id))
             conn.commit()
         except Exception as exc:
-            app.logger.warning("add_parsed_stops: compute_can_flow error: %s", exc)
+            app.logger.warning("add_parsed_stops: chain/can_flow error: %s", exc)
 
     conn.close()
     return jsonify({"added": added})
@@ -24073,92 +24139,71 @@ def add_parsed_stops(route_id):
 _PARSER_ACTION_MAP = {"PR": "Pickup and Return", "P": "Pull", "D": "Delivery", "S": "Swap", "R": "Relocate", "LL": "Live Load", "YARD": "Yard"}
 
 
-def _apply_chain_links(conn, inserted):
-    """Resolve can-swap chains for a freshly-inserted batch and write the chain
-    columns — all inside the caller's open transaction (before commit), so a
-    half-linked chain is never persisted.
+def _apply_route_chains(conn, route_id):
+    """THE single can-swap resolver for every path (AI parse, Quick Add, Confirm
+    Stop, Edit Stop). Runs against the route's FINAL SAVED ORDER, inside the
+    caller's open transaction, and writes the two-FK chain columns.
 
-    `inserted` is a list of (stop_id, stop_dict) in insert order; each stop_dict
-    supplies at least `address` and (optionally) `chain_hint`. The deterministic
-    matcher assigns groups/roles; here we map the partner's batch index to its
-    real stop id and UPDATE both rows. Legacy/unchained stops get NULLs written,
-    which is a no-op relative to their existing NULL state.
-    """
-    if not inserted:
-        return []
-    stop_ids = [sid for sid, _ in inserted]
-    dicts = [dict(d or {}) for _, d in inserted]
-    links = chain_resolver.resolve_chains(dicts)
-    for i, d in enumerate(dicts):
-        partner_idx = d.get("_chain_partner_index")
-        linked_id = stop_ids[partner_idx] if partner_idx is not None else None
-        conn.execute(
-            "UPDATE stops SET chain_group_id=?, chain_role=?, chain_target_ref=?, "
-            "chain_linked_stop_id=? WHERE id=?",
-            (d.get("_chain_group_id"), d.get("_chain_role"),
-             d.get("_chain_target_ref"), linked_id, stop_ids[i]),
-        )
-    return links
+    Resolution is note-driven so all paths behave identically: the boss's swap
+    phrase lives in the stop note on every path, and the resolver scans it. A
+    boss's explicit "Swaps with" pick is preserved via chain_source='manual' +
+    chain_gives_to_stop_id; a persisted chain_target_ref feeds an explicit
+    address target back in. compute_can_flow()/swap_with_prev_pull are untouched.
 
-
-def _log_chain_conflicts(conn, route_id):
-    """Explicit chain wins over positional inference. When they name DIFFERENT
-    sources for a receiver's empty — the chain link skips over an adjacent
-    can-producer that swap_with_prev_pull would otherwise pair it with — log a
-    single diagnostic line. Never surfaced to the user: the boss wrote the swap
-    note on purpose. Call after compute_can_flow, when both signals exist.
+    Returns {"errors","infos","needs_link"}: errors are BLOCKING (container-size
+    mismatch, cycle) and the caller must surface them and reject/flag.
     """
     rows = conn.execute(
-        "SELECT id, chain_group_id, chain_role, chain_linked_stop_id, swap_with_prev_pull "
+        "SELECT id, action, address, container_size, notes, chain_target_ref, "
+        "chain_source, chain_gives_to_stop_id "
         "FROM stops WHERE route_id=? ORDER BY stop_order, id", (route_id,)
     ).fetchall()
-    for i, r in enumerate(rows):
-        if r["chain_group_id"] and (r["chain_role"] or "") == "receives" and int(r["swap_with_prev_pull"] or 0):
-            prev_id = rows[i - 1]["id"] if i > 0 else None
-            if prev_id is not None and prev_id != r["chain_linked_stop_id"]:
-                app.logger.warning(
-                    "chain/positional source conflict: route %s stop %s takes its empty from chained "
-                    "stop %s, but positional inference points at adjacent stop %s — chain wins.",
-                    route_id, r["id"], r["chain_linked_stop_id"], prev_id)
-
-
-def _reresolve_route_chains(conn, route_id):
-    """Recompute this route's can-swap links from the persisted breadcrumbs.
-    Runs after a Save Stop edit (in the same transaction) because editing an
-    address or a target can move a stop into or out of a valid chain — and the
-    edit path UPDATEs in place, so nothing else would refresh the link.
-
-    Only stops that carry a hint (non-null chain_target_ref + chain_role) drive
-    the match; the reconstructed hint is fed back through the same resolver, so
-    a now-mismatched pair cleanly drops its group/link while keeping the raw
-    breadcrumb, and a newly-matching pair links up.
-    """
-    rows = conn.execute(
-        "SELECT id, address, chain_role, chain_target_ref FROM stops "
-        "WHERE route_id=? ORDER BY stop_order, id", (route_id,)
-    ).fetchall()
     if not rows:
-        return
-    inserted = []
+        return {"errors": [], "infos": [], "needs_link": []}
+    stops = []
     for r in rows:
-        ref = (r["chain_target_ref"] or "").strip()
-        role = (r["chain_role"] or "").strip()
-        hint = {"direction": role, "target_text": ref} if (ref and role in ("supplies", "receives")) else None
-        inserted.append((r["id"], {"address": r["address"] or "", "chain_hint": hint}))
-    _apply_chain_links(conn, inserted)
+        d = dict(r)
+        manual = d["chain_gives_to_stop_id"] if (d.get("chain_source") == "manual" and d.get("chain_gives_to_stop_id")) else None
+        # Persisted explicit target (from a prior resolve or an AI hint) feeds the
+        # address matcher again; a manual pick overrides it and is read above.
+        ref = (d.get("chain_target_ref") or "").strip()
+        hint = {"kind": "explicit", "target_text": ref} if (ref and d.get("chain_source") != "manual") else None
+        stops.append({"id": d["id"], "action": d["action"], "address": d["address"],
+                      "container_size": d["container_size"], "note": d.get("notes") or "",
+                      "chain_hint": hint, "manual_gives_to": manual})
+    res = chain_resolver.resolve_chain(stops)
+    for s in stops:
+        conn.execute(
+            "UPDATE stops SET chain_group_id=?, chain_seq=?, chain_gives_to_stop_id=?, "
+            "chain_takes_from_stop_id=?, chain_terminal=?, chain_target_ref=?, chain_source=? "
+            "WHERE id=?",
+            (s["_chain_group_id"], s["_chain_seq"], s["_chain_gives_to"], s["_chain_takes_from"],
+             s["_chain_terminal"], s["_chain_target_ref"], s["_chain_source"], s["id"]))
+    # Chain wins over positional inference: if a chained stop also carries the
+    # positional swap_with_prev_pull flag, log one line (never user-facing).
+    for r in conn.execute(
+            "SELECT id, chain_group_id, swap_with_prev_pull FROM stops WHERE route_id=?", (route_id,)).fetchall():
+        if r["chain_group_id"] and int(r["swap_with_prev_pull"] or 0):
+            app.logger.info("chain wins over positional swap on stop %s (route %s).", r["id"], route_id)
+    return res
 
 
-def _sanitize_chain_hint(raw):
-    """Accept a chain_hint only in the exact {direction, target_text} shape the
-    resolver understands; anything else becomes None. Target text is capped and
-    kept verbatim (never normalized here — the resolver owns matching)."""
-    if not isinstance(raw, dict):
-        return None
-    direction = (raw.get("direction") or "").strip().lower()
-    target_text = (raw.get("target_text") or "").strip()[:200]
-    if direction not in ("supplies", "receives") or not target_text:
-        return None
-    return {"direction": direction, "target_text": target_text}
+def _flash_chain_result(res):
+    """Surface a resolver result to the boss: blocking errors (red), INFO head
+    notices, and unresolved explicit targets. Returns True if there were
+    blocking errors."""
+    seen = set()
+    for e in (res or {}).get("errors", []):
+        m = e.get("msg", "")
+        if m and m not in seen:
+            flash(m, "error"); seen.add(m)
+    for inf in (res or {}).get("infos", []):
+        m = inf.get("msg", "")
+        if m and m not in seen:
+            flash(m, "info"); seen.add(m)
+    for nl in (res or {}).get("needs_link", []):
+        flash("Couldn't match \"%s\" to a stop on this route — link it in Edit Stop." % nl.get("target_text", ""), "info")
+    return bool((res or {}).get("errors"))
 
 
 def _validate_parser_stops(stops_in):
@@ -24203,10 +24248,52 @@ def _validate_parser_stops(stops_in):
             "empty_can_plan": (s.get("empty_can_plan") or "").strip()
                               if (s.get("empty_can_plan") or "").strip() in _EMPTY_CAN_PLANS else "",
             "carry_can_ref": (str(s.get("carry_can_ref") or "").strip()[:40]),
-            # Verbatim can-swap hint; the deterministic resolver links it at insert.
-            "chain_hint": _sanitize_chain_hint(s.get("chain_hint")),
         })
     return clean_stops, None
+
+
+@app.route("/api/chain-preview", methods=["POST"])
+@roles_required("dispatcher", api=True)
+def api_chain_preview():
+    """Pre-insert can-swap preview for the parser confirm sheet, so the boss sees
+    the WHOLE chain (and any BLOCKING size mismatch) before dispatching. Runs the
+    same resolver used at insert, over the confirm-sheet order, with temp ids =
+    the stop's position, so returned indexes map straight back to the UI rows."""
+    data = request.get_json(silent=True) or {}
+    stops_in = data.get("stops") or []
+    stops = []
+    for i, s in enumerate(stops_in):
+        if not isinstance(s, dict):
+            continue
+        _act = (s.get("action") or "").strip()
+        # Confirm-sheet actions arrive as codes (PR/P/S/…); map to the canonical
+        # label the resolver's can-producer check expects, exactly like dispatch.
+        _act = _PARSER_ACTION_MAP.get(_act.upper(), expand_abbrev(_act))
+        stops.append({"id": i, "action": _act,
+                      "address": expand_abbrev((s.get("address") or "").strip()),
+                      "container_size": (s.get("container_size") or "").strip(),
+                      "note": (s.get("notes") or "").strip(), "chain_hint": None, "manual_gives_to": None})
+    res = chain_resolver.resolve_chain(stops)
+    groups = {}
+    for st in stops:
+        g = st["_chain_group_id"]
+        if g:
+            groups.setdefault(g, []).append(st)
+    chains = []
+    for members in groups.values():
+        members.sort(key=lambda x: x["_chain_seq"] if x["_chain_seq"] is not None else 0)
+        tail = members[-1]
+        chains.append({
+            "indexes": [m["id"] for m in members],
+            "stops": [{"index": m["id"], "address": m["address"], "size": m["container_size"], "seq": m["_chain_seq"]} for m in members],
+            "terminal": tail["_chain_terminal"] or "head",
+            "trips": len(members),
+        })
+    return jsonify({
+        "chains": chains,
+        "errors": list(dict.fromkeys(e["msg"] for e in res["errors"])),
+        "infos": list(dict.fromkeys(i["msg"] for i in res["infos"])),
+    })
 
 
 @app.route("/api/dispatch", methods=["POST"])
@@ -24261,7 +24348,6 @@ def api_dispatch():
     next_order = conn.execute(
         "SELECT COALESCE(MAX(stop_order), 0) AS m FROM stops WHERE route_id=?", (route_id,)
     ).fetchone()["m"]
-    _chain_batch = []
     for s in clean_stops:
         next_order += 1
         cur.execute("""
@@ -24272,7 +24358,6 @@ def api_dispatch():
         """, (route_id, next_order, s.get("customer") or "", s["address"], s["action"],
               s["container_size"], s.get("dump_leg") or "", s.get("return_leg") or "",
               s["notes"], s.get("empty_can_plan") or "", s.get("carry_can_ref") or "", now_ts()))
-        _chain_batch.append((cur.lastrowid, {"address": s["address"], "chain_hint": s.get("chain_hint")}))
         # Resolve the dump/return site names to location records + set the FKs.
         _link_stop_sites(conn, cid(), cur.lastrowid, s.get("dump_leg") or "", s.get("return_leg") or "")
         # Self-building address book: learn every dispatched stop's address.
@@ -24280,15 +24365,20 @@ def api_dispatch():
                        action=s["action"], container_size=s["container_size"],
                        dump_location=s.get("dump_leg") or "")
 
-    # Link can-swap chains before commit, so a chain is never half-persisted.
-    _apply_chain_links(conn, _chain_batch)
     conn.commit()
     try:
         compute_can_flow(conn, route_id)
-        _log_chain_conflicts(conn, route_id)
-        conn.commit()
     except Exception as exc:
         app.logger.warning("api_dispatch: compute_can_flow error: %s", exc)
+    # Resolve can-swap chains over the FINAL saved order. A container-size
+    # mismatch (or a cycle) is BLOCKING — it would strand the driver mid-route,
+    # so refuse the dispatch and report both offending stops.
+    _chain_res = _apply_route_chains(conn, route_id)
+    if _chain_res["errors"]:
+        conn.commit()  # persist the partial links so the boss can see/fix them
+        conn.close()
+        return jsonify({"error": " ".join(dict.fromkeys(e["msg"] for e in _chain_res["errors"]))}), 400
+    conn.commit()
     conn.close()
 
     return jsonify({
@@ -24356,16 +24446,12 @@ def api_insert_stops(route_id):
               s.get("dump_leg") or "", s.get("return_leg") or "", s["notes"],
               s.get("empty_can_plan") or "", s.get("carry_can_ref") or "", now_ts()))
         new_stops.append((cur.lastrowid, s["insert_before"]))
-        _chain_batch.append((cur.lastrowid, {"address": s["address"], "chain_hint": s.get("chain_hint")}))
         # Resolve the dump/return site names to location records + set the FKs.
         _link_stop_sites(conn, cid(), cur.lastrowid, s.get("dump_leg") or "", s.get("return_leg") or "")
         # Self-building address book: learn every inserted stop's address.
         learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
                        action=s["action"], container_size=s["container_size"],
                        dump_location=s.get("dump_leg") or "")
-
-    # Link can-swap chains within this inserted batch, before commit.
-    _apply_chain_links(conn, _chain_batch)
 
     # Merge new stops into the insertable (unlocked) sequence at their chosen position.
     # Multiple stops targeting the same anchor stack in submission order, immediately
@@ -24384,10 +24470,16 @@ def api_insert_stops(route_id):
     conn.commit()
     try:
         compute_can_flow(conn, route_id)
-        _log_chain_conflicts(conn, route_id)
-        conn.commit()
     except Exception as exc:
         app.logger.warning("api_insert_stops: compute_can_flow error: %s", exc)
+    # Resolve chains against the FINAL saved order (after the reorder above), so
+    # positional links follow the boss's chosen sequence, not parse order.
+    _chain_res = _apply_route_chains(conn, route_id)
+    if _chain_res["errors"]:
+        conn.commit()
+        conn.close()
+        return jsonify({"error": " ".join(dict.fromkeys(e["msg"] for e in _chain_res["errors"]))}), 400
+    conn.commit()
     conn.close()
 
     return jsonify({
