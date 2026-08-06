@@ -14044,9 +14044,11 @@ _STOP_WARNINGS_JS = """
       var prevChain = prev.chain_group_id || null;
       var sameChain = !!(curChain && prevChain && curChain === prevChain);
       if (!sameChain && has(action, PICKUP_TYPES) && has(lastA, PICKUP_TYPES)) {
-        warns.push({ level: 'red',
-          msg: 'Service flow issue \u2014 consecutive pickup actions (' +
-               lastA + ' \u2192 ' + action + '). Verify route logic.' });
+        /* Advisory only \u2014 never blocks the save. Consecutive pickups are a
+           normal can-swap pattern; this is a heads-up, not a route error. */
+        warns.push({ level: 'yellow',
+          msg: 'Heads up \u2014 consecutive pickup actions (' +
+               lastA + ' \u2192 ' + action + '). Fine for a can swap; double-check if not.' });
       }
     }
 
@@ -24188,22 +24190,48 @@ def _apply_route_chains(conn, route_id):
     return res
 
 
-def _flash_chain_result(res):
-    """Surface a resolver result to the boss: blocking errors (red), INFO head
-    notices, and unresolved explicit targets. Returns True if there were
-    blocking errors."""
-    seen = set()
+def _chain_blocking_errors(res):
+    """The ONLY chain condition that may reject a save: a container-size mismatch,
+    which would strand the truck with an empty that can't serve the next site.
+    Every other chain finding (self-swap, double-receive, loop, unmatched target,
+    head-has-no-can) is ADVISORY — the driver keeps a route that is operationally
+    correct, and the boss sees a notice, never a block. A real route was lost over
+    an advisory warning; insert must always proceed unless the size is wrong."""
+    return [e for e in (res or {}).get("errors", []) if e.get("kind") == "size"]
+
+
+def _chain_notices(res):
+    """Deduped advisory messages for a resolver result: non-size errors, INFO head
+    notices, and unresolved explicit targets. Returned to API callers as
+    non-blocking `notices`; size errors are surfaced separately as a hard block."""
+    seen, out = set(), []
+    def _add(m):
+        if m and m not in seen:
+            seen.add(m); out.append(m)
     for e in (res or {}).get("errors", []):
+        if e.get("kind") != "size":
+            _add(e.get("msg", ""))
+    for inf in (res or {}).get("infos", []):
+        _add(inf.get("msg", ""))
+    for nl in (res or {}).get("needs_link", []):
+        _add("Couldn't match \"%s\" to a stop on this route — link it in Edit Stop." % nl.get("target_text", ""))
+    return out
+
+
+def _flash_chain_result(res):
+    """Surface a resolver result to the boss on form-based saves (Confirm/Edit
+    Stop): container-size mismatch as a red error, everything else as an advisory
+    info notice. Nothing here blocks a save — the caller decides that, and only a
+    size mismatch is blocking. Returns True if a blocking (size) error was shown."""
+    seen = set()
+    for e in _chain_blocking_errors(res):
         m = e.get("msg", "")
         if m and m not in seen:
             flash(m, "error"); seen.add(m)
-    for inf in (res or {}).get("infos", []):
-        m = inf.get("msg", "")
+    for m in _chain_notices(res):
         if m and m not in seen:
             flash(m, "info"); seen.add(m)
-    for nl in (res or {}).get("needs_link", []):
-        flash("Couldn't match \"%s\" to a stop on this route — link it in Edit Stop." % nl.get("target_text", ""), "info")
-    return bool((res or {}).get("errors"))
+    return bool(_chain_blocking_errors(res))
 
 
 def _validate_parser_stops(stops_in):
@@ -24370,15 +24398,17 @@ def api_dispatch():
         compute_can_flow(conn, route_id)
     except Exception as exc:
         app.logger.warning("api_dispatch: compute_can_flow error: %s", exc)
-    # Resolve can-swap chains over the FINAL saved order. A container-size
-    # mismatch (or a cycle) is BLOCKING — it would strand the driver mid-route,
-    # so refuse the dispatch and report both offending stops.
+    # Resolve can-swap chains over the FINAL saved order. ONLY a container-size
+    # mismatch is BLOCKING — a 30yd empty that can't serve a 20yd site would
+    # strand the truck. Every other chain finding is ADVISORY: the dispatch always
+    # goes through and the boss sees a notice. A real route was lost when a
+    # correct chain got blocked by a warning; insert must never fail on advice.
     _chain_res = _apply_route_chains(conn, route_id)
-    if _chain_res["errors"]:
-        conn.commit()  # persist the partial links so the boss can see/fix them
+    _blocking = _chain_blocking_errors(_chain_res)
+    conn.commit()  # persist the (partial) links either way so the boss can see/fix them
+    if _blocking:
         conn.close()
-        return jsonify({"error": " ".join(dict.fromkeys(e["msg"] for e in _chain_res["errors"]))}), 400
-    conn.commit()
+        return jsonify({"error": " ".join(dict.fromkeys(e["msg"] for e in _blocking))}), 400
     conn.close()
 
     return jsonify({
@@ -24387,6 +24417,7 @@ def api_dispatch():
         "driver": driver["username"],
         "stop_count": len(clean_stops),
         "appended": appended_to_existing,
+        "notices": _chain_notices(_chain_res),
     })
 
 
@@ -24473,19 +24504,22 @@ def api_insert_stops(route_id):
     except Exception as exc:
         app.logger.warning("api_insert_stops: compute_can_flow error: %s", exc)
     # Resolve chains against the FINAL saved order (after the reorder above), so
-    # positional links follow the boss's chosen sequence, not parse order.
+    # positional links follow the boss's chosen sequence, not parse order. Only a
+    # container-size mismatch blocks the insert; every other chain finding is an
+    # advisory notice and the stops still go in (see api_dispatch for the why).
     _chain_res = _apply_route_chains(conn, route_id)
-    if _chain_res["errors"]:
-        conn.commit()
-        conn.close()
-        return jsonify({"error": " ".join(dict.fromkeys(e["msg"] for e in _chain_res["errors"]))}), 400
+    _blocking = _chain_blocking_errors(_chain_res)
     conn.commit()
+    if _blocking:
+        conn.close()
+        return jsonify({"error": " ".join(dict.fromkeys(e["msg"] for e in _blocking))}), 400
     conn.close()
 
     return jsonify({
         "success": True,
         "route_id": route_id,
         "stop_count": len(clean_stops),
+        "notices": _chain_notices(_chain_res),
     })
 
 

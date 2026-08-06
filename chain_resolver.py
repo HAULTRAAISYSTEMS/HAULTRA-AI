@@ -212,10 +212,10 @@ def resolve_chain(stops):
             continue
         ri = index_by_id[mid]
         if ri == i:
-            errors.append({"stop_id": id_by_index[i], "msg": "A stop can't swap with itself."})
+            errors.append({"stop_id": id_by_index[i], "kind": "self", "msg": "A stop can't swap with itself."})
             continue
         if claimed_taker[ri]:
-            errors.append({"stop_id": id_by_index[i],
+            errors.append({"stop_id": id_by_index[i], "kind": "double",
                            "msg": "That stop already receives a can from another stop in this chain."})
             continue
         _set_link(i, ri, "manual")
@@ -278,12 +278,12 @@ def resolve_chain(stops):
                     # BLOCKING: a 30yd empty can't serve a 20yd site. Flag both,
                     # break the chain here; k may start a fresh same-size sub-chain.
                     errors.append({
-                        "stop_id": id_by_index[prev],
+                        "stop_id": id_by_index[prev], "kind": "size",
                         "msg": "Container size mismatch — a %s empty can't serve the %s site at %s. Chain broken here." % (
                             stops[prev].get("container_size") or "?", stops[k].get("container_size") or "?",
                             stops[k].get("address") or "this stop")})
                     errors.append({
-                        "stop_id": id_by_index[k],
+                        "stop_id": id_by_index[k], "kind": "size",
                         "msg": "Container size mismatch — this %s site can't take the %s empty from %s. Chain broken here." % (
                             stops[k].get("container_size") or "?", stops[prev].get("container_size") or "?",
                             stops[prev].get("address") or "the prior stop")})
@@ -348,14 +348,14 @@ def resolve_chain(stops):
     #    start from) is an unintended cycle — reject it and clear the links.
     for i in range(n):
         if gives[i] is not None and stops[i]["_chain_group_id"] is None:
-            errors.append({"stop_id": id_by_index[i],
+            errors.append({"stop_id": id_by_index[i], "kind": "loop",
                            "msg": "Swap links form a loop with no starting stop — break one link."})
             stops[i]["_chain_gives_to"] = None
             stops[i]["_chain_takes_from"] = None
     # Reject any leftover self-link (defensive).
     for i in range(n):
         if stops[i]["_chain_gives_to"] == id_by_index[i]:
-            errors.append({"stop_id": id_by_index[i], "msg": "A stop can't swap with itself."})
+            errors.append({"stop_id": id_by_index[i], "kind": "self", "msg": "A stop can't swap with itself."})
             stops[i]["_chain_gives_to"] = None
 
     return {"errors": errors, "infos": infos, "needs_link": needs_link}
