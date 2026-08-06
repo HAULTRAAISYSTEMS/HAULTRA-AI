@@ -3016,8 +3016,11 @@ def init_db():
     _add_column_if_missing(conn, "stops", "chain_seq", "chain_seq INTEGER")
     _add_column_if_missing(conn, "stops", "chain_gives_to_stop_id", "chain_gives_to_stop_id INTEGER")
     _add_column_if_missing(conn, "stops", "chain_takes_from_stop_id", "chain_takes_from_stop_id INTEGER")
+    #   chain_terminal            tail only: 'head' | 'yard' | 'none' | 'delivery'
+    #   chain_delivery_stop_id    tail only: the D stop the final empty is delivered to
     _add_column_if_missing(conn, "stops", "chain_terminal", "chain_terminal TEXT")
     _add_column_if_missing(conn, "stops", "chain_start", "chain_start TEXT")
+    _add_column_if_missing(conn, "stops", "chain_delivery_stop_id", "chain_delivery_stop_id INTEGER")
     _add_column_if_missing(conn, "stops", "chain_target_ref", "chain_target_ref TEXT")
     _add_column_if_missing(conn, "stops", "chain_source", "chain_source TEXT")
     # Retired two-role columns from the earlier pair-only model (#88). Kept as
@@ -11288,7 +11291,8 @@ def _build_route_board_html(user):
                s.id AS stop_id, s.stop_order, s.customer_name, s.address, s.city,
                s.action, s.container_size, s.status AS stop_status, s.driver_status,
                s.completed_at, s.held_at, s.empty_can_plan,
-               s.chain_group_id, s.chain_seq, s.chain_gives_to_stop_id, s.chain_takes_from_stop_id, s.chain_terminal, s.chain_start,
+               s.chain_group_id, s.chain_seq, s.chain_gives_to_stop_id, s.chain_takes_from_stop_id,
+               s.chain_terminal, s.chain_start, s.chain_delivery_stop_id,
                ii.vendor_status AS vendor_status,
                EXISTS(SELECT 1 FROM route_photos rp WHERE rp.stop_id = s.id) AS has_photo
         FROM routes r
@@ -11316,12 +11320,17 @@ def _build_route_board_html(user):
         _cg = _d.get("chain_group_id")
         if _cg:
             _chain_len_by_group[_cg] = _chain_len_by_group.get(_cg, 0) + 1
+        # Every stop feeds render_flows — a delivery-target D stop has no
+        # chain_group_id of its own but still shows the "arrives from swap chain"
+        # reference, so it must be in the map.
+        if _sid is not None:
             _chain_stops_for_flows.append({
                 "id": _sid, "address": _chain_label_by_id.get(_sid, ""),
                 "chain_group_id": _cg, "chain_seq": _d.get("chain_seq"),
                 "chain_gives_to_stop_id": _d.get("chain_gives_to_stop_id"),
                 "chain_takes_from_stop_id": _d.get("chain_takes_from_stop_id"),
-                "chain_terminal": _d.get("chain_terminal"), "chain_start": _d.get("chain_start")})
+                "chain_terminal": _d.get("chain_terminal"), "chain_start": _d.get("chain_start"),
+                "chain_delivery_stop_id": _d.get("chain_delivery_stop_id")})
     # FK-derived flow lines (both sides, or a data-integrity notice for a half-link).
     _chain_flows_by_id = chain_resolver.render_flows(_chain_stops_for_flows)
 
@@ -11485,6 +11494,13 @@ def _build_route_board_html(user):
             chain_badge = ""
             _sd = dict(s)
             _cg = _sd.get("chain_group_id")
+            _flow = _chain_flows_by_id.get(_sd.get("stop_id"), {})
+            _cpill = ('display:inline-block;margin-top:5px;padding:2px 7px;border-radius:999px;'
+                      'font-size:9px;font-weight:800;letter-spacing:.4px;white-space:nowrap;'
+                      'overflow:hidden;text-overflow:ellipsis;max-width:100%;'
+                      'background:rgba(140,160,179,0.16);color:#B8C6D4;border:1px solid rgba(140,160,179,0.5);')
+            _wpill = _cpill.replace('rgba(140,160,179,0.16)', 'rgba(255,157,0,0.12)') \
+                           .replace('#B8C6D4', '#fbbf24').replace('rgba(140,160,179,0.5)', 'rgba(255,157,0,0.45)')
             if _cg:
                 _clen = _chain_len_by_group.get(_cg, 1)
                 _cseq = (_sd.get("chain_seq") or 0) + 1
@@ -11492,13 +11508,6 @@ def _build_route_board_html(user):
                 # its empty goes, the receiver shows where its empty arrives from, so
                 # the same link renders on both cards (or neither). A half-written
                 # link surfaces as a data-integrity line, never a misleading arrow.
-                _flow = _chain_flows_by_id.get(_sd.get("stop_id"), {})
-                _cpill = ('display:inline-block;margin-top:5px;padding:2px 7px;border-radius:999px;'
-                          'font-size:9px;font-weight:800;letter-spacing:.4px;white-space:nowrap;'
-                          'overflow:hidden;text-overflow:ellipsis;max-width:100%;'
-                          'background:rgba(140,160,179,0.16);color:#B8C6D4;border:1px solid rgba(140,160,179,0.5);')
-                _wpill = _cpill.replace('rgba(140,160,179,0.16)', 'rgba(255,157,0,0.12)') \
-                               .replace('#B8C6D4', '#fbbf24').replace('rgba(140,160,179,0.5)', 'rgba(255,157,0,0.45)')
                 _flow_line = _flow.get("takes") or _flow.get("start") or _flow.get("gives") or ""
                 _pill = (f'<span class="stop-mini-chain" title="Can-swap chain" style="{_cpill}">'
                          f'&#128257; SWAP {_cseq} of {_clen}{(" &middot; " + e(_flow_line)) if _flow_line else ""}</span>')
@@ -11506,6 +11515,13 @@ def _build_route_board_html(user):
                     _pill += (f'<span class="stop-mini-chain" title="Chain data integrity" style="{_wpill}">'
                               f'&#9888; {e(_flow["integrity"])}</span>')
                 chain_badge = f'<div style="display:flex;flex-direction:column;gap:3px;">{_pill}</div>'
+            elif _flow.get("takes"):
+                # A delivery-target D stop: not a chain member, but it receives the
+                # chain's final empty — show the reference so the driver doesn't also
+                # expect a yard can for it.
+                chain_badge = (f'<div style="display:flex;flex-direction:column;gap:3px;">'
+                               f'<span class="stop-mini-chain" title="Delivered from swap chain" style="{_cpill}">'
+                               f'&#128257; {e(_flow["takes"])}</span></div>')
 
             time_html = ""
             if stop_status == "completed" and s["completed_at"]:
@@ -12697,13 +12713,14 @@ def driver_route_detail(route_id):
     _c_gives  = _s.get("chain_gives_to_stop_id") if _chained else None
     _c_takes  = _s.get("chain_takes_from_stop_id") if _chained else None
     _c_term   = (_s.get("chain_terminal") or "").strip() if _chained else ""
+    _c_delivery = _s.get("chain_delivery_stop_id") if _chained else None
     # Neighbor addresses come from the already-loaded route stops (conn is closed
     # by now) so the chain workflow can name where the empty goes.
     _c_nbr = {}
     if _chained:
         for _row in stops:
             _rid = _row["id"]
-            if _rid in (_c_gives, _c_takes):
+            if _rid in (_c_gives, _c_takes, _c_delivery):
                 _c_nbr[_rid] = ((_row["address"] or _row["customer_name"] or "the stop") or "").strip()
 
     # ── Reuse the exact existing workflow state machine (arrived / box out /
@@ -12722,9 +12739,12 @@ def driver_route_detail(route_id):
             _deliver_step = None
         elif _c_term == "yard":
             _deliver_step = ("box_in", "&#128666; Empty to Yard", "btn-driver btn-driver-complete")
+        elif _c_term == "delivery":
+            _dlv_addr = e(_c_nbr.get(_c_delivery, "the delivery stop"))
+            _deliver_step = ("box_in", f"&#128666; Deliver Empty to {_dlv_addr}", "btn-driver btn-driver-complete")
         elif _c_term == "head":
             _deliver_step = ("box_in", f"&#128666; Return Empty to {_gives_addr}", "btn-driver btn-driver-complete")
-        else:  # head or middle — deliver the empty to the next chain stop
+        else:  # middle — deliver the empty to the next chain stop
             _deliver_step = ("box_in", f"&#128666; Deliver Empty to {_gives_addr}", "btn-driver btn-driver-complete")
         wf_map = {
             "pending":  ("arrived",       "&#128666; Arrived at Stop",    "btn-driver btn-driver-complete"),
@@ -13074,6 +13094,14 @@ def driver_route_detail(route_id):
         _dn = _display_note(s["notes"])
         if _dn:
             meta_bits.append(e(_dn))
+    # If this D stop receives a swap chain's final empty as its delivery, show the
+    # reference so the driver does not also expect a yard can for it.
+    if not _s.get("chain_group_id"):
+        for _row in stops:
+            if _row["id"] != _s.get("id") and _row["chain_delivery_stop_id"] == _s.get("id"):
+                _tail_addr = ((_row["address"] or _row["customer_name"] or "the swap chain") or "").strip()
+                meta_bits.append("&#128257; Can arrives from swap chain (" + e(_tail_addr) + ")")
+                break
     meta_line = " &middot; ".join(meta_bits) if meta_bits else ""
     ticket_line = f'<div class="cab-meta-line"><strong>Ticket:</strong> {e(s["ticket_number"])}</div>' if s["ticket_number"] else ""
 
@@ -18635,6 +18663,9 @@ Rules:
     * {"kind":"next"}     — a bare "use to swap" / "swap next" with no address given.
     * {"kind":"terminal","terminal":"yard"}  — "back to yard" (final empty returns to the yard).
     * {"kind":"terminal","terminal":"none"}  — "no return", "last one dumps" (final empty just dumps).
+    * {"kind":"terminal","terminal":"delivery"} — "until the del", "til the delivery", "last one
+      drops at", "ends with the drop", "final can goes to X" (the final empty is DELIVERED at a
+      later drop/delivery stop — code binds it to that D stop).
     * {"kind":"start","start":"yard"}         — "grab the first one from the yard", "start from yard".
     * null — no chain signal.
   Do NOT put any swap phrase in `notes` — the readable chain text is DERIVED in code from the
@@ -24178,6 +24209,22 @@ def add_parsed_stops(route_id):
 _PARSER_ACTION_MAP = {"PR": "Pickup and Return", "P": "Pull", "D": "Delivery", "S": "Swap", "R": "Relocate", "LL": "Live Load", "YARD": "Yard"}
 
 
+def _persist_manual_delivery(conn, clean_stops, new_ids):
+    """Write a confirm-sheet [change]->delivery pick as a manual delivery FK before
+    chain resolution: clean_stops[p]['manual_delivery'] is the POSITION of the D
+    stop; translate both to the just-inserted real ids and mark the picking stop
+    chain_source='manual' so _apply_route_chains reads and keeps it."""
+    n = len(new_ids)
+    for p, s in enumerate(clean_stops):
+        if p >= n:
+            break
+        d_pos = s.get("manual_delivery")
+        if isinstance(d_pos, int) and 0 <= d_pos < n and d_pos != p:
+            conn.execute(
+                "UPDATE stops SET chain_delivery_stop_id=?, chain_source='manual' WHERE id=?",
+                (new_ids[d_pos], new_ids[p]))
+
+
 def _apply_route_chains(conn, route_id):
     """THE single can-swap resolver for every path (AI parse, Quick Add, Confirm
     Stop, Edit Stop). Runs against the route's FINAL SAVED ORDER, inside the
@@ -24194,7 +24241,7 @@ def _apply_route_chains(conn, route_id):
     """
     rows = conn.execute(
         "SELECT id, action, address, container_size, notes, chain_target_ref, "
-        "chain_source, chain_gives_to_stop_id "
+        "chain_source, chain_gives_to_stop_id, chain_delivery_stop_id "
         "FROM stops WHERE route_id=? ORDER BY stop_order, id", (route_id,)
     ).fetchall()
     if not rows:
@@ -24203,21 +24250,26 @@ def _apply_route_chains(conn, route_id):
     for r in rows:
         d = dict(r)
         manual = d["chain_gives_to_stop_id"] if (d.get("chain_source") == "manual" and d.get("chain_gives_to_stop_id")) else None
+        # A persisted manual delivery pick (chain_source='manual' + a delivery FK,
+        # no gives FK) feeds back in so the boss's choice is sticky across re-resolves.
+        manual_dlv = d["chain_delivery_stop_id"] if (d.get("chain_source") == "manual" and d.get("chain_delivery_stop_id")) else None
         # Persisted explicit target (from a prior resolve or an AI hint) feeds the
         # address matcher again; a manual pick overrides it and is read above.
         ref = (d.get("chain_target_ref") or "").strip()
         hint = {"kind": "explicit", "target_text": ref} if (ref and d.get("chain_source") != "manual") else None
         stops.append({"id": d["id"], "action": d["action"], "address": d["address"],
                       "container_size": d["container_size"], "note": d.get("notes") or "",
-                      "chain_hint": hint, "manual_gives_to": manual})
+                      "chain_hint": hint, "manual_gives_to": manual, "manual_delivery": manual_dlv})
     res = chain_resolver.resolve_chain(stops)
     for s in stops:
         conn.execute(
             "UPDATE stops SET chain_group_id=?, chain_seq=?, chain_gives_to_stop_id=?, "
-            "chain_takes_from_stop_id=?, chain_terminal=?, chain_start=?, chain_target_ref=?, chain_source=? "
+            "chain_takes_from_stop_id=?, chain_terminal=?, chain_start=?, chain_delivery_stop_id=?, "
+            "chain_target_ref=?, chain_source=? "
             "WHERE id=?",
             (s["_chain_group_id"], s["_chain_seq"], s["_chain_gives_to"], s["_chain_takes_from"],
-             s["_chain_terminal"], s["_chain_start"], s["_chain_target_ref"], s["_chain_source"], s["id"]))
+             s["_chain_terminal"], s["_chain_start"], s["_chain_delivery"],
+             s["_chain_target_ref"], s["_chain_source"], s["id"]))
     # Chain wins over positional inference: if a chained stop also carries the
     # positional swap_with_prev_pull flag, log one line (never user-facing).
     for r in conn.execute(
@@ -24339,6 +24391,10 @@ def _validate_parser_stops(stops_in):
             "empty_can_plan": (s.get("empty_can_plan") or "").strip()
                               if (s.get("empty_can_plan") or "").strip() in _EMPTY_CAN_PLANS else "",
             "carry_can_ref": (str(s.get("carry_can_ref") or "").strip()[:40]),
+            # A confirm-sheet [change] -> delivery pick: the POSITION (0-based) of the
+            # D stop this stop's chain delivers its final empty to. Translated to a
+            # real stop id after insert (positions are all we have pre-insert).
+            "manual_delivery": (s.get("manual_delivery") if isinstance(s.get("manual_delivery"), int) else None),
         })
     return clean_stops, None
 
@@ -24363,11 +24419,14 @@ def api_chain_preview():
         # Honor the AI's structured chain_hint the same way the insert does, so the
         # preview shows the exact chain the insert will make.
         _pnote = _notes_with_chain_hint(s.get("notes"), s.get("chain_hint"))
+        _mdlv = s.get("manual_delivery")
         stops.append({"id": i, "action": _act,
                       "address": expand_abbrev((s.get("address") or "").strip()),
                       "container_size": (s.get("container_size") or "").strip(),
-                      "note": _pnote, "chain_hint": None, "manual_gives_to": None})
+                      "note": _pnote, "chain_hint": None, "manual_gives_to": None,
+                      "manual_delivery": _mdlv if isinstance(_mdlv, int) else None})
     res = chain_resolver.resolve_chain(stops)
+    addr_by_index = {st["id"]: st["address"] for st in stops}
     groups = {}
     for st in stops:
         g = st["_chain_group_id"]
@@ -24377,10 +24436,25 @@ def api_chain_preview():
     for members in groups.values():
         members.sort(key=lambda x: x["_chain_seq"] if x["_chain_seq"] is not None else 0)
         tail = members[-1]
+        _csize = chain_resolver.normalize_size(tail["container_size"])
+        # Delivery-terminal candidates: every D stop on the sheet whose size matches
+        # the chain size — the [change] -> delivery picker lists exactly these.
+        _cands = [{"index": st["id"], "address": st["address"], "size": st["container_size"]}
+                  for st in stops
+                  if chain_resolver._is_delivery(st["action"])
+                  and chain_resolver.normalize_size(st["container_size"]) == _csize]
+        _term = tail["_chain_terminal"] or "head"
+        _dlv_idx = None
+        if _term == "delivery" and tail.get("_chain_delivery") is not None:
+            _dlv_idx = tail["_chain_delivery"]
         chains.append({
             "indexes": [m["id"] for m in members],
             "stops": [{"index": m["id"], "address": m["address"], "size": m["container_size"], "seq": m["_chain_seq"]} for m in members],
-            "terminal": tail["_chain_terminal"] or "head",
+            "terminal": _term,
+            "start": members[0].get("_chain_start"),
+            "delivery_index": _dlv_idx,
+            "delivery_address": addr_by_index.get(_dlv_idx) if _dlv_idx is not None else None,
+            "delivery_candidates": _cands,
             "trips": len(members),
         })
     return jsonify({
@@ -24442,6 +24516,7 @@ def api_dispatch():
     next_order = conn.execute(
         "SELECT COALESCE(MAX(stop_order), 0) AS m FROM stops WHERE route_id=?", (route_id,)
     ).fetchone()["m"]
+    _new_ids = []
     for s in clean_stops:
         next_order += 1
         cur.execute("""
@@ -24452,6 +24527,7 @@ def api_dispatch():
         """, (route_id, next_order, s.get("customer") or "", s["address"], s["action"],
               s["container_size"], s.get("dump_leg") or "", s.get("return_leg") or "",
               s["notes"], s.get("empty_can_plan") or "", s.get("carry_can_ref") or "", now_ts()))
+        _new_ids.append(cur.lastrowid)
         # Resolve the dump/return site names to location records + set the FKs.
         _link_stop_sites(conn, cid(), cur.lastrowid, s.get("dump_leg") or "", s.get("return_leg") or "")
         # Self-building address book: learn every dispatched stop's address.
@@ -24459,6 +24535,10 @@ def api_dispatch():
                        action=s["action"], container_size=s["container_size"],
                        dump_location=s.get("dump_leg") or "")
 
+    # Persist a confirm-sheet [change] -> delivery pick: translate the D stop's
+    # POSITION to its real id and pre-write it as a manual delivery on the picking
+    # stop's tail, so the resolver honors and keeps it (chain_source='manual').
+    _persist_manual_delivery(conn, clean_stops, _new_ids)
     conn.commit()
     try:
         compute_can_flow(conn, route_id)

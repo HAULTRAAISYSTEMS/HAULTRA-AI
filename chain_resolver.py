@@ -76,6 +76,9 @@ def normalize_size(text):
 # ── Note / hint detection ───────────────────────────────────────────────────
 _TERMINAL_YARD_RE = re.compile(r"\b(back to (the )?yard|to the yard|return to yard)\b", re.I)
 _TERMINAL_NONE_RE = re.compile(r"\b(no return|don'?t (bring|come) back|last one dumps|no can back|leave last)\b", re.I)
+# The final empty is DELIVERED at a drop stop (customer delivery) — truck ends empty.
+_TERMINAL_DELIVERY_RE = re.compile(
+    r"\b(until|til|till) the del(ivery)?\b|\blast one drops at\b|\bends with the drop\b|\bfinal can goes to\b", re.I)
 _RUN_RE = re.compile(r"\b(swap (till|til|until) (the )?end|keep swapping|swap all|swap the whole|swap everything|swap down the line)\b", re.I)
 # "use to swap <target>" / "swap with <target>" / "use for <target>" / "take to <target>"
 _EXPLICIT_RE = re.compile(
@@ -90,7 +93,7 @@ _START_YARD_RE = re.compile(r"\b(start (?:from|at|with) (?:the )?yard|grab (?:on
 # exactly what detection matches, so a stored trigger phrase never renders raw while
 # the boss's real note text ("gate code 1234") survives. Detection and stripping
 # share this one list — they can never drift apart.
-_CHAIN_PHRASE_RES = (_RUN_RE, _TERMINAL_YARD_RE, _TERMINAL_NONE_RE, _START_YARD_RE, _EXPLICIT_RE, _NEXT_RE)
+_CHAIN_PHRASE_RES = (_RUN_RE, _TERMINAL_DELIVERY_RE, _TERMINAL_YARD_RE, _TERMINAL_NONE_RE, _START_YARD_RE, _EXPLICIT_RE, _NEXT_RE)
 
 
 def strip_chain_phrases(text):
@@ -128,6 +131,8 @@ def hint_to_note(hint):
             return "back to yard"
         if term == "none":
             return "no return"
+        if term == "delivery":
+            return "until the delivery"
         return ""
     if k == "start":
         if (hint.get("start") or "").lower() == "yard":
@@ -171,10 +176,14 @@ def detect_chain_hint(text):
 
 
 def detect_terminal(text):
-    """A terminal phrase in free text -> 'yard' | 'none' | None."""
+    """A terminal phrase in free text -> 'delivery' | 'yard' | 'none' | None.
+    'delivery' (the final empty is dropped at a customer D stop) is checked first
+    because its phrasing ("...to X") could otherwise look like a plain address."""
     t = (text or "").strip()
     if not t:
         return None
+    if _TERMINAL_DELIVERY_RE.search(t):
+        return "delivery"
     if _TERMINAL_YARD_RE.search(t):
         return "yard"
     if _TERMINAL_NONE_RE.search(t):
@@ -200,6 +209,7 @@ def render_flows(stops):
     gives = {}
     takes = {}
     seq = {}
+    delivery_from = {}   # delivery-target stop id -> the tail stop id that delivers to it
     for s in stops:
         sid = s.get("id")
         if sid is None:
@@ -208,6 +218,9 @@ def render_flows(stops):
         gives[sid] = s.get("chain_gives_to_stop_id")
         takes[sid] = s.get("chain_takes_from_stop_id")
         seq[sid] = s.get("chain_seq")
+        _dlv = s.get("chain_delivery_stop_id")
+        if _dlv is not None:
+            delivery_from[_dlv] = sid
 
     def _addr(sid):
         return addr.get(sid) or "another stop"
@@ -223,12 +236,18 @@ def render_flows(stops):
         start = (s.get("chain_start") or "")
         line = {"takes": None, "gives": None, "start": None, "integrity": None}
 
+        dlv = s.get("chain_delivery_stop_id")
+
         # incoming empty (reciprocal: the stop I take from must give to me)
         if t is not None:
             if gives.get(t) == sid:
                 line["takes"] = "← Empty arrives from " + _addr(t)
             else:
                 line["integrity"] = "Chain link to this stop is one-sided — re-link it in Edit Stop."
+        elif sid in delivery_from:
+            # this D stop receives the chain's final empty as its delivery — show
+            # the reference so the driver doesn't also expect a yard can for it.
+            line["takes"] = "← Can arrives from swap chain (" + _addr(delivery_from[sid]) + ")"
         elif start == "yard" and s.get("chain_group_id"):
             line["start"] = "← First empty grabbed from the yard"
 
@@ -242,6 +261,8 @@ def render_flows(stops):
                 line["gives"] = "→ Final empty returns to head " + _addr(g)
             else:
                 line["integrity"] = "Chain link from this stop is one-sided — re-link it in Edit Stop."
+        elif term == "delivery" and dlv is not None:
+            line["gives"] = "→ Final empty DELIVERED to " + _addr(dlv)
         elif term == "yard":
             line["gives"] = "→ Final empty back to the yard"
         elif term == "none":
@@ -260,6 +281,13 @@ def _is_can_producer(action):
     if "delivery" in a or "drop" in a or "relocate" in a or a == "yard" or a == "vendor":
         return False
     return any(k in a for k in CAN_PRODUCING)
+
+
+def _is_delivery(action):
+    """A drop/delivery stop — a candidate 'delivery' terminal for a swap chain
+    (the final empty is set off here as a customer delivery)."""
+    a = (action or "").strip().lower()
+    return "delivery" in a or "drop" in a or a == "d"
 
 
 def _new_group_id():
@@ -293,6 +321,7 @@ def resolve_chain(stops):
         s["_chain_target_ref"] = None
         s["_chain_source"] = None
         s["_chain_start"] = None
+        s["_chain_delivery"] = None   # tail only: the D stop id the final empty is delivered to
 
     id_by_index = [s.get("id") for s in stops]
     index_by_id = {sid: i for i, sid in enumerate(id_by_index) if sid is not None}
@@ -311,7 +340,7 @@ def resolve_chain(stops):
         if hint:
             k = (hint.get("kind") or "").lower()
             if k == "terminal":
-                terminals[i] = hint.get("terminal") if hint.get("terminal") in ("yard", "none") else None
+                terminals[i] = hint.get("terminal") if hint.get("terminal") in ("yard", "none", "delivery") else None
             elif k == "start":
                 starts[i] = "yard" if (hint.get("start") or "").lower() == "yard" else None
             elif k in ("explicit", "run", "next"):
@@ -338,6 +367,25 @@ def resolve_chain(stops):
         claimed_giver[gi] = True
         claimed_taker[ri] = True
 
+    def _size_conflict(gi, ri):
+        """A boss-SPECIFIED link (manual/explicit) into a container-size mismatch is
+        a BLOCKING error — the boss asked for the physically impossible and would
+        strand the driver. (An inferred link that mismatches just breaks silently.)
+        Records both stops + both sizes; returns True when it blocked the link."""
+        if normalize_size(stops[gi].get("container_size")) == normalize_size(stops[ri].get("container_size")):
+            return False
+        errors.append({
+            "stop_id": id_by_index[gi], "kind": "size",
+            "msg": "Container size mismatch — a %s empty can't serve the %s site at %s." % (
+                stops[gi].get("container_size") or "?", stops[ri].get("container_size") or "?",
+                stops[ri].get("address") or "that stop")})
+        errors.append({
+            "stop_id": id_by_index[ri], "kind": "size",
+            "msg": "Container size mismatch — this %s site can't take the %s empty from %s." % (
+                stops[ri].get("container_size") or "?", stops[gi].get("container_size") or "?",
+                stops[gi].get("address") or "the prior stop")})
+        return True
+
     # 1) MANUAL links (highest precedence) — the boss's explicit picker.
     for i, s in enumerate(stops):
         mid = s.get("manual_gives_to")
@@ -352,6 +400,8 @@ def resolve_chain(stops):
         if claimed_taker[ri]:
             errors.append({"stop_id": id_by_index[i], "kind": "double",
                            "msg": "That stop already receives a can from another stop in this chain."})
+            continue
+        if _size_conflict(i, ri):
             continue
         _set_link(i, ri, "manual")
 
@@ -373,8 +423,12 @@ def resolve_chain(stops):
             stops[i]["_chain_source"] = "explicit"
             needs_link.append({"stop_id": id_by_index[i], "target_text": targets[i]})
             continue
-        _set_link(i, match, "explicit")
+        # The boss named this target explicitly — a size mismatch here IS an error.
         stops[i]["_chain_target_ref"] = targets[i]
+        if _size_conflict(i, match):
+            stops[i]["_chain_source"] = "explicit"
+            continue
+        _set_link(i, match, "explicit")
 
     # 3) POSITIONAL runs. A maximal block of consecutive can-producers is a run;
     #    a run/next signal anywhere in it chains the WHOLE run, and a 'run' signal
@@ -410,24 +464,19 @@ def resolve_chain(stops):
         for k in run:
             if prev is not None:
                 if normalize_size(stops[prev].get("container_size")) != normalize_size(stops[k].get("container_size")):
-                    # BLOCKING: a 30yd empty can't serve a 20yd site. Flag both,
-                    # break the chain here; k may start a fresh same-size sub-chain.
-                    errors.append({
-                        "stop_id": id_by_index[prev], "kind": "size",
-                        "msg": "Container size mismatch — a %s empty can't serve the %s site at %s. Chain broken here." % (
-                            stops[prev].get("container_size") or "?", stops[k].get("container_size") or "?",
-                            stops[k].get("address") or "this stop")})
-                    errors.append({
-                        "stop_id": id_by_index[k], "kind": "size",
-                        "msg": "Container size mismatch — this %s site can't take the %s empty from %s. Chain broken here." % (
-                            stops[k].get("container_size") or "?", stops[prev].get("container_size") or "?",
-                            stops[prev].get("address") or "the prior stop")})
-                    prev = None if terminals[k] else k
+                    # INFERRED link into a size mismatch -> SILENTLY break the run
+                    # here. The app guessed the link; the guess was wrong, and that
+                    # is not the dispatcher's mistake, so no error and no warning.
+                    # This stop stands alone / starts a fresh same-size sub-chain.
+                    prev = k
                     continue
                 if not claimed_giver[prev] and not claimed_taker[k]:
                     _set_link(prev, k, "positional")
-            # A terminal signal on this member ends the chain here (it's the tail).
-            prev = None if terminals[k] else k
+            # The terminal is a CHAIN-level property (a phrase anywhere in the run —
+            # commonly on the head — applies to the tail; assembled in step 4). It
+            # does NOT split the positional walk, so "swap till end ... to the yard"
+            # written on the head still chains the whole run.
+            prev = k
 
     # 4) Assemble chains from the gives graph, assign seq / takes_from / terminal.
     #    A chain starts at a HEAD: a claimed giver that nobody hands a can to
@@ -454,21 +503,64 @@ def resolve_chain(stops):
             continue
         gid = _new_group_id()
         tail = seq_order[-1]
-        # terminal: any member's terminal signal lands on the tail; default head.
+        chain_size = normalize_size(stops[tail].get("container_size"))
+        # explicit terminal: any member's terminal signal lands on the tail.
         term = None
+        term_specified = False
         for k in seq_order:
             if terminals[k]:
                 term = terminals[k]
+                term_specified = True
                 break
-        term = term or "head"
         # start: any member's start signal records where the HEAD's first empty
-        # comes from ('yard'). Default None — the head starts can-less until a
-        # delivery is scheduled (the existing INFO), unless told to grab from yard.
+        # comes from ('yard'). Default None — the head starts can-less unless told
+        # to grab from yard.
         start = None
         for k in seq_order:
             if starts[k]:
                 start = starts[k]
                 break
+        # delivery terminal: the final empty is dropped at a size-matching D stop
+        # immediately after the tail in route order (the D is not part of the run,
+        # it is checked as a terminal candidate — never a silent chain-breaker).
+        delivery_id = None
+        # Highest precedence: a boss's manual delivery pick ([change] -> delivery ->
+        # picker). It may name any size-matching D stop on the route, not only the
+        # one right after the tail.
+        manual_dlv = None
+        for k in seq_order:
+            md = stops[k].get("manual_delivery")
+            if md is not None and md in index_by_id:
+                dj = index_by_id[md]
+                if _is_delivery(stops[dj].get("action")) and normalize_size(stops[dj].get("container_size")) == chain_size:
+                    manual_dlv = id_by_index[dj]
+                    break
+        if manual_dlv is not None:
+            term, term_specified, delivery_id = "delivery", True, manual_dlv
+        _di = tail + 1  # tail is an index into `stops`; next is the following stop
+        _d_ok = (_di < n and _is_delivery(stops[_di].get("action"))
+                 and normalize_size(stops[_di].get("container_size")) == chain_size)
+        if manual_dlv is not None:
+            pass  # already bound
+        elif term == "delivery":
+            # explicit delivery intent: bind the D if valid, else fall back cleanly.
+            if _d_ok:
+                delivery_id = id_by_index[_di]
+            else:
+                term = None
+                term_specified = False
+        if not term_specified and term is None:
+            # No explicit terminal. A yard-started chain defaults to returning the
+            # final empty to the yard (so the yard stays square — it gave one out);
+            # a cold-started chain returns to the head. If a size-matching D follows
+            # a yard-started run, prefer delivering the final empty there.
+            if start == "yard":
+                if _d_ok:
+                    term, delivery_id = "delivery", id_by_index[_di]
+                else:
+                    term = "yard"
+            else:
+                term = "head"
         for pos, k in enumerate(seq_order):
             s = stops[k]
             s["_chain_group_id"] = gid
@@ -479,13 +571,19 @@ def resolve_chain(stops):
             if k == tail:
                 s["_chain_terminal"] = term
                 s["_chain_gives_to"] = id_by_index[seq_order[0]] if term == "head" else None
+                s["_chain_delivery"] = delivery_id
             else:
                 s["_chain_gives_to"] = id_by_index[seq_order[pos + 1]]
             if s["_chain_source"] is None:
                 s["_chain_source"] = src[k] or "positional"
-        # INFO on the head when it is left without a can (yard/none terminal) AND
-        # it wasn't told to grab its first empty from the yard.
-        if term in ("yard", "none") and start != "yard":
+            # A manually-picked delivery stays 'manual' on the tail so a later
+            # re-resolve reads it back and the pick is sticky.
+            if k == tail and manual_dlv is not None:
+                s["_chain_source"] = "manual"
+        # Conservation INFO: the head is left can-less when the final empty does NOT
+        # come back to it (yard/none/delivery terminal) and it wasn't given a yard
+        # start. Allowed — never blocks — but the boss should see it.
+        if term in ("yard", "none", "delivery") and start != "yard":
             head = stops[seq_order[0]]
             infos.append({"stop_id": id_by_index[seq_order[0]],
                           "msg": "%s has no can until a delivery is scheduled." % (head.get("address") or "The head stop")})
