@@ -147,11 +147,42 @@ rows = route_rows(last_route())
 ok(rows[0]["chain_seq"] == 0 and rows[0]["address"].startswith("20 B"),
    "reversed saved order: head follows the new order (positional, not parse order)")
 
-# 12) 30->20 dispatch -> BLOCKING (400).
+# 12) 30->20 dispatch -> BLOCKING (400). Container-size mismatch is the ONLY chain
+#     condition that may reject an insert — it would strand the truck.
 r = dispatch([{"action": "PR", "address": "1 Big St", "container_size": "30yd", "notes": "swap till end"},
               {"action": "PR", "address": "2 Small St", "container_size": "20yd", "notes": ""}], "2026-09-03")
 ok(r.status_code == 400 and "mismatch" in (r.get_json() or {}).get("error", "").lower(),
    "30->20 dispatch blocked with a size-mismatch error")
+
+# 12a) FIX 1 — only a container-size mismatch is blocking; every other chain
+#      finding is advisory. The API filters errors through _chain_blocking_errors,
+#      so this MUST fail if anyone reverts to `if _chain_res["errors"]`.
+_mixed = {"errors": [{"kind": "size", "msg": "Container size mismatch — bad."},
+                     {"kind": "loop", "msg": "Swap links form a loop."},
+                     {"kind": "self", "msg": "A stop can't swap with itself."},
+                     {"kind": "double", "msg": "That stop already receives a can."}],
+          "infos": [{"msg": "The head stop has no can until a delivery is scheduled."}],
+          "needs_link": [{"target_text": "6969 Tidewater Dr"}]}
+_blk = app._chain_blocking_errors(_mixed)
+ok(len(_blk) == 1 and _blk[0]["kind"] == "size", "only the size mismatch is blocking; loop/self/double are not")
+_ntc = app._chain_notices(_mixed)
+ok(all("mismatch" not in m for m in _ntc), "size mismatch never appears as an advisory notice")
+ok(any("loop" in m for m in _ntc) and any("itself" in m for m in _ntc)
+   and any("already receives" in m for m in _ntc), "non-size errors surface as advisory notices")
+ok(any("no can" in m for m in _ntc) and any("Tidewater" in m for m in _ntc),
+   "INFO notices and unmatched targets fold into advisory notices")
+# an error set with NO size mismatch is fully non-blocking
+ok(app._chain_blocking_errors({"errors": [{"kind": "loop", "msg": "loop"}], "infos": [], "needs_link": []}) == [],
+   "a loop with no size mismatch does not block the insert")
+
+# 12b) FIX 1 end-to-end — a valid dispatch carries advisory notices in its 200
+#      response (an unmatched explicit target is advisory, never a block).
+r = dispatch([{"action": "PR", "address": "1 Head St", "container_size": "30yd", "notes": "use to swap 999 Nowhere Rd"},
+              {"action": "PR", "address": "2 Tail St", "container_size": "30yd", "notes": ""}], "2026-09-13")
+j = r.get_json() or {}
+ok(r.status_code == 200 and j.get("success") is True, "dispatch with an unmatched swap target still succeeds (advisory)")
+ok(isinstance(j.get("notices"), list) and any("Nowhere" in m for m in j["notices"]),
+   "the unmatched target is returned as a non-blocking notice, not a 400")
 
 # 13) Quick Add (manual note) identical to AI parse.
 r = dispatch([{"action": "PR", "address": "77 Q St", "container_size": "30yd", "notes": "use to swap"},
