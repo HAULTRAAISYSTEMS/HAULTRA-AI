@@ -894,7 +894,8 @@
     }
     if (!currentStops.length) { host.innerHTML = ''; return; }
     var payload = { stops: currentStops.map(function (s) {
-      return { action: s.action, address: s.address, container_size: s.container_size, notes: s.notes };
+      return { action: s.action, address: s.address, container_size: s.container_size,
+               notes: s.notes, chain_hint: s.chain_hint || null };
     }) };
     fetch('/api/chain-preview', {
       method: 'POST',

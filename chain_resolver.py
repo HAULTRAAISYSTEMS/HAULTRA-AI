@@ -82,6 +82,66 @@ _EXPLICIT_RE = re.compile(
     r"\b(?:use to swap|swap with|swap w/|use (?:it )?for|use on|take (?:it )?to|this can goes to|empty for)\b\s*[:,-]?\s*(.+)",
     re.I)
 _NEXT_RE = re.compile(r"\b(use to swap|swap w/? next|use (?:it )?for next|swap next|use to swap next)\b", re.I)
+# The head's first empty comes FROM the yard (not delivered on-route yet).
+_START_YARD_RE = re.compile(r"\b(start (?:from|at|with) (?:the )?yard|grab (?:one )?from (?:the )?yard(?: first)?|empty from (?:the )?yard(?: first)?|first can from (?:the )?yard)\b", re.I)
+
+# Every regex that RECOGNIZES a chain phrase, ordered so an explicit target (which
+# greedily consumes to end-of-line) is stripped last. strip_chain_phrases() removes
+# exactly what detection matches, so a stored trigger phrase never renders raw while
+# the boss's real note text ("gate code 1234") survives. Detection and stripping
+# share this one list — they can never drift apart.
+_CHAIN_PHRASE_RES = (_RUN_RE, _TERMINAL_YARD_RE, _TERMINAL_NONE_RE, _START_YARD_RE, _EXPLICIT_RE, _NEXT_RE)
+
+
+def strip_chain_phrases(text):
+    """Remove any recognized can-swap trigger phrase from a note so it is never
+    shown to a user as raw text — the chain renders from FK state instead. Returns
+    the note with only the human-meaningful remainder (empty string if the note was
+    nothing but a swap phrase). Uses the SAME regexes as detection."""
+    t = text or ""
+    for rx in _CHAIN_PHRASE_RES:
+        t = rx.sub(" ", t)
+    # tidy leftover separators/space from the excision
+    t = re.sub(r"\s{2,}", " ", t).strip(" \t\r\n.,;:-—–")
+    return t
+
+
+def hint_to_note(hint):
+    """Canonical note phrase for a STRUCTURED chain_hint from the AI parser, so
+    resolution stays note-driven and identical across every entry path — the model
+    emits pure structure, Python writes the deterministic phrase (never prose, never
+    a normalized address; an explicit target's verbatim text is passed through as-is).
+    Returns "" for a null/unknown hint."""
+    if not isinstance(hint, dict):
+        return ""
+    k = (hint.get("kind") or "").lower()
+    if k == "run":
+        return "swap till end"
+    if k == "next":
+        return "use to swap"
+    if k == "explicit":
+        target = (hint.get("target_text") or "").strip()
+        return ("use to swap " + target) if target else "use to swap"
+    if k == "terminal":
+        term = (hint.get("terminal") or "").lower()
+        if term == "yard":
+            return "back to yard"
+        if term == "none":
+            return "no return"
+        return ""
+    if k == "start":
+        if (hint.get("start") or "").lower() == "yard":
+            return "start from yard"
+        return ""
+    return ""
+
+
+def detect_start(text):
+    """A 'head grabs its first empty from the yard' phrase -> 'yard' | None."""
+    t = (text or "").strip()
+    if t and _START_YARD_RE.search(t):
+        return "yard"
+    return None
 
 
 def detect_chain_hint(text):
@@ -120,6 +180,75 @@ def detect_terminal(text):
     if _TERMINAL_NONE_RE.search(t):
         return "none"
     return None
+
+
+# ── FK-derived rendering (both sides, never prose) ──────────────────────────
+def render_flows(stops):
+    """Derive the human-readable can-swap lines for every stop PURELY from the two
+    FK columns, so both ends of a link always render together (or neither). Input:
+    a list of dicts carrying at least id, address, chain_gives_to_stop_id,
+    chain_takes_from_stop_id, chain_terminal, chain_start, chain_seq.
+
+    Returns {stop_id: {"takes","gives","start","integrity"}} where each value is a
+    string or None. A stop with no chain link maps to all-None (render NOTHING).
+
+    A link renders on BOTH stops: the giver gets ``gives`` ("Empty goes to <addr>")
+    and the receiver gets ``takes`` ("Empty arrives from <addr>"). If a giver points
+    at a receiver whose takes_from does NOT point back — a half-written link — the
+    giver gets an ``integrity`` notice instead of a silent one-sided render."""
+    addr = {}
+    gives = {}
+    takes = {}
+    seq = {}
+    for s in stops:
+        sid = s.get("id")
+        if sid is None:
+            continue
+        addr[sid] = (s.get("address") or "").strip()
+        gives[sid] = s.get("chain_gives_to_stop_id")
+        takes[sid] = s.get("chain_takes_from_stop_id")
+        seq[sid] = s.get("chain_seq")
+
+    def _addr(sid):
+        return addr.get(sid) or "another stop"
+
+    out = {}
+    for s in stops:
+        sid = s.get("id")
+        if sid is None:
+            continue
+        g = s.get("chain_gives_to_stop_id")
+        t = s.get("chain_takes_from_stop_id")
+        term = (s.get("chain_terminal") or "")
+        start = (s.get("chain_start") or "")
+        line = {"takes": None, "gives": None, "start": None, "integrity": None}
+
+        # incoming empty (reciprocal: the stop I take from must give to me)
+        if t is not None:
+            if gives.get(t) == sid:
+                line["takes"] = "← Empty arrives from " + _addr(t)
+            else:
+                line["integrity"] = "Chain link to this stop is one-sided — re-link it in Edit Stop."
+        elif start == "yard" and s.get("chain_group_id"):
+            line["start"] = "← First empty grabbed from the yard"
+
+        # outgoing empty. A normal link is reciprocal (my target takes from me); the
+        # tail's terminal-head link is the return-home closure (the head starts the
+        # chain, so its takes_from is legitimately null) — that is NOT one-sided.
+        if g is not None:
+            if takes.get(g) == sid:
+                line["gives"] = "→ Empty goes to " + _addr(g)
+            elif term == "head" and seq.get(g) == 0:
+                line["gives"] = "→ Final empty returns to head " + _addr(g)
+            else:
+                line["integrity"] = "Chain link from this stop is one-sided — re-link it in Edit Stop."
+        elif term == "yard":
+            line["gives"] = "→ Final empty back to the yard"
+        elif term == "none":
+            line["gives"] = "→ Final empty just gets dumped (no return)"
+
+        out[sid] = line
+    return out
 
 
 # ── Chain model ─────────────────────────────────────────────────────────────
@@ -163,6 +292,7 @@ def resolve_chain(stops):
         s["_chain_terminal"] = None
         s["_chain_target_ref"] = None
         s["_chain_source"] = None
+        s["_chain_start"] = None
 
     id_by_index = [s.get("id") for s in stops]
     index_by_id = {sid: i for i, sid in enumerate(id_by_index) if sid is not None}
@@ -172,6 +302,7 @@ def resolve_chain(stops):
     kinds = [None] * n            # 'explicit' | 'run' | 'next'
     targets = [None] * n          # explicit target text
     terminals = [None] * n        # 'yard' | 'none'
+    starts = [None] * n           # 'yard' (head grabs its first empty from the yard)
     for i, s in enumerate(stops):
         hint = s.get("chain_hint") if isinstance(s.get("chain_hint"), dict) else None
         note = s.get("note") or ""
@@ -181,13 +312,17 @@ def resolve_chain(stops):
             k = (hint.get("kind") or "").lower()
             if k == "terminal":
                 terminals[i] = hint.get("terminal") if hint.get("terminal") in ("yard", "none") else None
+            elif k == "start":
+                starts[i] = "yard" if (hint.get("start") or "").lower() == "yard" else None
             elif k in ("explicit", "run", "next"):
                 kinds[i] = k
                 if k == "explicit":
                     targets[i] = (hint.get("target_text") or "").strip()
-        # A terminal phrase can co-exist with a swap phrase in the same note.
+        # A terminal / start phrase can co-exist with a swap phrase in the same note.
         if terminals[i] is None:
             terminals[i] = detect_terminal(note)
+        if starts[i] is None:
+            starts[i] = detect_start(note)
 
     errors, infos, needs_link = [], [], []
 
@@ -326,10 +461,20 @@ def resolve_chain(stops):
                 term = terminals[k]
                 break
         term = term or "head"
+        # start: any member's start signal records where the HEAD's first empty
+        # comes from ('yard'). Default None — the head starts can-less until a
+        # delivery is scheduled (the existing INFO), unless told to grab from yard.
+        start = None
+        for k in seq_order:
+            if starts[k]:
+                start = starts[k]
+                break
         for pos, k in enumerate(seq_order):
             s = stops[k]
             s["_chain_group_id"] = gid
             s["_chain_seq"] = pos
+            if pos == 0:
+                s["_chain_start"] = start
             s["_chain_takes_from"] = id_by_index[seq_order[pos - 1]] if pos > 0 else None
             if k == tail:
                 s["_chain_terminal"] = term
@@ -338,8 +483,9 @@ def resolve_chain(stops):
                 s["_chain_gives_to"] = id_by_index[seq_order[pos + 1]]
             if s["_chain_source"] is None:
                 s["_chain_source"] = src[k] or "positional"
-        # INFO on the head when the head is left without a can (yard/none terminal).
-        if term in ("yard", "none"):
+        # INFO on the head when it is left without a can (yard/none terminal) AND
+        # it wasn't told to grab its first empty from the yard.
+        if term in ("yard", "none") and start != "yard":
             head = stops[seq_order[0]]
             infos.append({"stop_id": id_by_index[seq_order[0]],
                           "msg": "%s has no can until a delivery is scheduled." % (head.get("address") or "The head stop")})

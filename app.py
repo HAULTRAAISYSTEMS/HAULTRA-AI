@@ -3009,6 +3009,7 @@ def init_db():
     #   chain_gives_to_stop_id    my dumped can becomes the empty set off HERE
     #   chain_takes_from_stop_id  my empty arrives FROM here
     #   chain_terminal            tail only: 'head' (default) | 'yard' | 'none'
+    #   chain_start               head only: 'yard' (grab first empty from yard) | NULL
     #   chain_target_ref          raw unresolved boss text (kept when unmatched)
     #   chain_source              'manual' | 'explicit' | 'positional' (precedence high→low)
     _add_column_if_missing(conn, "stops", "chain_group_id", "chain_group_id TEXT")
@@ -3016,6 +3017,7 @@ def init_db():
     _add_column_if_missing(conn, "stops", "chain_gives_to_stop_id", "chain_gives_to_stop_id INTEGER")
     _add_column_if_missing(conn, "stops", "chain_takes_from_stop_id", "chain_takes_from_stop_id INTEGER")
     _add_column_if_missing(conn, "stops", "chain_terminal", "chain_terminal TEXT")
+    _add_column_if_missing(conn, "stops", "chain_start", "chain_start TEXT")
     _add_column_if_missing(conn, "stops", "chain_target_ref", "chain_target_ref TEXT")
     _add_column_if_missing(conn, "stops", "chain_source", "chain_source TEXT")
     # Retired two-role columns from the earlier pair-only model (#88). Kept as
@@ -10388,6 +10390,10 @@ def text_to_route():
                       stop["dump_location"], stop["notes"], now_ts()))
 
             conn.commit()
+            # Resolve can-swap chains through the ONE resolver, like every other
+            # multi-stop entry path — a "use to swap" note here links the same.
+            _flash_chain_result(_apply_route_chains(conn, route_id))
+            conn.commit()
             conn.close()
             flash(f"Route created with {len(final_stops)} stop(s).", "success")
             return redirect(url_for("view_route", route_id=route_id))
@@ -11282,7 +11288,7 @@ def _build_route_board_html(user):
                s.id AS stop_id, s.stop_order, s.customer_name, s.address, s.city,
                s.action, s.container_size, s.status AS stop_status, s.driver_status,
                s.completed_at, s.held_at, s.empty_can_plan,
-               s.chain_group_id, s.chain_seq, s.chain_gives_to_stop_id, s.chain_takes_from_stop_id, s.chain_terminal,
+               s.chain_group_id, s.chain_seq, s.chain_gives_to_stop_id, s.chain_takes_from_stop_id, s.chain_terminal, s.chain_start,
                ii.vendor_status AS vendor_status,
                EXISTS(SELECT 1 FROM route_photos rp WHERE rp.stop_id = s.id) AS has_photo
         FROM routes r
@@ -11301,6 +11307,7 @@ def _build_route_board_html(user):
     # query) and the size of each chain group (for the "SWAP n of m" badge).
     _chain_label_by_id = {}
     _chain_len_by_group = {}
+    _chain_stops_for_flows = []
     for _r in board_rows:
         _d = dict(_r)
         _sid = _d.get("stop_id")
@@ -11309,6 +11316,14 @@ def _build_route_board_html(user):
         _cg = _d.get("chain_group_id")
         if _cg:
             _chain_len_by_group[_cg] = _chain_len_by_group.get(_cg, 0) + 1
+            _chain_stops_for_flows.append({
+                "id": _sid, "address": _chain_label_by_id.get(_sid, ""),
+                "chain_group_id": _cg, "chain_seq": _d.get("chain_seq"),
+                "chain_gives_to_stop_id": _d.get("chain_gives_to_stop_id"),
+                "chain_takes_from_stop_id": _d.get("chain_takes_from_stop_id"),
+                "chain_terminal": _d.get("chain_terminal"), "chain_start": _d.get("chain_start")})
+    # FK-derived flow lines (both sides, or a data-integrity notice for a half-link).
+    _chain_flows_by_id = chain_resolver.render_flows(_chain_stops_for_flows)
 
     # Real, derived "urgent" signal: a pending Pull/PR stop whose container has
     # already been sitting overdue at that address (from compute_containers_out,
@@ -11473,21 +11488,24 @@ def _build_route_board_html(user):
             if _cg:
                 _clen = _chain_len_by_group.get(_cg, 1)
                 _cseq = (_sd.get("chain_seq") or 0) + 1
-                _term = (_sd.get("chain_terminal") or "").strip()
-                # Neighbor: the stop this one hands its empty to (mid/head) or, for
-                # a tail returning home, the head address.
-                _giv = _sd.get("chain_gives_to_stop_id")
-                if _term in ("yard", "none"):
-                    _nbr = "yard" if _term == "yard" else "done"
-                else:
-                    _nbr = _chain_label_by_id.get(_giv, "") or "next"
-                _arrow = "&#8594;"  # →
+                # Both sides come from the FK-derived flows — the giver shows where
+                # its empty goes, the receiver shows where its empty arrives from, so
+                # the same link renders on both cards (or neither). A half-written
+                # link surfaces as a data-integrity line, never a misleading arrow.
+                _flow = _chain_flows_by_id.get(_sd.get("stop_id"), {})
                 _cpill = ('display:inline-block;margin-top:5px;padding:2px 7px;border-radius:999px;'
                           'font-size:9px;font-weight:800;letter-spacing:.4px;white-space:nowrap;'
                           'overflow:hidden;text-overflow:ellipsis;max-width:100%;'
                           'background:rgba(140,160,179,0.16);color:#B8C6D4;border:1px solid rgba(140,160,179,0.5);')
-                chain_badge = (f'<div><span class="stop-mini-chain" title="Can-swap chain" style="{_cpill}">'
-                               f'&#128257; SWAP {_cseq} of {_clen} {_arrow} {e(_nbr)}</span></div>')
+                _wpill = _cpill.replace('rgba(140,160,179,0.16)', 'rgba(255,157,0,0.12)') \
+                               .replace('#B8C6D4', '#fbbf24').replace('rgba(140,160,179,0.5)', 'rgba(255,157,0,0.45)')
+                _flow_line = _flow.get("takes") or _flow.get("start") or _flow.get("gives") or ""
+                _pill = (f'<span class="stop-mini-chain" title="Can-swap chain" style="{_cpill}">'
+                         f'&#128257; SWAP {_cseq} of {_clen}{(" &middot; " + e(_flow_line)) if _flow_line else ""}</span>')
+                if _flow.get("integrity"):
+                    _pill += (f'<span class="stop-mini-chain" title="Chain data integrity" style="{_wpill}">'
+                              f'&#9888; {e(_flow["integrity"])}</span>')
+                chain_badge = f'<div style="display:flex;flex-direction:column;gap:3px;">{_pill}</div>'
 
             time_html = ""
             if stop_status == "completed" and s["completed_at"]:
@@ -11902,6 +11920,10 @@ def new_route():
                 now_ts()
             ))
 
+        conn.commit()
+        # Resolve can-swap chains through the ONE resolver, like every other
+        # multi-stop entry path.
+        _flash_chain_result(_apply_route_chains(conn, route_id))
         conn.commit()
         conn.close()
         flash(f"Route created with {len(parsed_stops)} parsed stops.", "success")
@@ -13049,7 +13071,9 @@ def driver_route_detail(route_id):
     if s["container_size"]:
         meta_bits.append(e(s["container_size"]))
     if s["notes"]:
-        meta_bits.append(e(s["notes"]))
+        _dn = _display_note(s["notes"])
+        if _dn:
+            meta_bits.append(e(_dn))
     meta_line = " &middot; ".join(meta_bits) if meta_bits else ""
     ticket_line = f'<div class="cab-meta-line"><strong>Ticket:</strong> {e(s["ticket_number"])}</div>' if s["ticket_number"] else ""
 
@@ -15500,7 +15524,7 @@ def view_route(route_id):
             <p><strong>Container:</strong> {e(s['container_size'] or '')}</p>
             <p><strong>Ticket:</strong> {e(s['ticket_number'] or '')}</p>
             <p><strong>Reference:</strong> {e(s['reference_number'] or '')}</p>
-            <p><strong>Notes:</strong><br>{e(s['notes'] or '').replace(chr(10), '<br>')}</p>
+            <p><strong>Notes:</strong><br>{e(_display_note(s['notes'])).replace(chr(10), '<br>')}</p>
             <p><strong>Signature:</strong> {e(s['driver_signature'] or '')}</p>
             <p><strong>Completed At:</strong> {e(s['completed_at'] or '')}</p>
             {photo_html}
@@ -15876,6 +15900,10 @@ def add_stop(route_id):
     conn.commit()
     # Recompute can flow so the new stop gets swap_with_prev_pull derived from sequence
     compute_can_flow(conn, route_id)
+    conn.commit()
+    # Resolve can-swap chains through the ONE resolver, exactly like every other
+    # write path — a Quick-Add "use to swap" note must link the same as an AI parse.
+    _flash_chain_result(_apply_route_chains(conn, route_id))
     conn.commit()
     upsert_saved_address(conn, cid(),
         expand_abbrev(request.form.get("customer_name")), expand_abbrev(request.form.get("address")),
@@ -18584,7 +18612,8 @@ For every stop extract:
   empty_can_plan  what to do with the EMPTY can after dumping (see rule below), or null
   raw             the original text for this stop, verbatim
   confidence      "low" or "high"
-  notes           any extra detail worth surfacing (see SWAP NOTES rule), or ""
+  notes           any extra human detail worth surfacing (gate code, contact, etc.), or ""
+  chain_hint      a STRUCTURED can-swap signal (see CHAIN HINT rule), or null
 
 Rules:
 - Use the KNOWN LOCATIONS & VOCABULARY to expand shorthand (e.g. "newpt" → "Newport News"),
@@ -18596,35 +18625,43 @@ Rules:
   returns the empty to this customer by default — do NOT set "return_here" explicitly).
 - Set confidence "low" ONLY when the action or address is genuinely ambiguous or missing —
   not merely because a dump/return leg or a preamble is present.
-- SWAP NOTES: sometimes the can pulled here rides on to become the empty set off at a later
-  stop (a "can-swap chain"). Trigger phrases: "use to swap X", "use for X", "swap with X",
-  "take to X", "this can goes to X", "swap till end", "keep swapping", "back to yard",
-  "no return", "last one dumps". When you see any of these, keep that phrase VERBATIM in the
-  stop's `notes` field — do NOT drop it, do NOT resolve it, do NOT guess a stop or normalize an
-  address ("5125 ballahack" stays "5125 ballahack"). The chain is linked later in code from the
-  note text. A swap note NEVER changes the action — a PR stays PR; never invent a new action code.
+- CHAIN HINT: sometimes the can pulled here rides on to become the empty set off at a later
+  stop (a "can-swap chain"). When the text signals this, set `chain_hint` to a STRUCTURED object
+  — NEVER prose, NEVER a stop number, NEVER a normalized address — one of exactly these shapes:
+    * {"kind":"explicit","target_text":"<verbatim address text>"}  — "use to swap 5125 ballahack",
+      "swap with X", "take to X", "this can goes to X". Copy the address text VERBATIM into
+      target_text ("5125 ballahack" stays "5125 ballahack"); code matches it to a stop later.
+    * {"kind":"run"}      — "swap till end", "keep swapping", "swap the whole run".
+    * {"kind":"next"}     — a bare "use to swap" / "swap next" with no address given.
+    * {"kind":"terminal","terminal":"yard"}  — "back to yard" (final empty returns to the yard).
+    * {"kind":"terminal","terminal":"none"}  — "no return", "last one dumps" (final empty just dumps).
+    * {"kind":"start","start":"yard"}         — "grab the first one from the yard", "start from yard".
+    * null — no chain signal.
+  Do NOT put any swap phrase in `notes` — the readable chain text is DERIVED in code from the
+  structured link, so a swap phrase in notes would double-render. A chain_hint NEVER changes the
+  action — a PR stays PR; never invent a new action code.
 - Respond with ONLY valid JSON — no markdown, no commentary — in exactly this shape:
-  {"stops":[{"action":"","address":"","customer":"","container_size":null,"dump_leg":null,"return_leg":null,"empty_can_plan":null,"raw":"","confidence":"","notes":""}]}
+  {"stops":[{"action":"","address":"","customer":"","container_size":null,"dump_leg":null,"return_leg":null,"empty_can_plan":null,"raw":"","confidence":"","notes":"","chain_hint":null}]}
 
 WORKED EXAMPLE
 Input:
   Before you return paragon use it to
   Pr 527 j Clyde Morris blvd,newpt, Serv pro 30yd dump holland then return it to paragon
 Output:
-  {"stops":[{"action":"PR","address":"527 J Clyde Morris Blvd, Newport News","customer":"Serv Pro","container_size":"30yd","dump_leg":"Holland","return_leg":"Paragon","empty_can_plan":null,"raw":"Pr 527 j Clyde Morris blvd,newpt, Serv pro 30yd dump holland then return it to paragon","confidence":"high","notes":""}]}
+  {"stops":[{"action":"PR","address":"527 J Clyde Morris Blvd, Newport News","customer":"Serv Pro","container_size":"30yd","dump_leg":"Holland","return_leg":"Paragon","empty_can_plan":null,"raw":"Pr 527 j Clyde Morris blvd,newpt, Serv pro 30yd dump holland then return it to paragon","confidence":"high","notes":"","chain_hint":null}]}
 
 WORKED EXAMPLE (carry the empty to the next stop)
 Input:
   PR 1013 Paragon Way Napo can 3085 dump holland — don't return the can, carry the empty to the next stop
 Output:
-  {"stops":[{"action":"PR","address":"1013 Paragon Way","customer":"Napo","container_size":null,"dump_leg":"Holland","return_leg":null,"empty_can_plan":"carry_next","carry_can_ref":"3085","raw":"PR 1013 Paragon Way Napo can 3085 dump holland — don't return the can, carry the empty to the next stop","confidence":"high","notes":""}]}
+  {"stops":[{"action":"PR","address":"1013 Paragon Way","customer":"Napo","container_size":null,"dump_leg":"Holland","return_leg":null,"empty_can_plan":"carry_next","carry_can_ref":"3085","raw":"PR 1013 Paragon Way Napo can 3085 dump holland — don't return the can, carry the empty to the next stop","confidence":"high","notes":"","chain_hint":null}]}
 
-WORKED EXAMPLE (can-swap chain — keep the swap phrase verbatim in notes)
+WORKED EXAMPLE (can-swap chain — STRUCTURED chain_hint, nothing in notes)
 Input:
   PR 1351 Virginia Beach blvd, VB, REAP 30yd dump dominion note use to swap
   PR 5125 ballahack rd,ches, RES 30yd dump dominion
 Output:
-  {"stops":[{"action":"PR","address":"1351 Virginia Beach Blvd","customer":"REAP","container_size":"30yd","dump_leg":"Dominion","return_leg":null,"empty_can_plan":null,"raw":"PR 1351 Virginia Beach blvd, VB, REAP 30yd dump dominion note use to swap","confidence":"high","notes":"use to swap"},{"action":"PR","address":"5125 Ballahack Rd","customer":"RES","container_size":"30yd","dump_leg":"Dominion","return_leg":null,"empty_can_plan":null,"raw":"PR 5125 ballahack rd,ches, RES 30yd dump dominion","confidence":"high","notes":""}]}
+  {"stops":[{"action":"PR","address":"1351 Virginia Beach Blvd","customer":"REAP","container_size":"30yd","dump_leg":"Dominion","return_leg":null,"empty_can_plan":null,"raw":"PR 1351 Virginia Beach blvd, VB, REAP 30yd dump dominion note use to swap","confidence":"high","notes":"","chain_hint":{"kind":"next"}},{"action":"PR","address":"5125 Ballahack Rd","customer":"RES","container_size":"30yd","dump_leg":"Dominion","return_leg":null,"empty_can_plan":null,"raw":"PR 5125 ballahack rd,ches, RES 30yd dump dominion","confidence":"high","notes":"","chain_hint":null}]}
 """
 
 
@@ -24089,9 +24126,9 @@ def add_parsed_stops(route_id):
                                            stop.get("to_city")              or "")
         return_destination = expand_abbrev(stop.get("return_destination")  or "")
         pr_mode            = (stop.get("pr_mode") or "").strip()
-        # Keep the note verbatim — the swap phrase lives here and the chain
-        # resolver scans it (the same way every entry path does).
-        notes              = (stop.get("notes") or "").strip()
+        # Fold any STRUCTURED chain_hint into the note so the one note-driven
+        # resolver scans it — identical to every other entry path.
+        notes              = _notes_with_chain_hint(stop.get("notes"), stop.get("chain_hint"))
         swap_flag          = 1 if stop.get("swap_with_previous_empty") or stop.get("swap_with_prev_pull") else 0
         try:
             _cur = conn.execute("""
@@ -24177,10 +24214,10 @@ def _apply_route_chains(conn, route_id):
     for s in stops:
         conn.execute(
             "UPDATE stops SET chain_group_id=?, chain_seq=?, chain_gives_to_stop_id=?, "
-            "chain_takes_from_stop_id=?, chain_terminal=?, chain_target_ref=?, chain_source=? "
+            "chain_takes_from_stop_id=?, chain_terminal=?, chain_start=?, chain_target_ref=?, chain_source=? "
             "WHERE id=?",
             (s["_chain_group_id"], s["_chain_seq"], s["_chain_gives_to"], s["_chain_takes_from"],
-             s["_chain_terminal"], s["_chain_target_ref"], s["_chain_source"], s["id"]))
+             s["_chain_terminal"], s["_chain_start"], s["_chain_target_ref"], s["_chain_source"], s["id"]))
     # Chain wins over positional inference: if a chained stop also carries the
     # positional swap_with_prev_pull flag, log one line (never user-facing).
     for r in conn.execute(
@@ -24216,6 +24253,29 @@ def _chain_notices(res):
     for nl in (res or {}).get("needs_link", []):
         _add("Couldn't match \"%s\" to a stop on this route — link it in Edit Stop." % nl.get("target_text", ""))
     return out
+
+
+def _display_note(note):
+    """A stop's note with any can-swap trigger phrase removed, for user-facing
+    render — the chain shows from FK state, so a raw "use to swap" must never
+    appear as note text. Real note content (gate codes, contacts) is preserved."""
+    return chain_resolver.strip_chain_phrases(note or "")
+
+
+def _notes_with_chain_hint(notes, chain_hint):
+    """Fold a STRUCTURED chain_hint from the AI parser into the stored note as the
+    canonical trigger phrase, so the one note-driven resolver handles the AI path
+    identically to a hand-typed note. Used by EVERY insert path (dispatch, insert-
+    stops, add-parsed-stops, preview) so the conversion lives in exactly one place.
+    A hand-typed note with no hint is returned unchanged (its phrase must survive
+    for the resolver — display-side stripping hides it from the card, not here)."""
+    notes = (notes or "").strip()
+    hint = chain_hint if isinstance(chain_hint, dict) else None
+    phrase = chain_resolver.hint_to_note(hint)
+    if not phrase:
+        return notes
+    notes = chain_resolver.strip_chain_phrases(notes)
+    return (notes + " " + phrase).strip() if notes else phrase
 
 
 def _flash_chain_result(res):
@@ -24261,6 +24321,9 @@ def _validate_parser_stops(stops_in):
         _notes = expand_abbrev((s.get("notes") or "").strip())
         if _cust_overflow:
             _notes = (_cust_overflow + ((" — " + _notes) if _notes else "")).strip()
+        # The model emits a STRUCTURED chain_hint, never prose — fold it into the
+        # note so the one note-driven resolver handles the AI path uniformly.
+        _notes = _notes_with_chain_hint(_notes, s.get("chain_hint"))
         clean_stops.append({
             "address": address,
             "action": _PARSER_ACTION_MAP[action_code],
@@ -24297,10 +24360,13 @@ def api_chain_preview():
         # Confirm-sheet actions arrive as codes (PR/P/S/…); map to the canonical
         # label the resolver's can-producer check expects, exactly like dispatch.
         _act = _PARSER_ACTION_MAP.get(_act.upper(), expand_abbrev(_act))
+        # Honor the AI's structured chain_hint the same way the insert does, so the
+        # preview shows the exact chain the insert will make.
+        _pnote = _notes_with_chain_hint(s.get("notes"), s.get("chain_hint"))
         stops.append({"id": i, "action": _act,
                       "address": expand_abbrev((s.get("address") or "").strip()),
                       "container_size": (s.get("container_size") or "").strip(),
-                      "note": (s.get("notes") or "").strip(), "chain_hint": None, "manual_gives_to": None})
+                      "note": _pnote, "chain_hint": None, "manual_gives_to": None})
     res = chain_resolver.resolve_chain(stops)
     groups = {}
     for st in stops:
