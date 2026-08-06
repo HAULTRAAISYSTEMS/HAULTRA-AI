@@ -893,8 +893,10 @@
       cards.parentNode.insertBefore(host, cards);
     }
     if (!currentStops.length) { host.innerHTML = ''; return; }
-    var payload = { stops: currentStops.map(function (s) {
-      return { action: s.action, address: s.address, container_size: s.container_size, notes: s.notes };
+    var payload = { stops: currentStops.map(function (s, i) {
+      return { action: s.action, address: s.address, container_size: s.container_size,
+               notes: s.notes, chain_hint: s.chain_hint || null,
+               manual_delivery: (typeof s.manual_delivery === 'number') ? s.manual_delivery : null };
     }) };
     fetch('/api/chain-preview', {
       method: 'POST',
@@ -907,28 +909,54 @@
 
   function _esc2(s) { return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 
+  // [change] -> delivery picker: set the chain tail's delivery drop (a D stop
+  // index) and re-preview so the boss sees the delivery terminal take effect.
+  window.setChainDelivery = function (sel) {
+    var tail = parseInt(sel.getAttribute('data-chain-tail'), 10);
+    var val = sel.value === '' ? null : parseInt(sel.value, 10);
+    if (currentStops[tail]) { currentStops[tail].manual_delivery = val; }
+    refreshChainPreview();
+  };
+
   function renderChainSummary(data) {
     var html = '';
     (data.errors || []).forEach(function (m) {
       html += '<div style="margin:8px 0;padding:10px 13px;border-radius:8px;background:rgba(255,59,92,.12);' +
               'border:1px solid rgba(255,59,92,.4);color:#ff8099;font-size:13px;font-weight:600;">&#9888; ' + _esc2(m) + '</div>';
     });
-    (data.chains || []).forEach(function (c) {
+    (data.chains || []).forEach(function (c, ci) {
+      var tailIndex = c.indexes[c.indexes.length - 1];
       var term = c.terminal === 'yard' ? 'Final empty &rarr; back to the yard'
-               : c.terminal === 'none' ? 'Final can just gets dumped (no return)'
-               : 'Final empty &rarr; back to ' + _esc2((c.stops[0] || {}).address || 'the first stop');
+               : c.terminal === 'none' ? 'Final empty &rarr; just gets dumped (no return)'
+               : c.terminal === 'delivery' ? 'Final empty &rarr; DELIVERED to ' + _esc2(c.delivery_address || 'a drop stop')
+               : 'Final empty &rarr; back to head ' + _esc2((c.stops[0] || {}).address || 'the first stop');
+      var startLine = (c.start === 'yard')
+        ? '<div style="font-size:12px;color:#9fb0c0;margin-bottom:6px;">Start: empty from the yard</div>' : '';
       var lines = c.stops.map(function (st) {
         return '<div style="display:flex;gap:8px;font-size:13px;padding:2px 0;">' +
                '<span style="opacity:.6;min-width:20px;">' + (st.seq + 1) + '.</span>' +
                '<span style="flex:1;">' + _esc2(st.address || '') + '</span>' +
                '<span style="opacity:.7;">' + _esc2(st.size || '') + '</span></div>';
       }).join('');
+      // [change] -> delivery: a picker of size-matching D stops on the route.
+      var changeCtl = '';
+      if ((c.delivery_candidates || []).length) {
+        var opts = '<option value="">— set delivery drop —</option>' + c.delivery_candidates.map(function (d) {
+          var sel = (d.index === c.delivery_index) ? ' selected' : '';
+          return '<option value="' + d.index + '"' + sel + '>' + _esc2(d.address || ('stop ' + (d.index + 1))) + '</option>';
+        }).join('');
+        changeCtl = '<div style="margin-top:6px;font-size:12px;color:#9fb0c0;">Deliver final empty to: ' +
+          '<select data-chain-tail="' + tailIndex + '" onchange="setChainDelivery(this)" ' +
+          'style="background:#12202e;color:#cfe;border:1px solid rgba(140,160,179,.4);border-radius:6px;padding:3px 6px;font-size:12px;">' +
+          opts + '</select></div>';
+      }
       html += '<div style="margin:10px 0;padding:12px 14px;border-radius:10px;background:rgba(140,160,179,.10);' +
               'border:1px solid rgba(140,160,179,.35);">' +
               '<div style="font-weight:800;letter-spacing:.4px;font-size:12px;text-transform:uppercase;color:#B8C6D4;margin-bottom:8px;">' +
               '&#128257; Swap chain &mdash; ' + c.trips + ' stops, ' + c.trips + ' dump trips</div>' +
-              lines +
-              '<div style="margin-top:8px;font-size:12px;color:#9fb0c0;">' + term + '</div></div>';
+              startLine + lines +
+              '<div style="margin-top:8px;font-size:12px;color:#9fb0c0;">' + term + '</div>' +
+              changeCtl + '</div>';
     });
     (data.infos || []).forEach(function (m) {
       html += '<div style="margin:6px 0;padding:8px 12px;border-radius:8px;background:rgba(255,157,0,.09);' +

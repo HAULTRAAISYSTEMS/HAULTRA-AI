@@ -67,12 +67,15 @@ g1, g2 = s[0]["_chain_group_id"], s[3]["_chain_group_id"]
 ok(g1 and g2 and g1 != g2, "D-break: two separate chains")
 ok(s[2]["_chain_group_id"] is None, "D-break: the D stop is not in a chain")
 
-# 7) 30yd -> 20yd link -> BLOCKING error, chain breaks, both stops flagged.
+# 7) INFERRED (positional) 30yd -> 20yd -> SILENT break: the app guessed the link,
+#    the guess was wrong, and that is not the dispatcher's mistake. No error, no
+#    link; the 20yd stop stands alone. (An EXPLICIT/manual mismatch still blocks —
+#    see test_chain_corrections.py.)
 s = [mk(1, "Pickup and Return", "1 St", "30yd", note="swap till end"),
      mk(2, "Pickup and Return", "2 St", "20yd")]
 res = cr.resolve_chain(s)
-ok(len(res["errors"]) >= 2 and {e["stop_id"] for e in res["errors"]} == {1, 2}, "size mismatch: blocking error on BOTH")
-ok(s[0]["_chain_gives_to"] != 2, "size mismatch: the bad link is not created")
+ok(res["errors"] == [], "inferred size mismatch: NO error (silent break)")
+ok(s[0]["_chain_gives_to"] != 2 and s[1]["_chain_group_id"] is None, "inferred size mismatch: no link, the odd-size stop stands alone")
 
 # 8) Explicit address target skipping an intermediate stop.
 s = [mk(1, "Pickup and Return", "1351 vb blvd", "30yd", hint={"kind": "explicit", "target_text": "6969 tidewater"}),
@@ -147,12 +150,16 @@ rows = route_rows(last_route())
 ok(rows[0]["chain_seq"] == 0 and rows[0]["address"].startswith("20 B"),
    "reversed saved order: head follows the new order (positional, not parse order)")
 
-# 12) 30->20 dispatch -> BLOCKING (400). Container-size mismatch is the ONLY chain
-#     condition that may reject an insert — it would strand the truck.
-r = dispatch([{"action": "PR", "address": "1 Big St", "container_size": "30yd", "notes": "swap till end"},
+# 12) EXPLICIT 30->20 dispatch -> BLOCKING (400). Only a BOSS-SPECIFIED mismatch
+#     blocks (the boss asked for the impossible); an inferred one breaks silently.
+r = dispatch([{"action": "PR", "address": "1 Big St", "container_size": "30yd", "notes": "use to swap 2 Small St"},
               {"action": "PR", "address": "2 Small St", "container_size": "20yd", "notes": ""}], "2026-09-03")
 ok(r.status_code == 400 and "mismatch" in (r.get_json() or {}).get("error", "").lower(),
-   "30->20 dispatch blocked with a size-mismatch error")
+   "explicit 30->20 dispatch blocked with a size-mismatch error")
+# the same sizes as an INFERRED run dispatch clean (silent break, no 400)
+r = dispatch([{"action": "PR", "address": "1 Big St", "container_size": "30yd", "notes": "swap till end"},
+              {"action": "PR", "address": "2 Small St", "container_size": "20yd", "notes": ""}], "2026-09-23")
+ok(r.status_code == 200, "inferred 30->20 dispatch succeeds (silent break, no block)")
 
 # 12a) FIX 1 — only a container-size mismatch is blocking; every other chain
 #      finding is advisory. The API filters errors through _chain_blocking_errors,
@@ -257,8 +264,12 @@ ok(len(pv["chains"]) == 1 and pv["chains"][0]["trips"] == 3 and pv["chains"][0][
    "chain-preview: 3-stop chain, 3 dump trips, yard terminal, before insert")
 ok(any("no can" in m for m in pv["infos"]), "chain-preview: INFO surfaced for the head")
 pv2 = cl.post("/api/chain-preview", json={"stops": [
+    {"action": "PR", "address": "1 Big St", "container_size": "30yd", "notes": "use to swap 2 Small St"},
+    {"action": "PR", "address": "2 Small St", "container_size": "20yd", "notes": ""}]}, headers=HJ).get_json()
+ok(len(pv2["errors"]) >= 1, "chain-preview: EXPLICIT size mismatch surfaced as a blocking error before insert")
+pv3 = cl.post("/api/chain-preview", json={"stops": [
     {"action": "PR", "address": "1 Big St", "container_size": "30yd", "notes": "swap till end"},
     {"action": "PR", "address": "2 Small St", "container_size": "20yd", "notes": ""}]}, headers=HJ).get_json()
-ok(len(pv2["errors"]) >= 1, "chain-preview: size mismatch surfaced as a blocking error before insert")
+ok(not pv3["errors"], "chain-preview: INFERRED size mismatch is silent (no error before insert)")
 
 print("\nALL CHAINED-SWAP (two-FK) / OPTIONAL-TICKET TESTS PASSED")
