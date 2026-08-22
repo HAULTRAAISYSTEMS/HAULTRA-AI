@@ -16,8 +16,10 @@ by two directional FKs per stop:
 plus a 0-based ``chain_seq`` and, on the tail only, a ``chain_terminal`` of
 'head' (default — return to head), 'yard', or 'none'.
 
-Detection: the boss annotates ONE stop; the RUN itself is the chain. A single
-swap signal anywhere in a run of can-producers extends across the whole run.
+Detection: the boss annotates the stop whose empty should move. A bare
+``use to swap`` / ``swap next`` signal links only that stop to the immediately
+following can-producing stop. An explicit run phrase such as ``swap till end``
+extends across the whole consecutive run.
 Signals come either from the AI parser's ``chain_hint`` or, for the manual
 entry paths, from scanning the stop's note text — the SAME function, so every
 path behaves identically.
@@ -430,12 +432,27 @@ def resolve_chain(stops):
             continue
         _set_link(i, match, "explicit")
 
-    # 3) POSITIONAL runs. A maximal block of consecutive can-producers is a run;
-    #    a run/next signal anywhere in it chains the WHOLE run, and a 'run' signal
-    #    propagates to every later run (each still its own chain). The run breaks
-    #    on a non-producer, and — inside link creation — on a size mismatch, an
-    #    already-claimed giver, or a member with a terminal signal (that member
-    #    becomes the tail).
+    # 3a) POSITIONAL "next" links. A bare "use to swap" means exactly what the
+    #     dispatcher sees in the final confirm-sheet order: this stop hands its
+    #     dumped empty to the immediately following stop. It must not absorb an
+    #     unrelated producer immediately before it or continue past that one
+    #     target. Quick-Add and AI-parsed cards deliberately share this order.
+    for i in range(n):
+        if kinds[i] != "next" or claimed_giver[i]:
+            continue
+        ri = i + 1
+        if ri >= n or not producer[i] or not producer[ri] or claimed_taker[ri]:
+            continue
+        # This is positional inference, so a size mismatch simply means no link;
+        # only boss-selected manual/explicit links produce a blocking error.
+        if normalize_size(stops[i].get("container_size")) != normalize_size(stops[ri].get("container_size")):
+            continue
+        _set_link(i, ri, "positional")
+
+    # 3b) POSITIONAL runs. A maximal block of consecutive can-producers is a run;
+    #     only an explicit RUN signal chains the whole run and propagates to every
+    #     later run (each still its own chain). A plain NEXT signal was handled
+    #     above and never widens the chain.
     runs = []
     i = 0
     while i < n:
@@ -454,7 +471,7 @@ def resolve_chain(stops):
             propagate_from = r_idx if propagate_from is None else min(propagate_from, r_idx)
 
     for r_idx, run in enumerate(runs):
-        has_signal = any(kinds[k] in ("run", "next") for k in run)
+        has_signal = any(kinds[k] == "run" for k in run)
         propagated = propagate_from is not None and r_idx >= propagate_from
         if not (has_signal or propagated):
             continue

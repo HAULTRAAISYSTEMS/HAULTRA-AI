@@ -51,10 +51,25 @@ res = cr.resolve_chain(s)
 ok(s[3]["_chain_terminal"] == "yard" and s[3]["_chain_gives_to"] is None, "back-to-yard: terminal yard, no return link")
 ok(any("no can" in inf["msg"] for inf in res["infos"]), "back-to-yard: INFO notice on the head")
 
-# 5) Bare "use to swap" on stop 1 of a 4-PR run -> chain extends the full run.
+# 5) Bare "use to swap" means NEXT only; "swap till end" is the full-run phrase.
 s = [mk(i, "Pickup and Return", "%d00 St" % i, "30yd", note=("use to swap" if i == 1 else "")) for i in range(1, 5)]
 cr.resolve_chain(s)
-ok([x["_chain_seq"] for x in s] == [0, 1, 2, 3], "bare use-to-swap: extends the full run")
+ok([x["_chain_seq"] for x in s[:2]] == [0, 1] and all(x["_chain_group_id"] is None for x in s[2:]),
+   "bare use-to-swap: links only the current and next stop")
+
+s = [mk(i, "Pickup and Return", "%d00 St" % i, "30yd", note=("swap till end" if i == 1 else "")) for i in range(1, 5)]
+cr.resolve_chain(s)
+ok([x["_chain_seq"] for x in s] == [0, 1, 2, 3], "swap-till-end: extends the full run")
+
+# Regression: an unrelated Quick-Add stop before the marked Quick-Add stop must
+# not be pulled into a chain whose target is the following AI-parsed stop.
+s = [mk(1, "Pickup and Return", "414 S Parliament Dr", "30yd"),
+     mk(2, "Pickup and Return", "414 S Parliament Dr", "30yd", note="use to swap"),
+     mk(3, "Pickup and Return", "1233 Westover Ave", "30yd")]
+cr.resolve_chain(s)
+ok(s[0]["_chain_group_id"] is None, "next-only regression: preceding route stays independent")
+ok(s[1]["_chain_seq"] == 0 and s[2]["_chain_seq"] == 1,
+   "next-only regression: marked Quick-Add links to following AI stop")
 
 # 6) Run broken by a D stop mid-run -> two separate chains.
 s = [mk(1, "Pickup and Return", "1 St", "30yd", note="swap till end"),
