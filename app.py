@@ -1256,6 +1256,32 @@ def csrf_protect():
             abort(403)
 
 
+@app.before_request
+def enforce_active_session_account():
+    """Invalidate every outstanding workforce session after account deletion.
+
+    Flask sessions are signed client-side cookies, so clearing the cookie used
+    for deletion cannot revoke copies already open on another device. Recheck
+    the durable account state before dispatching any request that carries a
+    workforce session; decorators then handle the now-logged-out request in
+    their normal way.
+    """
+    user_id = session.get("user_id")
+    if not user_id:
+        return
+    conn = get_db()
+    user = conn.execute(
+        "SELECT company_id,is_active FROM users WHERE id=?", (user_id,)
+    ).fetchone()
+    conn.close()
+    if (
+        user is None
+        or not user["is_active"]
+        or user["company_id"] != session.get("company_id")
+    ):
+        session.clear()
+
+
 _maintenance_lock = threading.Lock()
 _maintenance_last_started = 0.0
 
@@ -1277,6 +1303,9 @@ def run_scheduled_maintenance():
         try:
             purge_due_deletions()
             run_due_backup()
+            demo = verify_app_review_demo(repair=True)
+            if not demo["ready"]:
+                app.logger.error("App Review demo is not ready after scheduled repair")
         except Exception:
             app.logger.exception("scheduled production maintenance failed")
         finally:
@@ -2936,11 +2965,133 @@ def init_db():
         size        TEXT NOT NULL,
         label       TEXT,
         status      TEXT NOT NULL DEFAULT 'yard'
-                    CHECK(status IN ('yard','deployed','lost','retired')),
+                    CHECK(status IN ('yard','deployed','loaded_at_yard','lost','retired')),
         notes       TEXT,
         created_at  TEXT NOT NULL
     )
     """)
+
+    # Driver Exceptions: a full can can be removed from a customer site but not
+    # dumped. That is materially different from both "deployed" and "yard", so
+    # preserve it as its own fleet state. Older SQLite databases have a table-
+    # level CHECK that cannot be ALTERed; rebuild once, copying every row and
+    # keeping the table name stable for customer_containers.container_id.
+    _containers_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='containers'"
+    ).fetchone()
+    if _containers_sql_row and "loaded_at_yard" not in (_containers_sql_row["sql"] or ""):
+        conn.executescript("""
+            PRAGMA foreign_keys=off;
+            BEGIN;
+            CREATE TABLE containers_exception_new (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id  INTEGER NOT NULL,
+                size        TEXT NOT NULL,
+                label       TEXT,
+                status      TEXT NOT NULL DEFAULT 'yard'
+                            CHECK(status IN ('yard','deployed','loaded_at_yard','lost','retired')),
+                notes       TEXT,
+                created_at  TEXT NOT NULL
+            );
+            INSERT INTO containers_exception_new
+                (id, company_id, size, label, status, notes, created_at)
+            SELECT id, company_id, size, label, status, notes, created_at
+              FROM containers;
+            DROP TABLE containers;
+            ALTER TABLE containers_exception_new RENAME TO containers;
+            COMMIT;
+            PRAGMA foreign_keys=on;
+        """)
+        conn.commit()
+
+    # Structured disposal alternatives for exception resolution. company_id is
+    # required even though the user-facing model is a site: every operational
+    # lookup in HAULTRA must remain tenant-scoped.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS disposal_sites (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id          INTEGER NOT NULL,
+        name                TEXT NOT NULL,
+        address             TEXT,
+        lat                 REAL,
+        lng                 REAL,
+        material_type       TEXT,
+        notes               TEXT,
+        hours_last_verified TEXT,
+        created_at          TEXT NOT NULL,
+        FOREIGN KEY (company_id) REFERENCES companies(id)
+    )
+    """)
+
+    # Per-weekday hours are normalized rather than embedded as JSON so dispatch
+    # can query them reliably later. weekday follows Python's date.weekday():
+    # 0=Monday ... 6=Sunday. Closed days carry no opening/closing times; open
+    # days require both. A site has at most one row per weekday.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS disposal_site_hours (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        disposal_site_id INTEGER NOT NULL,
+        weekday          INTEGER NOT NULL CHECK(weekday BETWEEN 0 AND 6),
+        open_time        TEXT,
+        close_time       TEXT,
+        is_closed        INTEGER NOT NULL DEFAULT 0 CHECK(is_closed IN (0,1)),
+        CHECK((is_closed=1 AND open_time IS NULL AND close_time IS NULL)
+           OR (is_closed=0 AND open_time IS NOT NULL AND close_time IS NOT NULL)),
+        UNIQUE(disposal_site_id, weekday),
+        FOREIGN KEY (disposal_site_id) REFERENCES disposal_sites(id) ON DELETE CASCADE
+    )
+    """)
+
+    # Driver-originated, structured route exceptions. Exactly one context FK is
+    # required: customer/route problems point at a stop; DISPOSAL_CLOSED points
+    # at the landfill itself. client_uuid is generated on-device and unique per
+    # company so retrying a queued POST is idempotent. occurred_at preserves the
+    # driver's device-clock tap time; created_at is the later server receipt.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS route_exceptions (
+        id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id              INTEGER NOT NULL,
+        client_uuid             TEXT NOT NULL,
+        stop_id                 INTEGER,
+        disposal_site_id        INTEGER,
+        driver_id               INTEGER NOT NULL,
+        type                    TEXT NOT NULL
+            CHECK(type IN ('GATE_CLOSED','DISPOSAL_CLOSED','CAN_NOT_READY',
+                           'TRUCK_ISSUE','CUSTOMER_REFUSED')),
+        lat                     REAL,
+        lng                     REAL,
+        container_state_at_time TEXT,
+        note                    TEXT,
+        occurred_at             TEXT NOT NULL,
+        created_at              TEXT NOT NULL,
+        resolution              TEXT
+            CHECK(resolution IS NULL OR resolution IN
+                  ('TAKE_TO_YARD','REROUTE_TO_NEXT','HOLD_CALLING_DRIVER','VOIDED')),
+        resolved_by             INTEGER,
+        resolved_at             TEXT,
+        CHECK((stop_id IS NOT NULL AND disposal_site_id IS NULL)
+           OR (stop_id IS NULL AND disposal_site_id IS NOT NULL)),
+        FOREIGN KEY (company_id)  REFERENCES companies(id),
+        FOREIGN KEY (stop_id)     REFERENCES stops(id),
+        FOREIGN KEY (disposal_site_id) REFERENCES disposal_sites(id),
+        FOREIGN KEY (driver_id)   REFERENCES users(id),
+        FOREIGN KEY (resolved_by) REFERENCES users(id)
+    )
+    """)
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_disposal_sites_company ON disposal_sites(company_id, name)"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_route_exceptions_open "
+        "ON route_exceptions(company_id, resolved_at, created_at)"
+    )
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_route_exceptions_client_uuid "
+        "ON route_exceptions(company_id, client_uuid)"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_route_exceptions_stop ON route_exceptions(stop_id, created_at)"
+    )
     cur.execute("""
     CREATE TABLE IF NOT EXISTS customer_containers (
         id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3272,6 +3423,43 @@ def init_db():
     )
     """)
 
+    # Privacy-preserving account deletion audit. Deliberately exclude subject
+    # ids, usernames, emails, phone numbers, IP addresses, tokens and notes.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS account_deletion_audit (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id INTEGER NOT NULL,
+        deleted_at TEXT NOT NULL,
+        role       TEXT NOT NULL CHECK(role IN ('boss','driver','customer')),
+        outcome    TEXT NOT NULL CHECK(outcome IN ('completed'))
+    )
+    """)
+
+    # Operational alert raised when a customer revokes portal access. Site and
+    # company data are joined at render time; no customer contact PII is copied
+    # into this queue.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS boss_notifications (
+        id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id                 INTEGER NOT NULL,
+        site_id                    INTEGER NOT NULL,
+        type                       TEXT NOT NULL
+                                   CHECK(type IN ('CUSTOMER_PORTAL_DELETED')),
+        deployment_state           TEXT NOT NULL
+                                   CHECK(deployment_state IN ('deployed','not_deployed','unknown')),
+        orders_scrubbed_count       INTEGER NOT NULL DEFAULT 0,
+        orders_unattributed_count   INTEGER NOT NULL DEFAULT 0,
+        created_at                  TEXT NOT NULL,
+        read_at                     TEXT,
+        FOREIGN KEY (company_id) REFERENCES companies(id),
+        FOREIGN KEY (site_id) REFERENCES sites(id)
+    )
+    """)
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_boss_notifications_open "
+        "ON boss_notifications(company_id, read_at, created_at)"
+    )
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS driver_clock_entries (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3405,12 +3593,14 @@ def init_db():
         business_name TEXT,
         contact_name  TEXT,
         phone         TEXT,
+        email         TEXT,
         portal_token  TEXT NOT NULL UNIQUE,
         is_active     INTEGER NOT NULL DEFAULT 1,
         created_at    TEXT NOT NULL,
         FOREIGN KEY (company_id) REFERENCES companies(id)
     )
     """)
+    safe_add_column(conn, "customers", "email TEXT")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS sites (
@@ -6015,6 +6205,10 @@ def shell_page(title, body, extra_head=""):
                     WHERE i.company_id = ? AND ii.result='defect' AND ii.defect_status='open' AND ii.deleted_at IS NULL""",
                 (session.get("company_id"),),
             ).fetchone()["n"]
+            _account_alerts = _rc.execute(
+                "SELECT COUNT(*) n FROM boss_notifications WHERE company_id=? AND read_at IS NULL",
+                (session.get("company_id"),),
+            ).fetchone()["n"]
             _rc.close()
 
             _parts = []
@@ -6065,6 +6259,11 @@ def shell_page(title, body, extra_head=""):
             _mparts = []
             # TEAM
             _mparts.append(_mhead("Team"))
+            _mparts.append(nav_link(
+                url_for("boss_notifications_page"),
+                "🔔 Alerts" + _nav_badge("account-alert-nav-badge", _account_alerts),
+                path,
+            ))
             _mparts.append(nav_link(url_for("team_hours_page"), "🕐 Team Hours", path))
             _mparts.append(nav_link(url_for("team_time_off_page"), "🌴 Team Time Off", path))
             # FLEET — any management role can view (add/edit gated server-side).
@@ -6086,6 +6285,7 @@ def shell_page(title, body, extra_head=""):
                 nav_link(url_for("driver_dashboard"), "◈ My Routes", path)
                 + nav_link(url_for("my_inspections"), "🛠 My Inspections", path)
                 + nav_link(url_for("driver_clock"), "⏱ Clock In/Out", path)
+                + nav_link(url_for("account_settings"), "⚙ Account Settings", path)
             )
 
         superadmin_link = nav_link(url_for("superadmin_panel"), "🔧 Superadmin", path) \
@@ -8983,6 +9183,45 @@ def analytics_page():
 # =========================================================
 # TEAM — merged Users + Drivers roster
 # =========================================================
+@app.route("/boss/notifications")
+@boss_required
+def boss_notifications_page():
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT n.*, c.name AS company_name, s.address AS site_address
+             FROM boss_notifications n
+             JOIN companies c ON c.id=n.company_id
+             JOIN sites s ON s.id=n.site_id
+            WHERE n.company_id=?
+            ORDER BY n.created_at DESC, n.id DESC""",
+        (cid(),),
+    ).fetchall()
+    conn.execute(
+        "UPDATE boss_notifications SET read_at=COALESCE(read_at,?) WHERE company_id=?",
+        (now_ts(), cid()),
+    )
+    conn.commit()
+    conn.close()
+    cards = ""
+    for row in rows:
+        state = row["deployment_state"].replace("_", " ").title()
+        cards += f"""
+        <div class="card">
+            <div class="row between"><strong>Customer portal deleted</strong>
+                <span class="badge">{e(state)}</span></div>
+            <p style="margin:8px 0 0;">{e(row['company_name'])} &middot; {e(row['site_address'] or 'Site')}</p>
+            <p class="muted small">Exact orders scrubbed: {row['orders_scrubbed_count']} &middot;
+                Tenant orders not attributable by exact email/phone: {row['orders_unattributed_count']}</p>
+        </div>
+        """
+    body = f"""
+    <div class="hero"><h1>Boss Alerts</h1>
+        <p>Operational follow-up that may require dispatch action.</p></div>
+    {cards or '<div class="card muted">No alerts.</div>'}
+    """
+    return render_template_string(shell_page("Boss Alerts", body))
+
+
 @app.route("/team")
 @boss_required
 def team_page():
@@ -9000,16 +9239,19 @@ def team_page():
     conn.close()
 
     current_uid = session["user_id"]
-    boss_count  = sum(1 for u in users if u["role"] == "boss")
+    boss_count  = sum(1 for u in users if u["role"] == "boss" and u["is_active"])
 
     rows = ""
     for u in users:
         is_self      = u["id"] == current_uid
         is_driver    = u["role"] == "driver"
         is_last_boss = u["role"] == "boss" and boss_count <= 1
+        is_deleted   = not bool(u["is_active"])
 
         _del_td_style = 'style="text-align:right;white-space:nowrap;width:170px;"'
-        if is_self:
+        if is_deleted:
+            delete_cell = '<span class="muted small">Inactive tombstone</span>'
+        elif is_self:
             delete_cell = f'<span class="muted small">You</span>'
         elif is_last_boss:
             delete_cell = f'<span class="muted small" title="Cannot delete the last boss">&mdash;</span>'
@@ -9033,6 +9275,8 @@ def team_page():
         )
 
         role_badge = (
+            '<span class="badge">Inactive</span>'
+            if is_deleted else
             '<span class="badge completed">Boss</span>'
             if u["role"] == "boss"
             else '<span class="badge">Driver</span>'
@@ -9043,7 +9287,7 @@ def team_page():
             if is_driver else '<span class="muted small">&mdash;</span>'
         )
 
-        if is_driver:
+        if is_driver and not is_deleted:
             _cur_pref = u["nav_preference"] or ""
             _nav_opts = "".join(
                 f'<option value="{val}" {"selected" if _cur_pref == val else ""}>{label}</option>'
@@ -9356,6 +9600,7 @@ def purge_due_deletions():
 
             _delete_ids("requests", "customer_id", customer_ids)
             _delete_ids("bins", "customer_id", customer_ids)
+            conn.execute("DELETE FROM boss_notifications WHERE company_id=?", (company_id,))
             _delete_ids("sites", "customer_id", customer_ids)
             _delete_ids("customers", "id", customer_ids)
 
@@ -9427,53 +9672,261 @@ def purge_due_deletions():
     }
 
 
-@app.route("/account/delete", methods=["POST"])
+def _redact_matching_deletion_requests(conn, company_name, email, deleted_at):
+    """Redact only an exact normalized company+email public request match."""
+    email = (email or "").strip().casefold()
+    company_name = (company_name or "").strip().casefold()
+    if not email or not company_name:
+        return 0
+    cur = conn.execute(
+        """UPDATE account_deletion_requests
+              SET company_name='[redacted]', account_email='[redacted]',
+                  status='completed', processed_at=?
+            WHERE LOWER(TRIM(company_name))=?
+              AND LOWER(TRIM(account_email))=?""",
+        (deleted_at, company_name, email),
+    )
+    return cur.rowcount
+
+
+def _anonymize_user_account(conn, user, company):
+    """Irreversibly remove employee PII while preserving company records.
+
+    Caller owns an IMMEDIATE transaction and has already enforced policy
+    blockers. The existing user row becomes the non-identifying tombstone used
+    by NOT NULL historical foreign keys.
+    """
+    user_id = user["id"]
+    company_id = user["company_id"]
+    deleted_at = now_ts()
+    tombstone_name = "Deleted driver" if user["role"] == "driver" else "Deleted manager"
+    tombstone_username = f"deleted-{user['role']}-{user_id}-{secrets.token_hex(8)}"
+
+    conn.execute("DELETE FROM password_reset_tokens WHERE user_id=?", (user_id,))
+    conn.execute(
+        "UPDATE stops SET driver_signature='Deleted user' "
+        "WHERE driver_signature IS NOT NULL AND route_id IN "
+        "(SELECT id FROM routes WHERE company_id=? AND assigned_to=?)",
+        (company_id, user_id),
+    )
+    conn.execute(
+        "UPDATE routes SET assigned_to=NULL "
+        "WHERE company_id=? AND assigned_to=? AND status='open'",
+        (company_id, user_id),
+    )
+    conn.execute("UPDATE route_photos SET uploaded_by=NULL WHERE uploaded_by=?", (user_id,))
+    conn.execute("UPDATE dump_tickets SET created_by=NULL WHERE created_by=?", (user_id,))
+    conn.execute(
+        "UPDATE route_exceptions SET client_uuid='deleted-exception-' || id "
+        "WHERE company_id=? AND driver_id=?",
+        (company_id, user_id),
+    )
+    conn.execute("UPDATE route_exceptions SET resolved_by=NULL WHERE resolved_by=?", (user_id,))
+    conn.execute(
+        "UPDATE messages SET body='[Message removed: account deleted]' "
+        "WHERE sender_user_id=?",
+        (user_id,),
+    )
+    conn.execute("UPDATE load_scores SET created_by=NULL WHERE created_by=?", (user_id,))
+    conn.execute(
+        "UPDATE driver_clock_entries SET notes=NULL WHERE company_id=? AND driver_id=?",
+        (company_id, user_id),
+    )
+    conn.execute(
+        "DELETE FROM time_off_requests WHERE company_id=? AND driver_id=? "
+        "AND (status='pending' OR date(end_date) >= date('now'))",
+        (company_id, user_id),
+    )
+    conn.execute(
+        "UPDATE time_off_requests SET reason=NULL, boss_note=NULL "
+        "WHERE company_id=? AND driver_id=?",
+        (company_id, user_id),
+    )
+    conn.execute("UPDATE time_off_requests SET decided_by=NULL WHERE decided_by=?", (user_id,))
+    conn.execute(
+        "DELETE FROM recurring_off_overrides WHERE rule_id IN "
+        "(SELECT id FROM recurring_days_off WHERE company_id=? AND driver_id=?)",
+        (company_id, user_id),
+    )
+    conn.execute(
+        "DELETE FROM recurring_days_off WHERE company_id=? AND driver_id=?",
+        (company_id, user_id),
+    )
+    conn.execute("UPDATE recurring_days_off SET created_by=NULL WHERE created_by=?", (user_id,))
+    conn.execute("UPDATE recurring_off_overrides SET created_by=NULL WHERE created_by=?", (user_id,))
+    conn.execute(
+        "DELETE FROM late_checkins WHERE company_id=? AND driver_id=?",
+        (company_id, user_id),
+    )
+    conn.execute("UPDATE trucks SET oos_by=NULL WHERE oos_by=?", (user_id,))
+    conn.execute("UPDATE trucks SET oos_cleared_by=NULL WHERE oos_cleared_by=?", (user_id,))
+    conn.execute(
+        "UPDATE inspections SET signature_name='Deleted user' "
+        "WHERE company_id=? AND driver_id=?",
+        (company_id, user_id),
+    )
+    for column in ("resolved_by", "deleted_by", "flagged_by"):
+        conn.execute(f"UPDATE inspection_items SET {column}=NULL WHERE {column}=?", (user_id,))
+    for column in ("voided_by", "deleted_by"):
+        conn.execute(f"UPDATE maintenance_entries SET {column}=NULL WHERE {column}=?", (user_id,))
+    conn.execute("UPDATE maintenance_photos SET uploaded_by=NULL WHERE uploaded_by=?", (user_id,))
+
+    if user["role"] == "boss":
+        replacement = conn.execute(
+            """SELECT id FROM users
+                WHERE company_id=? AND role='boss' AND id!=? AND is_active=1
+                ORDER BY role_owner DESC, id LIMIT 1""",
+            (company_id, user_id),
+        ).fetchone()
+        conn.execute(
+            "UPDATE companies SET owner_id=? WHERE id=? AND owner_id=?",
+            (replacement["id"], company_id, user_id),
+        )
+
+    _redact_matching_deletion_requests(
+        conn, company["name"] if company else "", user["email"], deleted_at
+    )
+    conn.execute(
+        """UPDATE users SET username=?, password_hash=?, full_name=?, phone=NULL,
+                  email=NULL, avatar_path=NULL, nav_preference=NULL,
+                  role_owner=0, role_customer_manager=0, role_dispatcher=0,
+                  is_superadmin=0, is_active=0, pending_deletion_at=NULL
+            WHERE id=? AND company_id=?""",
+        (
+            tombstone_username,
+            generate_password_hash(secrets.token_urlsafe(64)),
+            tombstone_name,
+            user_id,
+            company_id,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO account_deletion_audit(company_id,deleted_at,role,outcome) "
+        "VALUES (?,?,?,'completed')",
+        (company_id, deleted_at, user["role"]),
+    )
+    return {"avatar_path": user["avatar_path"], "deleted_at": deleted_at}
+
+
+@app.route("/account/settings")
+@login_required
+def account_settings():
+    body = f"""
+    <div class="hero"><h1>Account Settings</h1>
+        <p>Manage your personal HAULTRA login.</p></div>
+    <div class="card" id="delete-account">
+        <h2>Delete Account</h2>
+        <p class="muted small">Review exactly what is removed and retained before continuing.</p>
+        <a class="btn" style="background:#f8717122;color:#f87171;border:1px solid #f8717155;"
+           href="{url_for('delete_own_account')}">Review Account Deletion</a>
+    </div>
+    """
+    return render_template_string(shell_page("Account Settings", body))
+
+
+@app.route("/account/delete", methods=["GET", "POST"])
 @login_required
 def delete_own_account():
-    """Self-service account deletion (Apple 5.1.1(v)). Drivers can always
-    delete themselves immediately. A boss can too, UNLESS they're the last
-    active boss on the company — in that case they must add another boss
-    first (via Team) or close the whole company via /company/close."""
+    """Password-confirmed, immediate self-service deletion for workforce users."""
+    if request.method == "GET":
+        body = f"""
+        <div class="hero"><h1>Delete My Account</h1>
+            <p>This action is permanent.</p></div>
+        <div class="card" style="max-width:680px;">
+            <h2>What will be removed</h2>
+            <ul>
+                <li>Your login credentials, name, phone, email, avatar and preferences.</li>
+                <li>Your active access to this company.</li>
+                <li>Pending personal scheduling requests.</li>
+            </ul>
+            <h2>What the company keeps</h2>
+            <ul>
+                <li>An inactive “Deleted driver/manager” roster entry.</li>
+                <li>Completed routes, DVIRs, route exceptions, time records and maintenance history without your name.</li>
+                <li>Open exceptions remain in the boss queue with anonymized attribution.</li>
+            </ul>
+            <form method="POST">
+                <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+                <label>Current password</label>
+                <input type="password" name="password" autocomplete="current-password" required>
+                <label>Type DELETE to confirm</label>
+                <input name="confirm_delete" autocomplete="off" required>
+                <button type="submit" class="btn" style="margin-top:16px;width:100%;background:#f8717122;color:#f87171;border:1px solid #f8717155;min-height:48px;">
+                    Permanently Delete My Account
+                </button>
+            </form>
+        </div>
+        """
+        return render_template_string(shell_page("Delete My Account", body))
+
+    password = request.form.get("password", "")
+    confirmed = request.form.get("confirm_delete", "").strip().upper() == "DELETE"
+    if not confirmed:
+        flash("Type DELETE to confirm account deletion.", "error")
+        return redirect(url_for("delete_own_account"))
+
     conn = get_db()
-    me = conn.execute("SELECT * FROM users WHERE id=?", (session["user_id"],)).fetchone()
-    if not me:
-        conn.close()
-        return redirect(url_for("logout"))
+    avatar_path = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        me = conn.execute(
+            "SELECT * FROM users WHERE id=? AND company_id=? AND is_active=1",
+            (session["user_id"], cid()),
+        ).fetchone()
+        company = conn.execute("SELECT * FROM companies WHERE id=?", (cid(),)).fetchone()
+        if not me or not check_password_hash(me["password_hash"], password):
+            conn.rollback()
+            flash("Your current password was not correct. Nothing was deleted.", "error")
+            return redirect(url_for("delete_own_account"))
 
-    if me["role"] == "boss":
-        other_active_bosses = conn.execute(
-            "SELECT COUNT(*) n FROM users WHERE role='boss' AND company_id=? AND id!=? AND is_active=1",
-            (cid(), me["id"])
-        ).fetchone()["n"]
-        if other_active_bosses == 0:
-            conn.close()
-            flash(
-                "You're the only manager on this account. Add another Boss on "
-                "the Team page first, or close the company entirely below.",
-                "error"
-            )
-            return redirect(url_for("settings_page") + "#delete-account")
+        if me["role"] == "boss":
+            remaining = conn.execute(
+                """SELECT COUNT(*) n FROM users
+                    WHERE company_id=? AND role='boss' AND id!=? AND is_active=1""",
+                (cid(), me["id"]),
+            ).fetchone()["n"]
+            if remaining == 0:
+                conn.rollback()
+                flash(
+                    "You are the last active boss for this company. Add another boss before deleting your account.",
+                    "error",
+                )
+                return redirect(url_for("delete_own_account"))
 
-    removal_date = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
-    conn.execute(
-        "UPDATE users SET is_active=0, pending_deletion_at=? WHERE id=?",
-        (removal_date, me["id"])
-    )
-    if me["role"] == "driver":
+        if me["role"] == "driver":
+            active_route = conn.execute(
+                """SELECT id FROM routes
+                    WHERE company_id=? AND assigned_to=? AND status='in_progress'
+                    LIMIT 1""",
+                (cid(), me["id"]),
+            ).fetchone()
+            if active_route:
+                conn.rollback()
+                flash(
+                    "You cannot delete your account while you have an in-progress route. "
+                    "Finish the route or ask your dispatcher to reassign it, then try again.",
+                    "error",
+                )
+                return redirect(url_for("delete_own_account"))
+
+        result = _anonymize_user_account(conn, me, company)
         conn.execute(
-            "UPDATE routes SET assigned_to=NULL WHERE assigned_to=? AND company_id=?",
-            (me["id"], cid())
+            "DELETE FROM auth_rate_limits WHERE scope='login-user' AND key_hash=?",
+            (_rate_limit_identity(me["username"]),),
         )
-    conn.commit()
-    conn.close()
+        conn.commit()
+        avatar_path = result["avatar_path"]
+    except Exception:
+        conn.rollback()
+        app.logger.exception("self-service account deletion failed")
+        flash("Account deletion could not be completed. Nothing was changed.", "error")
+        return redirect(url_for("delete_own_account"))
+    finally:
+        conn.close()
 
-    username = me["username"]
+    _remove_managed_upload(avatar_path)
     session.clear()
-    flash(
-        f"Account '{username}' has been deactivated. Remaining data will be "
-        f"permanently removed by {removal_date}.",
-        "success"
-    )
+    flash("Your HAULTRA login and personal account data were permanently deleted.", "success")
     return redirect(url_for("login"))
 
 
@@ -9763,7 +10216,7 @@ def register():
             co = conn.execute("SELECT max_drivers FROM companies WHERE id=?", (company_id,)).fetchone()
             if co:
                 current_drivers = conn.execute(
-                    "SELECT COUNT(*) n FROM users WHERE role='driver' AND company_id=?",
+                    "SELECT COUNT(*) n FROM users WHERE role='driver' AND company_id=? AND is_active=1",
                     (company_id,)
                 ).fetchone()["n"]
                 if current_drivers >= co["max_drivers"]:
@@ -9840,7 +10293,7 @@ def orders_page():
     conn = get_db()
     company_id = cid()
     drivers = conn.execute(
-        "SELECT id, username FROM users WHERE role='driver' AND company_id=? ORDER BY username",
+        "SELECT id, username FROM users WHERE role='driver' AND company_id=? AND is_active=1 ORDER BY username",
         (company_id,)
     ).fetchall()
 
@@ -10072,7 +10525,7 @@ def boss_dashboard():
     total_stops     = _sc["total"]
     completed_stops = _sc["completed"] or 0
 
-    drivers_count = conn.execute("SELECT COUNT(*) AS n FROM users WHERE role='driver' AND company_id=?", (company_id,)).fetchone()["n"]
+    drivers_count = conn.execute("SELECT COUNT(*) AS n FROM users WHERE role='driver' AND company_id=? AND is_active=1", (company_id,)).fetchone()["n"]
     new_orders    = conn.execute("SELECT COUNT(*) AS n FROM orders WHERE status='new' AND company_id=?", (company_id,)).fetchone()["n"]
 
     # --- active routes (open + in_progress) with per-route stop progress ---
@@ -10122,7 +10575,7 @@ def boss_dashboard():
 
     # --- all drivers for reassign dropdowns ---
     all_drivers = conn.execute(
-        "SELECT id, username FROM users WHERE role='driver' AND company_id=? ORDER BY username",
+        "SELECT id, username FROM users WHERE role='driver' AND company_id=? AND is_active=1 ORDER BY username",
         (company_id,)
     ).fetchall()
 
@@ -10280,7 +10733,7 @@ def reassign_route(route_id):
     off_info = None
     if driver_id is not None:
         driver = conn.execute(
-            "SELECT id FROM users WHERE id=? AND role='driver' AND company_id=?",
+            "SELECT id FROM users WHERE id=? AND role='driver' AND company_id=? AND is_active=1",
             (driver_id, cid())
         ).fetchone()
         if not driver:
@@ -10313,7 +10766,7 @@ def text_to_route():
     conn = get_db()
     company_id = cid()
     drivers = conn.execute(
-        "SELECT id, username FROM users WHERE role='driver' AND company_id=? ORDER BY username",
+        "SELECT id, username FROM users WHERE role='driver' AND company_id=? AND is_active=1 ORDER BY username",
         (company_id,)
     ).fetchall()
     dump_locs = conn.execute(
@@ -11642,7 +12095,7 @@ def reorder_board_lanes():
     conn = get_db()
     valid_driver_ids = {
         str(r["id"]) for r in conn.execute(
-            "SELECT id FROM users WHERE company_id=? AND role='driver'", (cid(),)
+            "SELECT id FROM users WHERE company_id=? AND role='driver' AND is_active=1", (cid(),)
         ).fetchall()
     }
     clean, seen = [], set()
@@ -11879,7 +12332,7 @@ def routes_page():
 def new_route():
     conn = get_db()
     drivers = conn.execute(
-        "SELECT id, username FROM users WHERE role='driver' AND company_id=? ORDER BY username",
+        "SELECT id, username FROM users WHERE role='driver' AND company_id=? AND is_active=1 ORDER BY username",
         (cid(),)
     ).fetchall()
     dump_locs = conn.execute(
@@ -12586,16 +13039,12 @@ def driver_route_detail(route_id):
 
         <div class="no-photo-confirm-title" style="font-size:15px;margin:22px 0 8px;color:#f87171;">Delete Account</div>
         <div class="no-photo-confirm-body" style="margin-bottom:12px;">
-            Deactivates your account immediately and permanently removes your data within 30 days.
+            Review what will be removed, then re-enter your password to continue.
         </div>
-        <form method="POST" action="{url_for('delete_own_account')}"
-              onsubmit="return confirm('Delete your account? This cannot be undone.');">
-            <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
-            <button type="submit" class="btn" style="width:100%;min-height:48px;background:#f8717122;
-                    color:#f87171;border:1px solid #f8717155;">
-                Delete My Account
-            </button>
-        </form>
+        <a href="{url_for('delete_own_account')}" class="btn" style="display:block;text-align:center;
+                width:100%;min-height:48px;background:#f8717122;color:#f87171;border:1px solid #f8717155;">
+            Review Account Deletion
+        </a>
     </div>
     """
 
@@ -19625,7 +20074,7 @@ def settings_page():
 
     conn3 = get_db()
     driver_count = conn3.execute(
-        "SELECT COUNT(*) n FROM users WHERE role='driver' AND company_id=?", (cid(),)
+        "SELECT COUNT(*) n FROM users WHERE role='driver' AND company_id=? AND is_active=1", (cid(),)
     ).fetchone()["n"]
     conn3.close()
 
@@ -19741,14 +20190,11 @@ def settings_page():
                 This deactivates your account immediately and permanently removes your
                 data within 30 days. This cannot be undone.
             </p>
-            <form method="POST" action="{url_for('delete_own_account')}"
-                  onsubmit="return confirm('Delete your account? This cannot be undone.');">
-                <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
-                <button type="submit" class="btn" style="background:#f8717122;color:#f87171;
-                        border:1px solid #f8717155;padding:10px 22px;border-radius:8px;cursor:pointer;">
-                    Delete My Account
-                </button>
-            </form>
+            <a href="{url_for('delete_own_account')}" class="btn"
+               style="background:#f8717122;color:#f87171;border:1px solid #f8717155;
+                      padding:10px 22px;border-radius:8px;cursor:pointer;">
+                Review Account Deletion
+            </a>
         </div>
         """
     else:
@@ -21848,7 +22294,7 @@ def driver_hours_page():
     co_settings = {k: company[k] for k in company.keys()} if company else {}
 
     drivers = conn.execute(
-        "SELECT id, username FROM users WHERE company_id=? AND role='driver' ORDER BY username",
+        "SELECT id, username FROM users WHERE company_id=? AND role='driver' AND is_active=1 ORDER BY username",
         (cid(),)
     ).fetchall()
     drivers = [dict(d) for d in drivers]
@@ -22226,7 +22672,7 @@ def edit_clock_entry():
 
     conn = get_db()
     ok_drv = conn.execute(
-        "SELECT id FROM users WHERE id=? AND company_id=? AND role='driver'",
+        "SELECT id FROM users WHERE id=? AND company_id=? AND role='driver' AND is_active=1",
         (int(driver_id), cid())
     ).fetchone()
     if not ok_drv:
@@ -22281,7 +22727,7 @@ def team_hours_page():
     week_lbl  = "%s &ndash; %s" % (monday.strftime("%b %-d"), sunday.strftime("%b %-d"))
 
     drivers = conn.execute(
-        "SELECT id, username, full_name, avatar_path FROM users WHERE company_id=? AND role='driver' "
+        "SELECT id, username, full_name, avatar_path FROM users WHERE company_id=? AND role='driver' AND is_active=1 "
         "ORDER BY username",
         (cid(),)
     ).fetchall()
@@ -22455,7 +22901,7 @@ def team_hours_export():
     sunday    = monday + timedelta(days=6)
 
     drivers = conn.execute(
-        "SELECT id, username FROM users WHERE company_id=? AND role='driver' "
+        "SELECT id, username FROM users WHERE company_id=? AND role='driver' AND is_active=1 "
         "ORDER BY username",
         (cid(),)
     ).fetchall()
@@ -22947,7 +23393,7 @@ def recurring_off_create():
         return redirect(url_for("team_time_off_page") if is_boss else url_for("driver_clock"))
     conn = get_db()
     ok_driver = conn.execute(
-        "SELECT id FROM users WHERE id=? AND company_id=? AND role='driver'",
+        "SELECT id FROM users WHERE id=? AND company_id=? AND role='driver' AND is_active=1",
         (driver_id, cid())
     ).fetchone()
     if not ok_driver:
@@ -23104,7 +23550,7 @@ def team_time_off_page():
     month_label = first.strftime("%B %Y")
 
     drivers = conn.execute(
-        "SELECT id, username, full_name, avatar_path FROM users WHERE role='driver' AND company_id=? ORDER BY username",
+        "SELECT id, username, full_name, avatar_path FROM users WHERE role='driver' AND company_id=? AND is_active=1 ORDER BY username",
         (company_id,)
     ).fetchall()
     dname = {d["id"]: (d["full_name"] or d["username"] or "Driver") for d in drivers}
@@ -24482,7 +24928,7 @@ def api_dispatch():
 
     conn = get_db()
     driver = conn.execute(
-        "SELECT id, username FROM users WHERE id=? AND company_id=? AND role='driver'",
+        "SELECT id, username FROM users WHERE id=? AND company_id=? AND role='driver' AND is_active=1",
         (driver_id, cid())
     ).fetchone()
     if not driver:
@@ -24800,6 +25246,126 @@ def _customer_by_token(conn, token):
 def _not_found():
     """Generic 404 that never reveals whether a token/site was 'close'."""
     return jsonify({"error": "not found"}), 404
+
+
+def _normalized_phone(value):
+    digits = re.sub(r"\D", "", value or "")
+    return digits if len(digits) >= 10 else ""
+
+
+def _scrub_exact_customer_orders(conn, customer):
+    """Remove order PII only on an exact tenant-scoped email/phone match."""
+    company_id = customer["company_id"]
+    email = (customer["email"] or "").strip().casefold()
+    phone = _normalized_phone(customer["phone"])
+    rows = conn.execute(
+        """SELECT id, email, phone FROM orders
+            WHERE company_id=? AND (
+                COALESCE(TRIM(customer_name),'')!='' OR COALESCE(TRIM(phone),'')!=''
+                OR COALESCE(TRIM(email),'')!='' OR COALESCE(TRIM(address),'')!=''
+            )""",
+        (company_id,),
+    ).fetchall()
+    matched = []
+    for row in rows:
+        email_match = bool(email) and (row["email"] or "").strip().casefold() == email
+        phone_match = bool(phone) and _normalized_phone(row["phone"]) == phone
+        if email_match or phone_match:
+            matched.append(row["id"])
+    for order_id in matched:
+        conn.execute(
+            """UPDATE orders SET customer_name='[redacted]', phone=NULL, email=NULL,
+                      address='[redacted]', city=NULL, state=NULL, zip_code=NULL
+                WHERE id=? AND company_id=?""",
+            (order_id, company_id),
+        )
+    return len(matched), max(0, len(rows) - len(matched))
+
+
+def _site_deployment_state(conn, company_id, customer_id, site_id):
+    """Use explicit stop/container links only; never infer identity by address."""
+    totals = conn.execute(
+        """SELECT COUNT(DISTINCT b.id) AS total,
+                  COUNT(DISTINCT CASE WHEN cc.id IS NOT NULL THEN b.id END) AS linked,
+                  MAX(CASE WHEN cc.status='on_site' AND c.status='deployed' THEN 1 ELSE 0 END) AS deployed
+             FROM bins b
+        LEFT JOIN customer_containers cc
+               ON cc.delivered_stop_id=b.drop_stop_id AND cc.company_id=?
+        LEFT JOIN containers c
+               ON c.id=cc.container_id AND c.company_id=?
+            WHERE b.customer_id=? AND b.site_id=?""",
+        (company_id, company_id, customer_id, site_id),
+    ).fetchone()
+    if totals["deployed"]:
+        return "deployed"
+    if totals["total"] == totals["linked"]:
+        return "not_deployed"
+    return "unknown"
+
+
+def _delete_customer_portal_account(conn, customer):
+    """Revoke portal auth and remove customer PII inside caller's transaction."""
+    customer_id = customer["id"]
+    company_id = customer["company_id"]
+    deleted_at = now_ts()
+    company = conn.execute("SELECT name FROM companies WHERE id=?", (company_id,)).fetchone()
+    sites = conn.execute(
+        "SELECT id FROM sites WHERE customer_id=? ORDER BY id", (customer_id,)
+    ).fetchall()
+    orders_scrubbed, orders_unattributed = _scrub_exact_customer_orders(conn, customer)
+
+    conn.execute(
+        "UPDATE requests SET notes=NULL, customer_note=NULL WHERE customer_id=?",
+        (customer_id,),
+    )
+    replacement_label = customer["business_name"] or "Former portal customer"
+    conn.execute(
+        """UPDATE stops SET customer_name=?, phone=NULL
+            WHERE customer_id=? OR id IN (
+                SELECT stop_id FROM requests
+                 WHERE customer_id=? AND stop_id IS NOT NULL
+            )""",
+        (replacement_label, customer_id, customer_id),
+    )
+
+    for site in sites:
+        deployment_state = _site_deployment_state(
+            conn, company_id, customer_id, site["id"]
+        )
+        conn.execute(
+            """INSERT INTO boss_notifications
+               (company_id,site_id,type,deployment_state,orders_scrubbed_count,
+                orders_unattributed_count,created_at)
+               VALUES (?,?,'CUSTOMER_PORTAL_DELETED',?,?,?,?)""",
+            (
+                company_id,
+                site["id"],
+                deployment_state,
+                orders_scrubbed,
+                orders_unattributed,
+                deleted_at,
+            ),
+        )
+
+    _redact_matching_deletion_requests(
+        conn, company["name"] if company else "", customer["email"], deleted_at
+    )
+    conn.execute(
+        """UPDATE customers SET contact_name=NULL, phone=NULL, email=NULL,
+                  portal_token=?, is_active=0
+            WHERE id=? AND company_id=?""",
+        (secrets.token_urlsafe(48), customer_id, company_id),
+    )
+    conn.execute(
+        "INSERT INTO account_deletion_audit(company_id,deleted_at,role,outcome) "
+        "VALUES (?,?,'customer','completed')",
+        (company_id, deleted_at),
+    )
+    return {
+        "orders_scrubbed_count": orders_scrubbed,
+        "orders_unattributed_count": orders_unattributed,
+        "site_count": len(sites),
+    }
 
 
 @app.route("/api/c/<token>/dashboard")
@@ -25443,12 +26009,113 @@ def customer_portal(token):
         "today":         today_str(),
     }
     body = (
+        '<div style="max-width:560px;margin:0 auto 10px;text-align:right;">'
+        f'<a class="small muted" href="{e(url_for("customer_portal_settings", token=token))}">'
+        '&#9881; Portal Settings</a></div>'
         '<div id="portal-root" class="portal"></div>'
         '<script id="portal-boot" type="application/json">'
         + json.dumps(boot) + '</script>'
         + _PORTAL_JS
     )
     return shell_page("Request Service", body)
+
+
+@app.route("/c/<token>/settings")
+def customer_portal_settings(token):
+    conn = get_db()
+    customer = _customer_by_token(conn, token)
+    conn.close()
+    if customer is None:
+        return shell_page("Link not valid", _PORTAL_INVALID_BODY), 404
+    body = f"""
+    <div class="hero"><h1>Portal Settings</h1>
+        <p>Manage access to your customer service portal.</p></div>
+    <div class="card" style="max-width:680px;">
+        <h2>Delete Portal Account</h2>
+        <p class="muted small">Review what is removed and what your hauling company retains.</p>
+        <a class="btn" style="background:#f8717122;color:#f87171;border:1px solid #f8717155;"
+           href="{e(url_for('delete_customer_portal_account', token=token))}">
+            Review Portal Deletion
+        </a>
+    </div>
+    """
+    return shell_page("Portal Settings", body)
+
+
+@app.route("/c/<token>/delete", methods=["GET", "POST"])
+def delete_customer_portal_account(token):
+    conn = get_db()
+    customer = _customer_by_token(conn, token)
+    if customer is None:
+        conn.close()
+        return shell_page("Link not valid", _PORTAL_INVALID_BODY), 404
+
+    if request.method == "GET":
+        conn.close()
+        body = f"""
+        <div class="hero"><h1>Delete Portal Account</h1>
+            <p>This permanently revokes this portal link.</p></div>
+        <div class="card" style="max-width:680px;">
+            <h2>What will be removed</h2>
+            <ul>
+                <li>Your portal access token and personal contact details.</li>
+                <li>Customer-authored request notes and attributable order contact data.</li>
+            </ul>
+            <h2>What the hauling company keeps</h2>
+            <ul>
+                <li>Business name, service sites, addresses, coordinates and access notes.</li>
+                <li>Bin/container facts, labels, routes and service history.</li>
+                <li>A non-personal alert showing which sites may still have a deployed bin.</li>
+            </ul>
+            <form method="POST">
+                <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+                <label>Paste your portal link or access token again</label>
+                <input name="portal_credential" autocomplete="off" required>
+                <label>Type DELETE to confirm</label>
+                <input name="confirm_delete" autocomplete="off" required>
+                <button type="submit" class="btn" style="margin-top:16px;width:100%;background:#f8717122;color:#f87171;border:1px solid #f8717155;min-height:48px;">
+                    Permanently Delete Portal Access
+                </button>
+            </form>
+        </div>
+        """
+        return shell_page("Delete Portal Account", body)
+
+    supplied = request.form.get("portal_credential", "").strip().rstrip("/")
+    if "/" in supplied:
+        supplied = supplied.rsplit("/", 1)[-1]
+    confirmed = request.form.get("confirm_delete", "").strip().upper() == "DELETE"
+    if not confirmed or not secrets.compare_digest(supplied, token):
+        conn.close()
+        flash("Re-enter the current portal link and type DELETE. Nothing was deleted.", "error")
+        return redirect(url_for("delete_customer_portal_account", token=token))
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        customer = _customer_by_token(conn, token)
+        if customer is None:
+            conn.rollback()
+            conn.close()
+            return shell_page("Link not valid", _PORTAL_INVALID_BODY), 404
+        result = _delete_customer_portal_account(conn, customer)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        app.logger.exception("customer portal deletion failed")
+        flash("Portal deletion could not be completed. Nothing was changed.", "error")
+        return redirect(url_for("delete_customer_portal_account", token=token))
+    conn.close()
+
+    body = f"""
+    <div class="hero"><h1>Portal Account Deleted</h1></div>
+    <div class="card" style="max-width:680px;">
+        <p>Your portal access and personal contact details were permanently removed.</p>
+        <p class="muted small">The hauling company was notified for {result['site_count']} site(s).
+        Exact order records scrubbed: {result['orders_scrubbed_count']}.</p>
+    </div>
+    """
+    return shell_page("Portal Account Deleted", body)
 
 
 @app.route("/api/requests")
@@ -25556,7 +26223,7 @@ def _perform_assignment(conn, req, req_id, data):
         return None, (400, "driver_id is required")
     driver_id = int(driver_id_raw)
     driver = conn.execute(
-        "SELECT id, username FROM users WHERE id=? AND company_id=? AND role='driver'",
+        "SELECT id, username FROM users WHERE id=? AND company_id=? AND role='driver' AND is_active=1",
         (driver_id, cid()),
     ).fetchone()
     if not driver:
@@ -25926,7 +26593,7 @@ def unassigned_work():
         (cid(),),
     ).fetchall()
     drivers = conn.execute(
-        "SELECT id, username FROM users WHERE role='driver' AND company_id=? ORDER BY username",
+        "SELECT id, username FROM users WHERE role='driver' AND company_id=? AND is_active=1 ORDER BY username",
         (cid(),),
     ).fetchall()
     conn.close()
@@ -26134,6 +26801,8 @@ def customers_page():
             <input id="ac-contact" style="width:100%;margin-bottom:10px;" placeholder="Sam Rivera">
             <label class="uw-lbl">Phone</label>
             <input id="ac-phone" style="width:100%;margin-bottom:10px;" placeholder="757-555-0142">
+            <label class="uw-lbl">Email</label>
+            <input id="ac-email" type="email" style="width:100%;margin-bottom:10px;" placeholder="dispatch@example.com">
             <label class="uw-lbl">Site address</label>
             <input id="ac-address" style="width:100%;margin-bottom:10px;" placeholder="1200 Industrial Blvd, Norfolk, VA">
             <label class="uw-lbl">Bins on site (optional)</label>
@@ -26194,6 +26863,7 @@ _CUSTOMERS_PAGE_JS = """
       business_name:(document.getElementById('ac-business')||{}).value||'',
       contact_name:(document.getElementById('ac-contact')||{}).value||'',
       phone:(document.getElementById('ac-phone')||{}).value||'',
+      email:(document.getElementById('ac-email')||{}).value||'',
       site_address:(document.getElementById('ac-address')||{}).value||'',
       bins:bins
     };
@@ -26223,6 +26893,7 @@ def create_customer():
     business = str(data.get("business_name") or "").strip()[:200]
     contact  = str(data.get("contact_name") or "").strip()[:200]
     phone    = str(data.get("phone") or "").strip()[:50]
+    email    = str(data.get("email") or "").strip().lower()[:254]
     address  = str(data.get("site_address") or "").strip()[:300]
     if not business and not contact:
         return jsonify({"error": "a business or contact name is required"}), 400
@@ -26254,10 +26925,10 @@ def create_customer():
         ts = now_ts()
         cur = conn.cursor()
         cur.execute(
-            """INSERT INTO customers (company_id, business_name, contact_name, phone,
+            """INSERT INTO customers (company_id, business_name, contact_name, phone, email,
                                       portal_token, is_active, created_at)
-               VALUES (?, ?, ?, ?, ?, 1, ?)""",
-            (cid(), business or None, contact or None, phone or None, token, ts),
+               VALUES (?, ?, ?, ?, ?, ?, 1, ?)""",
+            (cid(), business or None, contact or None, phone or None, email or None, token, ts),
         )
         customer_id = cur.lastrowid
         if address:
@@ -26332,7 +27003,7 @@ def add_customer_bin(customer_id):
 @app.route("/api/customers/<int:customer_id>", methods=["PATCH"])
 @login_required
 def update_customer(customer_id):
-    """Edit a customer's business name / contact / phone. cm/owner only."""
+    """Edit a customer's business name / contact / phone / email. cm/owner only."""
     if not has_role("customer_manager"):
         return jsonify({"error": "forbidden"}), 403
     data = request.get_json(silent=True) or {}
@@ -26344,12 +27015,13 @@ def update_customer(customer_id):
     business = str(data.get("business_name") or "").strip()[:200]
     contact  = str(data.get("contact_name") or "").strip()[:200]
     phone    = str(data.get("phone") or "").strip()[:50]
+    email    = str(data.get("email") or "").strip().lower()[:254]
     if not business and not contact:
         conn.close()
         return jsonify({"error": "a business or contact name is required"}), 400
     conn.execute(
-        "UPDATE customers SET business_name=?, contact_name=?, phone=? WHERE id=?",
-        (business or None, contact or None, phone or None, customer_id),
+        "UPDATE customers SET business_name=?, contact_name=?, phone=?, email=? WHERE id=?",
+        (business or None, contact or None, phone or None, email or None, customer_id),
     )
     conn.commit()
     conn.close()
@@ -26535,6 +27207,7 @@ def customer_detail_page(customer_id):
         <div id="cust-view" style="margin-top:10px;">
             <div style="font-size:14px;">👤 {e(contact) or "—"}</div>
             <div style="font-size:14px;color:var(--slate);margin-top:4px;">📞 {e(cust["phone"] or "—")}</div>
+            <div style="font-size:14px;color:var(--slate);margin-top:4px;">✉ {e(cust["email"] or "—")}</div>
         </div>
         <div id="cust-edit" hidden style="margin-top:10px;">
             <div id="edit-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
@@ -26543,7 +27216,9 @@ def customer_detail_page(customer_id):
             <label class="uw-lbl">Contact name</label>
             <input id="ed-contact" style="width:100%;margin-bottom:10px;" value="{e(cust["contact_name"] or "")}">
             <label class="uw-lbl">Phone</label>
-            <input id="ed-phone" style="width:100%;margin-bottom:12px;" value="{e(cust["phone"] or "")}">
+            <input id="ed-phone" style="width:100%;margin-bottom:10px;" value="{e(cust["phone"] or "")}">
+            <label class="uw-lbl">Email</label>
+            <input id="ed-email" type="email" style="width:100%;margin-bottom:12px;" value="{e(cust["email"] or "")}">
             <div style="display:flex;gap:8px;">
                 <button class="btn green" style="flex:1;" onclick="submitEdit()">Save</button>
                 <button class="btn secondary" onclick="toggleEdit()">Cancel</button>
@@ -26637,7 +27312,8 @@ def _customer_detail_js(customer_id):
   window.submitEdit=function(){{
     var body={{business_name:(document.getElementById('ed-business')||{{}}).value||'',
               contact_name:(document.getElementById('ed-contact')||{{}}).value||'',
-              phone:(document.getElementById('ed-phone')||{{}}).value||''}};
+              phone:(document.getElementById('ed-phone')||{{}}).value||'',
+              email:(document.getElementById('ed-email')||{{}}).value||''}};
     fetch('/api/customers/'+CID, {{method:'PATCH',
         headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},
         body:JSON.stringify(body)}})
@@ -29664,7 +30340,7 @@ def requests_page():
         (cid(),),
     ).fetchall()
     drivers = conn.execute(
-        "SELECT id, username FROM users WHERE role='driver' AND company_id=? ORDER BY username",
+        "SELECT id, username FROM users WHERE role='driver' AND company_id=? AND is_active=1 ORDER BY username",
         (cid(),),
     ).fetchall()
     conn.close()
@@ -30433,9 +31109,412 @@ def export_requests_csv():
     return _csv_response("requests", header, out, df, dt)
 
 
+APP_REVIEW_DEMO_SLUG = "haultra-app-review"
+_APP_REVIEW_ENV = (
+    "APP_REVIEW_BOSS_USERNAME", "APP_REVIEW_BOSS_PASSWORD",
+    "APP_REVIEW_DRIVER_USERNAME", "APP_REVIEW_DRIVER_PASSWORD",
+    "APP_REVIEW_DELETE_USERNAME", "APP_REVIEW_DELETE_PASSWORD",
+)
+
+
+def verify_app_review_demo(repair=True):
+    """Verify and, when requested, repair the isolated store-review tenant.
+
+    Credentials are read only from Render environment variables and are never
+    returned or logged. All writes are confined to the reserved demo company.
+    """
+    values = {name: os.environ.get(name, "").strip() for name in _APP_REVIEW_ENV}
+    missing_env = [name for name, value in values.items() if not value]
+    if missing_env:
+        return {"ready": False, "repaired": False, "missing": ["environment"]}
+    for name in (
+        "APP_REVIEW_BOSS_PASSWORD",
+        "APP_REVIEW_DRIVER_PASSWORD",
+        "APP_REVIEW_DELETE_PASSWORD",
+    ):
+        if password_policy_error(values[name]):
+            return {"ready": False, "repaired": False, "missing": ["password_policy"]}
+
+    conn = get_db()
+    repaired = False
+    try:
+        if repair:
+            conn.execute("BEGIN IMMEDIATE")
+        company = conn.execute(
+            "SELECT * FROM companies WHERE slug=?", (APP_REVIEW_DEMO_SLUG,)
+        ).fetchone()
+        if not company and repair:
+            cur = conn.execute(
+                """INSERT INTO companies
+                   (name,slug,subscription_plan,subscription_status,max_drivers,
+                    trial_ends_at,created_at)
+                   VALUES ('HAULTRA App Review Fleet',?,'pro','active',30,NULL,?)""",
+                (APP_REVIEW_DEMO_SLUG, now_ts()),
+            )
+            company_id = cur.lastrowid
+            repaired = True
+        elif company:
+            company_id = company["id"]
+            if repair and (
+                company["name"] != "HAULTRA App Review Fleet"
+                or company["subscription_status"] != "active"
+                or company["subscription_plan"] != "pro"
+            ):
+                conn.execute(
+                    """UPDATE companies SET name='HAULTRA App Review Fleet',
+                              subscription_plan='pro',subscription_status='active',
+                              max_drivers=30,trial_ends_at=NULL,closed_at=NULL
+                        WHERE id=?""",
+                    (company_id,),
+                )
+                repaired = True
+        else:
+            return {"ready": False, "repaired": False, "missing": ["tenant"]}
+
+        accounts = (
+            (values["APP_REVIEW_BOSS_USERNAME"], values["APP_REVIEW_BOSS_PASSWORD"],
+             "boss", "App Review Boss"),
+            (values["APP_REVIEW_DRIVER_USERNAME"], values["APP_REVIEW_DRIVER_PASSWORD"],
+             "driver", "Demo Driver"),
+            (values["APP_REVIEW_DELETE_USERNAME"], values["APP_REVIEW_DELETE_PASSWORD"],
+             "driver", "Demo Delete Test"),
+        )
+        account_ids = {}
+        for username, password, role, full_name in accounts:
+            row = conn.execute(
+                "SELECT * FROM users WHERE username=? COLLATE NOCASE", (username,)
+            ).fetchone()
+            if row and row["company_id"] != company_id:
+                if repair:
+                    conn.rollback()
+                return {"ready": False, "repaired": False, "missing": ["username_collision"]}
+            valid = bool(
+                row and row["role"] == role and row["is_active"]
+                and check_password_hash(row["password_hash"], password)
+            )
+            if not row and repair:
+                cur = conn.execute(
+                    """INSERT INTO users
+                       (username,password_hash,role,role_owner,full_name,phone,email,
+                        company_id,created_at,is_active)
+                       VALUES (?,?,?,?,?,NULL,NULL,?,?,1)""",
+                    (
+                        username,
+                        generate_password_hash(password),
+                        role,
+                        1 if role == "boss" else 0,
+                        full_name,
+                        company_id,
+                        now_ts(),
+                    ),
+                )
+                account_ids[role + ("-delete" if full_name == "Demo Delete Test" else "")] = cur.lastrowid
+                repaired = True
+            elif row:
+                key = role + ("-delete" if full_name == "Demo Delete Test" else "")
+                account_ids[key] = row["id"]
+                if repair and (not valid or row["full_name"] != full_name):
+                    conn.execute(
+                        """UPDATE users SET password_hash=?,role=?,full_name=?,phone=NULL,
+                                  email=NULL,company_id=?,is_active=1,pending_deletion_at=NULL,
+                                  role_owner=?,role_customer_manager=0,role_dispatcher=0
+                            WHERE id=?""",
+                        (
+                            generate_password_hash(password), role, full_name, company_id,
+                            1 if role == "boss" else 0, row["id"],
+                        ),
+                    )
+                    repaired = True
+            else:
+                if repair:
+                    conn.rollback()
+                return {"ready": False, "repaired": False, "missing": [role]}
+
+        boss_id = account_ids["boss"]
+        driver_id = account_ids["driver"]
+        delete_driver_id = account_ids["driver-delete"]
+        if repair:
+            conn.execute("UPDATE companies SET owner_id=? WHERE id=?", (boss_id, company_id))
+            # The expendable reviewer account must always remain workload-free.
+            conn.execute(
+                "UPDATE routes SET assigned_to=NULL WHERE company_id=? AND assigned_to=?",
+                (company_id, delete_driver_id),
+            )
+
+        if repair and not conn.execute(
+            "SELECT id FROM subscriptions WHERE company_id=? LIMIT 1", (company_id,)
+        ).fetchone():
+            conn.execute(
+                """INSERT INTO subscriptions
+                   (company_id,plan,status,started_at,notes,created_at)
+                   VALUES (?,'pro','active',?,'Store review access',?)""",
+                (company_id, now_ts(), now_ts()),
+            )
+            repaired = True
+
+        customer_specs = (
+            ("Northstar Demo Builders", "Alex Example", "5550101001", "review-one@example.invalid",
+             "101 Example Loop", 36.8501, -76.2901, "20yd", "Front demo bin"),
+            ("Bluebird Sample Roofing", "Jordan Example", "5550101002", "review-two@example.invalid",
+             "202 Sample Avenue", 36.8502, -76.2902, "30yd", "Roofing demo bin"),
+            ("Fictional Harbor Works", "Morgan Example", "5550101003", "review-three@example.invalid",
+             "303 Fictional Harbor Road", 36.8503, -76.2903, "40yd", "Harbor demo bin"),
+        )
+        demo_customers = []
+        if repair:
+            for business, contact, phone, email, address, lat, lng, size, label in customer_specs:
+                customer = conn.execute(
+                    "SELECT * FROM customers WHERE company_id=? AND business_name=?",
+                    (company_id, business),
+                ).fetchone()
+                if not customer:
+                    cur = conn.execute(
+                        """INSERT INTO customers
+                           (company_id,business_name,contact_name,phone,email,portal_token,is_active,created_at)
+                           VALUES (?,?,?,?,?,?,1,?)""",
+                        (company_id, business, contact, phone, email, secrets.token_urlsafe(32), now_ts()),
+                    )
+                    customer_id = cur.lastrowid
+                    repaired = True
+                else:
+                    customer_id = customer["id"]
+                    if not customer["is_active"]:
+                        conn.execute(
+                            """UPDATE customers SET contact_name=?,phone=?,email=?,portal_token=?,is_active=1
+                                WHERE id=?""",
+                            (contact, phone, email, secrets.token_urlsafe(32), customer_id),
+                        )
+                        repaired = True
+                site = conn.execute(
+                    "SELECT * FROM sites WHERE customer_id=? AND address=?",
+                    (customer_id, address),
+                ).fetchone()
+                if not site:
+                    cur = conn.execute(
+                        "INSERT INTO sites(customer_id,address,lat,lng,notes,created_at) VALUES (?,?,?,?,?,?)",
+                        (customer_id, address, lat, lng, "Fictional App Review site", now_ts()),
+                    )
+                    site_id = cur.lastrowid
+                    repaired = True
+                else:
+                    site_id = site["id"]
+                bin_row = conn.execute(
+                    "SELECT * FROM bins WHERE customer_id=? AND site_id=? AND label=?",
+                    (customer_id, site_id, label),
+                ).fetchone()
+                if not bin_row:
+                    cur = conn.execute(
+                        "INSERT INTO bins(customer_id,site_id,size,dropped_at,label) VALUES (?,?,?,?,?)",
+                        (customer_id, site_id, size, today_str(), label),
+                    )
+                    bin_id = cur.lastrowid
+                    repaired = True
+                else:
+                    bin_id = bin_row["id"]
+                demo_customers.append((customer_id, site_id, bin_id, business, address, size))
+
+            route_specs = (
+                ("Review North Route", demo_customers[0]),
+                ("Review Central Route", demo_customers[1]),
+                ("Review Harbor Route", demo_customers[2]),
+            )
+            route_ids = []
+            stop_ids = []
+            for route_name, spec in route_specs:
+                customer_id, site_id, bin_id, business, address, size = spec
+                route = conn.execute(
+                    "SELECT id FROM routes WHERE company_id=? AND route_name=? LIMIT 1",
+                    (company_id, route_name),
+                ).fetchone()
+                if not route:
+                    cur = conn.execute(
+                        """INSERT INTO routes
+                           (route_date,route_name,raw_text,assigned_to,created_by,status,notes,created_at,company_id)
+                           VALUES (?,?,?,?,?,'open','Fictional App Review route',?,?)""",
+                        (today_str(), route_name, f"D {address} {size}", driver_id, boss_id, now_ts(), company_id),
+                    )
+                    route_id = cur.lastrowid
+                    repaired = True
+                else:
+                    route_id = route["id"]
+                    conn.execute(
+                        "UPDATE routes SET assigned_to=?,status='open' WHERE id=? AND company_id=?",
+                        (driver_id, route_id, company_id),
+                    )
+                stop = conn.execute(
+                    "SELECT id FROM stops WHERE route_id=? ORDER BY id LIMIT 1", (route_id,)
+                ).fetchone()
+                if not stop:
+                    cur = conn.execute(
+                        """INSERT INTO stops
+                           (route_id,stop_order,customer_name,address,city,state,zip_code,
+                            action,container_size,status,created_at,customer_id)
+                           VALUES (?,1,?,?,'Review City','VA','00000','Delivery',?,'open',?,?)""",
+                        (route_id, business, address, size, now_ts(), customer_id),
+                    )
+                    stop_id = cur.lastrowid
+                    repaired = True
+                else:
+                    stop_id = stop["id"]
+                _apply_route_chains(conn, route_id)
+                route_ids.append(route_id)
+                stop_ids.append(stop_id)
+
+            exception = conn.execute(
+                "SELECT id FROM route_exceptions WHERE company_id=? AND client_uuid='app-review-open-exception'",
+                (company_id,),
+            ).fetchone()
+            if not exception:
+                conn.execute(
+                    """INSERT INTO route_exceptions
+                       (company_id,client_uuid,stop_id,driver_id,type,note,occurred_at,created_at)
+                       VALUES (?,'app-review-open-exception',?,?,'GATE_CLOSED',?,?,?)""",
+                    (company_id, stop_ids[0], driver_id, "Fictional gate-closed demo", now_ts(), now_ts()),
+                )
+                repaired = True
+
+            truck = conn.execute(
+                "SELECT id FROM trucks WHERE company_id=? AND name='Review Truck 01'",
+                (company_id,),
+            ).fetchone()
+            if not truck:
+                cur = conn.execute(
+                    """INSERT INTO trucks
+                       (company_id,name,make_model,plate,is_active,created_at)
+                       VALUES (?,'Review Truck 01','Fictional Roll-Off','DEMO-01',1,?)""",
+                    (company_id, now_ts()),
+                )
+                truck_id = cur.lastrowid
+                repaired = True
+            else:
+                truck_id = truck["id"]
+            inspection = conn.execute(
+                """SELECT id FROM inspections
+                    WHERE company_id=? AND truck_id=? AND signature_name='Demo Driver'
+                    LIMIT 1""",
+                (company_id, truck_id),
+            ).fetchone()
+            if not inspection:
+                cur = conn.execute(
+                    """INSERT INTO inspections
+                       (company_id,truck_id,driver_id,type,overall,signature_name,created_at)
+                       VALUES (?,? ,?,'pre_trip','safe','Demo Driver',?)""",
+                    (company_id, truck_id, driver_id, now_ts()),
+                )
+                inspection_id = cur.lastrowid
+                conn.execute(
+                    """INSERT INTO inspection_items
+                       (inspection_id,label,result,note)
+                       VALUES (?,'Brakes and service brake','pass','Fictional completed DVIR')""",
+                    (inspection_id,),
+                )
+                repaired = True
+
+            # Explicit relational chain for a deployed-bin reviewer alert.
+            container = conn.execute(
+                "SELECT id FROM containers WHERE company_id=? AND label='DEMO-CAN-20'",
+                (company_id,),
+            ).fetchone()
+            if not container:
+                cur = conn.execute(
+                    """INSERT INTO containers(company_id,size,label,status,notes,created_at)
+                       VALUES (?,'20yd','DEMO-CAN-20','deployed','Fictional review container',?)""",
+                    (company_id, now_ts()),
+                )
+                container_id = cur.lastrowid
+                repaired = True
+            else:
+                container_id = container["id"]
+                conn.execute("UPDATE containers SET status='deployed' WHERE id=?", (container_id,))
+            cc = conn.execute(
+                """SELECT id FROM customer_containers
+                    WHERE company_id=? AND delivered_stop_id=? AND container_id=?""",
+                (company_id, stop_ids[0], container_id),
+            ).fetchone()
+            if not cc:
+                conn.execute(
+                    """INSERT INTO customer_containers
+                       (company_id,address,size,container_id,delivered_stop_id,delivered_at,status,created_at)
+                       VALUES (?,?,?,?,?,?,'on_site',?)""",
+                    (company_id, demo_customers[0][4], "20yd", container_id, stop_ids[0], now_ts(), now_ts()),
+                )
+                repaired = True
+            conn.execute("UPDATE bins SET drop_stop_id=? WHERE id=?", (stop_ids[0], demo_customers[0][2]))
+
+            if repaired:
+                conn.execute(
+                    """INSERT INTO maintenance_state(name,value,updated_at)
+                       VALUES ('app-review-demo-repaired',?,?)
+                       ON CONFLICT(name) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""",
+                    (now_ts(), now_ts()),
+                )
+            conn.commit()
+
+        # Read-only final verification, including the workload-free delete user.
+        company = conn.execute(
+            "SELECT id FROM companies WHERE slug=? AND subscription_status='active'",
+            (APP_REVIEW_DEMO_SLUG,),
+        ).fetchone()
+        if not company:
+            return {"ready": False, "repaired": repaired, "missing": ["tenant"]}
+        company_id = company["id"]
+        missing = []
+        for username, password, role, full_name in accounts:
+            row = conn.execute(
+                """SELECT * FROM users
+                    WHERE username=? COLLATE NOCASE AND company_id=? AND role=? AND is_active=1""",
+                (username, company_id, role),
+            ).fetchone()
+            if not row or not check_password_hash(row["password_hash"], password):
+                missing.append("account")
+            if full_name == "Demo Delete Test" and row:
+                has_work = conn.execute(
+                    "SELECT 1 FROM routes WHERE company_id=? AND assigned_to=? LIMIT 1",
+                    (company_id, row["id"]),
+                ).fetchone()
+                if has_work:
+                    missing.append("delete_account_workload")
+        required_counts = {
+            "customers": conn.execute("SELECT COUNT(*) n FROM customers WHERE company_id=? AND is_active=1", (company_id,)).fetchone()["n"],
+            "routes": conn.execute("SELECT COUNT(*) n FROM routes WHERE company_id=? AND status='open'", (company_id,)).fetchone()["n"],
+            "exceptions": conn.execute("SELECT COUNT(*) n FROM route_exceptions WHERE company_id=? AND resolution IS NULL", (company_id,)).fetchone()["n"],
+            "dvir": conn.execute("SELECT COUNT(*) n FROM inspections WHERE company_id=?", (company_id,)).fetchone()["n"],
+        }
+        if required_counts["customers"] < 3 or required_counts["routes"] < 3:
+            missing.append("fictional_dataset")
+        if required_counts["exceptions"] < 1:
+            missing.append("route_exception")
+        if required_counts["dvir"] < 1:
+            missing.append("dvir")
+        return {"ready": not missing, "repaired": repaired, "missing": sorted(set(missing))}
+    except Exception:
+        if repair:
+            conn.rollback()
+        app.logger.exception("app review demo verification/repair failed")
+        return {"ready": False, "repaired": False, "missing": ["repair_failed"]}
+    finally:
+        conn.close()
+
+
 # =========================================================
 # DEBUG — temporary DB inspection route
 # =========================================================
+@app.route("/admin/health/app-review")
+@superadmin_required
+def app_review_health():
+    status = verify_app_review_demo(repair=False)
+    conn = get_db()
+    repaired = conn.execute(
+        "SELECT value FROM maintenance_state WHERE name='app-review-demo-repaired'"
+    ).fetchone()
+    conn.close()
+    return jsonify({
+        "ready": status["ready"],
+        "missing": status["missing"],
+        "last_repaired_at": repaired["value"] if repaired else None,
+    }), 200 if status["ready"] else 503
+
+
 @app.route("/debug/db")
 @superadmin_required
 def debug_db():
@@ -30546,7 +31625,7 @@ def parser_view():
         # Seed the address book from historical stops on first parser load.
         _ensure_address_book(conn, cid())
         drivers = conn.execute(
-            "SELECT id, username, full_name FROM users WHERE role='driver' AND company_id=? ORDER BY username",
+            "SELECT id, username, full_name FROM users WHERE role='driver' AND company_id=? AND is_active=1 ORDER BY username",
             (cid(),)
         ).fetchall()
         conn.close()
@@ -30651,6 +31730,9 @@ def android_asset_links():
 
 
 init_db()
+_review_demo_status = verify_app_review_demo(repair=True)
+if not _review_demo_status["ready"]:
+    app.logger.error("App Review demo is not ready; check required Render environment variables")
 print("Startup complete. DATABASE_PATH =", DATABASE, flush=True)
 
 # =========================================================
