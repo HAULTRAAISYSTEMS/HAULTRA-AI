@@ -73,7 +73,8 @@ ok("Tap to Navigate" not in h and "cab-sticky-bar" not in h and "2 B St" not in 
    "fresh route hides the stop list (no nav, no sticky bar, no later stops)")
 ok(">3<" in h and ">60<" in h and ">1<" in h, "stat tiles: 3 stops / 60 yards / 1 dump")
 ok("First stop" in h and "1 A St" in h, "first-stop preview present")
-ok("pretrip-checklist" in h and "Coming soon" in h, "reserved checklist slot present (not built)")
+ok("pretrip-checklist" not in h and "Coming soon" not in h,
+   "no placeholder checklist slot in shipped UI")
 ok("min-height:64px" in h, "START ROUTE button is >=64px tall")
 
 # 2) 0-stop route must not crash the tiles.

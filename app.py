@@ -12663,11 +12663,6 @@ def _cab_preflight_body(route, stops, total_count, csrf):
   .pf-first-cust {{ font-weight:700; font-size:1.05rem; margin-top:2px; }}
   .pf-first-addr {{ color: var(--text-muted); margin-top:2px; }}
   .pf-first-empty {{ color: var(--text-muted); }}
-  /* Reserved slot for the pre-trip / container-securement checklist (gated here
-     later). Intentionally a placeholder — the checklist is NOT built yet. */
-  .pf-checklist-slot {{ margin-top:16px; border:1px dashed rgba(255,255,255,0.18); border-radius:12px; padding:14px; background: rgba(255,255,255,0.02); }}
-  .pf-slot-label {{ font-weight:700; font-size:.9rem; }}
-  .pf-slot-hint {{ color: var(--text-muted); font-size:.8rem; margin-top:4px; }}
   .pf-start-btn {{ width:100%; min-height:64px; margin-top:18px; border:none; border-radius:14px;
                    background: var(--orange, #FF6B1A); color:#111; font-size:1.3rem; font-weight:800;
                    letter-spacing:1px; cursor:pointer; }}
@@ -12690,11 +12685,6 @@ def _cab_preflight_body(route, stops, total_count, csrf):
     </div>
 
     {first_html}
-
-    <div class="pf-checklist-slot" data-slot="pretrip-checklist" aria-hidden="true">
-      <div class="pf-slot-label">Pre-trip &amp; container securement</div>
-      <div class="pf-slot-hint">Coming soon &mdash; the pre-trip inspection checklist will be required here before you can start.</div>
-    </div>
 
     <form method="POST" action="{start_action}">
       <input type="hidden" name="_csrf_token" value="{csrf}">
