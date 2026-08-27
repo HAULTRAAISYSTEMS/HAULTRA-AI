@@ -727,6 +727,8 @@
   </div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
+<script src="/static/tray_sequence.js"></script>
 <script>
 (function () {
   'use strict';
@@ -774,6 +776,16 @@
   // collision-free id — the two lanes coexist and must never share an id.
   var stopSeq = 0;
 
+  // Staging-tray ordering: every pending stop carries a `seq` (a single counter
+  // shared by BOTH lanes, so entry order — not source — decides position) and a
+  // `batch_id` (one per parse run / per Quick-Add). currentRawBatchId is the batch
+  // the raw-text box currently owns; "Re-parse" replaces ONLY that batch. Emptying
+  // the raw box seals the batch so the next parse starts a fresh one appended at
+  // the end. See /static/tray_sequence.js for the pure ordering rules.
+  var batchCounter = 0;
+  var currentRawBatchId = null;
+  function nextBatchId(kind) { return kind + '-' + (++batchCounter); }
+
   function normalizeStop(raw) {
     var action = (raw && raw.action ? String(raw.action) : '').trim().toUpperCase();
     if (ACTION_CODES.indexOf(action) === -1) action = action || 'P';
@@ -803,6 +815,9 @@
       // they're never flagged for review.
       reviewed: isManual ? true : false,
       insert_before: 'end',
+      // Staging-tray ordering — assigned by TraySeq.appendBatch / replaceBatch.
+      seq: (raw && typeof raw.seq === 'number') ? raw.seq : null,
+      batch_id: (raw && raw.batch_id) ? String(raw.batch_id) : null,
     };
   }
 
@@ -814,17 +829,13 @@
     btn.textContent = 'Parsing...';
     dismissError();
 
-    // Hand-entered stops ride along so the server places them FIRST and never
-    // runs them through the model. They stay in currentStops if the request
-    // fails, so a network error never loses them.
-    var manualStops = currentStops
-      .filter(function (s) { return s.source === 'manual'; })
-      .map(serializeManualStop);
-
+    // The AI parses ONLY the raw text box into its own batch — it no longer
+    // reorders or replaces Quick-Add stops or earlier batches. Those live in
+    // currentStops by their own seq and are never sent to the model.
     fetch('/api/parse', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN },
-      body: JSON.stringify({ text: text, manual_stops: manualStops }),
+      body: JSON.stringify({ text: text, manual_stops: [] }),
     })
       .then(function (r) {
         return r.json().catch(function () { return null; }).then(function (data) {
@@ -835,14 +846,13 @@
         if (!res.ok || !res.data || !Array.isArray(res.data.stops)) {
           throw new Error((res.data && res.data.error) || 'Parser returned an unexpected response — try again.');
         }
-        renderStopCards(res.data.stops);
+        mergeAiBatch(res.data.stops);
         if (res.data.partial_failure) {
-          // The AI leg failed but the server returned the hand-entered stops —
-          // surface the reason without discarding that work.
-          showError(res.data.warning || 'AI parsing is unavailable right now — your Quick-Add stops are kept. Try re-parsing the dispatch text again.');
+          showError(res.data.warning || 'AI parsing is unavailable right now — the stops already in the tray are kept. Try re-parsing the dispatch text again.');
         }
       })
       .catch(function (err) {
+        // On failure the tray is UNTOUCHED — nothing was merged, so no stop is lost.
         showError(err.message || 'Network error — try again.');
       })
       .finally(function () {
@@ -852,18 +862,63 @@
   }
   window.reparse = reparse;
 
-  function renderStopCards(stops) {
-    // The server returns the full ordered draft: hand-entered (manual) stops
-    // FIRST, then AI-parsed stops — each already tagged with its source. We
-    // rebuild currentStops from that response verbatim (respecting source), so
-    // manual stops keep their non-teal treatment and the model never rewrites
-    // them. Re-parsing the same text twice can't duplicate or drop stops because
-    // the client's manual stops were sent along and echoed back in place.
-    currentStops = (stops || []).map(function (raw) { return normalizeStop(raw); });
+  // Fold the AI's parse of the raw text box into the tray as ONE batch. The first
+  // parse of a fresh box appends a new batch at the end (after any Quick-Add stops
+  // entered so far); a re-parse of the same box replaces ONLY that batch in place,
+  // reusing its seq window so every surrounding stop stays put. Emptying the box
+  // seals the batch (currentRawBatchId=null), so a genuinely new dispatch pasted
+  // next becomes its own batch rather than overwriting the previous one.
+  function mergeAiBatch(stops) {
+    var incoming = (stops || []).map(function (raw) {
+      var s = normalizeStop(raw);
+      s.source = 'ai';
+      return s;
+    });
+    if (currentRawBatchId === null) {
+      currentRawBatchId = nextBatchId('ai');
+      currentStops = TraySeq.appendBatch(currentStops, incoming, currentRawBatchId);
+    } else {
+      currentStops = TraySeq.replaceBatch(currentStops, currentRawBatchId, incoming);
+    }
+    currentStops = TraySeq.sortBySeq(currentStops);
     renderAllCards();
     updateCounts();
   }
-  window.renderStopCards = renderStopCards;
+  window.renderStopCards = mergeAiBatch;  // back-compat alias
+
+  // Long-press-drag reorder of pending stops. Parse order is not always drive
+  // order; the boss drags cards into the correct sequence before inserting, which
+  // rewrites seq so the display order becomes the insert order. Reuses the Route
+  // Board's SortableJS settings (450ms hold on touch, instant on mouse, generous
+  // touch jitter) — tuned for a phone in a truck. The whole card is the grab
+  // target (well over the 48px minimum). A no-op if SortableJS didn't load.
+  var trayJustDragged = false;
+  var _traySortable = null;
+  function initTrayDrag(container) {
+    if (typeof Sortable === 'undefined' || !container) return;
+    if (_traySortable) { try { _traySortable.destroy(); } catch (e) {} _traySortable = null; }
+    _traySortable = new Sortable(container, {
+      draggable: '.stop-card',
+      filter: '.stop-card-remove',           // the ✕ still deletes, never drags
+      delay: 450,
+      delayOnTouchOnly: true,
+      touchStartThreshold: 14,
+      forceFallback: true,
+      supportPointer: false,
+      fallbackTolerance: 4,
+      animation: 150,
+      onStart: function () { trayJustDragged = false; },
+      onEnd: function () {
+        var ids = Array.prototype.map.call(
+          container.querySelectorAll('.stop-card'), function (c) { return c.id; });
+        currentStops = TraySeq.reorder(currentStops, ids);
+        trayJustDragged = true;
+        setTimeout(function () { trayJustDragged = false; }, 350);
+        renderAllCards();
+        updateCounts();
+      },
+    });
+  }
 
   function renderAllCards() {
     var container = el('stop-cards');
@@ -873,9 +928,12 @@
       refreshChainPreview();
       return;
     }
+    // Render STRICTLY by seq — entry order, never grouped or sorted by source.
+    currentStops = TraySeq.sortBySeq(currentStops);
     currentStops.forEach(function (stop) {
       container.appendChild(buildCard(stop));
     });
+    initTrayDrag(container);
     refreshChainPreview();
   }
 
@@ -893,7 +951,7 @@
       cards.parentNode.insertBefore(host, cards);
     }
     if (!currentStops.length) { host.innerHTML = ''; return; }
-    var payload = { stops: currentStops.map(function (s, i) {
+    var payload = { stops: TraySeq.sortBySeq(currentStops).map(function (s, i) {
       return { action: s.action, address: s.address, container_size: s.container_size,
                notes: s.notes, chain_hint: s.chain_hint || null,
                manual_delivery: (typeof s.manual_delivery === 'number') ? s.manual_delivery : null };
@@ -1001,12 +1059,14 @@
     rm.addEventListener('click', function (ev) { ev.stopPropagation(); removeStop(stop.id); });
     top.appendChild(rm);
     card.appendChild(top);
-    var cardDidLongPress = attachLongPress(card, function () { removeStop(stop.id); });
+    // Long-press now initiates a drag-to-reorder (see initTrayDrag); the ✕ button
+    // is the delete affordance. A tap that follows a drag is suppressed so a
+    // reorder never also opens the edit sheet.
     if (isManual) {
       // Tapping an already-added Quick-Add stop reopens the sheet in Edit mode
-      // and saves in place — no duplicate. A long-press still removes it.
+      // and saves in place — no duplicate.
       card.addEventListener('click', function (ev) {
-        if (cardDidLongPress && cardDidLongPress()) return;   // long-press handled it
+        if (trayJustDragged) return;                          // a drag just ended
         if (ev.target && ev.target.closest && ev.target.closest('.stop-card-remove')) return;
         openStopSheet(stopToPrefill(stop), stop.id);
       });
@@ -1264,7 +1324,7 @@
     if (ROUTE_MODE) {
       url = '/api/route/' + ROUTE_MODE.route_id + '/insert-stops';
       payload = {
-        stops: currentStops.map(function (s) {
+        stops: TraySeq.sortBySeq(currentStops).map(function (s) {
           return {
             action: s.action,
             address: s.address,
@@ -1288,7 +1348,7 @@
       url = '/api/dispatch';
       payload = {
         driver_id: driverId,
-        stops: currentStops.map(function (s) {
+        stops: TraySeq.sortBySeq(currentStops).map(function (s) {
           return {
             action: s.action,
             address: s.address,
@@ -1333,17 +1393,36 @@
         successMsg = ROUTE_MODE
           ? ('✓ ' + res.data.stop_count + ' stop' + (res.data.stop_count === 1 ? '' : 's') + ' added to the route')
           : ('✓ Route dispatched to ' + res.data.driver + ' — ' + res.data.stop_count + ' stops');
-        showToast(successMsg);
-        btn.textContent = '✓ Done — redirecting…';
-        setTimeout(function () { window.location.href = '/routes'; }, 1100);
+        // Commit succeeded: clear the tray, the raw box, and reset the counters so
+        // the boss can immediately build the NEXT batch on a clean slate. We do NOT
+        // redirect — the batch workflow is type → eyeball → send → next batch.
+        resetTray();
+        showToast(successMsg + ' — tray cleared for the next batch');
+        btn.textContent = '✓ Dispatched';
+        setTimeout(function () { btn.textContent = originalText; updateCounts(); }, 1800);
       })
       .catch(function (err) {
+        // Commit FAILED: leave the tray and the raw text exactly as they were so
+        // nothing is lost — the boss fixes the error and resends.
         showError(err.message || 'Request failed — try again.');
         btn.disabled = false;
         btn.textContent = originalText;
       });
   }
   window.confirmDispatch = confirmDispatch;
+
+  // Clear all pending state after a successful commit (never on parse, never on a
+  // failed insert). The seq counter resets implicitly because an empty tray makes
+  // TraySeq.nextSeqValue restart at 1.
+  function resetTray() {
+    currentStops = [];
+    currentRawBatchId = null;
+    batchCounter = 0;
+    var box = el('raw-text');
+    if (box) box.value = '';
+    renderAllCards();
+    updateCounts();
+  }
 
   // ── Confirm / Edit Stop bottom sheet ────────────────────────────
   // A Quick-Add suggestion/chip (or tapping a pending manual card) opens this
@@ -1507,11 +1586,13 @@
       return;
     }
 
-    // Add mode: insert grouped with the other manual stops so manual stays first.
+    // Add mode: append at the END in true entry order — a Quick-Add stop created
+    // after two AI stops is stop 3, not shuffled to the front. Each Quick-Add is
+    // its own batch (so it's never disturbed by a re-parse) and gets the next seq.
     var stop = normalizeStop(fields);
-    var insertAt = 0;
-    currentStops.forEach(function (s, i) { if (s.source === 'manual') insertAt = i + 1; });
-    currentStops.splice(insertAt, 0, stop);
+    stop.source = 'manual';
+    currentStops = TraySeq.appendBatch(currentStops, [stop], nextBatchId('qa'));
+    currentStops = TraySeq.sortBySeq(currentStops);
     closeStopSheet(false);
     renderAllCards();
     updateCounts();
@@ -1538,6 +1619,18 @@
       if (ev.key === 'Escape' && bd && bd.classList.contains('open')) {
         closeStopSheet(sheetMode === 'add');
       }
+    });
+  })();
+
+  // Emptying the raw-text box SEALS the current AI batch: the next parse starts a
+  // fresh batch appended at the end (a new dispatch pasted in) rather than
+  // overwriting the previous one. Editing non-empty text keeps re-parse scoped to
+  // the same batch.
+  (function initRawBoxSeal() {
+    var box = el('raw-text');
+    if (!box) return;
+    box.addEventListener('input', function () {
+      if (!box.value.trim()) currentRawBatchId = null;
     });
   })();
 
