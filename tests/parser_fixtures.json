@@ -10,69 +10,191 @@
     "_note": "A field's matchers ALL must pass. 'fields' are hard (fail the suite). 'advisory' matchers are reported with a ⚠ but never fail — used for LLM-nuance we want to watch but not gate on yet."
   },
   "companies": [
-   {
-    "company_key": "haultra-1",
-    "label": "HAULTRA (company 1 — our real dispatch texts)",
-    "fixtures": [
     {
-      "id": "harbor-view-ew-40",
-      "text": "Pr 7021 harbor view blvd,suff,Ew 40yd dump holland",
-      "expect": {
-        "stop_count": 1,
-        "fields": {
-          "action": {"equals_ci": "PR"},
-          "address": {"regex": "7021.*harbou?r\\s+view", "contains_ci": ["suffolk"]},
-          "customer": {"equals_ci": "EW"},
-          "container_size": {"equals_ci": "40yd"},
-          "dump_leg": {"equals_ci": "holland"},
-          "return_leg": {"empty": true},
-          "confidence": {"equals_ci": "high"}
-        }
-      }
-    },
-    {
-      "id": "paragon-napo-after-harborview",
-      "text": "After harbor view\nPr 1013 paragon way,suff, napo 3085 at vista 23 dump holland",
-      "expect": {
-        "stop_count": 1,
-        "fields": {
-          "action": {"equals_ci": "PR"},
-          "address": {"regex": "1013.*paragon\\s+way", "contains_ci": ["suffolk"]},
-          "customer": {"equals_ci": "napo"},
-          "dump_leg": {"equals_ci": "holland"}
+      "company_key": "haultra-1",
+      "label": "HAULTRA (company 1 — our real dispatch texts)",
+      "fixtures": [
+        {
+          "id": "harbor-view-ew-40",
+          "text": "Pr 7021 harbor view blvd,suff,Ew 40yd dump holland",
+          "expect": {
+            "stop_count": 1,
+            "fields": {
+              "action": {
+                "equals_ci": "PR"
+              },
+              "address": {
+                "regex": "7021.*harbou?r\\s+view",
+                "contains_ci": [
+                  "suffolk"
+                ]
+              },
+              "customer": {
+                "equals_ci": "EW"
+              },
+              "container_size": {
+                "equals_ci": "40yd"
+              },
+              "dump_leg": {
+                "equals_ci": "holland"
+              },
+              "return_leg": {
+                "empty": true
+              },
+              "confidence": {
+                "equals_ci": "high"
+              }
+            }
+          }
         },
-        "any_field_contains_ci": ["3085"],
-        "advisory": {
-          "any_field_contains_ci": ["vista 23", "harbor view"],
-          "fields": {
-            "notes": {"contains_ci": ["vista 23"]}
+        {
+          "id": "paragon-napo-after-harborview",
+          "text": "After harbor view\nPr 1013 paragon way,suff, napo 3085 at vista 23 dump holland",
+          "expect": {
+            "stop_count": 1,
+            "fields": {
+              "action": {
+                "equals_ci": "PR"
+              },
+              "address": {
+                "regex": "1013.*paragon\\s+way",
+                "contains_ci": [
+                  "suffolk"
+                ]
+              },
+              "customer": {
+                "equals_ci": "napo"
+              },
+              "dump_leg": {
+                "equals_ci": "holland"
+              }
+            },
+            "any_field_contains_ci": [
+              "3085"
+            ],
+            "advisory": {
+              "any_field_contains_ci": [
+                "vista 23",
+                "harbor view"
+              ],
+              "fields": {
+                "notes": {
+                  "contains_ci": [
+                    "vista 23"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "serv-pro-clyde-morris-carryover",
+          "text": "Before you return paragon use it to\nPr 527 j Clyde Morris blvd,newpt, Serv pro 30yd dump holland then return it to paragon",
+          "expect": {
+            "stop_count": 1,
+            "fields": {
+              "action": {
+                "equals_ci": "PR"
+              },
+              "address": {
+                "regex": "527.*clyde\\s+morris",
+                "contains_ci": [
+                  "newport news"
+                ]
+              },
+              "customer": {
+                "equals_ci": "serv pro"
+              },
+              "container_size": {
+                "equals_ci": "30yd"
+              },
+              "dump_leg": {
+                "equals_ci": "holland"
+              },
+              "return_leg": {
+                "contains_ci": [
+                  "paragon"
+                ]
+              },
+              "confidence": {
+                "equals_ci": "high"
+              }
+            },
+            "advisory": {
+              "_why": "The preamble asks to bring the empty from the Paragon pull to this stop. Whether the model encodes that as empty_can_plan is a nuance we watch but don't gate on yet — promote to a hard field once confirmed against a live key.",
+              "fields": {
+                "empty_can_plan": {
+                  "nonempty": true
+                }
+              }
+            }
+          }
+        },
+        {
+          "id": "tim-0827-batch1-yard-united-tiger",
+          "_note": "Tim 8/27 real route, batch 1 (AI parse, 2 stops). Pull full from yard -> dump United; then PR at 1994 Tiger Dr -> dump SPSA. Interleaved-entry fixture.",
+          "text": "Dump full 30yd at yard dump united\nPR 1994 tiger dr, ches, IND LIGH 30yd dump spsa landfill",
+          "expect": {
+            "stop_count": 2,
+            "stop_index": 1,
+            "fields": {
+              "action": {
+                "equals_ci": "PR"
+              },
+              "address": {
+                "regex": "1994.*tiger",
+                "contains_ci": [
+                  "chesapeake"
+                ]
+              },
+              "container_size": {
+                "equals_ci": "30yd"
+              },
+              "dump_leg": {
+                "contains_ci": [
+                  "spsa"
+                ]
+              }
+            },
+            "any_field_contains_ci": [
+              "united",
+              "ind ligh"
+            ],
+            "advisory": {
+              "any_field_contains_ci": [
+                "2545 squadron",
+                "yard"
+              ]
+            }
+          }
+        },
+        {
+          "id": "tim-0827-batch3-clearfield-drop",
+          "_note": "Tim 8/27 real route, batch 3 (AI parse, 1 stop). Drop at 401 Clearfield with a placement phone note.",
+          "text": "D 401 Clearfield Ave, ches, 30yd, MM Gunter, call 581-2464 for placement",
+          "expect": {
+            "stop_count": 1,
+            "fields": {
+              "action": {
+                "equals_ci": "D"
+              },
+              "address": {
+                "regex": "401.*clearfield",
+                "contains_ci": [
+                  "chesapeake"
+                ]
+              },
+              "container_size": {
+                "equals_ci": "30yd"
+              }
+            },
+            "any_field_contains_ci": [
+              "581-2464",
+              "gunter"
+            ]
           }
         }
-      }
-    },
-    {
-      "id": "serv-pro-clyde-morris-carryover",
-      "text": "Before you return paragon use it to\nPr 527 j Clyde Morris blvd,newpt, Serv pro 30yd dump holland then return it to paragon",
-      "expect": {
-        "stop_count": 1,
-        "fields": {
-          "action": {"equals_ci": "PR"},
-          "address": {"regex": "527.*clyde\\s+morris", "contains_ci": ["newport news"]},
-          "customer": {"equals_ci": "serv pro"},
-          "container_size": {"equals_ci": "30yd"},
-          "dump_leg": {"equals_ci": "holland"},
-          "return_leg": {"contains_ci": ["paragon"]},
-          "confidence": {"equals_ci": "high"}
-        },
-        "advisory": {
-          "_why": "The preamble asks to bring the empty from the Paragon pull to this stop. Whether the model encodes that as empty_can_plan is a nuance we watch but don't gate on yet — promote to a hard field once confirmed against a live key.",
-          "fields": {
-            "empty_can_plan": {"nonempty": true}
-          }
-        }
-      }
+      ]
     }
-    ]
-   }
   ]
 }

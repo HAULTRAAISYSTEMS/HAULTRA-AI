@@ -106,4 +106,59 @@ c.close()
 ok(site is not None and site["dump_site_id"] is not None,
    "a stop that dumps 'at yard' links to the saved yard site (resolution intact)")
 
+# ── PERMANENT FIXTURE: Tim's real dispatched route, 8/27, entered in 3 batches ──
+# From the driver's paper log. Batch 1 (AI parse, 2 stops) -> Quick Add (3 stops)
+# -> Batch 3 (AI parse, 1 stop). The tray must render these SIX in this exact
+# order, seq 1..6, never grouped by source; all three 11496 Shiloh Dr stops must
+# survive (different actions/cans/lots); "dump full 30yd at yard" resolves to the
+# saved yard (2545 Squadron Ct) with the United note. This is the only fixture
+# covering interleaved multi-source entry — it runs on every parser/tray change.
+#
+# The tray order (seq 1..6) is what the client sends after the three batches; the
+# server-observable guarantee is that all six persist in that order, none deduped.
+as_boss()
+# a United dump site so the yard-origin stop's dump leg links to a real record
+conn = app.get_db(); cur = conn.cursor(); ts = app.now_ts()
+cur.execute("""INSERT INTO saved_addresses (company_id,customer_name,address,full_address,kind,norm_key,hidden,times_used,last_used_at,created_at)
+               VALUES (?,?,?,?,?,?,0,1,?,?)""",
+            (co, "United", "1000 Landfill Rd", "1000 Landfill Rd, Norfolk", "dump",
+             app._address_book_key("United", "1000 Landfill Rd", "dump"), ts, ts))
+conn.commit(); conn.close()
+
+tim_route = [
+    # batch 1 — AI parse
+    {"action": "P",  "address": "2545 Squadron Ct", "customer": "Yard", "container_size": "30yd",
+     "dump_leg": "United", "notes": "Pull full 30yd from yard, dump at United (Norfolk)"},
+    {"action": "PR", "address": "1994 Tiger Dr, Chesapeake", "customer": "IND LIGH", "container_size": "30yd",
+     "dump_leg": "SPSA"},
+    # batch 2 — Quick Add (three stops at ONE address, different cans/actions)
+    {"action": "D",  "address": "11496 Shiloh Dr, Windsor VA", "customer": "Ew", "container_size": "30yd",
+     "notes": "Place on lot 35"},
+    {"action": "PR", "address": "11496 Shiloh Dr, Windsor VA", "customer": "Ew", "container_size": "30yd",
+     "dump_leg": "SPSA", "notes": "container 3124"},
+    {"action": "P",  "address": "11496 Shiloh Dr, Windsor VA", "customer": "Ew", "container_size": "30yd",
+     "dump_leg": "SPSA", "notes": "bin 3104"},
+    # batch 3 — AI parse
+    {"action": "D",  "address": "401 Clearfield Ave, Chesapeake", "customer": "MM Gunter", "container_size": "30yd",
+     "notes": "call 581-2464 for placement"},
+]
+r = cl.post("/api/dispatch", json={"driver_id": drv, "route_date": "2026-08-27", "stops": tim_route}, headers=HJ)
+ok(r.status_code == 200 and (r.get_json() or {}).get("stop_count") == 6,
+   "Tim 8/27: all six interleaved-batch stops dispatch")
+c = app.get_db()
+rid = c.execute("SELECT id FROM routes WHERE company_id=? ORDER BY id DESC LIMIT 1", (co,)).fetchone()["id"]
+rows = [dict(x) for x in c.execute(
+    "SELECT stop_order, address, action, container_size, customer_name, notes, dump_location "
+    "FROM stops WHERE route_id=? ORDER BY stop_order", (rid,)).fetchall()]
+c.close()
+ok([x["stop_order"] for x in rows] == [1, 2, 3, 4, 5, 6], "Tim 8/27: stops persist in seq order 1..6")
+addrs = [(x["address"] or "").split(",")[0] for x in rows]
+ok(addrs == ["2545 Squadron Ct", "1994 Tiger Dr", "11496 Shiloh Dr", "11496 Shiloh Dr", "11496 Shiloh Dr", "401 Clearfield Ave"],
+   "Tim 8/27: exact drive order preserved, not grouped by source")
+shiloh = [x for x in rows if (x["address"] or "").startswith("11496 Shiloh")]
+ok(len(shiloh) == 3 and len({x["action"] for x in shiloh}) == 3,
+   "Tim 8/27: all three Shiloh Dr stops survive with distinct actions (no dedupe)")
+ok("United" in (rows[0]["notes"] or "") and (rows[0]["address"] or "").startswith("2545 Squadron Ct"),
+   "Tim 8/27: 'dump full 30yd at yard' resolves to the yard (2545 Squadron Ct) with the United note")
+
 print("\nALL STAGING-TRAY TESTS PASSED")
