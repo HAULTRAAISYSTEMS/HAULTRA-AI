@@ -14519,18 +14519,24 @@ _STOP_WARNINGS_JS = """
       }
     }
 
-    /* 3 — Duplicate stop */
-    if (customer || address) {
-      var cl = customer.toLowerCase();
+    /* 3 — Duplicate stop. Same STREET ADDRESS is legal for multiple stops — an
+       apartment complex or multi-lot job site has different cans, actions and lots
+       at one address (e.g. three stops at 11496 Shiloh Dr: a Drop on lot 35, a PR
+       for can 3124, a Pull on lot 41). Only a TRUE duplicate warns: same address
+       AND same action AND same container. Address alone never warns. */
+    var container = g('container_size');
+    if (address && action) {
       var al = address.toLowerCase();
+      var cz = container.toLowerCase().replace(/\s+/g, '');
       var dup = existingStops.some(function(s) {
-        var sc = (s.customer_name || '').toLowerCase();
-        var sa = (s.address || '').toLowerCase();
-        return (cl && sc && sc === cl) || (al && sa && sa === al);
+        var sa   = (s.address || '').toLowerCase();
+        var sact = (s.action || '').toLowerCase();
+        var scz  = (s.container_size || '').toLowerCase().replace(/\s+/g, '');
+        return sa && sa === al && sact && sact === action && scz === cz;
       });
       if (dup) {
         warns.push({ level: 'yellow',
-          msg: 'Duplicate \u2014 a stop for this customer or address already exists on this route.' });
+          msg: 'Possible duplicate \u2014 a stop with the same address, action, and container is already on this route.' });
       }
     }
 
@@ -16131,6 +16137,7 @@ def view_route(route_id):
     if session.get("role") == "boss":
         _existing_stops_json = json.dumps([
             {"customer_name": s["customer_name"] or "", "address": s["address"] or "", "action": s["action"] or "",
+             "container_size": (s["container_size"] if "container_size" in s.keys() else "") or "",
              "chain_group_id": (s["chain_group_id"] if "chain_group_id" in s.keys() else None)}
             for s in stops
         ])
@@ -16514,6 +16521,7 @@ def edit_stop(stop_id):
     ) if _swap_cands else ""
     _sibling_json = json.dumps([
         {"customer_name": s["customer_name"] or "", "address": s["address"] or "", "action": s["action"] or "",
+         "container_size": (s["container_size"] if "container_size" in s.keys() else "") or "",
          "chain_group_id": (s["chain_group_id"] if "chain_group_id" in s.keys() else None)}
         for s in _sibling_stops
     ])
