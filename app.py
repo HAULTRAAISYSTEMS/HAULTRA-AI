@@ -12685,7 +12685,7 @@ def _cab_preflight_body(route, stops, total_count, csrf):
   <div class="pf-card">
     <div class="pf-date">{e(route['route_date'])}</div>
     <div class="pf-name">{e(route['route_name'])}</div>
-    <div class="pf-driver">Driver: {e(route['assigned_username'] or 'You')}</div>
+    <div class="pf-driver">Driver: {e(route['assigned_full'] or route['assigned_username'] or 'You')}</div>
 
     <div class="pf-tiles">
       <div class="pf-tile"><div class="pf-tile-num">{total_count}</div><div class="pf-tile-lbl">Stops</div></div>
@@ -12850,7 +12850,8 @@ def _cab_stop_legs(s, full_address, site_addr_by_id, dump_loc_by_name):
 def driver_route_detail(route_id):
     conn = get_db()
     route = conn.execute("""
-        SELECT r.*, u.username AS assigned_username, u.nav_preference
+        SELECT r.*, u.username AS assigned_username, u.full_name AS assigned_full,
+               u.nav_preference
         FROM routes r
         LEFT JOIN users u ON r.assigned_to = u.id
         WHERE r.id = ? AND r.assigned_to = ? AND r.company_id = ?
