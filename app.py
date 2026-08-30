@@ -6341,7 +6341,7 @@ def shell_page(title, body, extra_head=""):
     <html>
    <head>
     <title>{e(title)}</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="theme-color" content="#FF6B1A">
     <meta name="csrf-token" content="{csrf_token}">
 
@@ -6417,7 +6417,12 @@ a {{ color: var(--cyan); text-decoration: none; transition: color .15s; }}
 a:hover {{ color: #FF9D5C; }}
 
 /* ── App Shell ──────────────────────────────────────────────*/
-.app-shell {{ display: flex; flex-direction: column; min-height: 100vh; width: 100%; }}
+.app-shell {{ display: flex; flex-direction: column; min-height: 100vh; width: 100%;
+             padding-bottom: env(safe-area-inset-bottom, 0px); }}
+/* No topnav (signed out) -> the first pane reserves the strip itself. Uses
+   margin, not padding: .content already sets its own padding and a padding
+   rule here would out-specify it and collapse it to 0 everywhere env() is 0. */
+.app-shell > .content:first-child {{ margin-top: env(safe-area-inset-top, 0px); }}
 
 /* ══════════════════════════════════════════════════════════
    TOP NAV
@@ -6428,6 +6433,10 @@ a:hover {{ color: #FF9D5C; }}
     position: sticky;
     top: 0;
     z-index: 200;
+    /* Own the status-bar strip in CSS. iOS drops the WebView's native top inset
+       when a system modal (e.g. the location prompt) returns focus, which used
+       to leave this bar drawn under the status bar until the next page load. */
+    padding-top: env(safe-area-inset-top, 0px);
     box-shadow: 0 1px 0 rgba(255,107,26,0.05), 0 2px 20px rgba(0,0,0,0.4);
 }}
 
@@ -12663,11 +12672,6 @@ def _cab_preflight_body(route, stops, total_count, csrf):
   .pf-first-cust {{ font-weight:700; font-size:1.05rem; margin-top:2px; }}
   .pf-first-addr {{ color: var(--text-muted); margin-top:2px; }}
   .pf-first-empty {{ color: var(--text-muted); }}
-  /* Reserved slot for the pre-trip / container-securement checklist (gated here
-     later). Intentionally a placeholder — the checklist is NOT built yet. */
-  .pf-checklist-slot {{ margin-top:16px; border:1px dashed rgba(255,255,255,0.18); border-radius:12px; padding:14px; background: rgba(255,255,255,0.02); }}
-  .pf-slot-label {{ font-weight:700; font-size:.9rem; }}
-  .pf-slot-hint {{ color: var(--text-muted); font-size:.8rem; margin-top:4px; }}
   .pf-start-btn {{ width:100%; min-height:64px; margin-top:18px; border:none; border-radius:14px;
                    background: var(--orange, #FF6B1A); color:#111; font-size:1.3rem; font-weight:800;
                    letter-spacing:1px; cursor:pointer; }}
@@ -12690,11 +12694,6 @@ def _cab_preflight_body(route, stops, total_count, csrf):
     </div>
 
     {first_html}
-
-    <div class="pf-checklist-slot" data-slot="pretrip-checklist" aria-hidden="true">
-      <div class="pf-slot-label">Pre-trip &amp; container securement</div>
-      <div class="pf-slot-hint">Coming soon &mdash; the pre-trip inspection checklist will be required here before you can start.</div>
-    </div>
 
     <form method="POST" action="{start_action}">
       <input type="hidden" name="_csrf_token" value="{csrf}">
