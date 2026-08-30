@@ -23,7 +23,7 @@
     }
   },
   "ios": {
-    "contentInset": "automatic",
+    "contentInset": "never",
     "backgroundColor": "#121212",
     "appendUserAgent": "HaultraNativeApp"
   },
