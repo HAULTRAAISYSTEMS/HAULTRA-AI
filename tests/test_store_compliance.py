@@ -105,4 +105,31 @@ ok(client.get("/.well-known/apple-app-site-association").status_code == 404,
 ok(client.get("/.well-known/assetlinks.json").status_code == 404,
    "unsigned Android association data fails closed")
 
+# ---- Guideline 3.1.1: no unauthenticated route reaches a purchase surface ----
+# The purchase surfaces are "/" (marketing, carries pricing) and
+# /register-company ("Start Free Trial"). Both are hidden from the native
+# shells by is_native_app(), but that is User-Agent sniffing and fails open,
+# so the checks below assert the session-keyed behaviour that does not.
+web_headers = {"User-Agent": "Mozilla/5.0 (Macintosh) Chrome/120"}
+
+for label, headers in (("native", native_headers), ("web", web_headers)):
+    blocked = client.get("/subscription/blocked", headers=headers)
+    ok(blocked.status_code == 302 and blocked.headers["Location"].endswith("/login"),
+       f"{label}: /subscription/blocked requires a session")
+
+    missing = client.get("/no-such-page-exists", headers=headers)
+    ok(missing.status_code == 404, f"{label}: unknown path still 404s")
+    ok(b'href="/login"' in missing.data,
+       f"{label}: signed-out 404 sends you to login")
+    ok(b'href="/">' not in missing.data,
+       f"{label}: signed-out 404 does not link to the marketing site")
+
+for path in ("/login", "/forgot-password", "/privacy", "/terms", "/support",
+             "/offline", "/order", "/delete-account", "/no-such-page-exists"):
+    page = client.get(path, headers=native_headers)
+    if page.status_code != 200:
+        continue
+    ok(b'href="/"' not in page.data and b'href="/register-company"' not in page.data,
+       f"native signed-out {path} links to no purchase surface")
+
 print("\nALL STORE COMPLIANCE TESTS PASSED")

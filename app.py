@@ -218,9 +218,29 @@ _ERROR_PAGE_TEMPLATE = """
 </style></head><body><div class="box">
   <h1>{code}</h1>
   <p>{message}</p>
-  <a href="/">&larr; Back to HAULTRA</a>
+  <a href="{home_url}">&larr; Back to HAULTRA</a>
 </div></body></html>
 """
+
+
+def _error_page_home_url():
+    """Where the error pages' "Back to HAULTRA" link points.
+
+    "/" is the marketing site and carries pricing, and App Store guideline
+    3.1.1 counts any in-app path to a purchase surface as steering. Only a
+    signed-in browser session is sent there; everything else goes to /login.
+
+    Deliberately keyed on the session rather than is_native_app() alone: UA
+    sniffing fails open, so if the HaultraNativeApp marker were ever dropped
+    every gate that depends on it would silently start leaking. An
+    unauthenticated request never reaches pricing from here regardless.
+    """
+    try:
+        if session.get("user_id") and not is_native_app():
+            return "/"
+    except Exception:
+        pass
+    return "/login"
 
 
 @app.errorhandler(404)
@@ -231,6 +251,7 @@ def _handle_not_found(err):
         _ERROR_PAGE_TEMPLATE.format(
             title="Not Found", code="404",
             message="That page doesn&rsquo;t exist, or you don&rsquo;t have access to it.",
+            home_url=_error_page_home_url(),
         )
     ), 404
 
@@ -244,6 +265,7 @@ def _handle_server_error(err):
         _ERROR_PAGE_TEMPLATE.format(
             title="Something Went Wrong", code="500",
             message="Something went wrong on our end. It&rsquo;s been logged &mdash; try again in a moment.",
+            home_url=_error_page_home_url(),
         )
     ), 500
 
@@ -20574,6 +20596,12 @@ def billing():
 # =========================================================
 @app.route("/subscription/blocked")
 def subscription_blocked():
+    # No session means no account status to report, and on the web this page
+    # says "Upgrade to a paid plan" -- a purchase surface a store reviewer
+    # could reach without ever logging in. Nothing here is public.
+    if not session.get("user_id"):
+        return redirect(url_for("login"))
+
     conn = get_db()
     company_id = session.get("company_id")
     co = None
