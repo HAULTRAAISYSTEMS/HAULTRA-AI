@@ -13007,6 +13007,200 @@ def _cab_stop_legs(s, full_address, site_addr_by_id, dump_loc_by_name):
     return legs, active
 
 
+# ── Driver-side cancel ─────────────────────────────────────────────────────
+# The scenario this exists for: the boss texts "cancel it" mid-shift and the
+# driver needs the work off their tablet without calling the office. Deliberate
+# design choices, in order of how much they matter at 60mph:
+#
+#   1. Behind a hold, never a tap. It sits next to Truck Issue at the bottom of
+#      the wrap, and needs a ~650ms press to arm. A one-tap cancel beside
+#      "Complete Stop" would get fat-fingered in a bouncing truck, and a
+#      mis-tapped cancel silently deletes a billable job.
+#   2. Reason first, action second. The driver picks WHY before they can pick
+#      WHAT, so no cancel ever lands without a reason attached.
+#   3. Plain form POSTs, not fetch. Same as END ROUTE — it survives a flaky
+#      connection and the service worker's replay path without special-casing.
+_CAB_CANCEL_CSS = """
+<style>
+.cab-cancel-btn {
+    display:flex; align-items:center; justify-content:center; gap:8px;
+    width:100%; min-height:48px; margin-top:10px;
+    background:rgba(140,140,132,0.10); border:1px solid rgba(140,140,132,0.40);
+    color:#A6A69E; font-weight:700; font-size:14px; letter-spacing:.3px;
+    border-radius:12px; cursor:pointer; -webkit-user-select:none; user-select:none;
+    -webkit-touch-callout:none; transition:background .15s, color .15s;
+}
+.cab-cancel-btn.arming { background:rgba(245,180,60,0.16); border-color:rgba(245,180,60,0.55); color:#F5B43C; }
+.cab-reason {
+    display:flex; align-items:center; gap:12px; min-height:52px; padding:0 12px;
+    border:1px solid rgba(255,255,255,0.14); border-radius:12px; margin-bottom:8px;
+    cursor:pointer; font-size:15px; color:#E6E6E0;
+}
+.cab-reason input { width:20px; height:20px; flex:none; }
+.cab-reason.sel { border-color:rgba(255,107,26,0.65); background:rgba(255,107,26,0.10); }
+/* Full-screen interrupt. Not a toast: a driver with the phone in a cradle does
+   not read toasts, and this is the one message that must stop the truck. */
+.cab-interrupt {
+    position:fixed; inset:0; z-index:4000; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; text-align:center; padding:28px;
+    background:rgba(10,10,10,0.97);
+}
+.cab-interrupt h2 { font-size:30px; font-weight:900; letter-spacing:1px; color:#FF5252; margin:0 0 12px; }
+.cab-interrupt p  { font-size:17px; color:#E6E6E0; margin:0 0 26px; max-width:420px; }
+.cab-interrupt button {
+    min-height:64px; width:100%; max-width:360px; border-radius:14px; border:none;
+    background:#FF6B1A; color:#0A0A0A; font-weight:800; font-size:18px; cursor:pointer;
+}
+</style>
+"""
+
+
+def _cab_cancel_ui(route_id, stop_id, csrf, stop_label=""):
+    """Trigger button + reason modal + realtime interrupt overlay for Cab View.
+
+    Returned as a plain string (not an f-string fragment) so the JS braces
+    inside it are never re-processed by the caller's f-string.
+    """
+    reasons = "".join(
+        '<label class="cab-reason" onclick="cabPickReason(this)">'
+        '<input type="radio" name="reason" value="%s"%s>%s</label>'
+        % (code, (" checked" if i == 0 else ""), text)
+        for i, (code, text) in enumerate(CANCEL_REASONS_DRIVER.items())
+    )
+    where = (" &mdash; " + stop_label) if stop_label else ""
+    return _CAB_CANCEL_CSS + """
+<div id="cab-cancel-overlay" class="no-photo-confirm-overlay" hidden onclick="closeCabCancel()"></div>
+<div id="cab-cancel-modal" class="no-photo-confirm-modal" hidden style="text-align:left;">
+    <div class="no-photo-confirm-title" style="margin-bottom:6px;">Can't run this</div>
+    <div class="no-photo-confirm-body" style="margin-bottom:14px;">
+        Pick a reason, then choose what to drop. Cancelled work stays on the
+        route marked cancelled &mdash; the office sees it either way.
+    </div>
+    <form method="POST" onsubmit="return cabConfirmCancel(this);">
+        <input type="hidden" name="_csrf_token" value="__CSRF__">
+        <input type="hidden" name="client_uuid" id="cab-cancel-uuid" value="">
+        __REASONS__
+        <button type="submit" class="btn" formaction="__STOP_URL__"
+                style="width:100%;min-height:56px;margin-top:6px;background:rgba(255,82,82,0.14);
+                       border:1px solid rgba(255,82,82,0.45);color:#FF7A7A;font-weight:800;">
+            Cancel this stop__WHERE__
+        </button>
+        <button type="submit" class="btn" formaction="__ROUTE_URL__"
+                style="width:100%;min-height:56px;margin-top:10px;background:rgba(255,82,82,0.22);
+                       border:1px solid rgba(255,82,82,0.6);color:#FF9A9A;font-weight:800;">
+            Cancel the WHOLE route
+        </button>
+        <button type="button" class="btn secondary" onclick="closeCabCancel()"
+                style="width:100%;min-height:52px;margin-top:12px;">Never mind</button>
+    </form>
+</div>
+
+<div id="cab-interrupt" class="cab-interrupt" hidden>
+    <h2 id="cab-interrupt-title">STOP CANCELLED</h2>
+    <p id="cab-interrupt-body">Do not service this stop.</p>
+    <button type="button" onclick="window.location.reload();">GOT IT</button>
+</div>
+
+<script>
+(function() {
+    var CURRENT_STOP_ID = __STOP_ID__;
+    var btn = document.getElementById('cab-cancel-btn');
+    var overlay = document.getElementById('cab-cancel-overlay');
+    var modal = document.getElementById('cab-cancel-modal');
+
+    window.cabPickReason = function(lbl) {
+        var all = document.querySelectorAll('.cab-reason');
+        for (var i = 0; i < all.length; i++) { all[i].classList.remove('sel'); }
+        lbl.classList.add('sel');
+        var r = lbl.querySelector('input'); if (r) r.checked = true;
+    };
+
+    function openCabCancel() {
+        var u = document.getElementById('cab-cancel-uuid');
+        // One id per opening of the sheet, so a queued POST replayed out of a
+        // dead zone is recognised as the same cancel, not a second one.
+        if (u) { u.value = 'c-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10); }
+        var sel = document.querySelector('.cab-reason input:checked');
+        if (sel && sel.parentNode) { window.cabPickReason(sel.parentNode); }
+        if (overlay) overlay.hidden = false;
+        if (modal) modal.hidden = false;
+    }
+    window.closeCabCancel = function() {
+        if (overlay) overlay.hidden = true;
+        if (modal) modal.hidden = true;
+    };
+    window.cabConfirmCancel = function(form) {
+        var whole = (document.activeElement &&
+                     (document.activeElement.getAttribute('formaction') || '').indexOf('/route/') !== -1);
+        return confirm(whole
+            ? 'Cancel the WHOLE route? Stops you already completed stay completed.'
+            : 'Cancel this stop? It stays on the route marked cancelled.');
+    };
+
+    // Hold to arm — a deliberate ~650ms press, cancelled by any real movement
+    // so a scroll on a bouncing seat never opens this.
+    if (btn) {
+        var timer = null, startY = 0;
+        function disarm() {
+            if (timer) { clearTimeout(timer); timer = null; }
+            btn.classList.remove('arming');
+        }
+        function arm(e) {
+            startY = (e.touches && e.touches[0]) ? e.touches[0].clientY : (e.clientY || 0);
+            btn.classList.add('arming');
+            timer = setTimeout(function() { disarm(); openCabCancel(); }, 650);
+        }
+        btn.addEventListener('touchstart', arm, { passive: true });
+        btn.addEventListener('touchend', disarm);
+        btn.addEventListener('touchmove', function(e) {
+            var y = (e.touches && e.touches[0]) ? e.touches[0].clientY : 0;
+            if (Math.abs(y - startY) > 14) disarm();
+        }, { passive: true });
+        btn.addEventListener('mousedown', arm);
+        btn.addEventListener('mouseup', disarm);
+        btn.addEventListener('mouseleave', disarm);
+        btn.addEventListener('click', function() {
+            // A plain tap explains itself rather than doing nothing.
+            if (modal && modal.hidden) {
+                btn.textContent = 'HOLD to cancel work';
+                setTimeout(function() { btn.innerHTML = '&#10005; Can\\'t run this'; }, 1600);
+            }
+        });
+    }
+
+    // Realtime interrupt, driven by the same 4s poll Cab View already runs.
+    window.cabCancelInterrupt = function(data) {
+        var el = document.getElementById('cab-interrupt');
+        if (!el || !el.hidden) return false;
+        if (data.route_cancelled) {
+            document.getElementById('cab-interrupt-title').textContent = 'ROUTE CANCELLED';
+            document.getElementById('cab-interrupt-body').textContent =
+                (data.route_cancel_reason || 'Dispatch cancelled this route.') +
+                ' Stop driving to these stops.';
+            el.hidden = false;
+            return true;
+        }
+        if (CURRENT_STOP_ID && data.cancelled_ids &&
+            data.cancelled_ids.indexOf(CURRENT_STOP_ID) !== -1) {
+            document.getElementById('cab-interrupt-title').textContent = 'STOP CANCELLED';
+            document.getElementById('cab-interrupt-body').textContent =
+                'Dispatch cancelled the stop you are on. Do not service it.';
+            el.hidden = false;
+            return true;
+        }
+        return false;
+    };
+})();
+</script>
+"""\
+        .replace("__CSRF__", str(csrf)) \
+        .replace("__REASONS__", reasons) \
+        .replace("__WHERE__", where) \
+        .replace("__STOP_URL__", url_for("cancel_stop", stop_id=stop_id) if stop_id else "#") \
+        .replace("__ROUTE_URL__", url_for("cancel_route", route_id=route_id)) \
+        .replace("__STOP_ID__", str(stop_id) if stop_id else "null")
+
+
 @app.route("/driver/route/<int:route_id>")
 @driver_required
 def driver_route_detail(route_id):
@@ -13153,6 +13347,45 @@ def driver_route_detail(route_id):
     _csrf = get_csrf_token()
 
     # ══════════════════════════════════════════════════════════
+    # CANCELLED ROUTE — terminal screen, before anything else
+    # ══════════════════════════════════════════════════════════
+    # Takes priority over the pre-flight gate and the stop card: there is no
+    # work here, and the one thing the driver needs is unambiguous confirmation
+    # that the thing they were told to drop is actually dropped. Completed stops
+    # are still summarised so a driver who ran half the route before the call
+    # can see their pay-relevant work is intact.
+    if route["cancelled_at"]:
+        _cx_by = "you" if (route["cancel_source"] or "") == "driver" else "the office"
+        body = f"""
+<div class="cab-wrap">
+    <div class="cab-header">
+        <div class="cab-title">MY ROUTE</div>
+        <span class="cab-online-badge" id="online-badge"><span class="cab-online-dot"></span>ONLINE</span>
+    </div>
+    <div class="cab-progress-label">{e(route['route_name'])} &middot; {e(route['route_date'])}</div>
+
+    <div class="cab-all-done">
+        <div class="cab-all-done-icon">&#10005;</div>
+        <h2 style="color:#A6A69E;">Route Cancelled</h2>
+        <p style="color:var(--text-muted);margin-top:8px;">
+            {e(cancel_label(route['cancel_reason']))} &mdash; cancelled by {_cx_by}.
+        </p>
+        <p style="color:var(--text-muted);margin-top:8px;">
+            Nothing left to run here. {completed_count} stop{'' if completed_count == 1 else 's'}
+            you already completed {'is' if completed_count == 1 else 'are'} saved and still count.
+        </p>
+        <div style="margin-top:22px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
+            <a class="btn orange" style="min-height:52px;" href="{url_for('driver_dashboard')}">&#8592; Back to My Routes</a>
+        </div>
+        <p class="muted small" style="margin-top:18px;">
+            Cancelled by mistake? The office can put this route back on.
+        </p>
+    </div>
+</div>
+"""
+        return render_template_string(shell_page("Cab View", body))
+
+    # ══════════════════════════════════════════════════════════
     # PRE-FLIGHT GATE — route not started yet ('open' == not_started)
     # Render ONLY a full-screen pre-flight card: no stop list, no map,
     # no scrolling. The driver reviews the route summary and taps START
@@ -13279,6 +13512,10 @@ def driver_route_detail(route_id):
     s = current_stop
     stop_id = s["id"]
     _s = dict(s)
+    _cab_cancel_block = _cab_cancel_ui(
+        route_id, stop_id, _csrf,
+        (s["customer_name"] or s["address"] or "").strip(),
+    )
 
     full_address = " ".join(filter(None, [
         s["address"] or "", s["city"] or "", s["state"] or "", s["zip_code"] or "",
@@ -14100,12 +14337,15 @@ def driver_route_detail(route_id):
     </div>
 
     <button type="button" id="cab-issue-btn" class="cab-issue-btn" onclick="openTruckIssue()">&#9888; Truck Issue</button>
+    <button type="button" id="cab-cancel-btn" class="cab-cancel-btn">&#10005; Can't run this</button>
 </div>
 {cab_map_panel}
 
 {_message_thread_modal_html(show_quick_taps=True)}
 
 {breakdown_ui_html}
+
+{_cab_cancel_block}
 
 <div id="gps-preprompt-overlay" class="no-photo-confirm-overlay" hidden></div>
 <div id="gps-preprompt-modal" class="no-photo-confirm-modal" hidden>
@@ -14194,6 +14434,14 @@ def driver_route_detail(route_id):
 
         function applyStatus(data) {{
             if (!data || typeof data.total !== 'number') return;
+            // A cancellation outranks every other update: the driver may be
+            // rolling toward this stop right now. Blocking interrupt, then stop
+            // processing — no point refreshing counters behind a full-screen
+            // overlay the driver has to clear anyway.
+            if (typeof window.cabCancelInterrupt === 'function'
+                && window.cabCancelInterrupt(data)) {{
+                return;
+            }}
             var banner = document.getElementById('route-updated-banner');
             var text   = document.getElementById('route-updated-text');
 
@@ -15500,9 +15748,13 @@ def driver_route_status(route_id):
         return jsonify({"error": "Access denied."}), 403
 
     stops = conn.execute(
-        "SELECT status, cancelled_at FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
+        """SELECT id, status, cancelled_at FROM stops
+            WHERE route_id=? ORDER BY stop_order ASC, id ASC""",
         (route_id,)
     ).fetchall()
+    route_cancel = conn.execute(
+        "SELECT cancelled_at, cancel_reason FROM routes WHERE id=?", (route_id,)
+    ).fetchone()
 
     unread_messages = conn.execute(
         "SELECT COUNT(*) n FROM messages WHERE route_id=? AND sender_user_id != ? AND read_at IS NULL",
@@ -15523,15 +15775,23 @@ def driver_route_status(route_id):
     total = len(_live)
     completed = sum(1 for s in _live if s["status"] == "completed")
     cancelled = len(stops) - total
-    current_stop_num = None
+    current_stop_num = current_stop_id = None
     for i, s in enumerate(stops, start=1):
         if stop_is_open(s):
-            current_stop_num = i
+            current_stop_num, current_stop_id = i, s["id"]
             break
 
     return jsonify({
         "total": total, "completed": completed, "cancelled": cancelled,
+        "cancelled_ids": [s["id"] for s in stops if stop_is_cancelled(s)],
+        "route_cancelled": bool(route_cancel and route_cancel["cancelled_at"]),
+        "route_cancel_reason": (cancel_label(route_cancel["cancel_reason"])
+                                if route_cancel and route_cancel["cancelled_at"] else None),
         "current_stop_num": current_stop_num,
+        # Previously absent here while the SSE snapshot had it, so Cab View's
+        # `data.current_stop_id !== lastCurrentId` check compared undefined to
+        # undefined and the mid-route soft-reload never fired on the poll path.
+        "current_stop_id": current_stop_id,
         "unread_messages": unread_messages,
         "urgent": ({"id": urgent_row["id"], "body": urgent_row["body"]} if urgent_row else None),
     })
@@ -15993,9 +16253,37 @@ def view_route(route_id):
     </form>
     <form class="inline" method="POST"
       action="{url_for('delete_route', route_id=route_id)}"
-      onsubmit="return confirm('Delete this entire route?')">
+      onsubmit="return confirm('Delete this entire route? This erases the stops and their photos. To take the work off the board but keep the record, use Cancel Route instead.')">
         <button class="btn red" type="submit">Delete Route</button>
     </form>
+    """
+
+        # Cancel Route — kills what is left, leaves completed stops billable.
+        if route["cancelled_at"]:
+            route_action_buttons += f"""
+    <form class="inline" method="POST" action="{url_for('uncancel_route', route_id=route_id)}">
+        <button class="btn green" type="submit">&#8635; Reinstate Route</button>
+    </form>
+    """
+        else:
+            _rr_opts = "".join(
+                '<option value="%s">%s</option>' % (e(_k), e(_v))
+                for _k, _v in CANCEL_REASONS_BOSS.items()
+            )
+            route_action_buttons += f"""
+    <button type="button" class="btn secondary" onclick="toggleRouteCancel()">&#10005; Cancel Route</button>
+    <div id="route-cancel-panel" hidden
+         style="width:100%;margin-top:10px;padding:14px;border:1px solid rgba(140,140,132,0.28);border-radius:8px;background:rgba(255,255,255,0.03);">
+        <form method="POST" action="{url_for('cancel_route', route_id=route_id)}">
+            <label style="font-size:12px;display:block;margin-bottom:4px;">Why is this route cancelled?</label>
+            <select name="reason" style="width:100%;max-width:320px;margin-bottom:10px;">{_rr_opts}</select>
+            <div class="row" style="gap:8px;">
+                <button class="btn red" type="submit">Cancel remaining stops</button>
+                <button type="button" class="btn secondary" onclick="toggleRouteCancel()">Never mind</button>
+            </div>
+            <p class="muted small" style="margin:8px 0 0;">Completed stops stay completed and stay billable. Only outstanding work is dropped.</p>
+        </form>
+    </div>
     """
 
     extra_head = '<script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>'
@@ -16035,6 +16323,14 @@ def view_route(route_id):
         <script>
         function toggleMove(id) {{
             var p = document.getElementById('move-panel-' + id);
+            if (p) p.hidden = !p.hidden;
+        }}
+        function toggleCancel(id) {{
+            var p = document.getElementById('cancel-panel-' + id);
+            if (p) p.hidden = !p.hidden;
+        }}
+        function toggleRouteCancel() {{
+            var p = document.getElementById('route-cancel-panel');
             if (p) p.hidden = !p.hidden;
         }}
         function moveStop(id) {{
@@ -16099,6 +16395,48 @@ def view_route(route_id):
                     <button type="button" class="btn secondary" onclick="toggleMove({_sid})">Cancel</button>
                 </div>
                 <div id="move-err-{_sid}" style="color:#FF7A7A;font-size:12px;margin-top:6px;" hidden></div>
+            </div>"""
+
+        # Cancel / Restore. Separate from Delete on purpose: Delete erases the
+        # stop and its photos, Cancel keeps the whole record and just takes the
+        # work off the board. Boss-side only here; the driver's equivalent lives
+        # in Cab View behind a long-press.
+        cancel_button = ""
+        cancel_panel = ""
+        cancel_note_html = ""
+        if _cancelled:
+            cancel_note_html = (
+                '<span class="cancel-note">&#10005; Cancelled &mdash; '
+                + e(cancel_label(s["cancel_reason"]))
+                + (' (by driver)' if (s["cancel_source"] or "") == "driver" else ' (by office)')
+                + '</span>'
+            )
+            if session.get("role") == "boss":
+                cancel_button = (
+                    f'<form class="inline" method="POST" '
+                    f'action="{url_for("uncancel_stop", stop_id=s["id"])}">'
+                    f'<button class="btn secondary" type="submit">Restore</button></form>'
+                )
+        elif session.get("role") == "boss" and s["status"] != "completed":
+            _sid_c = s["id"]
+            _reason_opts = "".join(
+                '<option value="%s">%s</option>' % (e(_k), e(_v))
+                for _k, _v in CANCEL_REASONS_BOSS.items()
+            )
+            cancel_button = (f'<button type="button" class="btn secondary" '
+                             f'onclick="toggleCancel({_sid_c})">&#10005; Cancel</button>')
+            cancel_panel = f"""
+            <div id="cancel-panel-{_sid_c}" class="move-panel" hidden
+                 style="margin-top:10px;padding:12px;border:1px solid rgba(140,140,132,0.28);border-radius:8px;background:rgba(255,255,255,0.03);">
+                <form method="POST" action="{url_for('cancel_stop', stop_id=_sid_c)}">
+                    <label style="font-size:12px;display:block;margin-bottom:4px;">Why is this stop cancelled?</label>
+                    <select name="reason" style="width:100%;margin-bottom:10px;">{_reason_opts}</select>
+                    <div class="row" style="gap:8px;">
+                        <button class="btn red" type="submit">Cancel this stop</button>
+                        <button type="button" class="btn secondary" onclick="toggleCancel({_sid_c})">Never mind</button>
+                    </div>
+                    <p class="muted small" style="margin:8px 0 0;">The stop stays on the route and in the daily log &mdash; it just stops counting as work.</p>
+                </form>
             </div>"""
 
         # Can-state pill — boss view only, shown when compute_can_flow has run
@@ -16187,25 +16525,31 @@ def view_route(route_id):
                 + (f'<p><strong>Return To:</strong> {_ret_dest}</p>' if _ret_dest else "")
             )
 
+        # A cancelled stop keeps its number and its place in the list so the
+        # driver's stop numbers never shuffle mid-route.
+        _complete_btn = "" if _cancelled else f"""<form class="inline" method="POST" action="{url_for('toggle_stop_complete', stop_id=s['id'])}">
+                        <button class="btn green" type="submit">{'Reopen Stop' if s['status']=='completed' else 'Complete Stop'}</button>
+                    </form>"""
         stop_cards += f"""
-        <div class="stop-card" data-stop-id="{s['id']}">
+        <div class="stop-card{' stop-cancelled' if _cancelled else ''}" data-stop-id="{s['id']}">
             <div class="row between">
                 <div>
-                    {'<span class="stop-handle">☰</span>' if session.get('role') == 'boss' else ''}
-                    <strong>Stop #{_pos}</strong>
-                    <span class="badge {e(s['status'])}">{e(s['status'])}</span>
+                    {'<span class="stop-handle">☰</span>' if session.get('role') == 'boss' and not _cancelled else ''}
+                    <strong class="stop-title">Stop #{_pos}</strong>
+                    {'<span class="badge cancelled">cancelled</span>' if _cancelled else f'<span class="badge {e(s["status"])}">{e(s["status"])}</span>'}
+                    {cancel_note_html}
                 </div>
                 <div class="row">
                     {edit_button}
                     {move_button}
+                    {cancel_button}
                     {delete_button}
                     {_dump_ticket_btn}
-                    <form class="inline" method="POST" action="{url_for('toggle_stop_complete', stop_id=s['id'])}">
-                        <button class="btn green" type="submit">{'Reopen Stop' if s['status']=='completed' else 'Complete Stop'}</button>
-                    </form>
+                    {_complete_btn}
                 </div>
             </div>
             {move_panel}
+            {cancel_panel}
             <p><strong>Customer:</strong> {e(s['customer_name'] or '')}</p>
             {_addr_block}
             <p><strong>Action:</strong> {e(s['action'] or '')}{_can_pill}{_swap_badge}</p>
@@ -16379,12 +16723,24 @@ def view_route(route_id):
         <script>{_STOP_WARNINGS_JS}</script>
         """
 
+    _route_cancel_banner = ""
+    if route["cancelled_at"]:
+        _route_cancel_banner = (
+            '<div class="flash" style="border-left:4px solid #A6A69E;background:rgba(140,140,132,0.12);">'
+            '<strong>This route is cancelled.</strong> '
+            + e(cancel_label(route["cancel_reason"]))
+            + (' &mdash; cancelled by the driver.' if (route["cancel_source"] or "") == "driver"
+               else ' &mdash; cancelled from the office.')
+            + ' Completed stops are unaffected.</div>'
+        )
+
     body = f"""
+    {_route_cancel_banner}
     <div class="hero">
         <h1>{e(route['route_name'])}</h1>
         <p>{e(route['route_date'])} | Assigned to: {e(route['assigned_username'] or 'Unassigned')}</p>
-        <p>Status: <span class="badge {e(route['status'])}">{e(route['status'])}</span></p>
-        <p>Progress: {completed_count}/{total_count} stops completed</p>
+        <p>Status: {'<span class="badge cancelled">cancelled</span>' if route['cancelled_at'] else f'<span class="badge {e(route["status"])}">{e(route["status"])}</span>'}</p>
+        <p>Progress: {completed_count}/{total_count} stops completed{f' &middot; {cancelled_count} cancelled' if cancelled_count else ''}</p>
         <div class="row" style="margin-top:12px;">
             {route_action_buttons}
         </div>

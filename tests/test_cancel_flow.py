@@ -203,4 +203,27 @@ as_driver()
 ok(cl.get("/driver").status_code == 200, "driver dashboard renders")
 ok(cl.get("/driver/route/%d" % rid).status_code == 200, "cab view renders")
 
+# ── driver-facing UI surfaces ─────────────────────────────────────────────
+as_driver()
+html = cl.get("/driver/route/%d" % rid).data.decode()
+ok("cab-cancel-btn" in html, "cab view exposes the cancel control")
+ok("Can&#39;t run this" in html or "Can't run this" in html, "cancel control is labelled for the cab")
+ok("cab-interrupt" in html, "cab view carries the realtime interrupt overlay")
+ok("BOSS_SAID_CANCEL" in html, "'Boss said cancel it' is an offered reason")
+ok("/route/%d/cancel" % rid in html, "whole-route cancel is reachable from the cab")
+
+# poll payload is the channel Cab View actually reads
+j = json.loads(cl.get("/driver/route/%d/status" % rid).data)
+ok("cancelled_ids" in j and "route_cancelled" in j, "poll carries the cancel signal")
+ok(j["current_stop_id"] is not None, "poll now returns current_stop_id")
+
+# cancelled route → terminal screen, not the stop card
+as_driver()
+cl.post("/route/%d/cancel" % rid, data={"_csrf_token": "tok", "reason": "BOSS_SAID_CANCEL"})
+html = cl.get("/driver/route/%d" % rid).data.decode()
+ok("Route Cancelled" in html, "driver sees a cancelled-route screen")
+ok("cab-cancel-btn" not in html, "no cancel control on an already-cancelled route")
+j = json.loads(cl.get("/driver/route/%d/status" % rid).data)
+ok(j["route_cancelled"] is True, "poll reports the route as cancelled")
+
 print("\nALL CANCEL TESTS PASSED")
