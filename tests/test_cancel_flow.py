@@ -206,7 +206,7 @@ ok(cl.get("/driver/route/%d" % rid).status_code == 200, "cab view renders")
 # ── driver-facing UI surfaces ─────────────────────────────────────────────
 as_driver()
 html = cl.get("/driver/route/%d" % rid).data.decode()
-ok("cab-cancel-btn" in html, "cab view exposes the cancel control")
+ok('id="cab-cancel-btn"' in html, "cab view exposes the cancel control")
 ok("Can&#39;t run this" in html or "Can't run this" in html, "cancel control is labelled for the cab")
 ok("cab-interrupt" in html, "cab view carries the realtime interrupt overlay")
 ok("BOSS_SAID_CANCEL" in html, "'Boss said cancel it' is an offered reason")
@@ -222,7 +222,7 @@ as_driver()
 cl.post("/route/%d/cancel" % rid, data={"_csrf_token": "tok", "reason": "BOSS_SAID_CANCEL"})
 html = cl.get("/driver/route/%d" % rid).data.decode()
 ok("Route Cancelled" in html, "driver sees a cancelled-route screen")
-ok("cab-cancel-btn" not in html, "no cancel control on an already-cancelled route")
+ok('id="cab-cancel-btn"' not in html, "no cancel control on an already-cancelled route")
 j = json.loads(cl.get("/driver/route/%d/status" % rid).data)
 ok(j["route_cancelled"] is True, "poll reports the route as cancelled")
 
@@ -269,5 +269,14 @@ ok(not offenders,
    "every hidden element's display: class has a [hidden] override (offenders: %s)"
    % sorted(set(offenders)))
 ok("cab-interrupt[hidden]" in css, "the cancel interrupt specifically is guarded")
+
+# The global `button:not(...)` rule paints every unlisted button in primary
+# safety-orange. The cancel control must stay opted out: rendered orange it
+# outshouts "Tap to Navigate" and reads as the thing to press.
+# Matched off the raw CSS, not the flat rule split above: @media blocks nest
+# braces and desync a naive selector/declaration pairing.
+prim = re.findall(r"button:not\([^{]*\{", css)
+ok(prim and all(".cab-cancel-btn" in s for s in prim),
+   "cancel button is excluded from the primary orange button rule (%d rule(s))" % len(prim))
 
 print("\nALL CANCEL TESTS PASSED")
