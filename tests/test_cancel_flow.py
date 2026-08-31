@@ -226,4 +226,48 @@ ok("cab-cancel-btn" not in html, "no cancel control on an already-cancelled rout
 j = json.loads(cl.get("/driver/route/%d/status" % rid).data)
 ok(j["route_cancelled"] is True, "poll reports the route as cancelled")
 
+# ── the [hidden] trap ─────────────────────────────────────────────────────
+# This app has no global `[hidden] { display:none !important }` rule -- every
+# component that toggles `hidden` ships its own `[hidden]` override. Any class
+# that sets `display:` and is used on a `hidden` element is therefore permanently
+# on screen. That shipped once already: the cancel interrupt covered the whole
+# Cab View and GOT IT looked dead, because tapping it reloaded into the same
+# stuck overlay. This scan fails the build the next time it happens.
+import re
+
+as_driver(drv2)
+cab_html = cl.get("/driver/route/%d" % rid2).data.decode()
+
+css = "\n".join(re.findall(r"<style[^>]*>(.*?)</style>", cab_html, re.S))
+rules = re.findall(r"([^{}]+)\{([^{}]*)\}", css)
+display_classes, hidden_guarded = set(), set()
+for sel, decl in rules:
+    sel = sel.strip()
+    if "display:" in decl.replace(" ", ""):
+        for cls in re.findall(r"\.([A-Za-z0-9_-]+)(?!\[)", sel.split("[")[0]):
+            display_classes.add(cls)
+    for cls in re.findall(r"\.([A-Za-z0-9_-]+)\[hidden\]", sel):
+        hidden_guarded.add(cls)
+
+offenders = []
+for tag in re.findall(r"<[a-zA-Z][^>]*?>", cab_html, re.S):
+    m = re.search(r'class="([^"]*)"', tag)
+    if not m:
+        continue
+    # Strip quoted attribute VALUES before looking for the boolean attribute.
+    # Otherwise an onclick like "...('nav-pref-overlay').hidden=false;" reads
+    # as a hidden element and reports a false offender.
+    bare = re.sub(r'=\s*"[^"]*"', "=x", tag)
+    bare = re.sub(r"=\s*'[^']*'", "=x", bare)
+    if not re.search(r"\shidden(?=[\s/>])", bare):
+        continue
+    for cls in m.group(1).split():
+        if cls in display_classes and cls not in hidden_guarded:
+            offenders.append(cls)
+
+ok(not offenders,
+   "every hidden element's display: class has a [hidden] override (offenders: %s)"
+   % sorted(set(offenders)))
+ok("cab-interrupt[hidden]" in css, "the cancel interrupt specifically is guarded")
+
 print("\nALL CANCEL TESTS PASSED")

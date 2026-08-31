@@ -7713,6 +7713,10 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     background: var(--red); color: #1A0000; font-size: 10px; font-weight: 800;
     border-radius: 9px;
 }}
+/* Required — see the note on .cab-interrupt[hidden]. Without this the badge's
+   display:inline-flex overrides [hidden] and an empty red pill is stuck on the
+   Message Boss button at zero unread. */
+.lane-msg-badge[hidden] {{ display: none; }}
 
 .lane-track {{
     display: flex; gap: 10px; overflow-x: auto; flex: 1; min-width: 0;
@@ -13045,6 +13049,13 @@ _CAB_CANCEL_CSS = """
     align-items:center; justify-content:center; text-align:center; padding:28px;
     background:rgba(10,10,10,0.97);
 }
+/* REQUIRED. This app has no global `[hidden] { display:none !important }` rule
+   -- every component that toggles `hidden` declares its own (see
+   .route-updated-banner[hidden], .msg-modal[hidden], .cab-canplan-toast[hidden]).
+   Without this line the `display:flex` above beats the browser's [hidden] rule,
+   the overlay is on screen permanently, and GOT IT appears dead: the tap
+   reloads the page and the overlay is simply there again. */
+.cab-interrupt[hidden] { display:none; }
 .cab-interrupt h2 { font-size:30px; font-weight:900; letter-spacing:1px; color:#FF5252; margin:0 0 12px; }
 .cab-interrupt p  { font-size:17px; color:#E6E6E0; margin:0 0 26px; max-width:420px; }
 .cab-interrupt button {
