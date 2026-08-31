@@ -103,6 +103,8 @@ Before submitting either binary:
 
 - merge the release pull request and require all GitHub production-readiness
   checks to pass
+- open the production service shell and run `python3 scripts/release_check.py`;
+  do not submit while any required check fails
 - configure `APPLE_TEAM_ID` and `ANDROID_SHA256_FINGERPRINT`, then verify both
   `/.well-known/` association endpoints return HTTP 200
 - configure `BACKUP_S3_BUCKET` and AWS-compatible credentials, run a manual

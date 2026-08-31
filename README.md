@@ -10,8 +10,9 @@ Password reset emails are sent via [Resend](https://resend.com). Set these envir
 
 - `RESEND_API_KEY` — required. Without it, reset/username-recovery requests still succeed from the user's point of view (the app never reveals whether an email is on file or a send failed), but no email actually goes out — check the server logs for `send_email: RESEND_API_KEY not configured`.
 - `RESEND_FROM_EMAIL` — optional, defaults to `HAULTRA AI <onboarding@resend.dev>`. Set this to a verified sending domain in Resend for production.
+- `PUBLIC_BASE_URL` — required in production (for example `https://haultra-systems.com`). Password-reset links use this canonical origin and never trust the incoming request's Host header.
 
-The mail-sending logic lives entirely in the `send_email()` helper in `app.py` — swap providers by editing that one function.
+The mail-sending logic lives entirely in the `send_email()` helper in `app.py` — swap providers by editing that one function. Email bodies and reset tokens are never written to logs.
 
 ### Production backups and retention
 

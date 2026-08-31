@@ -16,7 +16,11 @@ os.environ["DATABASE_PATH"] = str(Path(TMP) / "store.db")
 os.environ["SECRET_KEY"] = "store-compliance-test-only"
 os.environ["UPLOAD_FOLDER"] = str(Path(TMP) / "uploads")
 os.environ.pop("APPLE_TEAM_ID", None)
-os.environ.pop("ANDROID_SHA256_FINGERPRINT", None)
+ANDROID_APP_SIGNING_SHA256 = (
+    "6F:8A:46:AD:1B:0D:D8:E0:98:97:CE:82:47:81:E1:A9:"
+    "C2:4C:D7:AF:65:37:35:C2:B9:59:33:D3:42:1F:10:D7"
+)
+os.environ["ANDROID_SHA256_FINGERPRINT"] = ANDROID_APP_SIGNING_SHA256
 sys.path.insert(0, str(ROOT))
 
 haultra = importlib.import_module("app")
@@ -102,8 +106,13 @@ ok(registration.status_code == 302 and registration.headers["Location"].endswith
 
 ok(client.get("/.well-known/apple-app-site-association").status_code == 404,
    "unsigned Apple association data fails closed")
-ok(client.get("/.well-known/assetlinks.json").status_code == 404,
-   "unsigned Android association data fails closed")
+android_links = client.get("/.well-known/assetlinks.json")
+ok(android_links.status_code == 200, "signed Android association data is published")
+android_target = android_links.get_json()[0]["target"]
+ok(android_target["package_name"] == "com.rockkstaar.haultra",
+   "Android association uses the release package name")
+ok(android_target["sha256_cert_fingerprints"] == [ANDROID_APP_SIGNING_SHA256],
+   "Android association uses the Play app-signing SHA-256 fingerprint")
 
 # ---- Guideline 3.1.1: no unauthenticated route reaches a purchase surface ----
 # The purchase surfaces are "/" (marketing, carries pricing) and

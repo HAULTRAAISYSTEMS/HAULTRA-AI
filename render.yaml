@@ -15,6 +15,12 @@ services:
         value: "0"
       - key: DATABASE_PATH
         value: haultra.db
+      - key: PUBLIC_BASE_URL
+        value: https://haultra-systems.com
+      - key: BOOTSTRAP_ADMIN_USERNAME
+        value: boss
+      - key: BOOTSTRAP_ADMIN_PASSWORD
+        sync: false   # required only when the production database has no boss; remove after first login
       - key: UPLOAD_FOLDER
         value: static/uploads
       - key: ANTHROPIC_API_KEY
@@ -34,7 +40,7 @@ services:
       - key: APPLE_TEAM_ID
         sync: false   # Apple Developer Team ID for Universal Links
       - key: ANDROID_SHA256_FINGERPRINT
-        sync: false   # Play App Signing certificate SHA-256 fingerprint
+        value: "6F:8A:46:AD:1B:0D:D8:E0:98:97:CE:82:47:81:E1:A9:C2:4C:D7:AF:65:37:35:C2:B9:59:33:D3:42:1F:10:D7"
       - key: BACKUP_S3_BUCKET
         sync: false   # required for independent disaster-recovery backups
       - key: BACKUP_S3_PREFIX
