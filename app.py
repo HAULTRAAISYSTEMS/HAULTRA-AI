@@ -1822,6 +1822,84 @@ def _dump_aware_order(stops_data, origin=None, action_map=None, starts_with_can=
     return [s["id"] for s in ordered], constrained
 
 
+# =========================================================
+# CANCELLATION — one definition of "live work"
+# =========================================================
+# Cancelled stops still exist (billing disputes, "prove you were dispatched",
+# analytics), so almost every query that used to mean "not done yet" now means
+# "not done yet AND not cancelled". Route this through one helper rather than
+# hand-writing the predicate at 25 call sites, where it WILL drift and leave a
+# cancelled stop as somebody's permanent current stop.
+
+# Reason codes. Free text is deliberately not accepted from the cab -- a driver
+# in a moving truck taps a chip, they do not type, and an unconstrained reason
+# column is useless for reporting six months out.
+CANCEL_REASONS_BOSS = {
+    "CUSTOMER_CANCELLED": "Customer cancelled",
+    "RESCHEDULED":        "Rescheduled",
+    "DUPLICATE":          "Duplicate / mistake",
+    "WEATHER":            "Weather",
+    "TRUCK_DOWN":         "Truck down",
+    "OTHER":              "Other",
+}
+CANCEL_REASONS_DRIVER = {
+    # First because it is the real-world common case: the boss texts "cancel
+    # it" and the driver clears it off the tablet.
+    "BOSS_SAID_CANCEL":  "Boss said cancel it",
+    "GATE_LOCKED":       "Gate locked",
+    "CAN_NOT_READY":     "Can not ready",
+    "CUSTOMER_REFUSED":  "Customer refused",
+    "NO_ACCESS":         "Can't access site",
+    "OUT_OF_HOURS":      "Out of hours / no time",
+    "OTHER":             "Other",
+}
+CANCEL_REASONS_ALL = {**CANCEL_REASONS_BOSS, **CANCEL_REASONS_DRIVER}
+
+
+def live_stops(alias="s"):
+    """SQL predicate for a stop that still counts as work.
+
+    Use in every query that drives progress counts, "current stop", route
+    auto-completion, or can-flow. A cancelled stop is neither open nor
+    completed -- it is off the board.
+    """
+    return f"{alias}.cancelled_at IS NULL"
+
+
+def cancel_label(code):
+    """Human text for a stored reason code; falls back to the raw code so an
+    older row written before a code was renamed still renders something."""
+    return CANCEL_REASONS_ALL.get(code or "", code or "No reason given")
+
+
+def stop_is_cancelled(row):
+    """True if this stop row is cancelled.
+
+    Tolerant of rows fetched by a query that didn't select cancelled_at --
+    sqlite3.Row raises on a missing key, and a hard failure deep in a render
+    path is a worse outcome than treating an unknown row as live.
+    """
+    try:
+        return bool(row["cancelled_at"]) if "cancelled_at" in row.keys() else False
+    except (TypeError, AttributeError):
+        try:
+            return bool(row["cancelled_at"])
+        except Exception:
+            return False
+
+
+def stop_is_open(row):
+    """True if this stop is still work the driver has to do.
+
+    The single test for "current stop" and "remaining work". A cancelled stop
+    is neither open nor completed. If this ever returns True for a cancelled
+    stop it becomes that driver's permanent current stop and the route can
+    never auto-complete -- which is exactly the bug this whole feature exists
+    to avoid.
+    """
+    return (not stop_is_cancelled(row)) and row["status"] != "completed"
+
+
 def compute_can_flow(conn, route_id, starts_with_can=False):
     """
     Walk ordered stops, stamp can_state_before, and derive swap_with_prev_pull.
@@ -3145,6 +3223,29 @@ def init_db():
     safe_add_column(conn, "stops", "wo_type TEXT")
     safe_add_column(conn, "stops", "dump_location TEXT")
     safe_add_column(conn, "stops", "swap_with_prev_pull INTEGER NOT NULL DEFAULT 0")
+
+    # --- cancellation (soft, reversible, auditable) ------------------------
+    # A cancelled stop/route keeps every row it ever had -- history, photos,
+    # dump tickets, messages -- and is simply no longer live work. This is the
+    # deliberate opposite of delete_stop()/delete_route(), which erase.
+    #
+    # The state is a nullable timestamp rather than a new value in the status
+    # CHECK on purpose: SQLite cannot ALTER a CHECK constraint, and rebuilding
+    # `stops` and `routes` (the two most FK-referenced tables in this app) to
+    # add one word is not a trade worth making. `cancelled_at IS NULL` is the
+    # single global definition of "work that still counts" -- see live_stops().
+    for _cancel_tbl in ("stops", "routes"):
+        safe_add_column(conn, _cancel_tbl, "cancelled_at TEXT")
+        safe_add_column(conn, _cancel_tbl, "cancelled_by INTEGER")
+        safe_add_column(conn, _cancel_tbl, "cancel_reason TEXT")
+        # 'boss' | 'driver' -- who tapped the button, not who authorised it. A
+        # driver cancelling because the boss texted "cancel it" still records
+        # 'driver' here, with reason BOSS_SAID_CANCEL.
+        safe_add_column(conn, _cancel_tbl, "cancel_source TEXT")
+        # Generated on-device so a cancel queued in a dead zone and replayed on
+        # reconnect lands exactly once -- same contract as
+        # route_exceptions.client_uuid.
+        safe_add_column(conn, _cancel_tbl, "cancel_client_uuid TEXT")
     safe_add_column(conn, "companies", "stripe_customer_id TEXT")
     safe_add_column(conn, "companies", "stripe_subscription_id TEXT")
     safe_add_column(conn, "users", "email TEXT")
@@ -6952,6 +7053,29 @@ tr:hover td {{ background: rgba(255,107,26,0.025); }}
     color: #3DDC84;
 }}
 
+/* Cancelled work. Deliberately grey and low-contrast, not red — red is the
+   truck-defect / urgent-dispatch colour in this app and must keep meaning
+   "act now". A cancelled stop is the opposite: nothing to do here. */
+.badge.cancelled {{
+    background: rgba(140,140,132,0.14);
+    border: 1px solid rgba(140,140,132,0.40);
+    color: #A6A69E;
+}}
+
+.stop-cancelled {{
+    opacity: 0.5;
+}}
+.stop-cancelled .stop-address,
+.stop-cancelled .stop-title {{
+    text-decoration: line-through;
+}}
+.cancel-note {{
+    display: inline-block;
+    margin-top: 6px;
+    font-size: 12px;
+    color: #A6A69E;
+}}
+
 /* ── Flash messages ─────────────────────────────────────────*/
 .flash {{
     padding: 12px 16px;
@@ -8689,13 +8813,21 @@ def driver_dashboard():
                 SELECT COUNT(*)
                 FROM stops s
                 WHERE s.route_id = r.id
+                  AND s.cancelled_at IS NULL
             ) AS total_stops,
             (
                 SELECT COUNT(*)
                 FROM stops s
                 WHERE s.route_id = r.id
                   AND s.status = 'completed'
-            ) AS completed_stops
+                  AND s.cancelled_at IS NULL
+            ) AS completed_stops,
+            (
+                SELECT COUNT(*)
+                FROM stops s
+                WHERE s.route_id = r.id
+                  AND s.cancelled_at IS NOT NULL
+            ) AS cancelled_stops
         FROM routes r
         WHERE r.assigned_to = ?
         ORDER BY r.route_date DESC, r.id DESC
@@ -8714,12 +8846,20 @@ def driver_dashboard():
 
     rows = ""
     for r in display_routes:
+        # A cancelled route stays on the driver's list for the rest of the pay
+        # week rather than vanishing -- the driver needs to see that the thing
+        # they were told to drop is actually dropped, and payroll needs the row.
+        _is_cancelled = bool(r["cancelled_at"])
+        _badge = ('<span class="badge cancelled">cancelled</span>' if _is_cancelled
+                  else f'<span class="badge {e(r["status"])}">{e(r["status"])}</span>')
+        _extra = (f' <span class="muted small">+{r["cancelled_stops"]} cancelled</span>'
+                  if r["cancelled_stops"] and not _is_cancelled else "")
         rows += f"""
-        <tr>
+        <tr{' style="opacity:.55;"' if _is_cancelled else ''}>
             <td>{e(r['route_date'])}</td>
             <td>{e(r['route_name'])}</td>
-            <td><span class="badge {e(r['status'])}">{e(r['status'])}</span></td>
-            <td>{r['completed_stops']} / {r['total_stops']}</td>
+            <td>{_badge}</td>
+            <td>{r['completed_stops']} / {r['total_stops']}{_extra}</td>
             <td><a class="btn secondary" href="{url_for('driver_route_detail', route_id=r['id'])}">Open</a></td>
         </tr>
         """
@@ -8730,7 +8870,7 @@ def driver_dashboard():
     _prefetch_urls = json.dumps([
         url_for('driver_route_detail', route_id=r['id'])
         for r in routes
-        if r['status'] in ('open', 'in_progress')
+        if r['status'] in ('open', 'in_progress') and not r['cancelled_at']
     ])
 
     body = f"""
@@ -12954,7 +13094,7 @@ def driver_route_detail(route_id):
     # EN ROUTE transition: when the driver's current stop is a scheduled vendor
     # visit, the truck is now en route to the shop (whichever fires first with
     # the Navigate tap). Idempotent — only bumps 'scheduled' → 'en_route'.
-    _cur_stop = next((st for st in stops if st["status"] != "completed"), None)
+    _cur_stop = next((st for st in stops if stop_is_open(st)), None)
     if (_cur_stop and (_cur_stop["action"] or "").lower() == "vendor"
             and _cur_stop["defect_item_id"]):
         _dv = conn.execute(
@@ -12983,22 +13123,33 @@ def driver_route_detail(route_id):
             '</div></div>'
         )
 
-    completed_count = sum(1 for s in stops if s["status"] == "completed")
-    total_count = len(stops)
+    # Cancelled stops keep their position in the list (so the driver's stop
+    # numbers never shuffle mid-route) but drop out of the denominator -- a
+    # 9-stop day with 1 cancelled reads "3 / 8", not "3 / 9" forever.
+    _live_stops     = [s for s in stops if not stop_is_cancelled(s)]
+    cancelled_count = len(stops) - len(_live_stops)
+    completed_count = sum(1 for s in _live_stops if s["status"] == "completed")
+    total_count     = len(_live_stops)
     pct = int(completed_count / total_count * 100) if total_count else 0
 
     current_stop = None
     current_stop_num = None
     for i, s in enumerate(stops, start=1):
-        if s["status"] != "completed":
+        if stop_is_open(s):
             current_stop = s
             current_stop_num = i
             break
 
-    # The stop immediately before current_stop, if any — by definition it's
-    # completed (current_stop is the first non-completed stop in order), so
-    # a driver who made a mistake can reopen it instead of being stuck.
-    prev_stop = stops[current_stop_num - 2] if current_stop_num and current_stop_num > 1 else None
+    # The nearest completed stop behind current_stop, so a driver who tapped
+    # Complete by mistake can reopen it instead of being stuck. Walks backwards
+    # past any cancelled stops -- "reopen" is meaningless on a cancelled stop,
+    # and offering it would be a second way to resurrect cancelled work.
+    prev_stop = None
+    if current_stop_num and current_stop_num > 1:
+        for _p in reversed(stops[:current_stop_num - 1]):
+            if not stop_is_cancelled(_p):
+                prev_stop = _p
+                break
     _csrf = get_csrf_token()
 
     # ══════════════════════════════════════════════════════════
@@ -15349,7 +15500,7 @@ def driver_route_status(route_id):
         return jsonify({"error": "Access denied."}), 403
 
     stops = conn.execute(
-        "SELECT status FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
+        "SELECT status, cancelled_at FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
         (route_id,)
     ).fetchall()
 
@@ -15368,16 +15519,19 @@ def driver_route_status(route_id):
 
     conn.close()
 
-    total = len(stops)
-    completed = sum(1 for s in stops if s["status"] == "completed")
+    _live = [s for s in stops if not stop_is_cancelled(s)]
+    total = len(_live)
+    completed = sum(1 for s in _live if s["status"] == "completed")
+    cancelled = len(stops) - total
     current_stop_num = None
     for i, s in enumerate(stops, start=1):
-        if s["status"] != "completed":
+        if stop_is_open(s):
             current_stop_num = i
             break
 
     return jsonify({
-        "total": total, "completed": completed, "current_stop_num": current_stop_num,
+        "total": total, "completed": completed, "cancelled": cancelled,
+        "current_stop_num": current_stop_num,
         "unread_messages": unread_messages,
         "urgent": ({"id": urgent_row["id"], "body": urgent_row["body"]} if urgent_row else None),
     })
@@ -15388,16 +15542,38 @@ def _route_realtime_snapshot(conn, route_id, uid):
     stop identity, unread + newest message id, and any unacked urgent message.
     Small and cheap so it can be polled every ~1.5s inside the SSE stream."""
     stops = conn.execute(
-        "SELECT id, status FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
+        """SELECT id, status, cancelled_at, cancel_reason, cancel_source
+             FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC""",
         (route_id,)
     ).fetchall()
-    total = len(stops)
-    completed = sum(1 for s in stops if s["status"] == "completed")
+    _live = [s for s in stops if not stop_is_cancelled(s)]
+    total = len(_live)
+    completed = sum(1 for s in _live if s["status"] == "completed")
     cur_id = cur_num = None
     for i, s in enumerate(stops, start=1):
-        if s["status"] != "completed":
+        if stop_is_open(s):
             cur_id, cur_num = s["id"], i
             break
+
+    # Cancellation signal. This is the whole reason a cancel has to travel over
+    # the stream rather than wait for the next page load: a driver can be
+    # actively rolling toward a stop the boss just killed. Cab View diffs
+    # `cancelled_ids`, and if one of them is the stop on screen it throws a
+    # blocking interrupt rather than quietly re-rendering a list.
+    cancelled_ids = [s["id"] for s in stops if stop_is_cancelled(s)]
+    newest_cancel = None
+    for s in stops:
+        if stop_is_cancelled(s):
+            newest_cancel = {
+                "stop_id": s["id"],
+                "reason":  cancel_label(s["cancel_reason"]),
+                "source":  s["cancel_source"] or "boss",
+            }
+    _rt = conn.execute(
+        "SELECT cancelled_at, cancel_reason, cancel_source FROM routes WHERE id=?",
+        (route_id,)
+    ).fetchone()
+    route_cancelled = bool(_rt and _rt["cancelled_at"])
     msg_max = conn.execute(
         "SELECT COALESCE(MAX(id), 0) mx FROM messages WHERE route_id=?", (route_id,)
     ).fetchone()["mx"]
@@ -15413,6 +15589,11 @@ def _route_realtime_snapshot(conn, route_id, uid):
     ).fetchone()
     return {
         "total": total, "completed": completed,
+        "cancelled": len(cancelled_ids),
+        "cancelled_ids": cancelled_ids,
+        "newest_cancel": newest_cancel,
+        "route_cancelled": route_cancelled,
+        "route_cancel_reason": (cancel_label(_rt["cancel_reason"]) if route_cancelled else None),
         "current_stop_num": cur_num, "current_stop_id": cur_id,
         "msg_max_id": msg_max, "unread_messages": unread,
         "urgent": ({"id": urow["id"], "body": urow["body"]} if urow else None),
@@ -15750,8 +15931,10 @@ def view_route(route_id):
         ).fetchall()
     conn.close()
 
-    completed_count = sum(1 for s in stops if s["status"] == "completed")
-    total_count = len(stops)
+    _live_stops     = [s for s in stops if not stop_is_cancelled(s)]
+    completed_count = sum(1 for s in _live_stops if s["status"] == "completed")
+    total_count     = len(_live_stops)
+    cancelled_count = len(stops) - total_count
 
     # Options for the per-load "Move to route" picker (boss only).
     move_options_html = "".join(
@@ -15885,8 +16068,9 @@ def view_route(route_id):
     # Stop numbers are DISPLAY POSITION (1..N in current order), never the stored
     # stop_order — so a deleted/reordered stop always renumbers cleanly.
     for _pos, s in enumerate(stops, start=1):
-        if next_open_stop_id is None and s["status"] != "completed":
+        if next_open_stop_id is None and stop_is_open(s):
          next_open_stop_id = s["stop_order"]
+        _cancelled = stop_is_cancelled(s)
         photo_html = build_photo_gallery_html(photos_by_stop.get(s["id"], []))
 
         edit_button = f'<a class="btn secondary" href="{url_for("edit_stop", stop_id=s["id"])}">Edit</a>' if session.get("role") == "boss" else ''
@@ -15896,7 +16080,7 @@ def view_route(route_id):
         # target). Reveals an inline picker that POSTs to /api/stops/<id>/move.
         move_button = ""
         move_panel = ""
-        if session.get("role") == "boss" and s["status"] != "completed" and move_options_html:
+        if session.get("role") == "boss" and stop_is_open(s) and move_options_html:
             _sid = s["id"]
             move_button = (f'<button type="button" class="btn secondary" '
                            f'onclick="toggleMove({_sid})">&#8646; Move</button>')
@@ -16358,6 +16542,332 @@ def reopen_route(route_id):
     if session.get("role") != "boss":
         return redirect(url_for("driver_route_detail", route_id=route_id))
     return redirect(url_for("view_route", route_id=route_id))
+
+
+# =========================================================
+# CANCEL / UN-CANCEL  — the soft, reversible opposite of delete
+# =========================================================
+# Two real-world jobs, one mechanism:
+#   * The boss kills a job from the office (customer called it off).
+#   * The driver kills a job from the cab — which in practice is almost always
+#     "the boss texted me cancel it", so that is the first reason chip.
+# Both write the same columns; cancel_source records which seat it came from so
+# the boss can tell at a glance what they cancelled themselves versus what a
+# driver cancelled on their say-so.
+#
+# Nothing here deletes. delete_stop()/delete_route() still exist for "this route
+# was a mistake, erase it"; cancel is "this job is off, keep the paper trail".
+
+
+def _cancel_actor():
+    """Which seat the cancel came from — not who authorised it."""
+    return "boss" if session.get("role") == "boss" else "driver"
+
+
+def _cancel_reason_code(raw, source):
+    """Validate a submitted reason against the chips allowed for that seat.
+
+    An unknown or blank code falls back to OTHER instead of 400. A cancel the
+    boss verbally authorised must never fail because a chip id drifted between
+    a cached tablet page and the server.
+    """
+    code = (raw or "").strip().upper()
+    allowed = CANCEL_REASONS_BOSS if source == "boss" else CANCEL_REASONS_DRIVER
+    return code if code in allowed else "OTHER"
+
+
+def _cancel_wants_json():
+    return (request.headers.get("X-Requested-With") == "XMLHttpRequest"
+            or request.headers.get("X-Sync-Replay") == "1")
+
+
+def _cancel_note(conn, route_id, user_id, body):
+    """Drop a line in the route message thread so the cancel appears in the
+    conversation both sides already watch, and rides the existing SSE push.
+    Best-effort: a missing note must never fail the cancel itself."""
+    try:
+        conn.execute(
+            "INSERT INTO messages (route_id, sender_user_id, body, created_at) "
+            "VALUES (?,?,?,?)",
+            (route_id, user_id, body, now_ts()),
+        )
+    except sqlite3.Error:
+        pass
+
+
+def _actor_name(conn):
+    """Display name for whoever is cancelling — real name when we have one,
+    username otherwise. Only ever used for the human-readable route note."""
+    try:
+        row = conn.execute(
+            "SELECT full_name, username FROM users WHERE id=?",
+            (session.get("user_id"),),
+        ).fetchone()
+        if row:
+            return ((row["full_name"] or row["username"] or "Someone") or "Someone").strip()
+    except sqlite3.Error:
+        pass
+    return session.get("username") or "Someone"
+
+
+def _cancel_redirect(route_id):
+    """Boss lands back on the dispatch view, driver back in the cab."""
+    if session.get("role") == "boss":
+        return redirect(url_for("view_route", route_id=route_id))
+    return redirect(url_for("driver_route_detail", route_id=route_id))
+
+
+@app.route("/stop/<int:stop_id>/cancel", methods=["POST"])
+@login_required
+def cancel_stop(stop_id):
+    """Cancel a single stop. Boss anywhere in the company; driver only on a
+    route assigned to them."""
+    conn = get_db()
+    stop = conn.execute(
+        """SELECT s.id, s.route_id, s.status, s.stop_order, s.customer_name,
+                  s.address, s.cancelled_at, s.cancel_client_uuid,
+                  r.assigned_to
+             FROM stops s JOIN routes r ON s.route_id = r.id
+            WHERE s.id=? AND r.company_id=?""",
+        (stop_id, cid()),
+    ).fetchone()
+    if not stop:
+        conn.close()
+        if _cancel_wants_json():
+            return jsonify({"error": "Stop not found."}), 404
+        abort(404)
+
+    route_id = stop["route_id"]
+    source = _cancel_actor()
+    if source != "boss" and stop["assigned_to"] != session["user_id"]:
+        conn.close()
+        if _cancel_wants_json():
+            return jsonify({"error": "Access denied."}), 403
+        flash("Access denied.", "error")
+        return redirect(url_for("dashboard"))
+
+    client_uuid = (request.form.get("client_uuid") or "").strip() or None
+
+    # Idempotent replay — the same queued tap arriving twice out of a landfill
+    # dead zone is a no-op, not a second cancel.
+    if stop["cancelled_at"]:
+        conn.close()
+        if _cancel_wants_json():
+            return jsonify({
+                "success": True, "already": True, "stop_id": stop_id,
+                "duplicate": bool(client_uuid and stop["cancel_client_uuid"] == client_uuid),
+            })
+        flash("That stop was already cancelled.", "info")
+        return _cancel_redirect(route_id)
+
+    # Completed work is not cancellable. The box is already on the ground or the
+    # can is already on the truck — cancelling would silently un-bill a job that
+    # physically happened. Reopen it first if that is really the intent.
+    if stop["status"] == "completed":
+        conn.close()
+        if _cancel_wants_json():
+            return jsonify({"error": "completed",
+                            "message": "That stop is already completed. Reopen it first."}), 409
+        flash("That stop is already completed — reopen it before cancelling.", "error")
+        return _cancel_redirect(route_id)
+
+    reason = _cancel_reason_code(request.form.get("reason"), source)
+    conn.execute(
+        """UPDATE stops
+              SET cancelled_at=?, cancelled_by=?, cancel_reason=?,
+                  cancel_source=?, cancel_client_uuid=?
+            WHERE id=? AND cancelled_at IS NULL""",
+        (now_ts(), session["user_id"], reason, source, client_uuid, stop_id),
+    )
+
+    _who = _actor_name(conn)
+    _where = (stop["customer_name"] or stop["address"] or ("Stop %d" % stop["stop_order"]))
+    _cancel_note(conn, route_id, session["user_id"],
+                 "%s cancelled stop: %s — %s" % (_who, _where, cancel_label(reason)))
+    conn.commit()
+
+    # The can chain has to be recomputed with this stop out of it, or every
+    # downstream swap/pull inherits a container that never moved.
+    compute_can_flow(conn, route_id)
+    conn.commit()
+    conn.close()
+
+    if _cancel_wants_json():
+        return jsonify({"success": True, "stop_id": stop_id,
+                        "reason": cancel_label(reason), "source": source})
+    flash("Stop cancelled — %s." % cancel_label(reason), "success")
+    return _cancel_redirect(route_id)
+
+
+@app.route("/stop/<int:stop_id>/uncancel", methods=["POST"])
+@boss_required
+def uncancel_stop(stop_id):
+    """Restore a cancelled stop. Boss only — deliberately. A driver can cancel
+    their own work, but only the office can put it back on the board."""
+    conn = get_db()
+    stop = conn.execute(
+        """SELECT s.id, s.route_id, s.cancelled_at
+             FROM stops s JOIN routes r ON s.route_id = r.id
+            WHERE s.id=? AND r.company_id=?""",
+        (stop_id, cid()),
+    ).fetchone()
+    if not stop:
+        conn.close()
+        abort(404)
+    route_id = stop["route_id"]
+    if not stop["cancelled_at"]:
+        conn.close()
+        flash("That stop isn't cancelled.", "info")
+        return _cancel_redirect(route_id)
+
+    conn.execute(
+        """UPDATE stops SET cancelled_at=NULL, cancelled_by=NULL,
+                            cancel_reason=NULL, cancel_source=NULL,
+                            cancel_client_uuid=NULL
+            WHERE id=?""",
+        (stop_id,),
+    )
+    _who = _actor_name(conn)
+    _cancel_note(conn, route_id, session["user_id"],
+                 "%s put a cancelled stop back on the route." % _who)
+    conn.commit()
+    compute_can_flow(conn, route_id)
+    conn.commit()
+    conn.close()
+    flash("Stop restored.", "success")
+    return _cancel_redirect(route_id)
+
+
+@app.route("/route/<int:route_id>/cancel", methods=["POST"])
+@login_required
+def cancel_route(route_id):
+    """Cancel a whole route and everything still outstanding on it.
+
+    Completed stops are left completely alone — they happened, they are
+    billable, and they stay in the daily log. This cancels the remainder.
+    """
+    conn = get_db()
+    route = conn.execute(
+        "SELECT id, route_name, assigned_to, cancelled_at, cancel_client_uuid "
+        "FROM routes WHERE id=? AND company_id=?",
+        (route_id, cid()),
+    ).fetchone()
+    if not route:
+        conn.close()
+        if _cancel_wants_json():
+            return jsonify({"error": "Route not found."}), 404
+        abort(404)
+
+    source = _cancel_actor()
+    if source != "boss" and route["assigned_to"] != session["user_id"]:
+        conn.close()
+        if _cancel_wants_json():
+            return jsonify({"error": "Access denied."}), 403
+        flash("Access denied.", "error")
+        return redirect(url_for("dashboard"))
+
+    client_uuid = (request.form.get("client_uuid") or "").strip() or None
+
+    if route["cancelled_at"]:
+        conn.close()
+        if _cancel_wants_json():
+            return jsonify({
+                "success": True, "already": True, "route_id": route_id,
+                "duplicate": bool(client_uuid and route["cancel_client_uuid"] == client_uuid),
+            })
+        flash("That route was already cancelled.", "info")
+        return _cancel_redirect(route_id)
+
+    reason = _cancel_reason_code(request.form.get("reason"), source)
+    ts = now_ts()
+
+    # Child stops are stamped with a uuid derived from the route cancel, so an
+    # un-cancel restores exactly the stops this action killed and leaves stops
+    # that were cancelled individually beforehand still cancelled.
+    child_uuid = "route-cancel:%d:%s" % (route_id, client_uuid or ts)
+
+    cancelled_n = conn.execute(
+        """UPDATE stops
+              SET cancelled_at=?, cancelled_by=?, cancel_reason=?,
+                  cancel_source=?, cancel_client_uuid=?
+            WHERE route_id=? AND cancelled_at IS NULL AND status != 'completed'""",
+        (ts, session["user_id"], reason, source, child_uuid, route_id),
+    ).rowcount
+
+    conn.execute(
+        """UPDATE routes
+              SET cancelled_at=?, cancelled_by=?, cancel_reason=?,
+                  cancel_source=?, cancel_client_uuid=?
+            WHERE id=? AND cancelled_at IS NULL""",
+        (ts, session["user_id"], reason, source, client_uuid, route_id),
+    )
+
+    _who = _actor_name(conn)
+    _cancel_note(conn, route_id, session["user_id"],
+                 "%s cancelled this route (%d stop%s) — %s"
+                 % (_who, cancelled_n, "" if cancelled_n == 1 else "s", cancel_label(reason)))
+    conn.commit()
+    compute_can_flow(conn, route_id)
+    conn.commit()
+    conn.close()
+
+    if _cancel_wants_json():
+        return jsonify({"success": True, "route_id": route_id,
+                        "cancelled_stops": cancelled_n,
+                        "reason": cancel_label(reason), "source": source})
+    flash("Route cancelled — %d stop%s dropped (%s)."
+          % (cancelled_n, "" if cancelled_n == 1 else "s", cancel_label(reason)), "success")
+    return _cancel_redirect(route_id)
+
+
+@app.route("/route/<int:route_id>/uncancel", methods=["POST"])
+@boss_required
+def uncancel_route(route_id):
+    """Restore a cancelled route and the stops that this cancel took down.
+
+    Stops cancelled individually *before* the route was cancelled stay
+    cancelled — they were a separate decision and restoring them here would
+    quietly resurrect work nobody asked for.
+    """
+    conn = get_db()
+    route = conn.execute(
+        "SELECT id, cancelled_at, cancel_client_uuid FROM routes WHERE id=? AND company_id=?",
+        (route_id, cid()),
+    ).fetchone()
+    if not route:
+        conn.close()
+        abort(404)
+    if not route["cancelled_at"]:
+        conn.close()
+        flash("That route isn't cancelled.", "info")
+        return _cancel_redirect(route_id)
+
+    restored = conn.execute(
+        """UPDATE stops SET cancelled_at=NULL, cancelled_by=NULL,
+                            cancel_reason=NULL, cancel_source=NULL,
+                            cancel_client_uuid=NULL
+            WHERE route_id=? AND cancel_client_uuid LIKE ?""",
+        (route_id, "route-cancel:%d:%%" % route_id),
+    ).rowcount
+
+    conn.execute(
+        """UPDATE routes SET cancelled_at=NULL, cancelled_by=NULL,
+                             cancel_reason=NULL, cancel_source=NULL,
+                             cancel_client_uuid=NULL
+            WHERE id=?""",
+        (route_id,),
+    )
+    _who = _actor_name(conn)
+    _cancel_note(conn, route_id, session["user_id"],
+                 "%s reinstated this route (%d stop%s back on)."
+                 % (_who, restored, "" if restored == 1 else "s"))
+    conn.commit()
+    compute_can_flow(conn, route_id)
+    conn.commit()
+    conn.close()
+    flash("Route reinstated — %d stop%s back on."
+          % (restored, "" if restored == 1 else "s"), "success")
+    return _cancel_redirect(route_id)
 
 
 # =========================================================
