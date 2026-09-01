@@ -10026,7 +10026,40 @@ def boss_notifications_page():
       var btn  = document.getElementById('push-btn');
       var sub  = document.getElementById('push-sub');
       var KEY  = null;
-      if (!('Notification' in window) || !('PushManager' in window) || !navigator.serviceWorker) return;
+
+      // Tell the truth about where push can and cannot arrive, BEFORE offering
+      // a button. Two contexts accept a permission prompt and then never
+      // deliver anything, which is worse than saying so up front:
+      //   * iOS Safari in a normal tab — Apple only allows push to a web app
+      //     launched from the Home Screen, and there is no way around it.
+      //   * the Capacitor store build — its WebView has no Push API; that
+      //     needs FCM/APNs through the native layer.
+      var ua = navigator.userAgent || '';
+      var isIOS = /iPad|iPhone|iPod/.test(ua) ||
+                  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+      var isStandalone = window.navigator.standalone === true ||
+                         window.matchMedia('(display-mode: standalone)').matches;
+      var isNativeShell = ua.indexOf('HaultraNativeApp') !== -1;
+
+      function blocked(reason) {
+        card.hidden = false;
+        btn.hidden = true;
+        sub.textContent = reason;
+      }
+      if (isNativeShell) {
+        blocked('Phone alerts don\u2019t work in the installed app yet. ' +
+                'Open haultra-systems.com in Safari or Chrome and add it to your Home Screen to get them.');
+        return;
+      }
+      if (isIOS && !isStandalone) {
+        blocked('On iPhone, tap Share \u2192 Add to Home Screen, then open HAULTRA from that icon ' +
+                'and come back here. Apple only allows alerts for a home-screen app.');
+        return;
+      }
+      if (!('Notification' in window) || !('PushManager' in window) || !navigator.serviceWorker) {
+        blocked('This browser can\u2019t receive push notifications.');
+        return;
+      }
 
       // base64url -> Uint8Array. PushManager wants raw bytes for the app server
       // key; handing it the string silently fails to subscribe.

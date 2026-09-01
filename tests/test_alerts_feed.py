@@ -205,6 +205,10 @@ html = cl.get("/boss/notifications").get_data(as_text=True)
 ok("push-card" in html, "the phone-alerts row is on the page")
 ok("firebasejs" not in html, "no Firebase scripts are loaded any more")
 ok("applicationServerKey" in html, "the client subscribes through the standard PushManager")
+ok("Add to Home Screen" in html,
+   "iPhone users in a Safari tab are told why push can't work, instead of a button that fails")
+ok("HaultraNativeApp" in html,
+   "the store build is detected and told where push does work")
 
 # ── relative time uses the same clock the rows were written with ──────────
 ok(app._ago(app.now_ts()) == "just now",
