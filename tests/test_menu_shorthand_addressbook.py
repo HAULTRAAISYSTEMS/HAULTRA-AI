@@ -89,15 +89,32 @@ ok(row["n"] == 1, "re-learning 'hamp' added no row (still one)")
 ok((row["u"] or 0) >= 2, "re-learning bumped times_used")
 
 # ---- item 1: More menu grouped sections in the exact order -----------------
-html = cl.get("/", follow_redirects=True).get_data(as_text=True)
+import re as _re
+full_html = cl.get("/", follow_redirects=True).get_data(as_text=True)
+# Anchor on the MARKUP, not the class name — "topnav-more" first appears in the
+# stylesheet, thousands of characters before the menu itself.
+_more_start = full_html.find('<details class="topnav-more"')
+assert _more_start != -1, "More menu markup not found in page"
+html = full_html[_more_start:full_html.find("</details>", _more_start)]
 def pos(t): return html.find(t)
-order = ["Team Hours","Team Time Off","🚛 Trucks","🔧 Vendors","🛠 Maintenance","👥 Team","🏗 Yard Setup","⚙ Settings","Logout"]
-positions = [pos(t) for t in order]
-ok(all(p != -1 for p in positions), "all More-menu items present")
-ok(positions == sorted(positions), "More-menu items in the exact required order")
-ok("topnav-more-head" in html and pos("Team") < pos("Fleet") < pos("Setup"),
+
+# Read the menu's actual item labels in document order, rather than searching
+# the raw HTML for each word. The SVG icon set replaced the emoji that used to
+# prefix these, and a bare "Team" would otherwise match the "Team" SECTION
+# HEADER before it ever reached the Team menu item. What this guards is the
+# menu's contents and order — not which glyph sits in front of each one.
+_items = [_re.sub(r"<[^>]+>", "", m).strip()
+          for m in _re.findall(r'<a class="nav-item[^"]*"[^>]*>(.*?)</a>', html, _re.S)]
+_items += [_re.sub(r"<[^>]+>", "", m).strip()
+           for m in _re.findall(r'<button[^>]*class="nav-item[^"]*"[^>]*>(.*?)</button>', html, _re.S)]
+order = ["Team Hours","Team Time Off","Trucks","Vendors","Maintenance","Team","Yard Setup","Settings","Logout"]
+missing = [lbl for lbl in order if lbl not in _items]
+ok(not missing, "all More-menu items present (missing: %s; found: %s)" % (missing, _items))
+_idx = [_items.index(lbl) for lbl in order]
+ok(_idx == sorted(_idx), "More-menu items in the exact required order (found: %s)" % _items)
+ok("topnav-more-head" in html and pos(">Team<") < pos(">Fleet<") < pos(">Setup<"),
    "three grouped section headers (Team, Fleet, Setup) render in order")
-ok(pos(chr(34)+"topnav-more-sep"+chr(34)) < pos("⏻ Logout") and pos(chr(34)+"topnav-more-sep"+chr(34)) > pos("⚙ Settings"),
+ok(pos(chr(34)+"topnav-more-sep"+chr(34)) < pos("Logout") and pos(chr(34)+"topnav-more-sep"+chr(34)) > pos("Yard Setup"),
    "separator sits between Settings and Logout")
 
 # ---- item 3c: no-name entry shows the street label -------------------------

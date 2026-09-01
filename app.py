@@ -6301,6 +6301,10 @@ _BRAND_SPRITE = """
   <path d="M3.5 13 6 5h12l2.5 8v6h-17z"/><path d="M3.5 13H9l1 2.5h4l1-2.5h5.5"/></symbol>
 <symbol id="i-spark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
   <path d="M12 3.2 13.9 9l5.8 1.9-5.8 1.9L12 18.6 10.1 12.8 4.3 10.9 10.1 9z"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M18 9a6 6 0 1 0-12 0c0 5-2 6.5-2 6.5h16S18 14 18 9Z"/><path d="M13.7 19.5a2 2 0 0 1-3.4 0"/></symbol>
+<symbol id="i-power" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M12 3.5v8"/><path d="M17.5 6.6a7.5 7.5 0 1 1-11 0"/></symbol>
 <symbol id="i-gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
   <circle cx="12" cy="12" r="3.1"/><path d="M19.4 14.6a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1v.2a2 2 0 0 1-4 0v-.1a1.6 1.6 0 0 0-2.8-1.1l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0-1.1-2.7h-.2a2 2 0 0 1 0-4h.1A1.6 1.6 0 0 0 4.5 7l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 2.7-1.1v-.2a2 2 0 0 1 4 0v.1a1.6 1.6 0 0 0 2.8 1.1l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0 1.1 2.7h.2a2 2 0 0 1 0 4h-.1a1.6 1.6 0 0 0-1.4 1z"/></symbol>
 <symbol id="i-calendar" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
@@ -6523,7 +6527,7 @@ def shell_page(title, body, extra_head=""):
             _mparts.append(_mhead("Team"))
             _mparts.append(nav_link(
                 url_for("boss_notifications_page"),
-                "🔔 Alerts" + _nav_badge("account-alert-nav-badge", _account_alerts),
+                icon('bell') + 'Alerts' + _nav_badge("account-alert-nav-badge", _account_alerts),
                 path,
             ))
             _mparts.append(nav_link(url_for("team_hours_page"), icon('clock') + 'Team Hours', path))
@@ -6577,7 +6581,7 @@ def shell_page(title, body, extra_head=""):
                             {superadmin_link}
                             <div class="topnav-more-sep"></div>
                             <form method="POST" action="{url_for('logout')}" style="margin:0;padding:0;">
-                                <button type="submit" class="nav-item nav-logout">⏻ Logout</button>
+                                <button type="submit" class="nav-item nav-logout">{icon('power')} Logout</button>
                             </form>
                         </div>
                     </details>
@@ -6688,6 +6692,93 @@ a:hover {{ color: #FF9D5C; }}
 }}
 .footer-slim a {{ color: var(--text-muted); }}
 .footer-slim a:hover {{ color: var(--text-soft); }}
+
+/* ── Dashboard focus row ────────────────────────────────────*/
+/* Three tiles that answer "what needs me right now", each carrying a line of
+   context. The rail down the left encodes state in form as well as number, so
+   the shape of the day reads before any word does. */
+.focus-row {{
+    display: grid; gap: 12px; margin-bottom: 12px;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}}
+.focus-tile {{
+    position: relative; overflow: hidden;
+    background: var(--bg-card); border: 1px solid rgba(255,255,255,0.07);
+    border-radius: var(--radius-lg); padding: 17px 19px;
+}}
+.focus-tile::before {{
+    content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 2px;
+    background: rgba(255,255,255,0.1);
+}}
+.focus-tile.live::before {{ background: var(--orange, #FF6B1A); }}
+.focus-tile.good::before {{ background: var(--green); }}
+.focus-tile.need::before {{ background: var(--slate); }}
+.focus-tile.calm::before {{ background: rgba(61,220,132,0.4); }}
+.focus-tile h4 {{
+    margin: 0 0 10px; font-family: var(--font-mono);
+    font-size: 10px; letter-spacing: 1.6px; text-transform: uppercase;
+    color: var(--text-muted); font-weight: 600;
+}}
+.focus-num {{
+    font-family: var(--font-head); font-size: 42px; line-height: .85;
+    letter-spacing: .5px; color: var(--text); font-variant-numeric: tabular-nums;
+}}
+.focus-num.live {{ color: #FF9D5C; }}
+.focus-num.good {{ color: var(--green); }}
+.focus-num.need {{ color: #B4C4D3; }}
+.focus-num.calm {{ color: var(--text-soft); }}
+.focus-of {{ font-family: var(--font-head); font-size: 21px; color: var(--text-muted); }}
+.focus-tile p {{ margin: 9px 0 0; font-size: 12px; color: var(--text-muted); line-height: 1.45; }}
+
+.minor-strip {{ display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 22px; }}
+.minor-chip {{
+    border: 1px solid rgba(255,255,255,0.07); border-radius: 9px;
+    padding: 7px 12px; font-size: 11.5px; color: var(--text-muted);
+}}
+.minor-chip b {{ color: var(--text-soft); font-weight: 700; font-variant-numeric: tabular-nums; }}
+
+/* Card section headings carry an icon at the text's own size. */
+.card h2 {{ display: flex; align-items: center; gap: 9px; }}
+
+/* ── Auth screens ───────────────────────────────────────────*/
+.auth-wrap {{
+    min-height: calc(100vh - 60px);
+    display: flex; align-items: center; justify-content: center;
+    padding: 32px 24px 40px;
+}}
+.auth-inner {{ width: 100%; max-width: 420px; }}
+.auth-brand {{
+    display: flex; align-items: center; justify-content: center; gap: 16px;
+    margin-bottom: 30px;
+}}
+.auth-mark {{ filter: drop-shadow(0 0 18px rgba(255,107,26,0.28)); }}
+.auth-word {{
+    font-family: var(--font-head);
+    font-size: 46px; letter-spacing: 3px; line-height: 1;
+    background: linear-gradient(130deg, #ffffff 0%, #F5F5F0 55%, #FF6B1A 100%);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+}}
+.auth-tagline {{
+    font-family: var(--font-mono);
+    font-size: 9.5px; font-weight: 400; letter-spacing: 3.4px;
+    color: var(--text-muted); text-transform: uppercase; margin-top: 6px;
+}}
+.auth-card {{ background: #171719; border: 1px solid rgba(255,255,255,0.08); }}
+
+/* The toggle sits inside the field, vertically centred on the INPUT rather
+   than stretched over the wrapper — the old top:0;bottom:0 also covered the
+   input's margin, which is why it hung past the field's edge. */
+.pw-wrap {{ position: relative; display: block; }}
+.pw-wrap input {{ padding-right: 74px; }}
+.pw-toggle {{
+    position: absolute; right: 6px; top: 6px;
+    min-height: 44px; padding: 0 12px;
+    background: transparent; border: 0; border-radius: 8px;
+    color: var(--text-muted);
+    font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 1px;
+    text-transform: uppercase; cursor: pointer; box-shadow: none;
+}}
+.pw-toggle:hover {{ color: var(--text-soft); background: rgba(255,255,255,0.05); }}
 
 /* ── Icons ──────────────────────────────────────────────────*/
 /* One stroke set, sized in em so an icon always matches the text it sits
@@ -7079,7 +7170,7 @@ a:hover {{ color: #FF9D5C; }}
    BUTTONS
    ══════════════════════════════════════════════════════════*/
 .btn,
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.cab-leg-chip) {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.cab-leg-chip) {{
     display: inline-block;
     border: none;
     cursor: pointer;
@@ -7097,7 +7188,7 @@ button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact
 }}
 
 .btn:hover,
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.cab-leg-chip):hover {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.cab-leg-chip):hover {{
     filter: brightness(1.1);
     transform: translateY(-1px);
     text-decoration: none;
@@ -7362,13 +7453,16 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .footer-note a {{ color: #4A4A42; margin: 0 6px; }}
 .footer-note a:hover {{ color: var(--cyan); }}
 .footer-trust {{ display: flex; justify-content: center; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }}
+.footer-trust {{ gap: 8px !important; }}
 .footer-badge {{
-    display: inline-flex; align-items: center; gap: 4px;
-    font-size: 10px; color: #4A4A42;
-    background: rgba(255,255,255,0.015);
-    border: 1px solid rgba(255,107,26,0.06);
-    border-radius: 20px; padding: 3px 10px;
+    display: inline-flex; align-items: center; gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 9.5px; letter-spacing: .7px; color: #5A5A52;
+    background: rgba(255,255,255,0.02);
+    border: 1px solid rgba(255,255,255,0.055);
+    border-radius: 20px; padding: 5px 11px;
 }}
+.footer-badge .ic {{ width: 12px; height: 12px; opacity: .8; }}
 
 /* ══════════════════════════════════════════════════════════
    OWNER DASHBOARD — diesel-gauge stat cards, bar chart, inventory
@@ -7615,11 +7709,16 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     font-size: 15px; border: none; letter-spacing: .02em;
 }}
 .cab-urgent-ack:disabled {{ opacity: .6; cursor: progress; }}
-.cab-action-name {{ font-size: 15px; font-weight: 700; color: #D8D8D0; letter-spacing: .3px; }}
+.cab-action-name {{
+    font-size: 23px; font-weight: 800; color: #F5F5F0;
+    letter-spacing: -.2px; line-height: 1.15;
+}}
+@media (max-width: 360px) {{ .cab-action-name {{ font-size: 20px; }} }}
 
 .cab-address {{
-    font-family: var(--font-mono); font-size: 26px; font-weight: 700;
-    color: #F5F5F0; line-height: 1.25; word-break: break-word; margin-bottom: 6px;
+    font-family: var(--font-body); font-size: 20px; font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-soft); line-height: 1.35; word-break: break-word; margin-bottom: 6px;
 }}
 .cab-meta-line {{ font-size: 14px; color: var(--text-muted); margin-bottom: 4px; }}
 .cab-legs {{
@@ -7958,7 +8057,7 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 @media (max-width: 560px) {{
     .topnav-brand-sub {{ display: none; }}
     .logo-h, .logo-rest {{ font-size: 16px; }}
-    .cab-address {{ font-size: 21px; }}
+    .cab-address {{ font-size: 18px; }}
     .cab-card {{ padding: 14px 15px; }}
 }}
 </style>
@@ -8737,41 +8836,32 @@ def login():
     """
 
     body = f"""
-    <div style="min-height:calc(100vh - 60px);display:flex;align-items:center;justify-content:center;padding:24px;">
-      <div style="width:100%;max-width:420px;">
-        <div style="text-align:center;margin-bottom:28px;">
-            <div style="font-family:var(--font-head);font-size:52px;letter-spacing:3px;line-height:1;
-                        background:linear-gradient(130deg, #ffffff 0%, #F5F5F0 55%, #FF6B1A 100%);
-                        -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;">
-                HAULTRA
-            </div>
-            <div style="font-size:11px;font-weight:700;letter-spacing:4px;color:#78786F;
-                        text-transform:uppercase;margin-top:6px;">
-                AI Dispatch Systems
+    <div class="auth-wrap">
+      <div class="auth-inner">
+        <div class="auth-brand">
+            {brand_mark(64, "auth-mark")}
+            <div>
+                <div class="auth-word">HAULTRA</div>
+                <div class="auth-tagline">AI Dispatch Systems</div>
             </div>
         </div>
-        <div class="card" style="background:#171717;border:1px solid rgba(255,255,255,0.08);">
+        <div class="card auth-card">
                 <form method="POST">
                 <label>Username</label>
-                <input name="username" required autocomplete="username">
+                <input name="username" required autocomplete="username" autocapitalize="none" spellcheck="false">
                 <label>Password</label>
-                <div style="position:relative;">
+                <div class="pw-wrap">
                     <input type="password" id="login-password" name="password" required
-                           autocomplete="current-password" style="padding-right:56px;">
-                    <button type="button" id="toggle-login-password"
+                           autocomplete="current-password">
+                    <button type="button" id="toggle-login-password" class="pw-toggle"
                             onclick="var p=document.getElementById('login-password');var showing=p.type==='text';p.type=showing?'password':'text';this.textContent=showing?'Show':'Hide';this.setAttribute('aria-label',showing?'Show password':'Hide password');"
-                            aria-label="Show password"
-                            style="position:absolute;right:0;top:0;bottom:0;min-width:48px;min-height:48px;
-                                   background:none;border:none;color:#78786F;font-size:12px;font-weight:700;
-                                   letter-spacing:.3px;text-transform:uppercase;cursor:pointer;padding:0 14px;">
-                        Show
-                    </button>
+                            aria-label="Show password">Show</button>
                 </div>
-                <div style="margin-top:16px;">
-                    <button type="submit" style="width:100%;min-height:48px;font-size:15px;">Login</button>
+                <div style="margin-top:18px;">
+                    <button type="submit" style="width:100%;min-height:54px;font-size:15.5px;">Log In</button>
                 </div>
 
-                <div style="margin-top:14px;text-align:center;">
+                <div style="margin-top:16px;text-align:center;">
                 <a href="{url_for('forgot_password')}" class="small">Forgot password?</a>
                 </div>
 
@@ -10873,7 +10963,7 @@ def boss_dashboard():
     # --- active routes (open + in_progress) with per-route stop progress ---
     active_routes = conn.execute("""
         SELECT r.id, r.route_name, r.route_date, r.status, r.assigned_to,
-               COALESCE(u.username, 'Unassigned') AS assigned_username,
+               COALESCE(NULLIF(TRIM(u.full_name),''), u.username, 'Unassigned') AS assigned_username,
                COUNT(s.id) AS total_stops,
                SUM(CASE WHEN s.status='completed' THEN 1 ELSE 0 END) AS done_stops
         FROM routes r
@@ -10888,7 +10978,7 @@ def boss_dashboard():
     # --- recently completed routes (capped at 25) ---
     recent_completed = conn.execute("""
         SELECT r.id, r.route_name, r.route_date, r.status, r.assigned_to,
-               COALESCE(u.username, 'Unassigned') AS assigned_username,
+               COALESCE(NULLIF(TRIM(u.full_name),''), u.username, 'Unassigned') AS assigned_username,
                COUNT(s.id) AS total_stops,
                SUM(CASE WHEN s.status='completed' THEN 1 ELSE 0 END) AS done_stops
         FROM routes r
@@ -10902,7 +10992,8 @@ def boss_dashboard():
 
     # --- driver performance ---
     driver_stats = conn.execute("""
-        SELECT u.id, u.username,
+        SELECT u.id,
+               COALESCE(NULLIF(TRIM(u.full_name),''), u.username) AS username,
                COUNT(DISTINCT r.id) AS route_count,
                COUNT(s.id) AS stop_count,
                SUM(CASE WHEN s.status='completed' THEN 1 ELSE 0 END) AS completed_stop_count,
@@ -10958,7 +11049,7 @@ def boss_dashboard():
             <td>
                 <a href="{url_for('view_route', route_id=r['id'])}">{e(r['route_name'])}</a>
                 <br><a href="{url_for('route_daily_log', route_id=r['id'])}"
-                       style="font-size:11px;color:#D8D8D0;">&#x1F4CB; Daily Log</a>
+                       style="font-size:11px;color:#D8D8D0;">{icon('clipboard')} Daily Log</a>
             </td>
             <td style="white-space:nowrap;">{e(r['route_date'] or '')}</td>
             <td><span class="badge {e(r['status'])}">{status_label}</span></td>
@@ -11000,31 +11091,68 @@ def boss_dashboard():
             </td>
         </tr>"""
 
+    # ── Focus row ──────────────────────────────────────────────────────
+    # Eight identical tiles, most of them reading zero, answer no question. The
+    # dashboard's job in the first second is "what needs me?", so three tiles
+    # carry that with a line of context each, and the raw counts drop to a
+    # reference strip underneath.
+    _running    = [r for r in active_routes if r["status"] == "in_progress"]
+    _unassigned = [r for r in active_routes if not r["assigned_to"]]
+
+    if not _running:
+        _running_ctx = "No route is moving right now."
+    elif len(_running) == 1:
+        _r0 = _running[0]
+        _cur = (_r0["done_stops"] or 0) + 1
+        _running_ctx = (f'{e(_r0["route_name"])} &middot; {e(_r0["assigned_username"])} '
+                        f'&middot; stop {min(_cur, _r0["total_stops"] or _cur)} of {_r0["total_stops"]}')
+    else:
+        _running_ctx = f'{len(_running)} routes moving &middot; {drivers_count} driver{"" if drivers_count == 1 else "s"} on the clock'
+
+    _pct = int(completed_stops / total_stops * 100) if total_stops else 0
+    _stops_ctx = f"{_pct}% of the board cleared"
+
+    if not _unassigned:
+        _unassigned_ctx = "Every active route has a driver."
+    else:
+        _unassigned_ctx = " &middot; ".join(e(r["route_name"]) for r in _unassigned[:2])
+        if len(_unassigned) > 2:
+            _unassigned_ctx += f" &middot; +{len(_unassigned) - 2} more"
+
     body = f"""
     <div class="hero">
         <h1>Boss Panel</h1>
         <p>Live overview of all routes, driver progress, and assignments.</p>
     </div>
 
-    <div class="grid">
-        <div class="stat"><div>Total Routes</div><div class="num">{total_routes}</div></div>
-        <div class="stat"><div>Open</div><div class="num">{open_routes}</div></div>
-        <div class="stat" style="border-color:rgba(255,107,26,0.45);">
-            <div>In Progress</div><div class="num" style="color:#FF6B1A;">{progress_routes}</div>
+    <div class="focus-row">
+        <div class="focus-tile live">
+            <h4>Running now</h4>
+            <div class="focus-num live">{len(_running)}</div>
+            <p>{_running_ctx}</p>
         </div>
-        <div class="stat" style="border-color:rgba(61,220,132,0.35);">
-            <div>Completed</div><div class="num" style="color:#3DDC84;">{completed_routes}</div>
+        <div class="focus-tile good">
+            <h4>Stops done</h4>
+            <div class="focus-num good">{completed_stops}<span class="focus-of">/{total_stops}</span></div>
+            <p>{_stops_ctx}</p>
         </div>
-        <div class="stat"><div>Total Stops</div><div class="num">{total_stops}</div></div>
-        <div class="stat" style="border-color:rgba(61,220,132,0.35);">
-            <div>Stops Done</div><div class="num" style="color:#3DDC84;">{completed_stops}</div>
+        <div class="focus-tile {'need' if _unassigned else 'calm'}">
+            <h4>Needs a driver</h4>
+            <div class="focus-num {'need' if _unassigned else 'calm'}">{len(_unassigned)}</div>
+            <p>{_unassigned_ctx}</p>
         </div>
-        <div class="stat"><div>Drivers</div><div class="num">{drivers_count}</div></div>
-        <div class="stat"><div>New Orders</div><div class="num">{new_orders}</div></div>
+    </div>
+
+    <div class="minor-strip">
+        <span class="minor-chip">Total routes <b>{total_routes}</b></span>
+        <span class="minor-chip">Open <b>{open_routes}</b></span>
+        <span class="minor-chip">Completed <b>{completed_routes}</b></span>
+        <span class="minor-chip">Drivers <b>{drivers_count}</b></span>
+        <span class="minor-chip">New orders <b>{new_orders}</b></span>
     </div>
 
     <div class="card">
-        <h2>&#128338; Active Routes</h2>
+        <h2>{icon('clock')} Active Routes</h2>
         <div class="table-wrap">
             <table>
                 {route_thead}
@@ -11034,7 +11162,7 @@ def boss_dashboard():
     </div>
 
     <div class="card">
-        <h2>&#10003; Recently Completed</h2>
+        <h2>{icon('check')} Recently Completed</h2>
         <div class="table-wrap">
             <table>
                 {completed_thead}
@@ -11044,7 +11172,7 @@ def boss_dashboard():
     </div>
 
     <div class="card">
-        <h2>&#128100; Driver Performance</h2>
+        <h2>{icon('users')} Driver Performance</h2>
         <div class="table-wrap">
             <table>
                 <thead><tr><th>Driver</th><th>Routes</th><th>Stops Progress</th></tr></thead>
@@ -14273,7 +14401,7 @@ def driver_route_detail(route_id):
 
     # Action badge — vendor visits get a distinct wrench badge.
     if is_vendor:
-        cab_action_badge = '<div class="cab-action-badge vendor">&#128295; VENDOR</div>'
+        cab_action_badge = f'<div class="cab-action-badge vendor">{icon("wrench")} VENDOR</div>'
     else:
         cab_action_badge = f'<div class="cab-action-badge badge-{_action_badge_code(s["action"])}">{e(s["action"] or "STOP")}</div>'
     phone_line = f'<div class="cab-meta-line"><strong>Phone:</strong> <a href="tel:{e(_s["phone"])}" style="color:#3DDC84;">{e(_s["phone"])}</a></div>' if _s.get("phone") else ""
@@ -14338,7 +14466,7 @@ def driver_route_detail(route_id):
     _copy_dis = "" if nav_has_addr else " disabled"
     _msg_boss_html = (
         f'<button type="button" class="cab-neutral" id="msg-boss-btn" onclick="openMessageThread({route_id}, \'Boss\')">'
-        f'&#128172; Message Boss<span id="msg-boss-badge" class="lane-msg-badge" '
+        f'{icon("msg")} Message Boss<span id="msg-boss-badge" class="lane-msg-badge" '
         f'{"hidden" if not unread_messages else ""}>{unread_messages or ""}</span></button>'
     )
     _arrive_action = url_for('stop_driver_action', stop_id=stop_id)
@@ -14378,12 +14506,12 @@ def driver_route_detail(route_id):
         {phone_line}
         {_noaddr_html}
         <a class="cab-primary{_dis}" id="cab-nav-btn" href="{nav_google_web}"
-           aria-disabled="{_dis_aria}" onclick="{_nav_onclick}">&#128205; Tap to Navigate</a>
+           aria-disabled="{_dis_aria}" onclick="{_nav_onclick}">{icon('pin','ic ic-lg')} Navigate</a>
         {_msg_boss_html}
         <form method="POST" action="{_arrive_action}" class="inline" style="margin:0;">
             <input type="hidden" name="_csrf_token" value="{_csrf}">
             <input type="hidden" name="action" value="arrived">
-            <button type="submit" class="cab-neutral cab-arrived-btn" id="cab-arrived-btn">&#9989; Arrived at Stop</button>
+            <button type="submit" class="cab-neutral cab-arrived-btn" id="cab-arrived-btn">{icon('check')} Arrived at Stop</button>
         </form>
         """
 
@@ -14428,6 +14556,7 @@ def driver_route_detail(route_id):
       min-height:64px; margin-top:10px; padding:0 16px; border:none; border-radius:14px;
       background: var(--orange, #FF6B1A); color:#0A0A0A; font-size:1.15rem; font-weight:800;
       letter-spacing:.4px; text-decoration:none; box-shadow:none; cursor:pointer; }}
+  .cab-primary:hover, .cab-primary:focus, .cab-primary:active {{ color:#0A0A0A; }}
   .cab-primary.is-disabled {{ opacity:.45; pointer-events:none; }}
   /* Neutral: dark fill, light text, hairline border, NO orange, NO glow. */
   .cab-neutral {{ display:flex; align-items:center; justify-content:center; width:100%;
@@ -14435,6 +14564,7 @@ def driver_route_detail(route_id):
       border-radius:12px; background: var(--cab-neutral-bg, #161616); color: var(--text, #F5F5F0);
       font-size:1rem; font-weight:700; text-decoration:none; box-shadow:none; cursor:pointer; }}
   .cab-neutral:active {{ background:#1c1c1c; }}
+  .cab-primary, .cab-neutral {{ gap: 10px; }}
   .cab-unarrive {{ min-height:44px; font-size:.9rem; color: var(--text-dim, #A6A69E); font-weight:600; }}
   /* Phase-2 thin nav strip: one line — address + small Navigate + Copy. */
   .cab-navstrip {{ display:flex; align-items:center; gap:10px; margin-top:10px; padding:10px 12px;
@@ -16423,7 +16553,7 @@ def view_route(route_id):
         )
         route_action_buttons += f"""
     {_paste_route_btn}
-    <a class="btn secondary" href="{url_for('route_daily_log', route_id=route_id)}">&#x1F4CB; Daily Log</a>
+    <a class="btn secondary" href="{url_for('route_daily_log', route_id=route_id)}">{icon('clipboard')} Daily Log</a>
     <form class="inline" method="POST" action="{url_for('optimize_route', route_id=route_id)}"
           id="optimize-form"
           onsubmit="showOptimizeOverlay(event, {len(stops)})">
