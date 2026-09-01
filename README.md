@@ -56,6 +56,29 @@ the push service reports as gone (404/410) are retired automatically.
 Only `critical` and `warning` alerts push. A time-off request is recorded but
 never buzzes a phone.
 
+### Email alerts (the channel that reaches the store apps)
+
+The Capacitor App Store / Play Store builds have **no Push API at all** — their
+WebView cannot receive web push, and the iOS project carries no `aps-environment`
+entitlement. Until native push is wired (`@capacitor/push-notifications` plus an
+APNs key and a `google-services.json`, which means new builds and a store
+resubmission), **email is what actually reaches a phone.**
+
+Critical and warning alerts are emailed through the same `send_email()` /
+Resend path as password resets, so it needs no new configuration beyond
+`RESEND_API_KEY` and `RESEND_FROM_EMAIL`. Info-level alerts are never emailed.
+
+- Recipients default to every active boss in the company who has an email on
+  their account. Drivers are never emailed alerts.
+- `ALERT_EMAIL_TO` overrides that with one or more comma-separated addresses,
+  for a company that wants alerts going to a dispatch inbox instead.
+- `PUBLIC_BASE_URL` sets the host used in the email's "Open in HAULTRA" link
+  (defaults to `https://haultra-systems.com`).
+
+The subject line **is** the alert title — "Dave Miller is running late — ETA 30
+min" — because on a lock screen the subject is the whole message. Email and
+push claim their rows separately, so a failing push never costs you the email.
+
 **Reach:** this is plain Web Push, so it covers desktop browsers, Android
 Chrome, and iPhone **only when the site is added to the Home Screen** — iOS
 Safari refuses push to an ordinary tab. It does not reach the Capacitor App

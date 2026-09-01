@@ -35,6 +35,10 @@ services:
         sync: false   # Web Push. Handed to the browser so it can subscribe. Push is off until set.
       - key: VAPID_PRIVATE_KEY
         sync: false   # Signs the send — secret, never commit it.
+      - key: ALERT_EMAIL_TO
+        sync: false   # optional: send alerts to a dispatch inbox instead of each boss's own email
+      - key: PUBLIC_BASE_URL
+        value: https://haultra-systems.com   # host used in alert email links
       - key: VAPID_SUBJECT
         value: mailto:info@haultraai.com   # contact address push services can reach you at
       - key: APPLE_TEAM_ID
