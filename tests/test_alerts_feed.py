@@ -106,7 +106,31 @@ row = c.execute("SELECT eta FROM late_checkins WHERE company_id=? ORDER BY id DE
 c.close()
 ok(row["eta"] == "be in by 7:30", "a typed ETA wins over a chip (got %r)" % row["eta"])
 ok(len([k for k in kinds() if k == "DRIVER_LATE"]) == 1,
-   "a second late check-in the same day does not raise a second alert")
+   "a second late check-in the same day does not raise a SECOND alert row")
+
+# ...but it must not vanish either. This shipped broken: dedupe_key was
+# "late:<driver>:<day>", so once an alert existed the driver was muted for the
+# rest of the day — every later check-in silently wrote nothing and the boss
+# saw no update at all.
+_late = [a for a in alerts() if a["kind"] == "DRIVER_LATE"][0]
+ok("be in by 7:30" in _late["title"],
+   "the repeat check-in UPDATED the alert with the new ETA (got %r)" % _late["title"])
+ok(_late["body"] == "shop first", "and with the new reason")
+
+# and a handled alert comes back when the driver sends again
+c = app.get_db()
+c.execute("UPDATE alerts SET resolved_at=?, read_at=? WHERE id=?",
+          (app.now_ts(), app.now_ts(), _late["id"]))
+c.commit(); c.close()
+c = app.get_db(); c.execute("DELETE FROM late_checkins WHERE company_id=?", (co,)); c.commit(); c.close()
+cl.post("/late/checkin", data={"_csrf_token": "t", "eta": "10 min", "reason": "almost there"})
+_late2 = [a for a in alerts() if a["kind"] == "DRIVER_LATE"][0]
+ok(_late2["resolved_at"] is None,
+   "a new check-in re-opens an alert the boss had already marked handled")
+ok(_late2["read_at"] is None, "and marks it unread again so the badge counts it")
+ok(_late2["emailed_at"] is None and _late2["pushed_at"] is None,
+   "and clears the delivery stamps so the update actually gets sent")
+ok("10 min" in _late2["title"], "carrying the latest ETA")
 
 # ── time off ──────────────────────────────────────────────────────────────
 r = cl.post("/time-off/request", data={"_csrf_token": "t", "start_date": "2099-01-05", "reason": "family"})
