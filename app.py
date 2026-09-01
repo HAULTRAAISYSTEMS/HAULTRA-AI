@@ -6238,6 +6238,110 @@ def parse_load_input_line(line):
 # =========================================================
 # UI SHELL
 # =========================================================
+# =========================================================
+# BRAND — the mark and the icon set, defined once per page
+# =========================================================
+# Everything here is one inline <svg> sprite dropped at the top of <body>, so
+# the mark and every icon cost a single definition no matter how many times
+# they appear, scale to any size without a second asset, and inherit
+# currentColor. It replaces the emoji that used to stand in for icons: emoji
+# render differently on every device, carry their own colour, and can't take
+# on a hover or active state.
+#
+# Plain (non-f) string on purpose — it is substituted into shell_page's
+# f-string as a whole, so nothing inside it is ever re-processed.
+_BRAND_SPRITE = """
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false"><defs>
+<linearGradient id="hx-grad" x1="0" y1="0" x2="1" y2="1">
+  <stop offset="0%" stop-color="#FFC061"/><stop offset="52%" stop-color="#FF8A42"/><stop offset="100%" stop-color="#FF6B1A"/>
+</linearGradient>
+<symbol id="hx-mark" viewBox="0 0 100 100">
+  <g fill="none" stroke="url(#hx-grad)" stroke-width="7" stroke-linecap="square">
+    <path d="M50 8 18 27v18"/><path d="M50 8l32 19v18"/><path d="M18 55v18l32 19"/><path d="M82 55v18L50 92"/></g>
+  <g fill="none" stroke="url(#hx-grad)" stroke-width="5" stroke-linecap="square">
+    <path d="M50 24 32 34v9"/><path d="M50 24l18 10v9"/><path d="M32 57v9l18 10"/><path d="M68 57v9L50 76"/></g>
+  <g><path d="M50 40l11 6.5v13L50 66l-11-6.5v-13z" fill="#141416"/>
+     <path d="M50 40l11 6.5L50 53l-11-6.5z" fill="#2A2A2E"/>
+     <path d="M50 53v13l-11-6.5v-13z" fill="#1C1C20"/>
+     <path d="M50 53v13l11-6.5v-13z" fill="#101012"/></g>
+  <g fill="url(#hx-grad)">
+    <rect x="1" y="43" width="13" height="3" rx="1.5"/><rect x="4" y="50" width="10" height="3" rx="1.5"/>
+    <rect x="7" y="57" width="7" height="3" rx="1.5"/>
+    <circle cx="90" cy="42" r="2"/><circle cx="93" cy="50" r="2"/><circle cx="90" cy="58" r="2"/></g>
+</symbol>
+<g id="hx-ico-base" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></g>
+<symbol id="i-pin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 1 1 16 0Z"/><circle cx="12" cy="10" r="2.6"/></symbol>
+<symbol id="i-msg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 9.6 9.6 0 0 1-2.8-.4L3 21l1.6-4.6A8.3 8.3 0 0 1 3.6 11 8.4 8.4 0 0 1 12 3a8.4 8.4 0 0 1 9 8.5Z"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <path d="m4 12.5 5 5L20 6.5"/></symbol>
+<symbol id="i-truck" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M2 7h11v9H2zM13 10h4.5l3.5 3.5V16h-8z"/><circle cx="6.5" cy="18" r="1.9"/><circle cx="17" cy="18" r="1.9"/></symbol>
+<symbol id="i-wrench" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M15.5 3.5a5.5 5.5 0 0 0-5 7.7L3.6 18a2 2 0 1 0 2.8 2.8l6.8-6.9a5.5 5.5 0 0 0 6.9-7.2l-3 3-2.6-2.6 3-3a5.4 5.4 0 0 0-2-.6Z"/></symbol>
+<symbol id="i-board" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3" y="4" width="7" height="16" rx="1.6"/><rect x="14" y="4" width="7" height="9" rx="1.6"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="9" cy="8" r="3.2"/><path d="M2.8 20a6.4 6.4 0 0 1 12.4 0M16.5 5.2a3.2 3.2 0 0 1 0 5.9M18 20a6 6 0 0 0-2.2-4.4"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M12 4.2 21 19.5H3L12 4.2Z"/><path d="M12 10v4"/><circle cx="12" cy="17" r=".9" fill="currentColor" stroke="none"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="4.5" y="10" width="15" height="10" rx="2"/><path d="M8 10V7.5a4 4 0 0 1 8 0V10"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M12 3l7.5 3v5.6C19.5 16.4 16.3 20 12 21.4 7.7 20 4.5 16.4 4.5 11.6V6L12 3Z"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="12" cy="12" r="8.6"/><path d="M12 7v5.3l3.2 2"/></symbol>
+<symbol id="i-flag" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M5.5 21V4M5.5 5.2h11l-2.2 3.9 2.2 3.9h-11"/></symbol>
+<symbol id="i-clipboard" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="5" y="5" width="14" height="16" rx="2"/><path d="M9 5V3.6h6V5"/><path d="M9 11h6M9 15h4"/></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M3.5 13 6 5h12l2.5 8v6h-17z"/><path d="M3.5 13H9l1 2.5h4l1-2.5h5.5"/></symbol>
+<symbol id="i-spark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M12 3.2 13.9 9l5.8 1.9-5.8 1.9L12 18.6 10.1 12.8 4.3 10.9 10.1 9z"/></symbol>
+<symbol id="i-gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="12" cy="12" r="3.1"/><path d="M19.4 14.6a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1v.2a2 2 0 0 1-4 0v-.1a1.6 1.6 0 0 0-2.8-1.1l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0-1.1-2.7h-.2a2 2 0 0 1 0-4h.1A1.6 1.6 0 0 0 4.5 7l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 2.7-1.1v-.2a2 2 0 0 1 4 0v.1a1.6 1.6 0 0 0 2.8 1.1l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0 1.1 2.7h.2a2 2 0 0 1 0 4h-.1a1.6 1.6 0 0 0-1.4 1z"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3.5" y="5" width="17" height="15.5" rx="2"/><path d="M3.5 10h17M8 3.4V6.6M16 3.4V6.6"/></symbol>
+<symbol id="i-box" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M12 3.3 20.2 8v8L12 20.7 3.8 16V8z"/><path d="M3.8 8 12 12.6 20.2 8M12 12.6v8.1"/></symbol>
+</defs></svg>
+"""
+
+
+_APP_BACKDROP = """
+<svg class="app-backdrop" viewBox="0 0 1400 900" preserveAspectRatio="xMidYMid slice"
+     aria-hidden="true" focusable="false">
+  <g stroke="#FF6B1A" fill="none">
+    <g opacity=".055" stroke-width="1">
+      <path d="M-20 120H1420M-20 260H1420M-20 400H1420M-20 540H1420M-20 680H1420M-20 820H1420"/>
+      <path d="M140 -20V920M340 -20V920M540 -20V920M740 -20V920M940 -20V920M1140 -20V920M1340 -20V920"/>
+    </g>
+    <path d="M-20 300C240 300 330 150 560 146S880 250 1120 180 1330 60 1420 52"
+          opacity=".20" stroke-width="1.8"/>
+    <path d="M-20 700C280 696 460 620 700 616S1020 690 1230 640s150-60 210-66"
+          opacity=".12" stroke-width="1.4"/>
+  </g>
+  <circle cx="560" cy="146" r="3.5" fill="#FF8A42" opacity=".5"/>
+  <circle cx="1120" cy="180" r="3" fill="#FFC061" opacity=".4"/>
+</svg>
+"""
+
+
+def brand_mark(px=26, cls="brand-mark"):
+    """The HAULTRA hex mark at any size, from the one sprite definition."""
+    return (f'<svg class="{cls}" width="{px}" height="{px}" viewBox="0 0 100 100" '
+            f'aria-hidden="true" focusable="false"><use href="#hx-mark"/></svg>')
+
+
+def icon(name, cls="ic"):
+    """One stroke icon. `name` is the sprite key without the `i-` prefix."""
+    return (f'<svg class="{cls}" aria-hidden="true" focusable="false">'
+            f'<use href="#i-{name}"/></svg>')
+
+
 def nav_link(href, label, current_path):
     active = "active" if current_path == href else ""
     return f'<a class="nav-item {active}" href="{href}">{label}</a>'
@@ -6288,6 +6392,41 @@ def shell_page(title, body, extra_head=""):
     user = get_current_user()
     path = request.path
 
+    # ── Page chrome ────────────────────────────────────────────────────
+    # Cab View is a single-job screen used through a windscreen: no footer at
+    # all. Every other signed-in page keeps one quiet legal line (the footer is
+    # the only place /privacy is linked, and the store builds need it reachable
+    # in-app). The full marketing block — trust badges, tagline — is for
+    # signed-out visitors, who are the only people it was ever written for.
+    _is_cab = path.startswith("/driver/route/")
+    if _is_cab:
+        footer_html = ""
+    elif user:
+        footer_html = (
+            '<div class="footer-note footer-slim">'
+            '<a href="/privacy">Privacy</a> &middot; '
+            '<a href="/terms">Terms</a> &middot; '
+            '<a href="mailto:info@haultraai.com">Support</a>'
+            '</div>'
+        )
+    else:
+        footer_html = f"""
+                <div class="footer-note">
+                    <div class="footer-trust">
+                        <span class="footer-badge">{icon('lock')} SSL Encrypted</span>
+                        <span class="footer-badge">{icon('shield')} Role-Based Access</span>
+                        <span class="footer-badge">{icon('flag')} US-Based Data</span>
+                    </div>
+                    <div>
+                        <a href="/privacy">Privacy Policy</a>
+                        &middot;
+                        <a href="/terms">Terms of Service</a>
+                        &middot;
+                        <a href="mailto:info@haultraai.com">Support</a>
+                    </div>
+                    <div style="margin-top:4px;">&copy; {datetime.now().year} HAULTRA AI SYSTEMS &mdash; Built for the hauling industry.</div>
+                </div>"""
+
     sidebar = ""
     if user:
         _co_name = session.get("company_name", "") if user["company_id"] else ""
@@ -6336,19 +6475,19 @@ def shell_page(title, body, extra_head=""):
 
             _parts = []
             if is_disp:
-                _parts.append(nav_link('/parser', '✦ Parser', path))
-                _parts.append(nav_link(url_for("routes_page"), 'Route Board', path))
+                _parts.append(nav_link('/parser', icon('spark') + 'Parser', path))
+                _parts.append(nav_link(url_for("routes_page"), icon('board') + 'Route Board', path))
                 _parts.append(nav_link(url_for("unassigned_work"),
-                              '📋 Unassigned' + _nav_badge('unassigned-nav-badge', _unassigned), path))
+                              icon('clipboard') + 'Unassigned' + _nav_badge('unassigned-nav-badge', _unassigned), path))
             if is_cm:
                 _parts.append(nav_link(url_for("requests_page"),
-                              '✉ Requests' + _nav_badge('req-nav-badge', _pending_reqs), path))
-                _parts.append(nav_link(url_for("customers_page"), '👤 Customers', path))
+                              icon('inbox') + 'Requests' + _nav_badge('req-nav-badge', _pending_reqs), path))
+                _parts.append(nav_link(url_for("customers_page"), icon('users') + 'Customers', path))
             if is_disp:
-                _parts.append(nav_link(url_for("bin_tracker"), 'Bin Tracker', path))
+                _parts.append(nav_link(url_for("bin_tracker"), icon('box') + 'Bin Tracker', path))
             # Maintenance/defects — any management role can view.
             _parts.append(nav_link(url_for("maintenance_page"),
-                          '🔧 Maintenance' + _nav_badge('maint-nav-badge', _open_defects), path))
+                          icon('wrench') + 'Maintenance' + _nav_badge('maint-nav-badge', _open_defects), path))
             if is_own:
                 _parts.append(nav_link(url_for("dashboard"), 'Owner', path))
             primary_items = "".join(_parts)
@@ -6366,7 +6505,7 @@ def shell_page(title, body, extra_head=""):
             primary_items = (
                 nav_link(url_for("dashboard"), 'My Day', path)
                 + nav_link(cab_href, 'Cab View', path)
-                + nav_link(url_for("inspection_new"), '🔧 Inspection', path)
+                + nav_link(url_for("inspection_new"), icon('clipboard') + 'Inspection', path)
             )
 
         # ── Overflow "More" items (role-aware) ───────────────────────────
@@ -6387,31 +6526,31 @@ def shell_page(title, body, extra_head=""):
                 "🔔 Alerts" + _nav_badge("account-alert-nav-badge", _account_alerts),
                 path,
             ))
-            _mparts.append(nav_link(url_for("team_hours_page"), "🕐 Team Hours", path))
-            _mparts.append(nav_link(url_for("team_time_off_page"), "🌴 Team Time Off", path))
+            _mparts.append(nav_link(url_for("team_hours_page"), icon('clock') + 'Team Hours', path))
+            _mparts.append(nav_link(url_for("team_time_off_page"), icon('calendar') + 'Team Time Off', path))
             # FLEET — any management role can view (add/edit gated server-side).
             _mparts.append(_mhead("Fleet"))
-            _mparts.append(nav_link(url_for("trucks_page"), "🚛 Trucks", path))
-            _mparts.append(nav_link(url_for("vendors_page"), "🔧 Vendors", path))
-            _mparts.append(nav_link(url_for("maintenance_page"), "🛠 Maintenance", path))
+            _mparts.append(nav_link(url_for("trucks_page"), icon('truck') + 'Trucks', path))
+            _mparts.append(nav_link(url_for("vendors_page"), icon('wrench') + 'Vendors', path))
+            _mparts.append(nav_link(url_for("maintenance_page"), icon('wrench') + 'Maintenance', path))
             # Team roster sits between Fleet and Setup (per spec order).
             if is_disp:
-                _mparts.append(nav_link(url_for("team_page"), "👥 Team", path))
+                _mparts.append(nav_link(url_for("team_page"), icon('users') + 'Team', path))
             # SETUP
             if is_own:
                 _mparts.append(_mhead("Setup"))
-                _mparts.append(nav_link(url_for("yard_setup_page"), "🏗 Yard Setup", path))
-                _mparts.append(nav_link(url_for("settings_page"), "⚙ Settings", path))
+                _mparts.append(nav_link(url_for("yard_setup_page"), icon('box') + 'Yard Setup', path))
+                _mparts.append(nav_link(url_for("settings_page"), icon('gear') + 'Settings', path))
             more_items = "".join(_mparts)
         else:
             more_items = (
-                nav_link(url_for("driver_dashboard"), "◈ My Routes", path)
-                + nav_link(url_for("my_inspections"), "🛠 My Inspections", path)
-                + nav_link(url_for("driver_clock"), "⏱ Clock In/Out", path)
-                + nav_link(url_for("account_settings"), "⚙ Account Settings", path)
+                nav_link(url_for("driver_dashboard"), icon('board') + 'My Routes', path)
+                + nav_link(url_for("my_inspections"), icon('clipboard') + 'My Inspections', path)
+                + nav_link(url_for("driver_clock"), icon('clock') + 'Clock In/Out', path)
+                + nav_link(url_for("account_settings"), icon('gear') + 'Account Settings', path)
             )
 
-        superadmin_link = nav_link(url_for("superadmin_panel"), "🔧 Superadmin", path) \
+        superadmin_link = nav_link(url_for("superadmin_panel"), icon('shield') + 'Superadmin', path) \
             if session.get("is_superadmin") else ""
 
         co_pill = (f'<span class="company-pill">{e(_co_name)}</span>') if _co_name else ""
@@ -6420,7 +6559,8 @@ def shell_page(title, body, extra_head=""):
         <nav class="topnav">
             <div class="topnav-inner">
                 <a href="/" class="topnav-brand">
-                    <span class="logo-h">H</span><span class="logo-rest">AULTRA</span>
+                    {brand_mark(26)}
+                    <span class="topnav-wordmark"><span class="logo-h">H</span><span class="logo-rest">AULTRA</span></span>
                     <span class="topnav-brand-sub">AI</span>
                 </a>
                 <div class="topnav-links">
@@ -6539,6 +6679,42 @@ body {{
 a {{ color: var(--cyan); text-decoration: none; transition: color .15s; }}
 a:hover {{ color: #FF9D5C; }}
 
+.footer-slim {{
+    text-align: center;
+    font-size: 11.5px;
+    color: var(--text-muted);
+    padding: 26px 0 18px;
+    opacity: .62;
+}}
+.footer-slim a {{ color: var(--text-muted); }}
+.footer-slim a:hover {{ color: var(--text-soft); }}
+
+/* ── Icons ──────────────────────────────────────────────────*/
+/* One stroke set, sized in em so an icon always matches the text it sits
+   beside, and inheriting currentColor so it picks up hover/active states.
+   This is what replaced the emoji that used to stand in for iconography. */
+.ic {{
+    width: 1.15em; height: 1.15em;
+    flex: none; vertical-align: -0.2em;
+    color: inherit;
+}}
+.ic-lg {{ width: 1.4em; height: 1.4em; vertical-align: -0.3em; }}
+
+/* ── Route-line backdrop ────────────────────────────────────*/
+/* The signature texture from the logo: a faint survey grid with two route
+   traces running across it. Fixed, non-interactive, and held under 8% so it
+   reads as depth rather than pattern. Pure inline SVG — no image request. */
+.app-backdrop {{
+    position: fixed; inset: 0; z-index: 0;
+    pointer-events: none;
+    opacity: .5;
+}}
+.app-shell {{ position: relative; z-index: 1; }}
+@media (prefers-reduced-motion: reduce) {{ .app-backdrop {{ opacity: .32; }} }}
+
+/* ── Brand lockup ───────────────────────────────────────────*/
+.brand-mark {{ flex: none; display: block; }}
+
 /* ── App Shell ──────────────────────────────────────────────*/
 .app-shell {{ display: flex; flex-direction: column; min-height: 100vh; width: 100%;
              padding-bottom: env(safe-area-inset-bottom, 0px); }}
@@ -6575,11 +6751,14 @@ a:hover {{ color: #FF9D5C; }}
 /* ── Brand ──────────────────────────────────────────────────*/
 .topnav-brand {{
     display: flex;
-    align-items: baseline;
-    gap: 6px;
+    align-items: center;
+    gap: 9px;
     line-height: 1;
     flex-shrink: 0;
 }}
+/* The letters are ONE word — any gap here splits it visually. The lockup's
+   spacing lives on .topnav-brand above, between the mark and the word. */
+.topnav-wordmark {{ display: inline-flex; align-items: baseline; gap: 0; line-height: 1; }}
 
 .logo-wordmark {{ display: flex; align-items: baseline; gap: 1px; line-height: 1; }}
 
@@ -6636,6 +6815,7 @@ a:hover {{ color: #FF9D5C; }}
 .nav-item {{
     display: inline-flex;
     align-items: center;
+    gap: 7px;
     white-space: nowrap;
     padding: 10px 14px;
     min-height: 48px;
@@ -7784,27 +7964,14 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 </style>
     </head>
     <body>
+        {_BRAND_SPRITE}
+        {_APP_BACKDROP}
         <div class="app-shell">
             {sidebar}
             <main class="content">
                 {messages_html}
                 {body}
-                <div class="footer-note">
-                    <div class="footer-trust">
-                        <span class="footer-badge">&#128274; SSL Encrypted</span>
-                        <span class="footer-badge">&#128737; Security-Focused Architecture</span>
-                        <span class="footer-badge">&#128100; Role-Based Access</span>
-                        <span class="footer-badge">&#127968; US-Based Data</span>
-                    </div>
-                    <div>
-                        <a href="/privacy">Privacy Policy</a>
-                        &middot;
-                        <a href="/terms">Terms of Service</a>
-                        &middot;
-                        <a href="mailto:info@haultraai.com">Support</a>
-                    </div>
-                    <div style="margin-top:4px;">&copy; {datetime.now().year} HAULTRA AI SYSTEMS &mdash; Built for the hauling industry.</div>
-                </div>
+                {footer_html}
             </main>
         </div>
 
