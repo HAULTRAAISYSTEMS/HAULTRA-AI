@@ -13,7 +13,7 @@ except Exception:
 from flask import (
     Flask, request, redirect, url_for, session, flash,
     render_template, render_template_string, send_file, send_from_directory, abort, jsonify,
-    Response, stream_with_context
+    Response, stream_with_context, g
 )
 import sqlite3
 import os
@@ -9746,6 +9746,220 @@ def analytics_page():
 # =========================================================
 # TEAM — merged Users + Drivers roster
 # =========================================================
+# =========================================================
+# PUSH — alerts on the boss's phone
+# =========================================================
+# Delivery rides Firebase Cloud Messaging, which the service worker was already
+# half-wired for: it had an onBackgroundMessage handler and a firebase config,
+# but nothing ever requested a token and there was no server side, so no push
+# has ever actually been sent from this app.
+#
+# Configuration is env-only and degrades exactly like RESEND_API_KEY does: with
+# no credentials the app runs normally, alerts still land in the feed, and the
+# send is skipped with a log line. Nothing here can break a request.
+#
+#   FCM_PROJECT_ID            Firebase console -> Project settings -> General
+#   FCM_SERVICE_ACCOUNT_JSON  ...-> Service accounts -> Generate new private key
+#                             (paste the whole JSON blob as one env var)
+#   FCM_VAPID_PUBLIC_KEY      ...-> Cloud Messaging -> Web Push certificates
+#
+# The first two let the server SEND. The third lets a browser ASK for a token.
+
+FCM_PROJECT_ID = os.environ.get("FCM_PROJECT_ID", "").strip()
+FCM_VAPID_PUBLIC_KEY = os.environ.get("FCM_VAPID_PUBLIC_KEY", "").strip()
+_FCM_SA_RAW = os.environ.get("FCM_SERVICE_ACCOUNT_JSON", "").strip()
+
+_fcm_token_cache = {"token": None, "exp": 0.0}
+_fcm_lock = threading.Lock()
+
+
+def push_configured():
+    return bool(FCM_PROJECT_ID and _FCM_SA_RAW)
+
+
+def _fcm_access_token():
+    """OAuth token for the FCM HTTP v1 API, cached until shortly before expiry.
+
+    google-auth is imported lazily so the dependency is only needed by
+    deployments that actually turn push on.
+    """
+    with _fcm_lock:
+        now = time.time()
+        if _fcm_token_cache["token"] and now < _fcm_token_cache["exp"]:
+            return _fcm_token_cache["token"]
+        try:
+            from google.oauth2 import service_account
+            from google.auth.transport.requests import Request as _GRequest
+            info = json.loads(_FCM_SA_RAW)
+            creds = service_account.Credentials.from_service_account_info(
+                info, scopes=["https://www.googleapis.com/auth/firebase.messaging"])
+            creds.refresh(_GRequest())
+            _fcm_token_cache["token"] = creds.token
+            _fcm_token_cache["exp"] = now + 3000     # tokens last ~1h
+            return creds.token
+        except Exception as exc:
+            app.logger.warning("push: could not mint FCM access token (%s)", exc)
+            return None
+
+
+def _push_recipients(conn, company_id):
+    """Every registered device belonging to a management user in this company.
+    Drivers are not notified — this feed is the boss's inbox."""
+    try:
+        return conn.execute(
+            """SELECT p.id, p.token FROM push_tokens p
+                 JOIN users u ON u.id = p.user_id
+                WHERE p.company_id=? AND p.failed_at IS NULL
+                  AND u.role='boss' AND u.is_active=1""",
+            (company_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+
+
+def _fcm_send(access_token, device_token, title, body, link):
+    """One message. Returns True on success, False if the token is dead."""
+    url = "https://fcm.googleapis.com/v1/projects/%s/messages:send" % FCM_PROJECT_ID
+    payload = {"message": {
+        "token": device_token,
+        # `data` only, no `notification` block: the service worker's
+        # onBackgroundMessage builds the notification itself, and a payload
+        # carrying both gets shown twice on Android.
+        "data": {"title": title[:120], "body": body[:240], "link": link or "/boss/notifications"},
+        "webpush": {"fcm_options": {"link": link or "/boss/notifications"}},
+        "android": {"priority": "high"},
+        "apns": {"headers": {"apns-priority": "10"}},
+    }}
+    try:
+        resp = requests.post(
+            url, json=payload, timeout=8,
+            headers={"Authorization": "Bearer " + access_token,
+                     "Content-Type": "application/json; UTF-8"},
+        )
+        if resp.status_code == 200:
+            return True
+        # 404 UNREGISTERED / 400 INVALID_ARGUMENT mean the device is gone —
+        # the caller retires the row rather than retrying it forever.
+        if resp.status_code in (400, 403, 404):
+            app.logger.info("push: retiring dead token (%s)", resp.status_code)
+            return False
+        app.logger.warning("push: FCM %s %s", resp.status_code, resp.text[:200])
+        return True     # transient — keep the token, try again next sweep
+    except Exception as exc:
+        app.logger.warning("push: send failed (%s)", exc)
+        return True
+
+
+def flush_alert_pushes(company_id=None, limit=20):
+    """Send any alert that hasn't been pushed yet, then stamp it.
+
+    Claims each row with a conditional UPDATE before sending, so the two
+    gunicorn workers can both run this without double-notifying anyone.
+    Info-level alerts are recorded but never pushed — a time-off request should
+    not buzz a phone.
+    """
+    if not push_configured():
+        return 0
+    access = _fcm_access_token()
+    if not access:
+        return 0
+    sent = 0
+    conn = get_db()
+    try:
+        where = "pushed_at IS NULL AND severity IN ('critical','warning')"
+        params = []
+        if company_id:
+            where += " AND company_id=?"
+            params.append(company_id)
+        rows = conn.execute(
+            "SELECT id, company_id, title, body, link FROM alerts WHERE %s "
+            "ORDER BY id DESC LIMIT ?" % where, params + [limit]
+        ).fetchall()
+        for row in rows:
+            claimed = conn.execute(
+                "UPDATE alerts SET pushed_at=? WHERE id=? AND pushed_at IS NULL",
+                (now_ts(), row["id"]),
+            ).rowcount
+            conn.commit()
+            if not claimed:
+                continue          # another worker got there first
+            for dev in _push_recipients(conn, row["company_id"]):
+                if not _fcm_send(access, dev["token"], row["title"], row["body"] or "", row["link"]):
+                    conn.execute("UPDATE push_tokens SET failed_at=? WHERE id=?",
+                                 (now_ts(), dev["id"]))
+                    conn.commit()
+                else:
+                    sent += 1
+    except sqlite3.Error as exc:
+        app.logger.warning("push: sweep failed (%s)", exc)
+    finally:
+        conn.close()
+    return sent
+
+
+def push_alerts_soon(company_id):
+    """Fire the sweep off the request thread.
+
+    A push must never sit between the driver tapping a button and the response
+    coming back — FCM is a network round trip and the driver may be on one bar.
+    """
+    if not push_configured():
+        return
+    try:
+        threading.Thread(target=flush_alert_pushes, args=(company_id,), daemon=True).start()
+    except Exception:
+        pass
+
+
+@app.route("/api/push/register", methods=["POST"])
+@login_required
+def api_push_register():
+    """The boss's browser hands us its FCM token after granting permission."""
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or "").strip()
+    platform = (data.get("platform") or "web").strip()[:20]
+    if not token or len(token) > 512:
+        return jsonify({"error": "bad token"}), 400
+    conn = get_db()
+    conn.execute(
+        """INSERT INTO push_tokens (company_id, user_id, token, platform, created_at, last_seen_at)
+           VALUES (?,?,?,?,?,?)
+           ON CONFLICT(token) DO UPDATE SET
+             user_id=excluded.user_id, company_id=excluded.company_id,
+             last_seen_at=excluded.last_seen_at, failed_at=NULL""",
+        (cid(), session["user_id"], token, platform, now_ts(), now_ts()),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.after_request
+def _push_after_request(response):
+    """Fire one push sweep per request that raised an alert.
+
+    Here rather than inside notify() so the send happens AFTER the caller has
+    committed — pushing an alert for a transaction that then rolls back would
+    buzz the boss about something that never happened.
+    """
+    try:
+        if getattr(g, "_alerts_raised", False) and session.get("company_id"):
+            push_alerts_soon(session["company_id"])
+    except Exception:
+        pass
+    return response
+
+
+@app.route("/api/push/config")
+@login_required
+def api_push_config():
+    """What the client needs to ask for a token — and whether it's worth asking."""
+    return jsonify({
+        "enabled": bool(FCM_VAPID_PUBLIC_KEY and push_configured()),
+        "vapidKey": FCM_VAPID_PUBLIC_KEY,
+    })
+
+
 @app.route("/boss/notifications")
 @boss_required
 def boss_notifications_page():
@@ -9817,12 +10031,107 @@ def boss_notifications_page():
 
     _empty = ('<div class="card muted">Nothing needs you right now.</div>' if show == "open"
               else '<div class="card muted">No alerts yet.</div>')
+
+    # Phone alerts. The permission prompt has to come from a real tap — browsers
+    # reject one fired on page load, and ambushing someone with it is rude
+    # anyway. The row hides itself when push isn't configured server-side, so
+    # nobody is offered a button that cannot work.
+    push_row = """
+    <div class="card" id="push-card" hidden style="margin-bottom:14px;">
+      <div class="row between" style="gap:12px;flex-wrap:wrap;">
+        <div>
+          <strong id="push-title">Get these on your phone</strong>
+          <div class="muted small" id="push-sub" style="margin-top:3px;">
+            Breakdowns, cancels and messages buzz you even when the app is closed.</div>
+        </div>
+        <button type="button" class="btn" id="push-btn" onclick="haultraEnablePush()">Turn on</button>
+      </div>
+    </div>
+    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-messaging-compat.js"></script>
+    <script>
+    (function () {
+      var card = document.getElementById('push-card');
+      var btn  = document.getElementById('push-btn');
+      var sub  = document.getElementById('push-sub');
+      var CFG  = null;
+      if (!('Notification' in window) || !navigator.serviceWorker) return;
+
+      fetch('/api/push/config', {credentials: 'same-origin'})
+        .then(function (r) { return r.json(); })
+        .then(function (cfg) {
+          CFG = cfg;
+          if (!cfg.enabled) return;               // not configured on the server
+          card.hidden = false;
+          if (Notification.permission === 'granted') {
+            btn.textContent = 'On';
+            btn.disabled = true;
+            sub.textContent = 'This device is registered for alerts.';
+            register();                            // refresh the token quietly
+          } else if (Notification.permission === 'denied') {
+            btn.disabled = true;
+            btn.textContent = 'Blocked';
+            sub.textContent = 'Notifications are blocked for this site in your browser settings.';
+          }
+        })
+        .catch(function () {});
+
+      function register() {
+        try {
+          if (!firebase.apps.length) {
+            firebase.initializeApp({
+              apiKey: "AIzaSyBAWm08bVHH5uia21H5VPd1mAW0Ei0MnV4",
+              authDomain: "haultra-dispatch.firebaseapp.com",
+              projectId: "haultra-dispatch",
+              storageBucket: "haultra-dispatch.firebasestorage.app",
+              messagingSenderId: "66096047367",
+              appId: "1:66096047367:web:a7a3da473ba9d0bf5b51a2"
+            });
+          }
+          navigator.serviceWorker.ready.then(function (reg) {
+            firebase.messaging().getToken({vapidKey: CFG.vapidKey, serviceWorkerRegistration: reg})
+              .then(function (token) {
+                if (!token) throw new Error('no token');
+                return fetch('/api/push/register', {
+                  method: 'POST', credentials: 'same-origin',
+                  headers: {'Content-Type': 'application/json',
+                            'X-CSRF-Token': document.querySelector('meta[name=\"csrf-token\"]').getAttribute('content')},
+                  body: JSON.stringify({token: token, platform: 'web'})
+                });
+              })
+              .then(function () {
+                btn.textContent = 'On'; btn.disabled = true;
+                sub.textContent = 'This device is registered for alerts.';
+              })
+              .catch(function () {
+                sub.textContent = "Couldn't register this device. Try again, or check that notifications are allowed.";
+              });
+          });
+        } catch (e) {
+          sub.textContent = "Push isn't available in this browser.";
+        }
+      }
+
+      window.haultraEnablePush = function () {
+        btn.disabled = true; btn.textContent = 'Asking…';
+        Notification.requestPermission().then(function (p) {
+          if (p === 'granted') { register(); }
+          else {
+            btn.disabled = false; btn.textContent = 'Turn on';
+            sub.textContent = 'You said no to notifications. You can change that in browser settings.';
+          }
+        });
+      };
+    })();
+    </script>
+    """
     body = f"""
     <div class="hero">
         <h1>Alerts</h1>
         <p>Everything your drivers send, in one place &mdash; running late, messages,
            truck trouble, cancels and time off.</p>
     </div>
+    {push_row}
     <div class="alert-filters">
         <a class="alert-filter{' on' if show == 'open' else ''}" href="{url_for('boss_notifications_page')}">
             Needs you{f' &middot; {open_n}' if open_n else ''}</a>
@@ -9862,9 +10171,13 @@ def _ago(ts):
     timestamp they have to subtract in their head."""
     try:
         then = datetime.strptime((ts or "")[:19], "%Y-%m-%d %H:%M:%S")
+        # Compare against now_ts(), NOT datetime.now(): every timestamp in this
+        # database is written in company-Eastern time, while the server clock is
+        # UTC on Render. Mixing the two made a just-posted alert read "4h ago".
+        now = datetime.strptime(now_ts()[:19], "%Y-%m-%d %H:%M:%S")
     except Exception:
         return ""
-    secs = max(0, int((datetime.now() - then).total_seconds()))
+    secs = max(0, int((now - then).total_seconds()))
     if secs < 90:
         return "just now"
     if secs < 3600:
@@ -25290,6 +25603,10 @@ def notify(conn, company_id, kind, title, body="", link="", actor_user_id=None,
              (link or "")[:300], actor_user_id, (entity_type or "")[:40],
              entity_id, dedupe_key, now_ts()),
         )
+        try:
+            g._alerts_raised = True
+        except Exception:
+            pass
     except sqlite3.Error:
         # An alert is a notification, not the work itself. Losing one must never
         # roll back the cancel, the clock-in, or the message that caused it.

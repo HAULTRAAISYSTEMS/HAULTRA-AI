@@ -13,6 +13,34 @@ Password reset emails are sent via [Resend](https://resend.com). Set these envir
 
 The mail-sending logic lives entirely in the `send_email()` helper in `app.py` — swap providers by editing that one function.
 
+### Push alerts to the boss's phone
+
+Everything a driver sends — running late, messages, breakdowns, cancels, time
+off — lands in one feed at `/boss/notifications`, and the nav badge counts what
+still needs a decision. That much works with no configuration.
+
+To also push those alerts to a phone, set three environment variables from the
+[Firebase console](https://console.firebase.google.com) for the
+`haultra-dispatch` project:
+
+- `FCM_PROJECT_ID` — Project settings → General → Project ID
+- `FCM_SERVICE_ACCOUNT_JSON` — Project settings → Service accounts → *Generate
+  new private key*. Paste the whole JSON blob as one variable.
+- `FCM_VAPID_PUBLIC_KEY` — Project settings → Cloud Messaging → Web Push
+  certificates → *Generate key pair*. This is what lets a browser request a token.
+
+With none of them set the app runs exactly as before: alerts still appear in the
+feed, and the send is skipped with a log line — same graceful degradation as
+`RESEND_API_KEY`. The "Get these on your phone" row stays hidden until the
+server reports push is configured, so nobody is offered a button that can't work.
+
+Each boss device registers itself once from that row. `push_tokens` holds one
+row per browser or app install; a boss with a phone and a laptop has two. Dead
+tokens are retired automatically when FCM reports them unregistered.
+
+Only `critical` and `warning` alerts push. A time-off request is recorded but
+never buzzes a phone.
+
 ### Production backups and retention
 
 The web workers create a consistent SQLite snapshot once per day. Configure

@@ -31,6 +31,12 @@ services:
         sync: false   # set manually in Render dashboard — Stripe Price ID for the Pro plan
       - key: STRIPE_WEBHOOK_SECRET
         sync: false   # set manually in Render dashboard — never commit the value
+      - key: FCM_PROJECT_ID
+        sync: false   # Firebase console -> Project settings -> General. Push is off until this is set.
+      - key: FCM_SERVICE_ACCOUNT_JSON
+        sync: false   # ... -> Service accounts -> Generate new private key. Paste the whole JSON blob.
+      - key: FCM_VAPID_PUBLIC_KEY
+        sync: false   # ... -> Cloud Messaging -> Web Push certificates. Lets a browser ask for a token.
       - key: APPLE_TEAM_ID
         sync: false   # Apple Developer Team ID for Universal Links
       - key: ANDROID_SHA256_FINGERPRINT

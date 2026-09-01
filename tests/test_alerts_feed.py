@@ -173,4 +173,34 @@ ok(cl.get("/boss/notifications").status_code in (302, 403), "driver cannot open 
 ok(cl.post("/alerts/%d/resolve" % target, data={"_csrf_token": "t"}).status_code in (302, 403),
    "driver cannot resolve alerts")
 
+# ── push plumbing ─────────────────────────────────────────────────────────
+as_boss()
+cfg = json.loads(cl.get("/api/push/config").data)
+ok("enabled" in cfg and "vapidKey" in cfg, "push config endpoint answers")
+ok(cfg["enabled"] is False, "push reports itself off with no FCM env set")
+ok(app.push_configured() is False, "push_configured() false without credentials")
+ok(app.flush_alert_pushes(co) == 0, "the push sweep is a safe no-op when unconfigured")
+
+r = cl.post("/api/push/register", json={"_csrf_token": "t", "token": "tok-abc", "platform": "web"})
+ok(r.status_code == 200, "a device can register a push token")
+c = app.get_db()
+n = c.execute("SELECT COUNT(*) n FROM push_tokens WHERE company_id=? AND token='tok-abc'", (co,)).fetchone()["n"]
+c.close()
+ok(n == 1, "token stored")
+cl.post("/api/push/register", json={"_csrf_token": "t", "token": "tok-abc", "platform": "web"})
+c = app.get_db()
+n = c.execute("SELECT COUNT(*) n FROM push_tokens WHERE token='tok-abc'", ()).fetchone()["n"]
+c.close()
+ok(n == 1, "re-registering the same device updates rather than duplicates")
+ok(cl.post("/api/push/register", json={"_csrf_token": "t", "token": ""}).status_code == 400,
+   "an empty token is rejected")
+
+html = cl.get("/boss/notifications").get_data(as_text=True)
+ok("push-card" in html and "hidden" in html, "the phone-alerts row ships hidden until push is configured")
+
+# ── relative time uses the same clock the rows were written with ──────────
+ok(app._ago(app.now_ts()) == "just now",
+   "a brand-new alert reads 'just now', not a timezone-skewed hours-ago (got %r)"
+   % app._ago(app.now_ts()))
+
 print("\nALL ALERT FEED TESTS PASSED")
