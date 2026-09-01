@@ -205,6 +205,60 @@ html = cl.get("/boss/notifications").get_data(as_text=True)
 ok("push-card" in html, "the phone-alerts row is on the page")
 ok("firebasejs" not in html, "no Firebase scripts are loaded any more")
 ok("applicationServerKey" in html, "the client subscribes through the standard PushManager")
+ok("Add to Home Screen" in html,
+   "iPhone users in a Safari tab are told why push can't work, instead of a button that fails")
+ok("HaultraNativeApp" in html,
+   "the store build is detected and told where push does work")
+
+# ── email delivery ────────────────────────────────────────────────────────
+# Email is the channel that reaches a phone TODAY: the Capacitor store builds
+# have no Push API, so until native push exists this is what actually gets a
+# breakdown in front of the boss.
+_sent = []
+_real_send = app.send_email
+app.send_email = lambda to, subj, html: (_sent.append((to, subj, html)) or True)
+try:
+    c = app.get_db()
+    c.execute("UPDATE users SET email='tim@haultraai.com' WHERE id=?", (boss,))
+    c.execute("UPDATE users SET email='dave@example.com' WHERE id=?", (drv,))
+    c.execute("UPDATE alerts SET emailed_at=? WHERE company_id=?", (app.now_ts(), co))
+    c.commit()
+    app.notify(c, co, "BREAKDOWN", "Dave Miller reported a breakdown",
+               "Truck 12 hydraulics", severity="critical", link="/route/9")
+    app.notify(c, co, "TIME_OFF_REQUEST", "Dave asked for a Friday", "2099-01-05")
+    c.commit(); c.close()
+
+    n = app.flush_alert_emails(co)
+    ok(n == 1, "one email per critical alert, to the one boss with an address (got %d)" % n)
+    to, subj, html = _sent[0]
+    ok(to == "tim@haultraai.com", "sent to the boss")
+    ok(not any(t == "dave@example.com" for t, _, _ in _sent), "drivers are never emailed alerts")
+    ok(subj == "Dave Miller reported a breakdown",
+       "the subject IS the alert, so a lock screen shows what happened")
+    ok("/route/9" in html, "the email links straight to what the alert is about")
+    ok(not any("Friday" in s2 for _, s2, _ in _sent), "info alerts are never emailed")
+    ok(app.flush_alert_emails(co) == 0, "a second sweep re-sends nothing")
+
+    # email and push claim independently
+    c = app.get_db()
+    row = c.execute("""SELECT emailed_at, pushed_at FROM alerts
+                        WHERE company_id=? AND kind='BREAKDOWN' ORDER BY id DESC LIMIT 1""",
+                    (co,)).fetchone()
+    c.close()
+    ok(row["emailed_at"] and not row["pushed_at"],
+       "email and push stamp separately, so a dead push never costs you the email")
+
+    os.environ["ALERT_EMAIL_TO"] = "dispatch@haultraai.com"
+    c = app.get_db()
+    app.notify(c, co, "ROUTE_CANCELLED", "Dave cancelled a route", "weather", severity="critical")
+    c.commit(); c.close()
+    _sent.clear()
+    app.flush_alert_emails(co)
+    ok(_sent and _sent[0][0] == "dispatch@haultraai.com",
+       "ALERT_EMAIL_TO overrides the per-user addresses")
+    os.environ.pop("ALERT_EMAIL_TO")
+finally:
+    app.send_email = _real_send
 
 # ── relative time uses the same clock the rows were written with ──────────
 ok(app._ago(app.now_ts()) == "just now",

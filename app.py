@@ -3580,6 +3580,7 @@ def init_db():
         resolved_at    TEXT,
         resolved_by    INTEGER,
         pushed_at      TEXT,
+        emailed_at     TEXT,
         FOREIGN KEY (company_id) REFERENCES companies(id),
         FOREIGN KEY (actor_user_id) REFERENCES users(id)
     )
@@ -3596,6 +3597,12 @@ def init_db():
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_alerts_unpushed "
         "ON alerts(company_id, pushed_at, created_at)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alerts_unemailed "
+        "ON alerts(company_id, emailed_at, created_at)")
+    # Older databases predate the column; adding it here keeps the migration
+    # additive rather than rebuilding the table.
+    safe_add_column(conn, "alerts", "emailed_at TEXT")
 
     # Devices registered to receive push. One row per browser/app install; a
     # boss with a phone and a laptop has two.
@@ -9867,17 +9874,121 @@ def flush_alert_pushes(company_id=None, limit=20):
     return sent
 
 
-def push_alerts_soon(company_id):
-    """Fire the sweep off the request thread.
+def _alert_email_recipients(conn, company_id):
+    """Active bosses in this company who have an email on file.
 
-    A push must never sit between the driver tapping a button and the response
-    coming back — the push service is a network round trip and the driver may
+    ALERT_EMAIL_TO overrides it entirely, for a company that wants alerts going
+    to a dispatch inbox rather than to individual accounts.
+    """
+    override = os.environ.get("ALERT_EMAIL_TO", "").strip()
+    if override:
+        return [a.strip() for a in override.split(",") if a.strip()]
+    try:
+        rows = conn.execute(
+            """SELECT DISTINCT email FROM users
+                WHERE company_id=? AND role='boss' AND is_active=1
+                  AND email IS NOT NULL AND TRIM(email) != ''""",
+            (company_id,),
+        ).fetchall()
+        return [r["email"].strip() for r in rows]
+    except sqlite3.Error:
+        return []
+
+
+def _alert_email_html(title, body, label, when, link):
+    """One alert, rendered for a phone's mail app.
+
+    The subject line does the real work on a lock screen, so this stays short:
+    what happened, any detail, and one button through to the feed.
+    """
+    url = (os.environ.get("PUBLIC_BASE_URL", "https://haultra-systems.com").rstrip("/")
+           + (link or "/boss/notifications"))
+    return f"""
+<div style="background:#121212;padding:28px 20px;font-family:-apple-system,'Segoe UI',Arial,sans-serif;">
+  <div style="max-width:480px;margin:0 auto;background:#171719;border:1px solid rgba(255,255,255,0.08);
+              border-left:3px solid #FF6B1A;border-radius:0 14px 14px 0;padding:22px 24px;">
+    <div style="font-size:10px;letter-spacing:1.6px;text-transform:uppercase;color:#85857C;
+                font-weight:700;margin-bottom:10px;">{e(label)} &middot; {e(when)}</div>
+    <div style="font-size:18px;font-weight:800;color:#F5F5F0;line-height:1.35;">{e(title)}</div>
+    {f'<div style="font-size:14px;color:#ADADA4;margin-top:8px;line-height:1.5;">{e(body)}</div>' if body else ''}
+    <a href="{url}" style="display:inline-block;margin-top:20px;padding:13px 22px;border-radius:10px;
+       background:#FF6B1A;color:#140800;font-weight:800;font-size:14px;text-decoration:none;">
+      Open in HAULTRA</a>
+  </div>
+  <div style="max-width:480px;margin:14px auto 0;font-size:11px;color:#5A5A52;text-align:center;">
+    You get this because you are a manager on HAULTRA. Only urgent driver alerts are emailed.
+  </div>
+</div>"""
+
+
+def flush_alert_emails(company_id=None, limit=20):
+    """Email any un-emailed critical/warning alert.
+
+    Email is the delivery channel that reaches a phone TODAY: the Capacitor
+    store builds have no Push API, so until native push is wired this is what
+    actually gets a breakdown in front of the boss.
+    """
+    sent = 0
+    conn = get_db()
+    try:
+        where = "emailed_at IS NULL AND severity IN ('critical','warning')"
+        params = []
+        if company_id:
+            where += " AND company_id=?"
+            params.append(company_id)
+        rows = conn.execute(
+            "SELECT id, company_id, kind, title, body, link, created_at "
+            "FROM alerts WHERE %s ORDER BY id DESC LIMIT ?" % where, params + [limit]
+        ).fetchall()
+        for row in rows:
+            claimed = conn.execute(
+                "UPDATE alerts SET emailed_at=? WHERE id=? AND emailed_at IS NULL",
+                (now_ts(), row["id"]),
+            ).rowcount
+            conn.commit()
+            if not claimed:
+                continue          # another worker got there first
+            recipients = _alert_email_recipients(conn, row["company_id"])
+            if not recipients:
+                continue
+            _icon, _sev, label = ALERT_KINDS.get(row["kind"], ("bell", "info", row["kind"]))
+            html = _alert_email_html(row["title"], row["body"] or "", label,
+                                     _ago(row["created_at"]), row["link"])
+            for addr in recipients:
+                # The alert title already reads as a sentence ("Dave Miller is
+                # running late — ETA 30 min"), which is exactly what a lock
+                # screen should show. No app-name prefix eating characters.
+                if send_email(addr, row["title"], html):
+                    sent += 1
+    except sqlite3.Error as exc:
+        app.logger.warning("alert email: sweep failed (%s)", exc)
+    finally:
+        conn.close()
+    return sent
+
+
+def _deliver_alerts(company_id):
+    """Both channels, one background pass. Each is independently guarded so a
+    failing push never costs you the email."""
+    try:
+        flush_alert_pushes(company_id)
+    except Exception as exc:
+        app.logger.warning("alert delivery: push leg failed (%s)", exc)
+    try:
+        flush_alert_emails(company_id)
+    except Exception as exc:
+        app.logger.warning("alert delivery: email leg failed (%s)", exc)
+
+
+def push_alerts_soon(company_id):
+    """Fire delivery off the request thread.
+
+    Neither a push nor an email may sit between the driver tapping a button and
+    the response coming back — both are network round trips and the driver may
     be on one bar.
     """
-    if not push_configured():
-        return
     try:
-        threading.Thread(target=flush_alert_pushes, args=(company_id,), daemon=True).start()
+        threading.Thread(target=_deliver_alerts, args=(company_id,), daemon=True).start()
     except Exception:
         pass
 
@@ -10026,7 +10137,40 @@ def boss_notifications_page():
       var btn  = document.getElementById('push-btn');
       var sub  = document.getElementById('push-sub');
       var KEY  = null;
-      if (!('Notification' in window) || !('PushManager' in window) || !navigator.serviceWorker) return;
+
+      // Tell the truth about where push can and cannot arrive, BEFORE offering
+      // a button. Two contexts accept a permission prompt and then never
+      // deliver anything, which is worse than saying so up front:
+      //   * iOS Safari in a normal tab — Apple only allows push to a web app
+      //     launched from the Home Screen, and there is no way around it.
+      //   * the Capacitor store build — its WebView has no Push API; that
+      //     needs FCM/APNs through the native layer.
+      var ua = navigator.userAgent || '';
+      var isIOS = /iPad|iPhone|iPod/.test(ua) ||
+                  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+      var isStandalone = window.navigator.standalone === true ||
+                         window.matchMedia('(display-mode: standalone)').matches;
+      var isNativeShell = ua.indexOf('HaultraNativeApp') !== -1;
+
+      function blocked(reason) {
+        card.hidden = false;
+        btn.hidden = true;
+        sub.textContent = reason;
+      }
+      if (isNativeShell) {
+        blocked('Phone alerts don\u2019t work in the installed app yet. ' +
+                'Open haultra-systems.com in Safari or Chrome and add it to your Home Screen to get them.');
+        return;
+      }
+      if (isIOS && !isStandalone) {
+        blocked('On iPhone, tap Share \u2192 Add to Home Screen, then open HAULTRA from that icon ' +
+                'and come back here. Apple only allows alerts for a home-screen app.');
+        return;
+      }
+      if (!('Notification' in window) || !('PushManager' in window) || !navigator.serviceWorker) {
+        blocked('This browser can\u2019t receive push notifications.');
+        return;
+      }
 
       // base64url -> Uint8Array. PushManager wants raw bytes for the app server
       // key; handing it the string silently fails to subscribe.
