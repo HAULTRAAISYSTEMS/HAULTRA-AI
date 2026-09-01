@@ -17,29 +17,50 @@ The mail-sending logic lives entirely in the `send_email()` helper in `app.py` �
 
 Everything a driver sends — running late, messages, breakdowns, cancels, time
 off — lands in one feed at `/boss/notifications`, and the nav badge counts what
-still needs a decision. That much works with no configuration.
+still needs a decision. That much works with no configuration at all.
 
-To also push those alerts to a phone, set three environment variables from the
-[Firebase console](https://console.firebase.google.com) for the
-`haultra-dispatch` project:
+To also push those alerts to a phone, set two environment variables. Generate
+the pair once with:
 
-- `FCM_PROJECT_ID` — Project settings → General → Project ID
-- `FCM_SERVICE_ACCOUNT_JSON` — Project settings → Service accounts → *Generate
-  new private key*. Paste the whole JSON blob as one variable.
-- `FCM_VAPID_PUBLIC_KEY` — Project settings → Cloud Messaging → Web Push
-  certificates → *Generate key pair*. This is what lets a browser request a token.
+```bash
+python3 - <<'EOF'
+import base64
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+k = ec.generate_private_key(ec.SECP256R1())
+pub = k.public_key().public_bytes(serialization.Encoding.X962,
+                                  serialization.PublicFormat.UncompressedPoint)
+priv = k.private_numbers().private_value.to_bytes(32, "big")
+b64 = lambda b: base64.urlsafe_b64encode(b).decode().rstrip("=")
+print("VAPID_PUBLIC_KEY=" + b64(pub))
+print("VAPID_PRIVATE_KEY=" + b64(priv))
+EOF
+```
 
-With none of them set the app runs exactly as before: alerts still appear in the
+- `VAPID_PUBLIC_KEY` — handed to the browser so it can build a subscription
+- `VAPID_PRIVATE_KEY` — signs the send. Secret; never commit it.
+- `VAPID_SUBJECT` — optional contact address, defaults to `mailto:info@haultraai.com`
+
+**Rotating these invalidates every existing subscription.** Every device has to
+tap "Turn on" again, so generate once and keep them.
+
+With no keys set the app runs exactly as before: alerts still appear in the
 feed, and the send is skipped with a log line — same graceful degradation as
 `RESEND_API_KEY`. The "Get these on your phone" row stays hidden until the
 server reports push is configured, so nobody is offered a button that can't work.
 
-Each boss device registers itself once from that row. `push_tokens` holds one
-row per browser or app install; a boss with a phone and a laptop has two. Dead
-tokens are retired automatically when FCM reports them unregistered.
+Each device registers itself once from that row. `push_tokens` holds one row per
+browser or app install; a boss with a phone and a laptop has two. Subscriptions
+the push service reports as gone (404/410) are retired automatically.
 
 Only `critical` and `warning` alerts push. A time-off request is recorded but
 never buzzes a phone.
+
+**Reach:** this is plain Web Push, so it covers desktop browsers, Android
+Chrome, and iPhone **only when the site is added to the Home Screen** — iOS
+Safari refuses push to an ordinary tab. It does not reach the Capacitor App
+Store / Play Store builds; those would need FCM or APNs wired through the
+native layer, which is a separate job.
 
 ### Production backups and retention
 
