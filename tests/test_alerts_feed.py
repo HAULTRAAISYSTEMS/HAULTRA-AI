@@ -169,6 +169,15 @@ for needle in ["running late", "asked for time off", "sent a message", "cancelle
     ok(needle in html, "feed shows: %s" % needle)
 ok("Mark handled" in html, "each open alert offers a way to close it")
 
+# The badge is the whole point of an alert system, and it used to live inside
+# the closed "More" dropdown where it could never be seen. It belongs in the
+# primary nav.
+nav = html[:html.find("</nav>")] if "</nav>" in html else html
+ok("account-alert-nav-badge" in nav,
+   "the alert badge is in the top nav, not buried in a dropdown")
+ok(nav.find("Alerts") < nav.find("Route Board") if "Route Board" in nav else True,
+   "Alerts comes before the dispatch tooling \u2014 what needs you outranks what you can go do")
+
 # badge counts things needing a decision, and ignores info
 c = app.get_db()
 _open = app.alert_open_count(c, co)

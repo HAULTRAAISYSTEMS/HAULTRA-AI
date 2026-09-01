@@ -6563,6 +6563,11 @@ def shell_page(title, body, extra_head=""):
                           icon('wrench') + 'Maintenance' + _nav_badge('maint-nav-badge', _open_defects), path))
             if is_own:
                 _parts.append(nav_link(url_for("dashboard"), 'Owner', path))
+            _parts.insert(0, nav_link(
+                url_for("boss_notifications_page"),
+                icon('bell') + 'Alerts' + _nav_badge("account-alert-nav-badge", _alert_open),
+                path,
+            ))
             primary_items = "".join(_parts)
             # NOTE: unassigned_work + customers_page routes are defined in the
             # same module (sections 3 & 4); url_for resolves them at request
@@ -6594,11 +6599,6 @@ def shell_page(title, body, extra_head=""):
             _mparts = []
             # TEAM
             _mparts.append(_mhead("Team"))
-            _mparts.append(nav_link(
-                url_for("boss_notifications_page"),
-                icon('bell') + 'Alerts' + _nav_badge("account-alert-nav-badge", _alert_open),
-                path,
-            ))
             _mparts.append(nav_link(url_for("team_hours_page"), icon('clock') + 'Team Hours', path))
             _mparts.append(nav_link(url_for("team_time_off_page"), icon('calendar') + 'Team Time Off', path))
             # FLEET — any management role can view (add/edit gated server-side).
@@ -25780,16 +25780,35 @@ def _driver_late_card_html(conn, company_id, driver_id, today, co_settings, csrf
     Off: a driver reaching for it is already behind, in a truck, and should not
     have to scroll past two other cards to reach it.
 
-    Returns "" once the driver has a start punch — telling the boss you're late
-    after you've clocked in is meaningless, and _late_active() clears the row at
-    that moment anyway.
+    Once the driver's day has started the control is gone — you cannot be
+    running late for work you have already begun, and _late_active() clears the
+    row at that moment anyway. It SAYS so rather than vanishing: with the
+    default 'first_action' rule the day starts the instant a driver completes
+    their first stop, so a driver can reach for this mid-morning and find
+    nothing there. Silence is indistinguishable from broken software.
     """
     try:
-        start_ts, _ = resolve_driver_day_punches(conn, driver_id, today, co_settings)
+        start_ts, end_ts = resolve_driver_day_punches(conn, driver_id, today, co_settings)
     except Exception:
-        start_ts = None
-    if start_ts:
+        start_ts = end_ts = None
+    if start_ts and end_ts:
+        # Day finished — the explainer would just be clutter on a closed day.
         return ""
+    if start_ts:
+        _t = ""
+        try:
+            _t = datetime.strptime(start_ts[:19], "%Y-%m-%d %H:%M:%S").strftime("%I:%M %p").lstrip("0")
+        except Exception:
+            _t = ""
+        return (
+            '<div class="card" style="max-width:460px;margin:0 auto 16px;">'
+            '<div class="muted small" style="display:flex;align-items:flex-start;gap:9px;line-height:1.55;">'
+            + icon('clock')
+            + '<span><strong style="color:var(--text-soft);">Running late is for before your day starts.</strong><br>'
+            + ('Your day started at ' + e(_t) + '. ' if _t else 'Your day has already started. ')
+            + 'If something is holding you up now, message dispatch from Cab View.</span></div>'
+            '</div>'
+        )
 
     late = _late_active(conn, company_id, driver_id, today, co_settings)
     if late:
