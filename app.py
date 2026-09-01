@@ -6563,7 +6563,7 @@ def shell_page(title, body, extra_head=""):
                           icon('wrench') + 'Maintenance' + _nav_badge('maint-nav-badge', _open_defects), path))
             if is_own:
                 _parts.append(nav_link(url_for("dashboard"), 'Owner', path))
-            _parts.insert(0, nav_link(
+            _parts.append(nav_link(
                 url_for("boss_notifications_page"),
                 icon('bell') + 'Alerts' + _nav_badge("account-alert-nav-badge", _alert_open),
                 path,
@@ -10078,6 +10078,9 @@ def boss_notifications_page():
         params,
     ).fetchall()
     open_n = alert_open_count(conn, cid())
+    total_n = conn.execute(
+        "SELECT COUNT(*) n FROM alerts WHERE company_id=?", (cid(),)
+    ).fetchone()["n"]
     # Opening the page is what marks things READ. Read is "I have seen this";
     # resolved is "I have dealt with it" — two different questions, and the
     # badge only ever counts the second.
@@ -10117,8 +10120,16 @@ def boss_notifications_page():
         </div>
         """
 
-    _empty = ('<div class="card muted">Nothing needs you right now.</div>' if show == "open"
-              else '<div class="card muted">No alerts yet.</div>')
+    if total_n == 0:
+        _empty = ('<div class="card muted">No alerts yet. When a driver reports running late, '
+                  'cancels a stop, sends a message or breaks down, it lands here.</div>')
+    elif show == "open":
+        _empty = ('<div class="card muted">Nothing needs you right now &mdash; '
+                  + str(total_n) + ' alert' + ('' if total_n == 1 else 's')
+                  + ' handled. <a href="' + url_for("boss_notifications_page", show="all")
+                  + '">See everything</a>.</div>')
+    else:
+        _empty = '<div class="card muted">No alerts yet.</div>' 
 
     # Phone alerts. The permission prompt has to come from a real tap — browsers
     # reject one fired on page load, and ambushing someone with it is rude
@@ -25744,10 +25755,17 @@ def notify(conn, company_id, kind, title, body="", link="", actor_user_id=None,
             g._alerts_raised = True
         except Exception:
             pass
-    except sqlite3.Error:
-        # An alert is a notification, not the work itself. Losing one must never
-        # roll back the cancel, the clock-in, or the message that caused it.
-        pass
+    except sqlite3.Error as exc:
+        # An alert is a notification, not the work itself: losing one must never
+        # roll back the cancel, the clock-in, or the message that caused it. But
+        # swallowing it in silence was wrong. A schema drift here -- a column an
+        # older database has not been migrated to yet -- would make every alert
+        # vanish with no trace anywhere, which is indistinguishable from the
+        # feature never having been wired up. Now it says so in the logs.
+        app.logger.error(
+            "notify: FAILED to record alert (kind=%s company=%s dedupe=%s): %s",
+            kind, company_id, dedupe_key, exc,
+        )
 
 
 def alert_unread_count(conn, company_id):
