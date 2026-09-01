@@ -6693,6 +6693,32 @@ a:hover {{ color: #FF9D5C; }}
 .footer-slim a {{ color: var(--text-muted); }}
 .footer-slim a:hover {{ color: var(--text-soft); }}
 
+/* ── Running late ───────────────────────────────────────────*/
+.late-open {{
+    display: flex; align-items: center; justify-content: center; gap: 9px;
+    width: 100%; min-height: 52px; border-radius: 11px; cursor: pointer;
+    background: rgba(245,180,60,0.10); border: 1px solid rgba(245,180,60,0.45);
+    color: #F5B43C; font-weight: 800; font-size: 15px; box-shadow: none;
+}}
+.late-open:hover {{ background: rgba(245,180,60,0.18); }}
+.late-chips {{ display: flex; gap: 7px; flex-wrap: wrap; margin-bottom: 14px; }}
+.late-chip {{
+    flex: 1; min-width: 72px; min-height: 48px; border-radius: 9px; cursor: pointer;
+    background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.14);
+    color: var(--text-soft); font-weight: 700; font-size: 14px; box-shadow: none;
+}}
+/* The selected state the old radios never had — tapping a chip used to change
+   nothing on screen, which is what made this read as broken. */
+.late-chip.on {{
+    background: rgba(245,180,60,0.18); border-color: rgba(245,180,60,0.7);
+    color: #F5B43C;
+}}
+.late-send {{
+    width: 100%; min-height: 52px; border-radius: 11px; border: none; cursor: pointer;
+    font-weight: 800; font-size: 15px;
+    background: linear-gradient(135deg,#FFC061,#F5B43C); color: #1A1206;
+}}
+
 /* ── Dashboard focus row ────────────────────────────────────*/
 /* Three tiles that answer "what needs me right now", each carrying a line of
    context. The rail down the left encodes state in form as well as number, so
@@ -7170,7 +7196,7 @@ a:hover {{ color: #FF9D5C; }}
    BUTTONS
    ══════════════════════════════════════════════════════════*/
 .btn,
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.cab-leg-chip) {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.cab-leg-chip) {{
     display: inline-block;
     border: none;
     cursor: pointer;
@@ -7188,7 +7214,7 @@ button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact
 }}
 
 .btn:hover,
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.cab-leg-chip):hover {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.cab-leg-chip):hover {{
     filter: brightness(1.1);
     transform: translateY(-1px);
     text-decoration: none;
@@ -24626,7 +24652,8 @@ def recurring_off_create():
 @app.route("/late/checkin", methods=["POST"])
 @driver_required
 def late_checkin():
-    eta = (request.form.get("eta") or "").strip()[:40]
+    _etas = [v.strip() for v in request.form.getlist("eta") if v and v.strip()]
+    eta = (_etas[-1] if _etas else "")[:40]
     reason = (request.form.get("reason") or "").strip()[:200]
     driver_id = session["user_id"]
     today = today_str()
@@ -24961,6 +24988,102 @@ def team_time_off_page():
     return render_template_string(shell_page("Team Time Off", body))
 
 
+def _driver_late_card_html(conn, company_id, driver_id, today, co_settings, csrf):
+    """The Running-late control, rendered next to Clock In / Out.
+
+    It belongs with the punch buttons, not at the bottom of the page under Time
+    Off: a driver reaching for it is already behind, in a truck, and should not
+    have to scroll past two other cards to reach it.
+
+    Returns "" once the driver has a start punch — telling the boss you're late
+    after you've clocked in is meaningless, and _late_active() clears the row at
+    that moment anyway.
+    """
+    try:
+        start_ts, _ = resolve_driver_day_punches(conn, driver_id, today, co_settings)
+    except Exception:
+        start_ts = None
+    if start_ts:
+        return ""
+
+    late = _late_active(conn, company_id, driver_id, today, co_settings)
+    if late:
+        _eta = e(late["eta"] or "")
+        _why = e(late["reason"] or "")
+        return (
+            '<div class="card" style="max-width:460px;margin:0 auto 16px;'
+            'border-color:rgba(245,180,60,0.45);background:rgba(245,180,60,0.07);">'
+            '<div style="display:flex;align-items:center;gap:9px;font-weight:800;color:#F5B43C;">'
+            + icon('clock') + 'Dispatch has been told you\'re running late</div>'
+            + ('<div style="margin-top:8px;color:var(--text-soft);font-size:14px;">ETA ' + _eta + '</div>' if _eta else '')
+            + ('<div style="margin-top:4px;color:var(--text-muted);font-size:13px;">' + _why + '</div>' if _why else '')
+            + '<div class="muted small" style="margin-top:8px;">Clears by itself when you clock in.</div>'
+            '</div>'
+        )
+
+    _chips = "".join(
+        '<button type="button" class="late-chip" data-eta="' + v + '" '
+        'onclick="haultraPickEta(this)">' + v + '</button>'
+        for v in ["15 min", "30 min", "45 min", "60+ min"]
+    )
+    _INP = ('width:100%;min-height:46px;padding:10px 12px;background:var(--bg-0,#121212);'
+            'border:1px solid rgba(255,255,255,0.12);border-radius:9px;color:var(--text);')
+    return (
+        '<div class="card" style="max-width:460px;margin:0 auto 16px;">'
+        '<button type="button" class="late-open" '
+        'onclick="var m=document.getElementById(\'late-modal\');m.hidden=!m.hidden;">'
+        + icon('clock') + 'Running late</button>'
+
+        '<div id="late-modal" hidden style="margin-top:12px;">'
+        '<form method="POST" action="' + url_for("late_checkin") + '">'
+        '<input type="hidden" name="_csrf_token" value="' + csrf + '">'
+        # ONE field named `eta`. It used to be two — a radio group and a text
+        # box sharing the name — so request.form.get("eta") took the radio and
+        # silently threw away anything the driver typed.
+        '<input type="hidden" name="eta" id="late-eta" value="">'
+        + LATE_LBL + 'How late?</div>'
+        '<div class="late-chips">' + _chips + '</div>'
+        + LATE_LBL + 'Or give a time</div>'
+        '<input id="late-eta-text" oninput="haultraTypeEta(this)" '
+        'placeholder="e.g. be in by 7:30" style="' + _INP + 'margin-bottom:12px;">'
+        + LATE_LBL + 'What\'s going on?</div>'
+        '<input name="reason" placeholder="traffic, truck won\'t start, family thing…" '
+        'style="' + _INP + 'margin-bottom:14px;">'
+        '<button type="submit" class="late-send">Tell dispatch</button>'
+        '</form></div>'
+        + _LATE_JS +
+        '</div>'
+    )
+
+
+LATE_LBL = ('<div style="font-size:10.5px;font-weight:700;letter-spacing:.09em;'
+            'text-transform:uppercase;color:var(--text-muted);margin:0 0 7px;">')
+
+# The chips used to be radios with `display:none` and no `:checked` styling, so
+# tapping one changed nothing on screen and the control read as broken. They are
+# buttons now, and the selection is both visible and written to a single hidden
+# field. Typing a time clears the chip, so the two can never disagree.
+_LATE_JS = """
+<script>
+window.haultraPickEta = function(btn) {
+  var all = document.querySelectorAll('.late-chip');
+  for (var i = 0; i < all.length; i++) { all[i].classList.remove('on'); }
+  btn.classList.add('on');
+  var hid = document.getElementById('late-eta');
+  var txt = document.getElementById('late-eta-text');
+  if (hid) hid.value = btn.getAttribute('data-eta');
+  if (txt) txt.value = '';
+};
+window.haultraTypeEta = function(input) {
+  var all = document.querySelectorAll('.late-chip');
+  for (var i = 0; i < all.length; i++) { all[i].classList.remove('on'); }
+  var hid = document.getElementById('late-eta');
+  if (hid) hid.value = input.value;
+};
+</script>
+"""
+
+
 def _driver_time_off_card_html(conn, company_id, driver_id, today, co_settings, csrf):
     """The driver's TIME OFF card for the clock page: request form + own request
     list with status badges + cancel, a recurring-off request, and (when not yet
@@ -25018,40 +25141,9 @@ def _driver_time_off_card_html(conn, company_id, driver_id, today, co_settings, 
                       + ' <span style="color:' + col + ';font-weight:700;">(' + st + ')</span>'
                       + (' · ends ' + e(r["ended_on"]) if r["ended_on"] else '') + '</div>')
 
-    # Running-late control (only before clocked in).
-    late_html = ""
-    if not start_ts:
-        if late:
-            late_html = ('<div style="margin-top:12px;padding:10px 12px;border-radius:10px;'
-                         'background:rgba(255,107,26,0.12);border:1px solid rgba(255,107,26,0.5);color:#FF9D5C;font-weight:700;">'
-                         '&#9201; Boss notified: running late, ETA ' + e(late["eta"] or "") + '. Clears when you clock in.</div>')
-        else:
-            late_html = (
-                '<div style="margin-top:12px;">'
-                '<button type="button" onclick="document.getElementById(\'late-modal\').hidden=false"'
-                ' style="width:100%;min-height:48px;border-radius:10px;border:1px solid rgba(255,107,26,0.5);'
-                'background:rgba(255,107,26,0.1);color:#FF9D5C;font-weight:800;cursor:pointer;">&#9201; Running late</button>'
-                '<div id="late-modal" hidden style="margin-top:10px;padding:12px;border-radius:10px;'
-                'border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.03);">'
-                '<form method="POST" action="' + url_for("late_checkin") + '">'
-                '<input type="hidden" name="_csrf_token" value="' + csrf + '">'
-                '<label class="muted small">ETA</label>'
-                '<div style="display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 10px;">'
-                + "".join('<label style="flex:1;min-width:64px;text-align:center;min-height:44px;display:flex;'
-                          'align-items:center;justify-content:center;border:1px solid rgba(255,255,255,0.14);'
-                          'border-radius:8px;cursor:pointer;"><input type="radio" name="eta" value="' + v + '" style="display:none;">' + v + '</label>'
-                          for v in ["15 min", "30 min", "45 min", "60+ min"])
-                + '</div>'
-                '<input name="eta" placeholder="or a time, e.g. be in by 7:30" '
-                'style="width:100%;min-height:44px;padding:8px 10px;background:var(--bg-0,#121212);'
-                'border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);margin-bottom:8px;">'
-                '<input name="reason" placeholder="reason (optional)" '
-                'style="width:100%;min-height:44px;padding:8px 10px;background:var(--bg-0,#121212);'
-                'border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);margin-bottom:10px;">'
-                '<button style="width:100%;min-height:48px;border-radius:10px;border:none;cursor:pointer;font-weight:800;'
-                'background:linear-gradient(135deg,#ff8a3d,#F5B43C);color:#1a1206;">Send</button>'
-                '</form></div></div>')
-
+    # The Running-late control used to live here, at the bottom of the page
+    # under Time Off. It now renders next to Clock In / Out — see
+    # _driver_late_card_html().
     return (
         '<div class="card" style="margin-top:16px;">'
         '<h2 style="margin-top:0;">&#127796; Time Off</h2>'
@@ -25070,7 +25162,6 @@ def _driver_time_off_card_html(conn, company_id, driver_id, today, co_settings, 
         '<button style="min-height:44px;padding:0 18px;border-radius:9px;border:none;cursor:pointer;font-weight:800;'
         'background:linear-gradient(135deg,#00c853,#00e57a);color:#001a0a;">Request</button>'
         '</form>'
-        + late_html
         + '<div style="margin-top:14px;">' + req_html + '</div>'
         + ('<details style="margin-top:12px;"><summary class="muted small" style="cursor:pointer;min-height:36px;">'
            'Recurring days off</summary>'
@@ -25269,6 +25360,7 @@ def driver_clock():
     week_tick_js = _WEEK_LIVE_TICK_JS if (week_summary["has_live"] and _w == 0) else ""
 
     # Time Off card (request form + own list + running-late control).
+    late_card_html     = _driver_late_card_html(conn, cid(), driver_id, today, co_settings, csrf_tok)
     time_off_card_html = _driver_time_off_card_html(conn, cid(), driver_id, today, co_settings, csrf_tok)
 
     # Driver's own profile photo + upload control for the page header.
@@ -25507,6 +25599,10 @@ def driver_clock():
         '<div class="card" style="max-width:460px;margin:0 auto 16px;">'
         + actions_html +
         '</div>'
+
+        # Running late sits with the punch buttons — a driver reaching for it is
+        # already behind and should not have to scroll to the bottom of the page.
+        + late_card_html
 
         # ── THIS WEEK summary (below today's status) ─────────────────────
         + week_card_html
