@@ -4463,7 +4463,16 @@ def driver_required(fn):
             flash("Login required.", "error")
             return redirect(url_for("login"))
         if session.get("role") != "driver":
-            flash("Driver access only.", "error")
+            # Log the bounce. A silent redirect on a POST looks exactly like a
+            # successful submit from the outside -- same status code, same
+            # destination -- so without this line a manager filling in a driver
+            # form gets no signal anywhere that nothing was saved.
+            app.logger.warning(
+                "driver_required: BOUNCED %s %s for user=%s role=%s",
+                request.method, request.path, session.get("user_id"), session.get("role"),
+            )
+            flash("That's a driver action \u2014 nothing was saved. "
+                  "Sign in as the driver to send it.", "error")
             return redirect(url_for("dashboard"))
         return fn(*args, **kwargs)
     return wrapper
@@ -25344,7 +25353,15 @@ def late_checkin():
         start_ts = None
     if start_ts:
         conn.close()
-        flash("You're already clocked in.", "info")
+        # Logged, because this path writes nothing: without a line here a
+        # refusal is a bare 302 that is indistinguishable from a success, which
+        # is exactly how this took six rounds to find.
+        app.logger.warning(
+            "late_checkin: REFUSED for user=%s company=%s date=%s (already started at %s)",
+            driver_id, company_id, today, start_ts,
+        )
+        flash("Not sent \u2014 your day has already started, so dispatch was not notified. "
+              "Message dispatch from Cab View instead.", "error")
         return redirect(url_for("driver_clock"))
     # Replace any existing active late check-in for today (latest wins).
     conn.execute(
@@ -25809,6 +25826,18 @@ def _driver_late_card_html(conn, company_id, driver_id, today, co_settings, csrf
         start_ts, end_ts = resolve_driver_day_punches(conn, driver_id, today, co_settings)
     except Exception:
         start_ts = end_ts = None
+    if session.get("role") != "driver":
+        # /driver/clock is only @login_required, so a boss can open this page —
+        # but /late/checkin is @driver_required and would bounce the POST. Say
+        # so instead of rendering a form that silently goes nowhere.
+        return (
+            '<div class="card" style="max-width:460px;margin:0 auto 16px;">'
+            '<div class="muted small" style="display:flex;align-items:flex-start;gap:9px;line-height:1.55;">'
+            + icon('clock')
+            + '<span><strong style="color:var(--text-soft);">Running late is a driver check-in.</strong><br>'
+            'You are signed in as a manager, so there is no shift here to report against. '
+            'Drivers send these from their own account.</span></div></div>'
+        )
     if start_ts and end_ts:
         # Day finished — the explainer would just be clutter on a closed day.
         return ""

@@ -37,10 +37,15 @@ _co = conn.execute("SELECT * FROM companies WHERE id=?", (co,)).fetchone()
 cos = {k: _co[k] for k in _co.keys()}
 
 
-def card():
-    # url_for() inside the helper needs an app context.
+def card(uid=None, role="driver"):
+    # url_for() needs an app context, and the helper now checks session role --
+    # it must not hand a driver form to someone the POST endpoint would bounce.
+    from flask import session as _sess
     with app.app.test_request_context("/driver/clock"):
-        return app._driver_late_card_html(conn, co, drv, today, cos, "tok")
+        _sess["user_id"] = uid or drv
+        _sess["company_id"] = co
+        _sess["role"] = role
+        return app._driver_late_card_html(conn, co, uid or drv, today, cos, "tok")
 
 
 # ── 1. Not started: the control is offered ────────────────────────────────
@@ -75,6 +80,22 @@ conn.execute("UPDATE driver_clock_entries SET clock_out_at=? WHERE driver_id=? A
              (today + " 17:10:00", drv, today))
 conn.commit()
 ok(card().strip() == "", "once the day is closed the explainer stops taking up space")
+conn.close()
+
+# ── 5. A manager on the driver page is told, not handed a dead form ───────
+# /driver/clock is only @login_required while /late/checkin is @driver_required,
+# so a boss could fill in the form and be redirected with nothing written and
+# nothing logged -- a 302 that reads exactly like success.
+conn = app.get_db()
+cur = conn.cursor()
+cur.execute("INSERT INTO users (username,password_hash,role,full_name,company_id,created_at)"
+            " VALUES (?,?,?,?,?,?)", ("l_boss", "x", "boss", "Tim Brown", co, ts))
+boss = cur.lastrowid
+conn.commit()
+
+h = card(uid=boss, role="boss")
+ok("late-open" not in h, "a manager is never shown a Running late form the POST would bounce")
+ok("driver check-in" in h, "and is told why (got: %s)" % h[-200:].replace(chr(10), " "))
 conn.close()
 
 print("\nALL RUNNING-LATE STATE TESTS PASSED")
