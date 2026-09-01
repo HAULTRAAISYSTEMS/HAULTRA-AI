@@ -84,6 +84,28 @@ ok(n == 1, "same dedupe_key twice writes one row (offline replay safe)")
 app.notify(c, co, "NOT_A_REAL_KIND", "unknown kind")
 c.commit()
 ok(True, "notify() with an unknown kind does not raise")
+
+# A database problem inside notify() must never roll back the driver's work --
+# but it must not disappear either. Swallowed in silence, a schema drift makes
+# every alert vanish with no trace, which looks exactly like the feature was
+# never wired up.
+import logging, io as _io
+_buf = _io.StringIO(); _h = logging.StreamHandler(_buf)
+app.app.logger.addHandler(_h); app.app.logger.setLevel(logging.ERROR)
+_bad = app.get_db()
+_bad.execute("ALTER TABLE alerts RENAME TO alerts_quarantine")
+_bad.execute("""CREATE TABLE alerts (id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id INTEGER NOT NULL, kind TEXT NOT NULL, severity TEXT NOT NULL DEFAULT 'info',
+    title TEXT NOT NULL, created_at TEXT NOT NULL)""")
+_bad.commit()
+app.notify(_bad, co, "BREAKDOWN", "cannot be recorded", dedupe_key="broken-1")
+_bad.commit()
+ok("FAILED to record alert" in _buf.getvalue(),
+   "a notify() that cannot write says so in the logs instead of vanishing")
+_bad.execute("DROP TABLE alerts")
+_bad.execute("ALTER TABLE alerts_quarantine RENAME TO alerts")
+_bad.commit(); _bad.close()
+app.app.logger.removeHandler(_h)
 c.execute("DELETE FROM alerts WHERE company_id=?", (co,)); c.commit(); c.close()
 
 # ── running late ──────────────────────────────────────────────────────────

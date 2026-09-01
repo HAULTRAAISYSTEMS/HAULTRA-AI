@@ -50,8 +50,15 @@ def as_boss():
         s.update(user_id=boss, role="boss", roles=["owner","dispatcher"], company_id=co, _csrf_token="tok")
 
 today = date.fromisoformat(app.today_str())
-d1 = (today + timedelta(days=20)).isoformat()
-d2 = (today + timedelta(days=21)).isoformat()
+# Far out, deliberately. The recurring-rule section below projects onto
+# Mondays from next week through today+42, and these one-time absences used to
+# sit at today+20/+21 — which lands exactly on the second recurring occurrence
+# whenever today is a Monday. The override assertion then failed because the
+# separate one-time absence still covered that date, and CI went red on a
+# calendar coincidence rather than a real defect. Verified: the override
+# behaviour itself is correct in isolation.
+d1 = (today + timedelta(days=200)).isoformat()
+d2 = (today + timedelta(days=201)).isoformat()
 
 # ---- 2. driver request → pending → boss approve → approved -----------------
 as_driver()
@@ -94,7 +101,7 @@ ok(r.status_code in (302,200), "reassign to off driver still succeeds (warn not 
 
 # ---- 4. deny + cancel + already-scheduled-off ------------------------------
 as_driver()
-d3=(today+timedelta(days=30)).isoformat()
+d3=(today+timedelta(days=210)).isoformat()
 cl.post("/time-off/request", data={"_csrf_token":"tok","start_date":d3})
 conn=app.get_db(); rid3=conn.execute("SELECT id FROM time_off_requests WHERE driver_id=? AND start_date=?",(tim,d3)).fetchone()["id"]; conn.close()
 as_boss(); cl.post(f"/time-off/{rid3}/decide", data={"_csrf_token":"tok","decision":"denied","boss_note":"need you"})
@@ -102,7 +109,7 @@ conn=app.get_db(); st=conn.execute("SELECT status FROM time_off_requests WHERE i
 ok(st=="denied","deny path works")
 # cancel while pending
 as_driver()
-d4=(today+timedelta(days=40)).isoformat()
+d4=(today+timedelta(days=220)).isoformat()
 cl.post("/time-off/request", data={"_csrf_token":"tok","start_date":d4})
 conn=app.get_db(); rid4=conn.execute("SELECT id FROM time_off_requests WHERE driver_id=? AND start_date=?",(tim,d4)).fetchone()["id"]; conn.close()
 cl.post(f"/time-off/{rid4}/cancel", data={"_csrf_token":"tok"})
@@ -162,7 +169,12 @@ conn=app.get_db()
 wk = app.company_week_start_for(_st, app._company_local_now(_st))
 summ = app.get_driver_week_summary(conn, tim, wk, _st, app._company_local_now(_st))
 conn.close()
-offday = summ["days"][0]["date"]
+# Pick a day with no punches. The card only renders an OFF row when the driver
+# did NOT work that day ("day['date'] in _off and not day['start']"), and an
+# earlier section of this file clocks the driver in today — which is days[0]
+# whenever today is the first day of the workweek. Asserting on days[0]
+# therefore failed on Mondays for a reason that has nothing to do with time off.
+offday = next((d["date"] for d in summ["days"] if not d["start"]), summ["days"][-1]["date"])
 card = app.render_week_hours_card(summ, "/driver/clock", 0, off_dates={offday})
 ok("OFF" in card, "weekly-hours card renders an OFF row for an approved-off day")
 
