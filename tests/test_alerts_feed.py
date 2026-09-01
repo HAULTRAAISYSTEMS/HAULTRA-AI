@@ -176,27 +176,35 @@ ok(cl.post("/alerts/%d/resolve" % target, data={"_csrf_token": "t"}).status_code
 # ── push plumbing ─────────────────────────────────────────────────────────
 as_boss()
 cfg = json.loads(cl.get("/api/push/config").data)
-ok("enabled" in cfg and "vapidKey" in cfg, "push config endpoint answers")
-ok(cfg["enabled"] is False, "push reports itself off with no FCM env set")
-ok(app.push_configured() is False, "push_configured() false without credentials")
+ok("enabled" in cfg and "publicKey" in cfg, "push config endpoint answers")
+ok(cfg["enabled"] is False, "push reports itself off with no VAPID keys set")
+ok(app.push_configured() is False, "push_configured() false without keys")
 ok(app.flush_alert_pushes(co) == 0, "the push sweep is a safe no-op when unconfigured")
 
-r = cl.post("/api/push/register", json={"_csrf_token": "t", "token": "tok-abc", "platform": "web"})
-ok(r.status_code == 200, "a device can register a push token")
+SUB = {"endpoint": "https://fcm.googleapis.com/wp/abc123",
+       "keys": {"p256dh": "BFake", "auth": "authfake"}}
+r = cl.post("/api/push/register", json={"_csrf_token": "t", "subscription": SUB, "platform": "web"})
+ok(r.status_code == 200, "a device can register a push subscription")
 c = app.get_db()
-n = c.execute("SELECT COUNT(*) n FROM push_tokens WHERE company_id=? AND token='tok-abc'", (co,)).fetchone()["n"]
+row = c.execute("SELECT token FROM push_tokens WHERE company_id=?", (co,)).fetchone()
 c.close()
-ok(n == 1, "token stored")
-cl.post("/api/push/register", json={"_csrf_token": "t", "token": "tok-abc", "platform": "web"})
+ok(row is not None and "abc123" in row["token"], "the whole subscription is stored, endpoint and keys")
+
+cl.post("/api/push/register", json={"_csrf_token": "t", "subscription": SUB, "platform": "web"})
 c = app.get_db()
-n = c.execute("SELECT COUNT(*) n FROM push_tokens WHERE token='tok-abc'", ()).fetchone()["n"]
+n = c.execute("SELECT COUNT(*) n FROM push_tokens WHERE company_id=?", (co,)).fetchone()["n"]
 c.close()
 ok(n == 1, "re-registering the same device updates rather than duplicates")
-ok(cl.post("/api/push/register", json={"_csrf_token": "t", "token": ""}).status_code == 400,
-   "an empty token is rejected")
+
+ok(cl.post("/api/push/register", json={"_csrf_token": "t"}).status_code == 400,
+   "a missing subscription is rejected")
+ok(cl.post("/api/push/register", json={"_csrf_token": "t", "subscription": {"keys": {}}}).status_code == 400,
+   "a subscription with no endpoint is rejected")
 
 html = cl.get("/boss/notifications").get_data(as_text=True)
-ok("push-card" in html and "hidden" in html, "the phone-alerts row ships hidden until push is configured")
+ok("push-card" in html, "the phone-alerts row is on the page")
+ok("firebasejs" not in html, "no Firebase scripts are loaded any more")
+ok("applicationServerKey" in html, "the client subscribes through the standard PushManager")
 
 # ── relative time uses the same clock the rows were written with ──────────
 ok(app._ago(app.now_ts()) == "just now",

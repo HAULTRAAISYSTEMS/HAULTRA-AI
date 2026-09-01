@@ -9749,57 +9749,28 @@ def analytics_page():
 # =========================================================
 # PUSH — alerts on the boss's phone
 # =========================================================
-# Delivery rides Firebase Cloud Messaging, which the service worker was already
-# half-wired for: it had an onBackgroundMessage handler and a firebase config,
-# but nothing ever requested a token and there was no server side, so no push
-# has ever actually been sent from this app.
+# Plain Web Push (VAPID), not Firebase. The service worker was originally
+# half-wired for FCM, but that path needs a live Firebase project, a service
+# account and a console round-trip; this needs two env vars and nothing else.
+# The trade-off, stated plainly: Web Push reaches browsers and installed PWAs,
+# NOT the Capacitor App Store / Play Store builds. Those would need FCM or APNs
+# through the native layer, which is a separate job.
 #
-# Configuration is env-only and degrades exactly like RESEND_API_KEY does: with
-# no credentials the app runs normally, alerts still land in the feed, and the
-# send is skipped with a log line. Nothing here can break a request.
+#   VAPID_PUBLIC_KEY   handed to the browser so it can build a subscription
+#   VAPID_PRIVATE_KEY  signs the send. Secret.
+#   VAPID_SUBJECT      contact address push services can reach you at
 #
-#   FCM_PROJECT_ID            Firebase console -> Project settings -> General
-#   FCM_SERVICE_ACCOUNT_JSON  ...-> Service accounts -> Generate new private key
-#                             (paste the whole JSON blob as one env var)
-#   FCM_VAPID_PUBLIC_KEY      ...-> Cloud Messaging -> Web Push certificates
-#
-# The first two let the server SEND. The third lets a browser ASK for a token.
+# With no keys set the app runs normally, alerts still land in the feed, and
+# sends are skipped with a log line — same graceful degradation as
+# RESEND_API_KEY.
 
-FCM_PROJECT_ID = os.environ.get("FCM_PROJECT_ID", "").strip()
-FCM_VAPID_PUBLIC_KEY = os.environ.get("FCM_VAPID_PUBLIC_KEY", "").strip()
-_FCM_SA_RAW = os.environ.get("FCM_SERVICE_ACCOUNT_JSON", "").strip()
-
-_fcm_token_cache = {"token": None, "exp": 0.0}
-_fcm_lock = threading.Lock()
+VAPID_PUBLIC_KEY  = os.environ.get("VAPID_PUBLIC_KEY", "").strip()
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "").strip()
+VAPID_SUBJECT     = os.environ.get("VAPID_SUBJECT", "mailto:info@haultraai.com").strip()
 
 
 def push_configured():
-    return bool(FCM_PROJECT_ID and _FCM_SA_RAW)
-
-
-def _fcm_access_token():
-    """OAuth token for the FCM HTTP v1 API, cached until shortly before expiry.
-
-    google-auth is imported lazily so the dependency is only needed by
-    deployments that actually turn push on.
-    """
-    with _fcm_lock:
-        now = time.time()
-        if _fcm_token_cache["token"] and now < _fcm_token_cache["exp"]:
-            return _fcm_token_cache["token"]
-        try:
-            from google.oauth2 import service_account
-            from google.auth.transport.requests import Request as _GRequest
-            info = json.loads(_FCM_SA_RAW)
-            creds = service_account.Credentials.from_service_account_info(
-                info, scopes=["https://www.googleapis.com/auth/firebase.messaging"])
-            creds.refresh(_GRequest())
-            _fcm_token_cache["token"] = creds.token
-            _fcm_token_cache["exp"] = now + 3000     # tokens last ~1h
-            return creds.token
-        except Exception as exc:
-            app.logger.warning("push: could not mint FCM access token (%s)", exc)
-            return None
+    return bool(VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY)
 
 
 def _push_recipients(conn, company_id):
@@ -9817,35 +9788,37 @@ def _push_recipients(conn, company_id):
         return []
 
 
-def _fcm_send(access_token, device_token, title, body, link):
-    """One message. Returns True on success, False if the token is dead."""
-    url = "https://fcm.googleapis.com/v1/projects/%s/messages:send" % FCM_PROJECT_ID
-    payload = {"message": {
-        "token": device_token,
-        # `data` only, no `notification` block: the service worker's
-        # onBackgroundMessage builds the notification itself, and a payload
-        # carrying both gets shown twice on Android.
-        "data": {"title": title[:120], "body": body[:240], "link": link or "/boss/notifications"},
-        "webpush": {"fcm_options": {"link": link or "/boss/notifications"}},
-        "android": {"priority": "high"},
-        "apns": {"headers": {"apns-priority": "10"}},
-    }}
+def _webpush_send(subscription_json, title, body, link):
+    """Send one notification. Returns True to keep the subscription, False when
+    the push service says it is permanently gone."""
     try:
-        resp = requests.post(
-            url, json=payload, timeout=8,
-            headers={"Authorization": "Bearer " + access_token,
-                     "Content-Type": "application/json; UTF-8"},
+        from pywebpush import webpush, WebPushException
+    except ImportError:
+        app.logger.warning("push: pywebpush not installed; skipping send")
+        return True
+    try:
+        webpush(
+            subscription_info=json.loads(subscription_json),
+            data=json.dumps({"title": title[:120], "body": body[:240],
+                             "link": link or "/boss/notifications"}),
+            vapid_private_key=VAPID_PRIVATE_KEY,
+            vapid_claims={"sub": VAPID_SUBJECT},
+            timeout=8,
         )
-        if resp.status_code == 200:
-            return True
-        # 404 UNREGISTERED / 400 INVALID_ARGUMENT mean the device is gone —
-        # the caller retires the row rather than retrying it forever.
-        if resp.status_code in (400, 403, 404):
-            app.logger.info("push: retiring dead token (%s)", resp.status_code)
-            return False
-        app.logger.warning("push: FCM %s %s", resp.status_code, resp.text[:200])
-        return True     # transient — keep the token, try again next sweep
+        return True
     except Exception as exc:
+        # 404/410 mean the browser dropped the subscription — the user cleared
+        # site data or uninstalled the PWA. Retire it rather than retrying it
+        # on every future alert forever.
+        # WebPushException exposes .status_code as the documented common
+        # interface across its requests/aiohttp response types; the nested
+        # .response is the fallback for anything else that reaches here.
+        status = getattr(exc, "status_code", None)
+        if status is None:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status in (404, 410):
+            app.logger.info("push: retiring expired subscription (%s)", status)
+            return False
         app.logger.warning("push: send failed (%s)", exc)
         return True
 
@@ -9859,9 +9832,6 @@ def flush_alert_pushes(company_id=None, limit=20):
     not buzz a phone.
     """
     if not push_configured():
-        return 0
-    access = _fcm_access_token()
-    if not access:
         return 0
     sent = 0
     conn = get_db()
@@ -9884,7 +9854,7 @@ def flush_alert_pushes(company_id=None, limit=20):
             if not claimed:
                 continue          # another worker got there first
             for dev in _push_recipients(conn, row["company_id"]):
-                if not _fcm_send(access, dev["token"], row["title"], row["body"] or "", row["link"]):
+                if not _webpush_send(dev["token"], row["title"], row["body"] or "", row["link"]):
                     conn.execute("UPDATE push_tokens SET failed_at=? WHERE id=?",
                                  (now_ts(), dev["id"]))
                     conn.commit()
@@ -9901,7 +9871,8 @@ def push_alerts_soon(company_id):
     """Fire the sweep off the request thread.
 
     A push must never sit between the driver tapping a button and the response
-    coming back — FCM is a network round trip and the driver may be on one bar.
+    coming back — the push service is a network round trip and the driver may
+    be on one bar.
     """
     if not push_configured():
         return
@@ -9914,12 +9885,16 @@ def push_alerts_soon(company_id):
 @app.route("/api/push/register", methods=["POST"])
 @login_required
 def api_push_register():
-    """The boss's browser hands us its FCM token after granting permission."""
+    """The boss's browser hands us its PushSubscription after granting
+    permission. Stored whole — endpoint plus the p256dh/auth keys — because
+    every future send needs all of it."""
     data = request.get_json(silent=True) or {}
-    token = (data.get("token") or "").strip()
-    platform = (data.get("platform") or "web").strip()[:20]
-    if not token or len(token) > 512:
-        return jsonify({"error": "bad token"}), 400
+    sub = data.get("subscription")
+    if not isinstance(sub, dict) or not sub.get("endpoint"):
+        return jsonify({"error": "bad subscription"}), 400
+    blob = json.dumps(sub, separators=(",", ":"))
+    if len(blob) > 2000:
+        return jsonify({"error": "subscription too large"}), 400
     conn = get_db()
     conn.execute(
         """INSERT INTO push_tokens (company_id, user_id, token, platform, created_at, last_seen_at)
@@ -9927,7 +9902,8 @@ def api_push_register():
            ON CONFLICT(token) DO UPDATE SET
              user_id=excluded.user_id, company_id=excluded.company_id,
              last_seen_at=excluded.last_seen_at, failed_at=NULL""",
-        (cid(), session["user_id"], token, platform, now_ts(), now_ts()),
+        (cid(), session["user_id"], blob,
+         (data.get("platform") or "web")[:20], now_ts(), now_ts()),
     )
     conn.commit()
     conn.close()
@@ -9953,11 +9929,8 @@ def _push_after_request(response):
 @app.route("/api/push/config")
 @login_required
 def api_push_config():
-    """What the client needs to ask for a token — and whether it's worth asking."""
-    return jsonify({
-        "enabled": bool(FCM_VAPID_PUBLIC_KEY and push_configured()),
-        "vapidKey": FCM_VAPID_PUBLIC_KEY,
-    })
+    """What the client needs to subscribe — and whether it's worth asking."""
+    return jsonify({"enabled": push_configured(), "publicKey": VAPID_PUBLIC_KEY})
 
 
 @app.route("/boss/notifications")
@@ -10047,75 +10020,70 @@ def boss_notifications_page():
         <button type="button" class="btn" id="push-btn" onclick="haultraEnablePush()">Turn on</button>
       </div>
     </div>
-    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-messaging-compat.js"></script>
     <script>
     (function () {
       var card = document.getElementById('push-card');
       var btn  = document.getElementById('push-btn');
       var sub  = document.getElementById('push-sub');
-      var CFG  = null;
-      if (!('Notification' in window) || !navigator.serviceWorker) return;
+      var KEY  = null;
+      if (!('Notification' in window) || !('PushManager' in window) || !navigator.serviceWorker) return;
+
+      // base64url -> Uint8Array. PushManager wants raw bytes for the app server
+      // key; handing it the string silently fails to subscribe.
+      function urlB64ToUint8(base64String) {
+        var padding = '='.repeat((4 - base64String.length % 4) % 4);
+        var base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+        var raw = window.atob(base64);
+        var out = new Uint8Array(raw.length);
+        for (var i = 0; i < raw.length; ++i) { out[i] = raw.charCodeAt(i); }
+        return out;
+      }
 
       fetch('/api/push/config', {credentials: 'same-origin'})
         .then(function (r) { return r.json(); })
         .then(function (cfg) {
-          CFG = cfg;
-          if (!cfg.enabled) return;               // not configured on the server
+          if (!cfg.enabled || !cfg.publicKey) return;   // not configured server-side
+          KEY = cfg.publicKey;
           card.hidden = false;
           if (Notification.permission === 'granted') {
-            btn.textContent = 'On';
-            btn.disabled = true;
+            btn.textContent = 'On'; btn.disabled = true;
             sub.textContent = 'This device is registered for alerts.';
-            register();                            // refresh the token quietly
+            subscribe();                                 // refresh quietly
           } else if (Notification.permission === 'denied') {
-            btn.disabled = true;
-            btn.textContent = 'Blocked';
+            btn.disabled = true; btn.textContent = 'Blocked';
             sub.textContent = 'Notifications are blocked for this site in your browser settings.';
           }
         })
         .catch(function () {});
 
-      function register() {
-        try {
-          if (!firebase.apps.length) {
-            firebase.initializeApp({
-              apiKey: "AIzaSyBAWm08bVHH5uia21H5VPd1mAW0Ei0MnV4",
-              authDomain: "haultra-dispatch.firebaseapp.com",
-              projectId: "haultra-dispatch",
-              storageBucket: "haultra-dispatch.firebasestorage.app",
-              messagingSenderId: "66096047367",
-              appId: "1:66096047367:web:a7a3da473ba9d0bf5b51a2"
+      function subscribe() {
+        navigator.serviceWorker.ready.then(function (reg) {
+          return reg.pushManager.getSubscription().then(function (existing) {
+            return existing || reg.pushManager.subscribe({
+              userVisibleOnly: true,
+              applicationServerKey: urlB64ToUint8(KEY)
             });
-          }
-          navigator.serviceWorker.ready.then(function (reg) {
-            firebase.messaging().getToken({vapidKey: CFG.vapidKey, serviceWorkerRegistration: reg})
-              .then(function (token) {
-                if (!token) throw new Error('no token');
-                return fetch('/api/push/register', {
-                  method: 'POST', credentials: 'same-origin',
-                  headers: {'Content-Type': 'application/json',
-                            'X-CSRF-Token': document.querySelector('meta[name=\"csrf-token\"]').getAttribute('content')},
-                  body: JSON.stringify({token: token, platform: 'web'})
-                });
-              })
-              .then(function () {
-                btn.textContent = 'On'; btn.disabled = true;
-                sub.textContent = 'This device is registered for alerts.';
-              })
-              .catch(function () {
-                sub.textContent = "Couldn't register this device. Try again, or check that notifications are allowed.";
-              });
           });
-        } catch (e) {
-          sub.textContent = "Push isn't available in this browser.";
-        }
+        }).then(function (s) {
+          return fetch('/api/push/register', {
+            method: 'POST', credentials: 'same-origin',
+            headers: {'Content-Type': 'application/json',
+                      'X-CSRF-Token': document.querySelector('meta[name=\"csrf-token\"]').getAttribute('content')},
+            body: JSON.stringify({subscription: s.toJSON(), platform: 'web'})
+          });
+        }).then(function () {
+          btn.textContent = 'On'; btn.disabled = true;
+          sub.textContent = 'This device is registered for alerts.';
+        }).catch(function (err) {
+          btn.disabled = false; btn.textContent = 'Turn on';
+          sub.textContent = "Couldn't register this device \u2014 " + (err && err.message ? err.message : 'try again') + '.';
+        });
       }
 
       window.haultraEnablePush = function () {
-        btn.disabled = true; btn.textContent = 'Asking…';
+        btn.disabled = true; btn.textContent = 'Asking\u2026';
         Notification.requestPermission().then(function (p) {
-          if (p === 'granted') { register(); }
+          if (p === 'granted') { subscribe(); }
           else {
             btn.disabled = false; btn.textContent = 'Turn on';
             sub.textContent = 'You said no to notifications. You can change that in browser settings.';
@@ -26310,57 +26278,38 @@ _SW_JS = r"""
 const CACHE   = 'haultra-v3';
 const OFFLINE = '/offline';
 
-// --- Firebase Cloud Messaging (background push for Live Dispatch) ---
-// This is the ONE service worker for the whole origin — FCM handling lives
-// here rather than in a second registered worker to avoid two SWs fighting
-// over the '/' scope.
-//
-// importScripts() is synchronous and throws on failure — if gstatic.com is
-// slow, blocked (ad blocker, corporate firewall, offline first install),
-// or briefly down, an uncaught throw here fails the ENTIRE service worker's
-// script evaluation, which means install/activate/fetch below never get
-// wired up either. Offline caching is the real PWA requirement and must
-// keep working even when FCM can't load, so this is wrapped defensively —
-// losing background push for a session is fine, losing offline support
-// is not.
-try {
-  importScripts('https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js');
-  importScripts('https://www.gstatic.com/firebasejs/10.12.0/firebase-messaging-compat.js');
-
-  firebase.initializeApp({
-    apiKey: "AIzaSyBAWm08bVHH5uia21H5VPd1mAW0Ei0MnV4",
-    authDomain: "haultra-dispatch.firebaseapp.com",
-    projectId: "haultra-dispatch",
-    storageBucket: "haultra-dispatch.firebasestorage.app",
-    messagingSenderId: "66096047367",
-    appId: "1:66096047367:web:a7a3da473ba9d0bf5b51a2"
-  });
-
-  const messaging = firebase.messaging();
-
-  messaging.onBackgroundMessage((payload) => {
-    const { title, body, stopId } = payload.data || {};
-    self.registration.showNotification(title || 'New Stop Assigned', {
-      body: body || 'You have a new stop. Tap to view.',
+// --- Web Push ---
+// Plain VAPID push, no Firebase. The server sends a JSON body of
+// {title, body, link}; everything the notification needs is in that payload,
+// so the worker never has to hit the network to render one.
+self.addEventListener('push', (event) => {
+  let d = {};
+  try { d = event.data ? event.data.json() : {}; } catch (e) { d = {}; }
+  const title = d.title || 'HAULTRA';
+  event.waitUntil(
+    self.registration.showNotification(title, {
+      body: d.body || '',
       icon: '/static/icon-192.png',
       badge: '/static/icon-192.png',
-      tag: stopId || 'haultra-stop',
-      data: { stopId }
-    });
-  });
-} catch (e) {
-  // FCM unavailable this session (network/CDN issue) — background push
-  // notifications won't fire, but offline caching below still will.
-}
+      // Same tag collapses repeats of one alert instead of stacking them.
+      tag: d.tag || 'haultra-alert',
+      renotify: true,
+      data: { link: d.link || '/boss/notifications' }
+    })
+  );
+});
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
+  // Open the thing the alert is about — the route, the stop, the feed —
+  // rather than dumping every tap on the driver dashboard.
+  const link = (event.notification.data && event.notification.data.link) || '/boss/notifications';
   event.waitUntil(
     clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientList) => {
       for (const client of clientList) {
-        if (client.url.includes('/driver') && 'focus' in client) return client.focus();
+        if ('focus' in client) { client.navigate(link); return client.focus(); }
       }
-      if (clients.openWindow) return clients.openWindow('/driver');
+      if (clients.openWindow) return clients.openWindow(link);
     })
   );
 });
