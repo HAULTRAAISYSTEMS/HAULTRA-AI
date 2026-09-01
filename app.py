@@ -25710,15 +25710,36 @@ def notify(conn, company_id, kind, title, body="", link="", actor_user_id=None,
     try:
         icon_name, default_sev, _label = ALERT_KINDS.get(kind, ("bell", "info", kind))
         sev = severity if severity in ALERT_SEVERITIES else default_sev
-        conn.execute(
+        _title = (title or "")[:160]
+        _body  = (body or "")[:400]
+        _link  = (link or "")[:300]
+        cur = conn.execute(
             """INSERT OR IGNORE INTO alerts
                (company_id, kind, severity, title, body, link, actor_user_id,
                 entity_type, entity_id, dedupe_key, created_at)
                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (company_id, kind, sev, (title or "")[:160], (body or "")[:400],
-             (link or "")[:300], actor_user_id, (entity_type or "")[:40],
-             entity_id, dedupe_key, now_ts()),
+            (company_id, kind, sev, _title, _body, _link, actor_user_id,
+             (entity_type or "")[:40], entity_id, dedupe_key, now_ts()),
         )
+        if cur.rowcount == 0 and dedupe_key:
+            # The key already exists. INSERT OR IGNORE alone would silently drop
+            # this, which is wrong: a driver who updates their ETA, or sends a
+            # second check-in after the boss handled the first, has given NEW
+            # information about a LIVE situation. Refresh the row and put it
+            # back in front of the boss — unread, unresolved, and eligible to
+            # push and email again. Dedupe is meant to absorb double-taps and
+            # offline replays, not to mute a driver for the rest of the day.
+            conn.execute(
+                """UPDATE alerts
+                      SET kind=?, severity=?, title=?, body=?, link=?,
+                          actor_user_id=?, entity_type=?, entity_id=?, created_at=?,
+                          read_at=NULL, resolved_at=NULL, resolved_by=NULL,
+                          pushed_at=NULL, emailed_at=NULL
+                    WHERE company_id=? AND dedupe_key=?""",
+                (kind, sev, _title, _body, _link, actor_user_id,
+                 (entity_type or "")[:40], entity_id, now_ts(),
+                 company_id, dedupe_key),
+            )
         try:
             g._alerts_raised = True
         except Exception:
