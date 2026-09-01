@@ -3597,12 +3597,16 @@ def init_db():
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_alerts_unpushed "
         "ON alerts(company_id, pushed_at, created_at)")
+    # The column MUST be added before the index that references it. On a fresh
+    # database the CREATE TABLE above already includes emailed_at, so ordering
+    # looks irrelevant — but on an existing one CREATE TABLE IF NOT EXISTS is a
+    # no-op, the column is absent, and indexing it raises "no such column" and
+    # kills the boot. Fresh-database tests cannot catch this; only an upgrade
+    # from the previous schema can.
+    safe_add_column(conn, "alerts", "emailed_at TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_alerts_unemailed "
         "ON alerts(company_id, emailed_at, created_at)")
-    # Older databases predate the column; adding it here keeps the migration
-    # additive rather than rebuilding the table.
-    safe_add_column(conn, "alerts", "emailed_at TEXT")
 
     # Devices registered to receive push. One row per browser/app install; a
     # boss with a phone and a laptop has two.
