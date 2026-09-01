@@ -3562,6 +3562,61 @@ def init_db():
     # company data are joined at render time; no customer contact PII is copied
     # into this queue.
     cur.execute("""
+    CREATE TABLE IF NOT EXISTS alerts (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id     INTEGER NOT NULL,
+        kind           TEXT NOT NULL,
+        severity       TEXT NOT NULL DEFAULT 'info'
+                       CHECK(severity IN ('critical','warning','info')),
+        title          TEXT NOT NULL,
+        body           TEXT,
+        link           TEXT,
+        actor_user_id  INTEGER,
+        entity_type    TEXT,
+        entity_id      INTEGER,
+        dedupe_key     TEXT,
+        created_at     TEXT NOT NULL,
+        read_at        TEXT,
+        resolved_at    TEXT,
+        resolved_by    INTEGER,
+        pushed_at      TEXT,
+        FOREIGN KEY (company_id) REFERENCES companies(id),
+        FOREIGN KEY (actor_user_id) REFERENCES users(id)
+    )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alerts_feed "
+        "ON alerts(company_id, resolved_at, created_at DESC)")
+    # The dedupe guarantee behind notify(): an offline POST replayed on
+    # reconnect writes one row, not two. NULL keys never collide in SQLite, so
+    # callers that don't pass one are unaffected.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_dedupe "
+        "ON alerts(company_id, dedupe_key) WHERE dedupe_key IS NOT NULL")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alerts_unpushed "
+        "ON alerts(company_id, pushed_at, created_at)")
+
+    # Devices registered to receive push. One row per browser/app install; a
+    # boss with a phone and a laptop has two.
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS push_tokens (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id  INTEGER NOT NULL,
+        user_id     INTEGER NOT NULL,
+        token       TEXT NOT NULL UNIQUE,
+        platform    TEXT,
+        created_at  TEXT NOT NULL,
+        last_seen_at TEXT,
+        failed_at   TEXT,
+        FOREIGN KEY (company_id) REFERENCES companies(id),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens(company_id, user_id)")
+
+    conn.execute("""
     CREATE TABLE IF NOT EXISTS boss_notifications (
         id                         INTEGER PRIMARY KEY AUTOINCREMENT,
         company_id                 INTEGER NOT NULL,
@@ -6443,12 +6498,16 @@ def shell_page(title, body, extra_head=""):
             is_own  = "owner" in _rset
 
             def _nav_badge(bid, n):
+                # `display:none` when empty is set INLINE rather than relying on
+                # the hidden attribute: an inline display declaration outranks
+                # the browser's [hidden] rule, which is why these badges used to
+                # sit in the nav as empty orange pills at zero.
                 return (
-                    '<span id="%s" style="display:inline-block;min-width:16px;padding:1px 6px;'
+                    '<span id="%s" style="display:%s;min-width:16px;padding:1px 6px;'
                     'margin-left:6px;border-radius:999px;background:var(--cyan);color:#121212;'
                     'font-size:10px;font-weight:800;line-height:16px;text-align:center;'
                     'vertical-align:middle;"%s>%s</span>'
-                    % (bid, "" if n else " hidden", n or "")
+                    % (bid, "inline-block" if n else "none", "" if n else " hidden", n or "")
                 )
 
             _rc = get_db()
@@ -6471,11 +6530,10 @@ def shell_page(title, body, extra_head=""):
                     WHERE i.company_id = ? AND ii.result='defect' AND ii.defect_status='open' AND ii.deleted_at IS NULL""",
                 (session.get("company_id"),),
             ).fetchone()["n"]
-            _account_alerts = _rc.execute(
-                "SELECT COUNT(*) n FROM boss_notifications WHERE company_id=? AND read_at IS NULL",
-                (session.get("company_id"),),
-            ).fetchone()["n"]
-            _rc.close()
+            # The badge counts alerts that still need a decision, across every
+            # driver channel — not just the customer-portal notices the old
+            # Alerts page could see.
+            _alert_open = alert_open_count(_rc, user["company_id"])
 
             _parts = []
             if is_disp:
@@ -6527,7 +6585,7 @@ def shell_page(title, body, extra_head=""):
             _mparts.append(_mhead("Team"))
             _mparts.append(nav_link(
                 url_for("boss_notifications_page"),
-                icon('bell') + 'Alerts' + _nav_badge("account-alert-nav-badge", _account_alerts),
+                icon('bell') + 'Alerts' + _nav_badge("account-alert-nav-badge", _alert_open),
                 path,
             ))
             _mparts.append(nav_link(url_for("team_hours_page"), icon('clock') + 'Team Hours', path))
@@ -6692,6 +6750,53 @@ a:hover {{ color: #FF9D5C; }}
 }}
 .footer-slim a {{ color: var(--text-muted); }}
 .footer-slim a:hover {{ color: var(--text-soft); }}
+
+/* ── Alert feed ─────────────────────────────────────────────*/
+.alert-filters {{ display: flex; gap: 8px; margin-bottom: 18px; flex-wrap: wrap; }}
+.alert-filter {{
+    padding: 9px 15px; border-radius: 999px; font-size: 12.5px; font-weight: 600;
+    border: 1px solid rgba(255,255,255,0.09); color: var(--text-muted);
+}}
+.alert-filter.on {{
+    background: rgba(255,107,26,0.12); border-color: rgba(255,107,26,0.45); color: #FF9D5C;
+}}
+.alert-card {{
+    border: 1px solid rgba(255,255,255,0.08);
+    border-left: 3px solid var(--slate);
+    border-radius: 0 var(--radius) var(--radius) 0;
+    padding: 15px 18px; margin-bottom: 10px;
+}}
+.alert-card.is-done {{ opacity: .55; }}
+.alert-head {{
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: 8px;
+}}
+.alert-kind {{
+    display: inline-flex; align-items: center; gap: 7px;
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 1.4px;
+    text-transform: uppercase; font-weight: 600;
+}}
+.alert-when {{ font-family: var(--font-mono); font-size: 10.5px; color: var(--text-muted); }}
+.alert-title {{ font-size: 15.5px; font-weight: 700; color: var(--text); line-height: 1.35; }}
+.alert-body {{ font-size: 13.5px; color: var(--text-soft); margin-top: 5px; line-height: 1.5; }}
+.alert-actions {{ display: flex; align-items: center; gap: 9px; margin-top: 13px; flex-wrap: wrap; }}
+.alert-link {{
+    display: inline-flex; align-items: center; gap: 6px; flex-direction: row-reverse;
+    padding: 8px 14px; min-height: 40px; border-radius: 9px;
+    border: 1px solid rgba(255,107,26,0.4); background: rgba(255,107,26,0.10);
+    color: #FF9D5C; font-size: 12.5px; font-weight: 700;
+}}
+.alert-resolve {{
+    display: inline-flex; align-items: center; gap: 7px;
+    min-height: 40px; padding: 8px 14px; border-radius: 9px; cursor: pointer;
+    background: transparent; border: 1px solid rgba(255,255,255,0.12);
+    color: var(--text-soft); font-size: 12.5px; font-weight: 700; box-shadow: none;
+}}
+.alert-resolve:hover {{ background: rgba(255,255,255,0.05); }}
+.alert-done-tag {{
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 1.2px;
+    text-transform: uppercase; color: var(--green);
+}}
 
 /* ── Running late ───────────────────────────────────────────*/
 .late-open {{
@@ -7196,7 +7301,7 @@ a:hover {{ color: #FF9D5C; }}
    BUTTONS
    ══════════════════════════════════════════════════════════*/
 .btn,
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.cab-leg-chip) {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip) {{
     display: inline-block;
     border: none;
     cursor: pointer;
@@ -7214,7 +7319,7 @@ button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact
 }}
 
 .btn:hover,
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.cab-leg-chip):hover {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip):hover {{
     filter: brightness(1.1);
     transform: translateY(-1px);
     text-decoration: none;
@@ -9644,40 +9749,129 @@ def analytics_page():
 @app.route("/boss/notifications")
 @boss_required
 def boss_notifications_page():
+    """The alert feed — one inbox for everything a driver sends.
+
+    Open items (still needing a decision) sort to the top regardless of age; a
+    breakdown from this morning outranks a time-off request from a minute ago.
+    Everything else is history, newest first.
+    """
+    show = (request.args.get("show") or "open").strip().lower()
+    if show not in ("open", "all"):
+        show = "open"
+
     conn = get_db()
+    where = "a.company_id=?"
+    params = [cid()]
+    if show == "open":
+        where += " AND a.resolved_at IS NULL"
     rows = conn.execute(
-        """SELECT n.*, c.name AS company_name, s.address AS site_address
-             FROM boss_notifications n
-             JOIN companies c ON c.id=n.company_id
-             JOIN sites s ON s.id=n.site_id
-            WHERE n.company_id=?
-            ORDER BY n.created_at DESC, n.id DESC""",
-        (cid(),),
+        f"""SELECT a.*, COALESCE(NULLIF(TRIM(u.full_name),''), u.username) AS actor_name
+              FROM alerts a
+              LEFT JOIN users u ON u.id = a.actor_user_id
+             WHERE {where}
+             ORDER BY (a.resolved_at IS NULL) DESC,
+                      CASE a.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
+                      a.created_at DESC, a.id DESC
+             LIMIT 200""",
+        params,
     ).fetchall()
+    open_n = alert_open_count(conn, cid())
+    # Opening the page is what marks things READ. Read is "I have seen this";
+    # resolved is "I have dealt with it" — two different questions, and the
+    # badge only ever counts the second.
     conn.execute(
-        "UPDATE boss_notifications SET read_at=COALESCE(read_at,?) WHERE company_id=?",
+        "UPDATE alerts SET read_at=COALESCE(read_at,?) WHERE company_id=? AND read_at IS NULL",
         (now_ts(), cid()),
     )
     conn.commit()
     conn.close()
+
+    _sev_style = {
+        "critical": ("#FF5252", "rgba(255,82,82,0.09)", "rgba(255,82,82,0.45)"),
+        "warning":  ("#F5B43C", "rgba(245,180,60,0.08)", "rgba(245,180,60,0.40)"),
+        "info":     ("#8CA0B3", "rgba(140,160,179,0.07)", "rgba(140,160,179,0.30)"),
+    }
+
     cards = ""
-    for row in rows:
-        state = row["deployment_state"].replace("_", " ").title()
+    for r in rows:
+        icon_name, _dsev, label = ALERT_KINDS.get(r["kind"], ("bell", "info", r["kind"]))
+        col, bg, bd = _sev_style.get(r["severity"], _sev_style["info"])
+        done = bool(r["resolved_at"])
         cards += f"""
-        <div class="card">
-            <div class="row between"><strong>Customer portal deleted</strong>
-                <span class="badge">{e(state)}</span></div>
-            <p style="margin:8px 0 0;">{e(row['company_name'])} &middot; {e(row['site_address'] or 'Site')}</p>
-            <p class="muted small">Exact orders scrubbed: {row['orders_scrubbed_count']} &middot;
-                Tenant orders not attributable by exact email/phone: {row['orders_unattributed_count']}</p>
+        <div class="alert-card{' is-done' if done else ''}"
+             style="border-left-color:{col};background:{'transparent' if done else bg};border-color:{bd};">
+            <div class="alert-head">
+                <span class="alert-kind" style="color:{col};">{icon(icon_name)}{e(label)}</span>
+                <span class="alert-when">{e(_ago(r['created_at']))}</span>
+            </div>
+            <div class="alert-title">{e(r['title'])}</div>
+            {f'<div class="alert-body">{e(r["body"])}</div>' if r["body"] else ''}
+            <div class="alert-actions">
+                {f'<a class="alert-link" href="{r["link"]}">Open{icon("board")}</a>' if r["link"] else ''}
+                {'<span class="alert-done-tag">Handled</span>' if done else
+                 f'''<form method="POST" action="{url_for('alert_resolve', alert_id=r['id'])}" style="margin:0;">
+                     <button type="submit" class="alert-resolve">{icon('check')}Mark handled</button></form>'''}
+            </div>
         </div>
         """
+
+    _empty = ('<div class="card muted">Nothing needs you right now.</div>' if show == "open"
+              else '<div class="card muted">No alerts yet.</div>')
     body = f"""
-    <div class="hero"><h1>Boss Alerts</h1>
-        <p>Operational follow-up that may require dispatch action.</p></div>
-    {cards or '<div class="card muted">No alerts.</div>'}
+    <div class="hero">
+        <h1>Alerts</h1>
+        <p>Everything your drivers send, in one place &mdash; running late, messages,
+           truck trouble, cancels and time off.</p>
+    </div>
+    <div class="alert-filters">
+        <a class="alert-filter{' on' if show == 'open' else ''}" href="{url_for('boss_notifications_page')}">
+            Needs you{f' &middot; {open_n}' if open_n else ''}</a>
+        <a class="alert-filter{' on' if show == 'all' else ''}" href="{url_for('boss_notifications_page', show='all')}">
+            Everything</a>
+    </div>
+    {cards or _empty}
     """
-    return render_template_string(shell_page("Boss Alerts", body))
+    return render_template_string(shell_page("Alerts", body))
+
+
+@app.route("/alerts/<int:alert_id>/resolve", methods=["POST"])
+@boss_required
+def alert_resolve(alert_id):
+    conn = get_db()
+    conn.execute(
+        "UPDATE alerts SET resolved_at=?, resolved_by=? WHERE id=? AND company_id=? AND resolved_at IS NULL",
+        (now_ts(), session["user_id"], alert_id, cid()),
+    )
+    conn.commit()
+    conn.close()
+    return redirect(request.referrer or url_for("boss_notifications_page"))
+
+
+@app.route("/api/alerts/count")
+@boss_required
+def api_alerts_count():
+    """Live badge count, polled by the nav the same way the other badges are."""
+    conn = get_db()
+    n = alert_open_count(conn, cid())
+    conn.close()
+    return jsonify({"count": n})
+
+
+def _ago(ts):
+    """'4m', '2h', '3d' — a dispatcher scanning a feed wants elapsed time, not a
+    timestamp they have to subtract in their head."""
+    try:
+        then = datetime.strptime((ts or "")[:19], "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+    secs = max(0, int((datetime.now() - then).total_seconds()))
+    if secs < 90:
+        return "just now"
+    if secs < 3600:
+        return "%dm ago" % (secs // 60)
+    if secs < 86400:
+        return "%dh ago" % (secs // 3600)
+    return "%dd ago" % (secs // 86400)
 
 
 @app.route("/team")
@@ -16443,8 +16637,21 @@ def route_messages(route_id):
             "INSERT INTO messages (route_id, sender_user_id, body, created_at, client_id) VALUES (?, ?, ?, ?, ?)",
             (route_id, session["user_id"], body, now_ts(), client_id)
         )
-        conn.commit()
         msg_id = cur.lastrowid
+        # Only the driver's side raises an alert — the boss messaging their own
+        # driver should obviously not notify the boss.
+        if session.get("role") != "boss":
+            notify(
+                conn, cid(), "DRIVER_MESSAGE",
+                _actor_name(conn) + " sent a message",
+                body,
+                link=url_for("view_route", route_id=route_id),
+                actor_user_id=session["user_id"], entity_type="message", entity_id=msg_id,
+                # client_id is the driver's own offline-queue id, so a replayed
+                # send can never raise a second alert.
+                dedupe_key=("msg:%s" % client_id) if client_id else None,
+            )
+        conn.commit()
         conn.close()
         return jsonify({"success": True, "id": msg_id})
 
@@ -17374,6 +17581,15 @@ def cancel_stop(stop_id):
     _where = (stop["customer_name"] or stop["address"] or ("Stop %d" % stop["stop_order"]))
     _cancel_note(conn, route_id, session["user_id"],
                  "%s cancelled stop: %s — %s" % (_who, _where, cancel_label(reason)))
+    if source != "boss":
+        notify(
+            conn, cid(), "STOP_CANCELLED",
+            "%s cancelled a stop — %s" % (_who, _where),
+            cancel_label(reason),
+            link=url_for("view_route", route_id=route_id),
+            actor_user_id=session["user_id"], entity_type="stop", entity_id=stop_id,
+            dedupe_key=("cancelstop:%s" % client_uuid) if client_uuid else None,
+        )
     conn.commit()
 
     # The can chain has to be recomputed with this stop out of it, or every
@@ -17496,6 +17712,17 @@ def cancel_route(route_id):
     _cancel_note(conn, route_id, session["user_id"],
                  "%s cancelled this route (%d stop%s) — %s"
                  % (_who, cancelled_n, "" if cancelled_n == 1 else "s", cancel_label(reason)))
+    if source != "boss":
+        notify(
+            conn, cid(), "ROUTE_CANCELLED",
+            "%s cancelled a whole route — %s" % (_who, route["route_name"] or "route"),
+            "%d stop%s dropped · %s"
+            % (cancelled_n, "" if cancelled_n == 1 else "s", cancel_label(reason)),
+            link=url_for("view_route", route_id=route_id),
+            actor_user_id=session["user_id"], entity_type="route", entity_id=route_id,
+            severity="critical",
+            dedupe_key=("cancelroute:%s" % client_uuid) if client_uuid else None,
+        )
     conn.commit()
     compute_can_flow(conn, route_id)
     conn.commit()
@@ -24577,6 +24804,15 @@ def time_off_request():
            VALUES (?,?,?,?,?,'pending',?)""",
         (company_id, driver_id, _iso(start), _iso(end), reason, now_ts())
     )
+    _span = _iso(start) if start == end else (_iso(start) + " \u2192 " + _iso(end))
+    notify(
+        conn, company_id, "TIME_OFF_REQUEST",
+        _actor_name(conn) + " asked for time off",
+        _span + ((" \u00b7 " + reason) if reason else ""),
+        link=url_for("team_time_off_page"),
+        actor_user_id=driver_id, entity_type="time_off_request",
+        dedupe_key="timeoff:%s:%s:%s" % (driver_id, _iso(start), _iso(end)),
+    )
     conn.commit()
     conn.close()
     flash("Time-off request sent.", "success")
@@ -24679,6 +24915,16 @@ def late_checkin():
         """INSERT INTO late_checkins (company_id, driver_id, work_date, eta, reason, created_at)
            VALUES (?,?,?,?,?,?)""",
         (company_id, driver_id, today, eta, reason, now_ts())
+    )
+    notify(
+        conn, company_id, "DRIVER_LATE",
+        _actor_name(conn) + " is running late" + (" \u2014 ETA " + eta if eta else ""),
+        reason or "No reason given.",
+        link=url_for("team_time_off_page"),
+        actor_user_id=driver_id, entity_type="late_checkin",
+        # One alert per driver per day — a driver who updates their ETA twice
+        # should not put two rows in the boss's feed.
+        dedupe_key="late:%s:%s" % (driver_id, today),
     )
     conn.commit()
     conn.close()
@@ -24986,6 +25232,91 @@ def team_time_off_page():
         + '</form></div>'
     )
     return render_template_string(shell_page("Team Time Off", body))
+
+
+# =========================================================
+# ALERTS — one inbox for everything a driver sends
+# =========================================================
+# Before this, a driver could reach the boss eight different ways and each one
+# landed somewhere else: running late on Team Time Off, messages in a route
+# thread, truck issues under Maintenance, defects under a nav badge, and the
+# page actually called "Alerts" showed exactly one event type
+# (CUSTOMER_PORTAL_DELETED) and nothing else.
+#
+# An alert row is a POINTER, not a copy. The source tables stay the source of
+# truth; this carries only what the feed needs to render a line and link to it,
+# plus the read/handled state that has to live somewhere. That keeps the feed a
+# single fast indexed read instead of a union across eight tables.
+
+ALERT_SEVERITIES = ("critical", "warning", "info")
+
+# Kind → (icon, default severity, human label). Adding a kind here is all it
+# takes for the feed to render it.
+ALERT_KINDS = {
+    "DRIVER_LATE":        ("clock",     "warning",  "Running late"),
+    "TIME_OFF_REQUEST":   ("calendar",  "info",     "Time off request"),
+    "DRIVER_MESSAGE":     ("msg",       "warning",  "Message from driver"),
+    "DRIVER_URGENT":      ("alert",     "critical", "Urgent from driver"),
+    "TRUCK_ISSUE":        ("wrench",    "critical", "Truck issue"),
+    "BREAKDOWN":          ("alert",     "critical", "Breakdown"),
+    "STOP_CANCELLED":     ("x",         "warning",  "Stop cancelled"),
+    "ROUTE_CANCELLED":    ("x",         "critical", "Route cancelled"),
+    "ROUTE_EXCEPTION":    ("alert",     "warning",  "Can't complete stop"),
+    "CLOCK_CORRECTION":   ("clock",     "info",     "Clock correction"),
+    "CUSTOMER_PORTAL_DELETED": ("shield", "info",   "Customer portal deleted"),
+}
+
+
+def notify(conn, company_id, kind, title, body="", link="", actor_user_id=None,
+           entity_type="", entity_id=None, severity=None, dedupe_key=None):
+    """Raise one alert. Safe to call inside any request; never raises.
+
+    `dedupe_key` makes a call idempotent — an offline POST replayed on
+    reconnect, or a poller that fires twice, writes one row. Same contract as
+    route_exceptions.client_uuid.
+
+    Deliberately does NOT commit: the caller owns the transaction, so an alert
+    can never outlive the thing it is announcing.
+    """
+    try:
+        icon_name, default_sev, _label = ALERT_KINDS.get(kind, ("bell", "info", kind))
+        sev = severity if severity in ALERT_SEVERITIES else default_sev
+        conn.execute(
+            """INSERT OR IGNORE INTO alerts
+               (company_id, kind, severity, title, body, link, actor_user_id,
+                entity_type, entity_id, dedupe_key, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (company_id, kind, sev, (title or "")[:160], (body or "")[:400],
+             (link or "")[:300], actor_user_id, (entity_type or "")[:40],
+             entity_id, dedupe_key, now_ts()),
+        )
+    except sqlite3.Error:
+        # An alert is a notification, not the work itself. Losing one must never
+        # roll back the cancel, the clock-in, or the message that caused it.
+        pass
+
+
+def alert_unread_count(conn, company_id):
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) n FROM alerts WHERE company_id=? AND read_at IS NULL",
+            (company_id,),
+        ).fetchone()["n"]
+    except sqlite3.Error:
+        return 0
+
+
+def alert_open_count(conn, company_id):
+    """Alerts still needing a decision — the number that belongs on the badge.
+    Info-level items are FYI and never hold the badge hostage."""
+    try:
+        return conn.execute(
+            """SELECT COUNT(*) n FROM alerts
+                WHERE company_id=? AND resolved_at IS NULL AND severity IN ('critical','warning')""",
+            (company_id,),
+        ).fetchone()["n"]
+    except sqlite3.Error:
+        return 0
 
 
 def _driver_late_card_html(conn, company_id, driver_id, today, co_settings, csrf):
@@ -30754,6 +31085,14 @@ def report_breakdown():
                VALUES (?, ?, ?, ?, 'urgent', ?)""",
             (route_id, driver_id, body[:500], now_ts(), item_id),
         )
+    notify(
+        conn, cid(), "BREAKDOWN",
+        _actor_name(conn) + " reported a breakdown \u2014 " + issue,
+        "Truck " + tname + ((" \u00b7 " + note_in) if note_in else ""),
+        link=url_for("driver_route_detail", route_id=route_id) if route_id else url_for("maintenance_page"),
+        actor_user_id=driver_id, entity_type="inspection_item", entity_id=item_id,
+        severity="critical",
+    )
     conn.commit()
     conn.close()
     return jsonify({"success": True, "item_id": item_id, "issue": issue})
