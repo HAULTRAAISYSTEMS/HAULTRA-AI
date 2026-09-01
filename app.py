@@ -13,7 +13,7 @@ except Exception:
 from flask import (
     Flask, request, redirect, url_for, session, flash,
     render_template, render_template_string, send_file, send_from_directory, abort, jsonify,
-    Response, stream_with_context
+    Response, stream_with_context, g
 )
 import sqlite3
 import os
@@ -3562,6 +3562,61 @@ def init_db():
     # company data are joined at render time; no customer contact PII is copied
     # into this queue.
     cur.execute("""
+    CREATE TABLE IF NOT EXISTS alerts (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id     INTEGER NOT NULL,
+        kind           TEXT NOT NULL,
+        severity       TEXT NOT NULL DEFAULT 'info'
+                       CHECK(severity IN ('critical','warning','info')),
+        title          TEXT NOT NULL,
+        body           TEXT,
+        link           TEXT,
+        actor_user_id  INTEGER,
+        entity_type    TEXT,
+        entity_id      INTEGER,
+        dedupe_key     TEXT,
+        created_at     TEXT NOT NULL,
+        read_at        TEXT,
+        resolved_at    TEXT,
+        resolved_by    INTEGER,
+        pushed_at      TEXT,
+        FOREIGN KEY (company_id) REFERENCES companies(id),
+        FOREIGN KEY (actor_user_id) REFERENCES users(id)
+    )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alerts_feed "
+        "ON alerts(company_id, resolved_at, created_at DESC)")
+    # The dedupe guarantee behind notify(): an offline POST replayed on
+    # reconnect writes one row, not two. NULL keys never collide in SQLite, so
+    # callers that don't pass one are unaffected.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_dedupe "
+        "ON alerts(company_id, dedupe_key) WHERE dedupe_key IS NOT NULL")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alerts_unpushed "
+        "ON alerts(company_id, pushed_at, created_at)")
+
+    # Devices registered to receive push. One row per browser/app install; a
+    # boss with a phone and a laptop has two.
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS push_tokens (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id  INTEGER NOT NULL,
+        user_id     INTEGER NOT NULL,
+        token       TEXT NOT NULL UNIQUE,
+        platform    TEXT,
+        created_at  TEXT NOT NULL,
+        last_seen_at TEXT,
+        failed_at   TEXT,
+        FOREIGN KEY (company_id) REFERENCES companies(id),
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens(company_id, user_id)")
+
+    conn.execute("""
     CREATE TABLE IF NOT EXISTS boss_notifications (
         id                         INTEGER PRIMARY KEY AUTOINCREMENT,
         company_id                 INTEGER NOT NULL,
@@ -6443,12 +6498,16 @@ def shell_page(title, body, extra_head=""):
             is_own  = "owner" in _rset
 
             def _nav_badge(bid, n):
+                # `display:none` when empty is set INLINE rather than relying on
+                # the hidden attribute: an inline display declaration outranks
+                # the browser's [hidden] rule, which is why these badges used to
+                # sit in the nav as empty orange pills at zero.
                 return (
-                    '<span id="%s" style="display:inline-block;min-width:16px;padding:1px 6px;'
+                    '<span id="%s" style="display:%s;min-width:16px;padding:1px 6px;'
                     'margin-left:6px;border-radius:999px;background:var(--cyan);color:#121212;'
                     'font-size:10px;font-weight:800;line-height:16px;text-align:center;'
                     'vertical-align:middle;"%s>%s</span>'
-                    % (bid, "" if n else " hidden", n or "")
+                    % (bid, "inline-block" if n else "none", "" if n else " hidden", n or "")
                 )
 
             _rc = get_db()
@@ -6471,11 +6530,10 @@ def shell_page(title, body, extra_head=""):
                     WHERE i.company_id = ? AND ii.result='defect' AND ii.defect_status='open' AND ii.deleted_at IS NULL""",
                 (session.get("company_id"),),
             ).fetchone()["n"]
-            _account_alerts = _rc.execute(
-                "SELECT COUNT(*) n FROM boss_notifications WHERE company_id=? AND read_at IS NULL",
-                (session.get("company_id"),),
-            ).fetchone()["n"]
-            _rc.close()
+            # The badge counts alerts that still need a decision, across every
+            # driver channel — not just the customer-portal notices the old
+            # Alerts page could see.
+            _alert_open = alert_open_count(_rc, user["company_id"])
 
             _parts = []
             if is_disp:
@@ -6527,7 +6585,7 @@ def shell_page(title, body, extra_head=""):
             _mparts.append(_mhead("Team"))
             _mparts.append(nav_link(
                 url_for("boss_notifications_page"),
-                icon('bell') + 'Alerts' + _nav_badge("account-alert-nav-badge", _account_alerts),
+                icon('bell') + 'Alerts' + _nav_badge("account-alert-nav-badge", _alert_open),
                 path,
             ))
             _mparts.append(nav_link(url_for("team_hours_page"), icon('clock') + 'Team Hours', path))
@@ -6692,6 +6750,79 @@ a:hover {{ color: #FF9D5C; }}
 }}
 .footer-slim a {{ color: var(--text-muted); }}
 .footer-slim a:hover {{ color: var(--text-soft); }}
+
+/* ── Alert feed ─────────────────────────────────────────────*/
+.alert-filters {{ display: flex; gap: 8px; margin-bottom: 18px; flex-wrap: wrap; }}
+.alert-filter {{
+    padding: 9px 15px; border-radius: 999px; font-size: 12.5px; font-weight: 600;
+    border: 1px solid rgba(255,255,255,0.09); color: var(--text-muted);
+}}
+.alert-filter.on {{
+    background: rgba(255,107,26,0.12); border-color: rgba(255,107,26,0.45); color: #FF9D5C;
+}}
+.alert-card {{
+    border: 1px solid rgba(255,255,255,0.08);
+    border-left: 3px solid var(--slate);
+    border-radius: 0 var(--radius) var(--radius) 0;
+    padding: 15px 18px; margin-bottom: 10px;
+}}
+.alert-card.is-done {{ opacity: .55; }}
+.alert-head {{
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: 8px;
+}}
+.alert-kind {{
+    display: inline-flex; align-items: center; gap: 7px;
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 1.4px;
+    text-transform: uppercase; font-weight: 600;
+}}
+.alert-when {{ font-family: var(--font-mono); font-size: 10.5px; color: var(--text-muted); }}
+.alert-title {{ font-size: 15.5px; font-weight: 700; color: var(--text); line-height: 1.35; }}
+.alert-body {{ font-size: 13.5px; color: var(--text-soft); margin-top: 5px; line-height: 1.5; }}
+.alert-actions {{ display: flex; align-items: center; gap: 9px; margin-top: 13px; flex-wrap: wrap; }}
+.alert-link {{
+    display: inline-flex; align-items: center; gap: 6px; flex-direction: row-reverse;
+    padding: 8px 14px; min-height: 40px; border-radius: 9px;
+    border: 1px solid rgba(255,107,26,0.4); background: rgba(255,107,26,0.10);
+    color: #FF9D5C; font-size: 12.5px; font-weight: 700;
+}}
+.alert-resolve {{
+    display: inline-flex; align-items: center; gap: 7px;
+    min-height: 40px; padding: 8px 14px; border-radius: 9px; cursor: pointer;
+    background: transparent; border: 1px solid rgba(255,255,255,0.12);
+    color: var(--text-soft); font-size: 12.5px; font-weight: 700; box-shadow: none;
+}}
+.alert-resolve:hover {{ background: rgba(255,255,255,0.05); }}
+.alert-done-tag {{
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 1.2px;
+    text-transform: uppercase; color: var(--green);
+}}
+
+/* ── Running late ───────────────────────────────────────────*/
+.late-open {{
+    display: flex; align-items: center; justify-content: center; gap: 9px;
+    width: 100%; min-height: 52px; border-radius: 11px; cursor: pointer;
+    background: rgba(245,180,60,0.10); border: 1px solid rgba(245,180,60,0.45);
+    color: #F5B43C; font-weight: 800; font-size: 15px; box-shadow: none;
+}}
+.late-open:hover {{ background: rgba(245,180,60,0.18); }}
+.late-chips {{ display: flex; gap: 7px; flex-wrap: wrap; margin-bottom: 14px; }}
+.late-chip {{
+    flex: 1; min-width: 72px; min-height: 48px; border-radius: 9px; cursor: pointer;
+    background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.14);
+    color: var(--text-soft); font-weight: 700; font-size: 14px; box-shadow: none;
+}}
+/* The selected state the old radios never had — tapping a chip used to change
+   nothing on screen, which is what made this read as broken. */
+.late-chip.on {{
+    background: rgba(245,180,60,0.18); border-color: rgba(245,180,60,0.7);
+    color: #F5B43C;
+}}
+.late-send {{
+    width: 100%; min-height: 52px; border-radius: 11px; border: none; cursor: pointer;
+    font-weight: 800; font-size: 15px;
+    background: linear-gradient(135deg,#FFC061,#F5B43C); color: #1A1206;
+}}
 
 /* ── Dashboard focus row ────────────────────────────────────*/
 /* Three tiles that answer "what needs me right now", each carrying a line of
@@ -7170,7 +7301,7 @@ a:hover {{ color: #FF9D5C; }}
    BUTTONS
    ══════════════════════════════════════════════════════════*/
 .btn,
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.cab-leg-chip) {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip) {{
     display: inline-block;
     border: none;
     cursor: pointer;
@@ -7188,7 +7319,7 @@ button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact
 }}
 
 .btn:hover,
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.cab-leg-chip):hover {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip):hover {{
     filter: brightness(1.1);
     transform: translateY(-1px);
     text-decoration: none;
@@ -9615,43 +9746,445 @@ def analytics_page():
 # =========================================================
 # TEAM — merged Users + Drivers roster
 # =========================================================
+# =========================================================
+# PUSH — alerts on the boss's phone
+# =========================================================
+# Delivery rides Firebase Cloud Messaging, which the service worker was already
+# half-wired for: it had an onBackgroundMessage handler and a firebase config,
+# but nothing ever requested a token and there was no server side, so no push
+# has ever actually been sent from this app.
+#
+# Configuration is env-only and degrades exactly like RESEND_API_KEY does: with
+# no credentials the app runs normally, alerts still land in the feed, and the
+# send is skipped with a log line. Nothing here can break a request.
+#
+#   FCM_PROJECT_ID            Firebase console -> Project settings -> General
+#   FCM_SERVICE_ACCOUNT_JSON  ...-> Service accounts -> Generate new private key
+#                             (paste the whole JSON blob as one env var)
+#   FCM_VAPID_PUBLIC_KEY      ...-> Cloud Messaging -> Web Push certificates
+#
+# The first two let the server SEND. The third lets a browser ASK for a token.
+
+FCM_PROJECT_ID = os.environ.get("FCM_PROJECT_ID", "").strip()
+FCM_VAPID_PUBLIC_KEY = os.environ.get("FCM_VAPID_PUBLIC_KEY", "").strip()
+_FCM_SA_RAW = os.environ.get("FCM_SERVICE_ACCOUNT_JSON", "").strip()
+
+_fcm_token_cache = {"token": None, "exp": 0.0}
+_fcm_lock = threading.Lock()
+
+
+def push_configured():
+    return bool(FCM_PROJECT_ID and _FCM_SA_RAW)
+
+
+def _fcm_access_token():
+    """OAuth token for the FCM HTTP v1 API, cached until shortly before expiry.
+
+    google-auth is imported lazily so the dependency is only needed by
+    deployments that actually turn push on.
+    """
+    with _fcm_lock:
+        now = time.time()
+        if _fcm_token_cache["token"] and now < _fcm_token_cache["exp"]:
+            return _fcm_token_cache["token"]
+        try:
+            from google.oauth2 import service_account
+            from google.auth.transport.requests import Request as _GRequest
+            info = json.loads(_FCM_SA_RAW)
+            creds = service_account.Credentials.from_service_account_info(
+                info, scopes=["https://www.googleapis.com/auth/firebase.messaging"])
+            creds.refresh(_GRequest())
+            _fcm_token_cache["token"] = creds.token
+            _fcm_token_cache["exp"] = now + 3000     # tokens last ~1h
+            return creds.token
+        except Exception as exc:
+            app.logger.warning("push: could not mint FCM access token (%s)", exc)
+            return None
+
+
+def _push_recipients(conn, company_id):
+    """Every registered device belonging to a management user in this company.
+    Drivers are not notified — this feed is the boss's inbox."""
+    try:
+        return conn.execute(
+            """SELECT p.id, p.token FROM push_tokens p
+                 JOIN users u ON u.id = p.user_id
+                WHERE p.company_id=? AND p.failed_at IS NULL
+                  AND u.role='boss' AND u.is_active=1""",
+            (company_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+
+
+def _fcm_send(access_token, device_token, title, body, link):
+    """One message. Returns True on success, False if the token is dead."""
+    url = "https://fcm.googleapis.com/v1/projects/%s/messages:send" % FCM_PROJECT_ID
+    payload = {"message": {
+        "token": device_token,
+        # `data` only, no `notification` block: the service worker's
+        # onBackgroundMessage builds the notification itself, and a payload
+        # carrying both gets shown twice on Android.
+        "data": {"title": title[:120], "body": body[:240], "link": link or "/boss/notifications"},
+        "webpush": {"fcm_options": {"link": link or "/boss/notifications"}},
+        "android": {"priority": "high"},
+        "apns": {"headers": {"apns-priority": "10"}},
+    }}
+    try:
+        resp = requests.post(
+            url, json=payload, timeout=8,
+            headers={"Authorization": "Bearer " + access_token,
+                     "Content-Type": "application/json; UTF-8"},
+        )
+        if resp.status_code == 200:
+            return True
+        # 404 UNREGISTERED / 400 INVALID_ARGUMENT mean the device is gone —
+        # the caller retires the row rather than retrying it forever.
+        if resp.status_code in (400, 403, 404):
+            app.logger.info("push: retiring dead token (%s)", resp.status_code)
+            return False
+        app.logger.warning("push: FCM %s %s", resp.status_code, resp.text[:200])
+        return True     # transient — keep the token, try again next sweep
+    except Exception as exc:
+        app.logger.warning("push: send failed (%s)", exc)
+        return True
+
+
+def flush_alert_pushes(company_id=None, limit=20):
+    """Send any alert that hasn't been pushed yet, then stamp it.
+
+    Claims each row with a conditional UPDATE before sending, so the two
+    gunicorn workers can both run this without double-notifying anyone.
+    Info-level alerts are recorded but never pushed — a time-off request should
+    not buzz a phone.
+    """
+    if not push_configured():
+        return 0
+    access = _fcm_access_token()
+    if not access:
+        return 0
+    sent = 0
+    conn = get_db()
+    try:
+        where = "pushed_at IS NULL AND severity IN ('critical','warning')"
+        params = []
+        if company_id:
+            where += " AND company_id=?"
+            params.append(company_id)
+        rows = conn.execute(
+            "SELECT id, company_id, title, body, link FROM alerts WHERE %s "
+            "ORDER BY id DESC LIMIT ?" % where, params + [limit]
+        ).fetchall()
+        for row in rows:
+            claimed = conn.execute(
+                "UPDATE alerts SET pushed_at=? WHERE id=? AND pushed_at IS NULL",
+                (now_ts(), row["id"]),
+            ).rowcount
+            conn.commit()
+            if not claimed:
+                continue          # another worker got there first
+            for dev in _push_recipients(conn, row["company_id"]):
+                if not _fcm_send(access, dev["token"], row["title"], row["body"] or "", row["link"]):
+                    conn.execute("UPDATE push_tokens SET failed_at=? WHERE id=?",
+                                 (now_ts(), dev["id"]))
+                    conn.commit()
+                else:
+                    sent += 1
+    except sqlite3.Error as exc:
+        app.logger.warning("push: sweep failed (%s)", exc)
+    finally:
+        conn.close()
+    return sent
+
+
+def push_alerts_soon(company_id):
+    """Fire the sweep off the request thread.
+
+    A push must never sit between the driver tapping a button and the response
+    coming back — FCM is a network round trip and the driver may be on one bar.
+    """
+    if not push_configured():
+        return
+    try:
+        threading.Thread(target=flush_alert_pushes, args=(company_id,), daemon=True).start()
+    except Exception:
+        pass
+
+
+@app.route("/api/push/register", methods=["POST"])
+@login_required
+def api_push_register():
+    """The boss's browser hands us its FCM token after granting permission."""
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or "").strip()
+    platform = (data.get("platform") or "web").strip()[:20]
+    if not token or len(token) > 512:
+        return jsonify({"error": "bad token"}), 400
+    conn = get_db()
+    conn.execute(
+        """INSERT INTO push_tokens (company_id, user_id, token, platform, created_at, last_seen_at)
+           VALUES (?,?,?,?,?,?)
+           ON CONFLICT(token) DO UPDATE SET
+             user_id=excluded.user_id, company_id=excluded.company_id,
+             last_seen_at=excluded.last_seen_at, failed_at=NULL""",
+        (cid(), session["user_id"], token, platform, now_ts(), now_ts()),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.after_request
+def _push_after_request(response):
+    """Fire one push sweep per request that raised an alert.
+
+    Here rather than inside notify() so the send happens AFTER the caller has
+    committed — pushing an alert for a transaction that then rolls back would
+    buzz the boss about something that never happened.
+    """
+    try:
+        if getattr(g, "_alerts_raised", False) and session.get("company_id"):
+            push_alerts_soon(session["company_id"])
+    except Exception:
+        pass
+    return response
+
+
+@app.route("/api/push/config")
+@login_required
+def api_push_config():
+    """What the client needs to ask for a token — and whether it's worth asking."""
+    return jsonify({
+        "enabled": bool(FCM_VAPID_PUBLIC_KEY and push_configured()),
+        "vapidKey": FCM_VAPID_PUBLIC_KEY,
+    })
+
+
 @app.route("/boss/notifications")
 @boss_required
 def boss_notifications_page():
+    """The alert feed — one inbox for everything a driver sends.
+
+    Open items (still needing a decision) sort to the top regardless of age; a
+    breakdown from this morning outranks a time-off request from a minute ago.
+    Everything else is history, newest first.
+    """
+    show = (request.args.get("show") or "open").strip().lower()
+    if show not in ("open", "all"):
+        show = "open"
+
     conn = get_db()
+    where = "a.company_id=?"
+    params = [cid()]
+    if show == "open":
+        where += " AND a.resolved_at IS NULL"
     rows = conn.execute(
-        """SELECT n.*, c.name AS company_name, s.address AS site_address
-             FROM boss_notifications n
-             JOIN companies c ON c.id=n.company_id
-             JOIN sites s ON s.id=n.site_id
-            WHERE n.company_id=?
-            ORDER BY n.created_at DESC, n.id DESC""",
-        (cid(),),
+        f"""SELECT a.*, COALESCE(NULLIF(TRIM(u.full_name),''), u.username) AS actor_name
+              FROM alerts a
+              LEFT JOIN users u ON u.id = a.actor_user_id
+             WHERE {where}
+             ORDER BY (a.resolved_at IS NULL) DESC,
+                      CASE a.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
+                      a.created_at DESC, a.id DESC
+             LIMIT 200""",
+        params,
     ).fetchall()
+    open_n = alert_open_count(conn, cid())
+    # Opening the page is what marks things READ. Read is "I have seen this";
+    # resolved is "I have dealt with it" — two different questions, and the
+    # badge only ever counts the second.
     conn.execute(
-        "UPDATE boss_notifications SET read_at=COALESCE(read_at,?) WHERE company_id=?",
+        "UPDATE alerts SET read_at=COALESCE(read_at,?) WHERE company_id=? AND read_at IS NULL",
         (now_ts(), cid()),
     )
     conn.commit()
     conn.close()
+
+    _sev_style = {
+        "critical": ("#FF5252", "rgba(255,82,82,0.09)", "rgba(255,82,82,0.45)"),
+        "warning":  ("#F5B43C", "rgba(245,180,60,0.08)", "rgba(245,180,60,0.40)"),
+        "info":     ("#8CA0B3", "rgba(140,160,179,0.07)", "rgba(140,160,179,0.30)"),
+    }
+
     cards = ""
-    for row in rows:
-        state = row["deployment_state"].replace("_", " ").title()
+    for r in rows:
+        icon_name, _dsev, label = ALERT_KINDS.get(r["kind"], ("bell", "info", r["kind"]))
+        col, bg, bd = _sev_style.get(r["severity"], _sev_style["info"])
+        done = bool(r["resolved_at"])
         cards += f"""
-        <div class="card">
-            <div class="row between"><strong>Customer portal deleted</strong>
-                <span class="badge">{e(state)}</span></div>
-            <p style="margin:8px 0 0;">{e(row['company_name'])} &middot; {e(row['site_address'] or 'Site')}</p>
-            <p class="muted small">Exact orders scrubbed: {row['orders_scrubbed_count']} &middot;
-                Tenant orders not attributable by exact email/phone: {row['orders_unattributed_count']}</p>
+        <div class="alert-card{' is-done' if done else ''}"
+             style="border-left-color:{col};background:{'transparent' if done else bg};border-color:{bd};">
+            <div class="alert-head">
+                <span class="alert-kind" style="color:{col};">{icon(icon_name)}{e(label)}</span>
+                <span class="alert-when">{e(_ago(r['created_at']))}</span>
+            </div>
+            <div class="alert-title">{e(r['title'])}</div>
+            {f'<div class="alert-body">{e(r["body"])}</div>' if r["body"] else ''}
+            <div class="alert-actions">
+                {f'<a class="alert-link" href="{r["link"]}">Open{icon("board")}</a>' if r["link"] else ''}
+                {'<span class="alert-done-tag">Handled</span>' if done else
+                 f'''<form method="POST" action="{url_for('alert_resolve', alert_id=r['id'])}" style="margin:0;">
+                     <button type="submit" class="alert-resolve">{icon('check')}Mark handled</button></form>'''}
+            </div>
         </div>
         """
-    body = f"""
-    <div class="hero"><h1>Boss Alerts</h1>
-        <p>Operational follow-up that may require dispatch action.</p></div>
-    {cards or '<div class="card muted">No alerts.</div>'}
+
+    _empty = ('<div class="card muted">Nothing needs you right now.</div>' if show == "open"
+              else '<div class="card muted">No alerts yet.</div>')
+
+    # Phone alerts. The permission prompt has to come from a real tap — browsers
+    # reject one fired on page load, and ambushing someone with it is rude
+    # anyway. The row hides itself when push isn't configured server-side, so
+    # nobody is offered a button that cannot work.
+    push_row = """
+    <div class="card" id="push-card" hidden style="margin-bottom:14px;">
+      <div class="row between" style="gap:12px;flex-wrap:wrap;">
+        <div>
+          <strong id="push-title">Get these on your phone</strong>
+          <div class="muted small" id="push-sub" style="margin-top:3px;">
+            Breakdowns, cancels and messages buzz you even when the app is closed.</div>
+        </div>
+        <button type="button" class="btn" id="push-btn" onclick="haultraEnablePush()">Turn on</button>
+      </div>
+    </div>
+    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-messaging-compat.js"></script>
+    <script>
+    (function () {
+      var card = document.getElementById('push-card');
+      var btn  = document.getElementById('push-btn');
+      var sub  = document.getElementById('push-sub');
+      var CFG  = null;
+      if (!('Notification' in window) || !navigator.serviceWorker) return;
+
+      fetch('/api/push/config', {credentials: 'same-origin'})
+        .then(function (r) { return r.json(); })
+        .then(function (cfg) {
+          CFG = cfg;
+          if (!cfg.enabled) return;               // not configured on the server
+          card.hidden = false;
+          if (Notification.permission === 'granted') {
+            btn.textContent = 'On';
+            btn.disabled = true;
+            sub.textContent = 'This device is registered for alerts.';
+            register();                            // refresh the token quietly
+          } else if (Notification.permission === 'denied') {
+            btn.disabled = true;
+            btn.textContent = 'Blocked';
+            sub.textContent = 'Notifications are blocked for this site in your browser settings.';
+          }
+        })
+        .catch(function () {});
+
+      function register() {
+        try {
+          if (!firebase.apps.length) {
+            firebase.initializeApp({
+              apiKey: "AIzaSyBAWm08bVHH5uia21H5VPd1mAW0Ei0MnV4",
+              authDomain: "haultra-dispatch.firebaseapp.com",
+              projectId: "haultra-dispatch",
+              storageBucket: "haultra-dispatch.firebasestorage.app",
+              messagingSenderId: "66096047367",
+              appId: "1:66096047367:web:a7a3da473ba9d0bf5b51a2"
+            });
+          }
+          navigator.serviceWorker.ready.then(function (reg) {
+            firebase.messaging().getToken({vapidKey: CFG.vapidKey, serviceWorkerRegistration: reg})
+              .then(function (token) {
+                if (!token) throw new Error('no token');
+                return fetch('/api/push/register', {
+                  method: 'POST', credentials: 'same-origin',
+                  headers: {'Content-Type': 'application/json',
+                            'X-CSRF-Token': document.querySelector('meta[name=\"csrf-token\"]').getAttribute('content')},
+                  body: JSON.stringify({token: token, platform: 'web'})
+                });
+              })
+              .then(function () {
+                btn.textContent = 'On'; btn.disabled = true;
+                sub.textContent = 'This device is registered for alerts.';
+              })
+              .catch(function () {
+                sub.textContent = "Couldn't register this device. Try again, or check that notifications are allowed.";
+              });
+          });
+        } catch (e) {
+          sub.textContent = "Push isn't available in this browser.";
+        }
+      }
+
+      window.haultraEnablePush = function () {
+        btn.disabled = true; btn.textContent = 'Asking…';
+        Notification.requestPermission().then(function (p) {
+          if (p === 'granted') { register(); }
+          else {
+            btn.disabled = false; btn.textContent = 'Turn on';
+            sub.textContent = 'You said no to notifications. You can change that in browser settings.';
+          }
+        });
+      };
+    })();
+    </script>
     """
-    return render_template_string(shell_page("Boss Alerts", body))
+    body = f"""
+    <div class="hero">
+        <h1>Alerts</h1>
+        <p>Everything your drivers send, in one place &mdash; running late, messages,
+           truck trouble, cancels and time off.</p>
+    </div>
+    {push_row}
+    <div class="alert-filters">
+        <a class="alert-filter{' on' if show == 'open' else ''}" href="{url_for('boss_notifications_page')}">
+            Needs you{f' &middot; {open_n}' if open_n else ''}</a>
+        <a class="alert-filter{' on' if show == 'all' else ''}" href="{url_for('boss_notifications_page', show='all')}">
+            Everything</a>
+    </div>
+    {cards or _empty}
+    """
+    return render_template_string(shell_page("Alerts", body))
+
+
+@app.route("/alerts/<int:alert_id>/resolve", methods=["POST"])
+@boss_required
+def alert_resolve(alert_id):
+    conn = get_db()
+    conn.execute(
+        "UPDATE alerts SET resolved_at=?, resolved_by=? WHERE id=? AND company_id=? AND resolved_at IS NULL",
+        (now_ts(), session["user_id"], alert_id, cid()),
+    )
+    conn.commit()
+    conn.close()
+    return redirect(request.referrer or url_for("boss_notifications_page"))
+
+
+@app.route("/api/alerts/count")
+@boss_required
+def api_alerts_count():
+    """Live badge count, polled by the nav the same way the other badges are."""
+    conn = get_db()
+    n = alert_open_count(conn, cid())
+    conn.close()
+    return jsonify({"count": n})
+
+
+def _ago(ts):
+    """'4m', '2h', '3d' — a dispatcher scanning a feed wants elapsed time, not a
+    timestamp they have to subtract in their head."""
+    try:
+        then = datetime.strptime((ts or "")[:19], "%Y-%m-%d %H:%M:%S")
+        # Compare against now_ts(), NOT datetime.now(): every timestamp in this
+        # database is written in company-Eastern time, while the server clock is
+        # UTC on Render. Mixing the two made a just-posted alert read "4h ago".
+        now = datetime.strptime(now_ts()[:19], "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+    secs = max(0, int((now - then).total_seconds()))
+    if secs < 90:
+        return "just now"
+    if secs < 3600:
+        return "%dm ago" % (secs // 60)
+    if secs < 86400:
+        return "%dh ago" % (secs // 3600)
+    return "%dd ago" % (secs // 86400)
 
 
 @app.route("/team")
@@ -16417,8 +16950,21 @@ def route_messages(route_id):
             "INSERT INTO messages (route_id, sender_user_id, body, created_at, client_id) VALUES (?, ?, ?, ?, ?)",
             (route_id, session["user_id"], body, now_ts(), client_id)
         )
-        conn.commit()
         msg_id = cur.lastrowid
+        # Only the driver's side raises an alert — the boss messaging their own
+        # driver should obviously not notify the boss.
+        if session.get("role") != "boss":
+            notify(
+                conn, cid(), "DRIVER_MESSAGE",
+                _actor_name(conn) + " sent a message",
+                body,
+                link=url_for("view_route", route_id=route_id),
+                actor_user_id=session["user_id"], entity_type="message", entity_id=msg_id,
+                # client_id is the driver's own offline-queue id, so a replayed
+                # send can never raise a second alert.
+                dedupe_key=("msg:%s" % client_id) if client_id else None,
+            )
+        conn.commit()
         conn.close()
         return jsonify({"success": True, "id": msg_id})
 
@@ -17348,6 +17894,15 @@ def cancel_stop(stop_id):
     _where = (stop["customer_name"] or stop["address"] or ("Stop %d" % stop["stop_order"]))
     _cancel_note(conn, route_id, session["user_id"],
                  "%s cancelled stop: %s — %s" % (_who, _where, cancel_label(reason)))
+    if source != "boss":
+        notify(
+            conn, cid(), "STOP_CANCELLED",
+            "%s cancelled a stop — %s" % (_who, _where),
+            cancel_label(reason),
+            link=url_for("view_route", route_id=route_id),
+            actor_user_id=session["user_id"], entity_type="stop", entity_id=stop_id,
+            dedupe_key=("cancelstop:%s" % client_uuid) if client_uuid else None,
+        )
     conn.commit()
 
     # The can chain has to be recomputed with this stop out of it, or every
@@ -17470,6 +18025,17 @@ def cancel_route(route_id):
     _cancel_note(conn, route_id, session["user_id"],
                  "%s cancelled this route (%d stop%s) — %s"
                  % (_who, cancelled_n, "" if cancelled_n == 1 else "s", cancel_label(reason)))
+    if source != "boss":
+        notify(
+            conn, cid(), "ROUTE_CANCELLED",
+            "%s cancelled a whole route — %s" % (_who, route["route_name"] or "route"),
+            "%d stop%s dropped · %s"
+            % (cancelled_n, "" if cancelled_n == 1 else "s", cancel_label(reason)),
+            link=url_for("view_route", route_id=route_id),
+            actor_user_id=session["user_id"], entity_type="route", entity_id=route_id,
+            severity="critical",
+            dedupe_key=("cancelroute:%s" % client_uuid) if client_uuid else None,
+        )
     conn.commit()
     compute_can_flow(conn, route_id)
     conn.commit()
@@ -24551,6 +25117,15 @@ def time_off_request():
            VALUES (?,?,?,?,?,'pending',?)""",
         (company_id, driver_id, _iso(start), _iso(end), reason, now_ts())
     )
+    _span = _iso(start) if start == end else (_iso(start) + " \u2192 " + _iso(end))
+    notify(
+        conn, company_id, "TIME_OFF_REQUEST",
+        _actor_name(conn) + " asked for time off",
+        _span + ((" \u00b7 " + reason) if reason else ""),
+        link=url_for("team_time_off_page"),
+        actor_user_id=driver_id, entity_type="time_off_request",
+        dedupe_key="timeoff:%s:%s:%s" % (driver_id, _iso(start), _iso(end)),
+    )
     conn.commit()
     conn.close()
     flash("Time-off request sent.", "success")
@@ -24626,7 +25201,8 @@ def recurring_off_create():
 @app.route("/late/checkin", methods=["POST"])
 @driver_required
 def late_checkin():
-    eta = (request.form.get("eta") or "").strip()[:40]
+    _etas = [v.strip() for v in request.form.getlist("eta") if v and v.strip()]
+    eta = (_etas[-1] if _etas else "")[:40]
     reason = (request.form.get("reason") or "").strip()[:200]
     driver_id = session["user_id"]
     today = today_str()
@@ -24652,6 +25228,16 @@ def late_checkin():
         """INSERT INTO late_checkins (company_id, driver_id, work_date, eta, reason, created_at)
            VALUES (?,?,?,?,?,?)""",
         (company_id, driver_id, today, eta, reason, now_ts())
+    )
+    notify(
+        conn, company_id, "DRIVER_LATE",
+        _actor_name(conn) + " is running late" + (" \u2014 ETA " + eta if eta else ""),
+        reason or "No reason given.",
+        link=url_for("team_time_off_page"),
+        actor_user_id=driver_id, entity_type="late_checkin",
+        # One alert per driver per day — a driver who updates their ETA twice
+        # should not put two rows in the boss's feed.
+        dedupe_key="late:%s:%s" % (driver_id, today),
     )
     conn.commit()
     conn.close()
@@ -24961,6 +25547,191 @@ def team_time_off_page():
     return render_template_string(shell_page("Team Time Off", body))
 
 
+# =========================================================
+# ALERTS — one inbox for everything a driver sends
+# =========================================================
+# Before this, a driver could reach the boss eight different ways and each one
+# landed somewhere else: running late on Team Time Off, messages in a route
+# thread, truck issues under Maintenance, defects under a nav badge, and the
+# page actually called "Alerts" showed exactly one event type
+# (CUSTOMER_PORTAL_DELETED) and nothing else.
+#
+# An alert row is a POINTER, not a copy. The source tables stay the source of
+# truth; this carries only what the feed needs to render a line and link to it,
+# plus the read/handled state that has to live somewhere. That keeps the feed a
+# single fast indexed read instead of a union across eight tables.
+
+ALERT_SEVERITIES = ("critical", "warning", "info")
+
+# Kind → (icon, default severity, human label). Adding a kind here is all it
+# takes for the feed to render it.
+ALERT_KINDS = {
+    "DRIVER_LATE":        ("clock",     "warning",  "Running late"),
+    "TIME_OFF_REQUEST":   ("calendar",  "info",     "Time off request"),
+    "DRIVER_MESSAGE":     ("msg",       "warning",  "Message from driver"),
+    "DRIVER_URGENT":      ("alert",     "critical", "Urgent from driver"),
+    "TRUCK_ISSUE":        ("wrench",    "critical", "Truck issue"),
+    "BREAKDOWN":          ("alert",     "critical", "Breakdown"),
+    "STOP_CANCELLED":     ("x",         "warning",  "Stop cancelled"),
+    "ROUTE_CANCELLED":    ("x",         "critical", "Route cancelled"),
+    "ROUTE_EXCEPTION":    ("alert",     "warning",  "Can't complete stop"),
+    "CLOCK_CORRECTION":   ("clock",     "info",     "Clock correction"),
+    "CUSTOMER_PORTAL_DELETED": ("shield", "info",   "Customer portal deleted"),
+}
+
+
+def notify(conn, company_id, kind, title, body="", link="", actor_user_id=None,
+           entity_type="", entity_id=None, severity=None, dedupe_key=None):
+    """Raise one alert. Safe to call inside any request; never raises.
+
+    `dedupe_key` makes a call idempotent — an offline POST replayed on
+    reconnect, or a poller that fires twice, writes one row. Same contract as
+    route_exceptions.client_uuid.
+
+    Deliberately does NOT commit: the caller owns the transaction, so an alert
+    can never outlive the thing it is announcing.
+    """
+    try:
+        icon_name, default_sev, _label = ALERT_KINDS.get(kind, ("bell", "info", kind))
+        sev = severity if severity in ALERT_SEVERITIES else default_sev
+        conn.execute(
+            """INSERT OR IGNORE INTO alerts
+               (company_id, kind, severity, title, body, link, actor_user_id,
+                entity_type, entity_id, dedupe_key, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (company_id, kind, sev, (title or "")[:160], (body or "")[:400],
+             (link or "")[:300], actor_user_id, (entity_type or "")[:40],
+             entity_id, dedupe_key, now_ts()),
+        )
+        try:
+            g._alerts_raised = True
+        except Exception:
+            pass
+    except sqlite3.Error:
+        # An alert is a notification, not the work itself. Losing one must never
+        # roll back the cancel, the clock-in, or the message that caused it.
+        pass
+
+
+def alert_unread_count(conn, company_id):
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) n FROM alerts WHERE company_id=? AND read_at IS NULL",
+            (company_id,),
+        ).fetchone()["n"]
+    except sqlite3.Error:
+        return 0
+
+
+def alert_open_count(conn, company_id):
+    """Alerts still needing a decision — the number that belongs on the badge.
+    Info-level items are FYI and never hold the badge hostage."""
+    try:
+        return conn.execute(
+            """SELECT COUNT(*) n FROM alerts
+                WHERE company_id=? AND resolved_at IS NULL AND severity IN ('critical','warning')""",
+            (company_id,),
+        ).fetchone()["n"]
+    except sqlite3.Error:
+        return 0
+
+
+def _driver_late_card_html(conn, company_id, driver_id, today, co_settings, csrf):
+    """The Running-late control, rendered next to Clock In / Out.
+
+    It belongs with the punch buttons, not at the bottom of the page under Time
+    Off: a driver reaching for it is already behind, in a truck, and should not
+    have to scroll past two other cards to reach it.
+
+    Returns "" once the driver has a start punch — telling the boss you're late
+    after you've clocked in is meaningless, and _late_active() clears the row at
+    that moment anyway.
+    """
+    try:
+        start_ts, _ = resolve_driver_day_punches(conn, driver_id, today, co_settings)
+    except Exception:
+        start_ts = None
+    if start_ts:
+        return ""
+
+    late = _late_active(conn, company_id, driver_id, today, co_settings)
+    if late:
+        _eta = e(late["eta"] or "")
+        _why = e(late["reason"] or "")
+        return (
+            '<div class="card" style="max-width:460px;margin:0 auto 16px;'
+            'border-color:rgba(245,180,60,0.45);background:rgba(245,180,60,0.07);">'
+            '<div style="display:flex;align-items:center;gap:9px;font-weight:800;color:#F5B43C;">'
+            + icon('clock') + 'Dispatch has been told you\'re running late</div>'
+            + ('<div style="margin-top:8px;color:var(--text-soft);font-size:14px;">ETA ' + _eta + '</div>' if _eta else '')
+            + ('<div style="margin-top:4px;color:var(--text-muted);font-size:13px;">' + _why + '</div>' if _why else '')
+            + '<div class="muted small" style="margin-top:8px;">Clears by itself when you clock in.</div>'
+            '</div>'
+        )
+
+    _chips = "".join(
+        '<button type="button" class="late-chip" data-eta="' + v + '" '
+        'onclick="haultraPickEta(this)">' + v + '</button>'
+        for v in ["15 min", "30 min", "45 min", "60+ min"]
+    )
+    _INP = ('width:100%;min-height:46px;padding:10px 12px;background:var(--bg-0,#121212);'
+            'border:1px solid rgba(255,255,255,0.12);border-radius:9px;color:var(--text);')
+    return (
+        '<div class="card" style="max-width:460px;margin:0 auto 16px;">'
+        '<button type="button" class="late-open" '
+        'onclick="var m=document.getElementById(\'late-modal\');m.hidden=!m.hidden;">'
+        + icon('clock') + 'Running late</button>'
+
+        '<div id="late-modal" hidden style="margin-top:12px;">'
+        '<form method="POST" action="' + url_for("late_checkin") + '">'
+        '<input type="hidden" name="_csrf_token" value="' + csrf + '">'
+        # ONE field named `eta`. It used to be two — a radio group and a text
+        # box sharing the name — so request.form.get("eta") took the radio and
+        # silently threw away anything the driver typed.
+        '<input type="hidden" name="eta" id="late-eta" value="">'
+        + LATE_LBL + 'How late?</div>'
+        '<div class="late-chips">' + _chips + '</div>'
+        + LATE_LBL + 'Or give a time</div>'
+        '<input id="late-eta-text" oninput="haultraTypeEta(this)" '
+        'placeholder="e.g. be in by 7:30" style="' + _INP + 'margin-bottom:12px;">'
+        + LATE_LBL + 'What\'s going on?</div>'
+        '<input name="reason" placeholder="traffic, truck won\'t start, family thing…" '
+        'style="' + _INP + 'margin-bottom:14px;">'
+        '<button type="submit" class="late-send">Tell dispatch</button>'
+        '</form></div>'
+        + _LATE_JS +
+        '</div>'
+    )
+
+
+LATE_LBL = ('<div style="font-size:10.5px;font-weight:700;letter-spacing:.09em;'
+            'text-transform:uppercase;color:var(--text-muted);margin:0 0 7px;">')
+
+# The chips used to be radios with `display:none` and no `:checked` styling, so
+# tapping one changed nothing on screen and the control read as broken. They are
+# buttons now, and the selection is both visible and written to a single hidden
+# field. Typing a time clears the chip, so the two can never disagree.
+_LATE_JS = """
+<script>
+window.haultraPickEta = function(btn) {
+  var all = document.querySelectorAll('.late-chip');
+  for (var i = 0; i < all.length; i++) { all[i].classList.remove('on'); }
+  btn.classList.add('on');
+  var hid = document.getElementById('late-eta');
+  var txt = document.getElementById('late-eta-text');
+  if (hid) hid.value = btn.getAttribute('data-eta');
+  if (txt) txt.value = '';
+};
+window.haultraTypeEta = function(input) {
+  var all = document.querySelectorAll('.late-chip');
+  for (var i = 0; i < all.length; i++) { all[i].classList.remove('on'); }
+  var hid = document.getElementById('late-eta');
+  if (hid) hid.value = input.value;
+};
+</script>
+"""
+
+
 def _driver_time_off_card_html(conn, company_id, driver_id, today, co_settings, csrf):
     """The driver's TIME OFF card for the clock page: request form + own request
     list with status badges + cancel, a recurring-off request, and (when not yet
@@ -25018,40 +25789,9 @@ def _driver_time_off_card_html(conn, company_id, driver_id, today, co_settings, 
                       + ' <span style="color:' + col + ';font-weight:700;">(' + st + ')</span>'
                       + (' · ends ' + e(r["ended_on"]) if r["ended_on"] else '') + '</div>')
 
-    # Running-late control (only before clocked in).
-    late_html = ""
-    if not start_ts:
-        if late:
-            late_html = ('<div style="margin-top:12px;padding:10px 12px;border-radius:10px;'
-                         'background:rgba(255,107,26,0.12);border:1px solid rgba(255,107,26,0.5);color:#FF9D5C;font-weight:700;">'
-                         '&#9201; Boss notified: running late, ETA ' + e(late["eta"] or "") + '. Clears when you clock in.</div>')
-        else:
-            late_html = (
-                '<div style="margin-top:12px;">'
-                '<button type="button" onclick="document.getElementById(\'late-modal\').hidden=false"'
-                ' style="width:100%;min-height:48px;border-radius:10px;border:1px solid rgba(255,107,26,0.5);'
-                'background:rgba(255,107,26,0.1);color:#FF9D5C;font-weight:800;cursor:pointer;">&#9201; Running late</button>'
-                '<div id="late-modal" hidden style="margin-top:10px;padding:12px;border-radius:10px;'
-                'border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.03);">'
-                '<form method="POST" action="' + url_for("late_checkin") + '">'
-                '<input type="hidden" name="_csrf_token" value="' + csrf + '">'
-                '<label class="muted small">ETA</label>'
-                '<div style="display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 10px;">'
-                + "".join('<label style="flex:1;min-width:64px;text-align:center;min-height:44px;display:flex;'
-                          'align-items:center;justify-content:center;border:1px solid rgba(255,255,255,0.14);'
-                          'border-radius:8px;cursor:pointer;"><input type="radio" name="eta" value="' + v + '" style="display:none;">' + v + '</label>'
-                          for v in ["15 min", "30 min", "45 min", "60+ min"])
-                + '</div>'
-                '<input name="eta" placeholder="or a time, e.g. be in by 7:30" '
-                'style="width:100%;min-height:44px;padding:8px 10px;background:var(--bg-0,#121212);'
-                'border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);margin-bottom:8px;">'
-                '<input name="reason" placeholder="reason (optional)" '
-                'style="width:100%;min-height:44px;padding:8px 10px;background:var(--bg-0,#121212);'
-                'border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);margin-bottom:10px;">'
-                '<button style="width:100%;min-height:48px;border-radius:10px;border:none;cursor:pointer;font-weight:800;'
-                'background:linear-gradient(135deg,#ff8a3d,#F5B43C);color:#1a1206;">Send</button>'
-                '</form></div></div>')
-
+    # The Running-late control used to live here, at the bottom of the page
+    # under Time Off. It now renders next to Clock In / Out — see
+    # _driver_late_card_html().
     return (
         '<div class="card" style="margin-top:16px;">'
         '<h2 style="margin-top:0;">&#127796; Time Off</h2>'
@@ -25070,7 +25810,6 @@ def _driver_time_off_card_html(conn, company_id, driver_id, today, co_settings, 
         '<button style="min-height:44px;padding:0 18px;border-radius:9px;border:none;cursor:pointer;font-weight:800;'
         'background:linear-gradient(135deg,#00c853,#00e57a);color:#001a0a;">Request</button>'
         '</form>'
-        + late_html
         + '<div style="margin-top:14px;">' + req_html + '</div>'
         + ('<details style="margin-top:12px;"><summary class="muted small" style="cursor:pointer;min-height:36px;">'
            'Recurring days off</summary>'
@@ -25269,6 +26008,7 @@ def driver_clock():
     week_tick_js = _WEEK_LIVE_TICK_JS if (week_summary["has_live"] and _w == 0) else ""
 
     # Time Off card (request form + own list + running-late control).
+    late_card_html     = _driver_late_card_html(conn, cid(), driver_id, today, co_settings, csrf_tok)
     time_off_card_html = _driver_time_off_card_html(conn, cid(), driver_id, today, co_settings, csrf_tok)
 
     # Driver's own profile photo + upload control for the page header.
@@ -25507,6 +26247,10 @@ def driver_clock():
         '<div class="card" style="max-width:460px;margin:0 auto 16px;">'
         + actions_html +
         '</div>'
+
+        # Running late sits with the punch buttons — a driver reaching for it is
+        # already behind and should not have to scroll to the bottom of the page.
+        + late_card_html
 
         # ── THIS WEEK summary (below today's status) ─────────────────────
         + week_card_html
@@ -30658,6 +31402,14 @@ def report_breakdown():
                VALUES (?, ?, ?, ?, 'urgent', ?)""",
             (route_id, driver_id, body[:500], now_ts(), item_id),
         )
+    notify(
+        conn, cid(), "BREAKDOWN",
+        _actor_name(conn) + " reported a breakdown \u2014 " + issue,
+        "Truck " + tname + ((" \u00b7 " + note_in) if note_in else ""),
+        link=url_for("driver_route_detail", route_id=route_id) if route_id else url_for("maintenance_page"),
+        actor_user_id=driver_id, entity_type="inspection_item", entity_id=item_id,
+        severity="critical",
+    )
     conn.commit()
     conn.close()
     return jsonify({"success": True, "item_id": item_id, "issue": issue})
