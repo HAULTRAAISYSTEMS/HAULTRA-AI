@@ -94,11 +94,18 @@ native_headers = {"User-Agent": "HAULTRA Test HaultraNativeApp"}
 
 login = client.get("/login", headers=native_headers)
 ok(login.status_code == 200, "native login renders")
-ok(b"/signup" not in login.data, "native login does not steer to registration")
+ok(b"/signup" not in login.data, "native login uses no legacy /signup steering path")
+ok(b"/register-company" in login.data,
+   "native login offers the registration flow App Review must be able to reach (2.1)")
 
 registration = client.get("/register-company", headers=native_headers)
-ok(registration.status_code == 302 and registration.headers["Location"].endswith("/login"),
-   "native company registration is blocked")
+ok(registration.status_code == 200, "native company registration renders")
+ok(b"stripe.com" not in registration.data.lower(),
+   "native registration page reaches no payment processor")
+ok(b"/create-checkout-session" not in registration.data,
+   "native registration page reaches no checkout endpoint")
+ok(b"no credit card required" in registration.data.lower(),
+   "native registration page states no payment is collected")
 
 ok(client.get("/.well-known/apple-app-site-association").status_code == 404,
    "unsigned Apple association data fails closed")
@@ -106,10 +113,11 @@ ok(client.get("/.well-known/assetlinks.json").status_code == 404,
    "unsigned Android association data fails closed")
 
 # ---- Guideline 3.1.1: no unauthenticated route reaches a purchase surface ----
-# The purchase surfaces are "/" (marketing, carries pricing) and
-# /register-company ("Start Free Trial"). Both are hidden from the native
-# shells by is_native_app(), but that is User-Agent sniffing and fails open,
-# so the checks below assert the session-keyed behaviour that does not.
+# The only unauthenticated purchase surface is "/" (marketing, carries
+# pricing), hidden from the native shells by is_native_app(). That is
+# User-Agent sniffing and fails open, so the checks below assert the
+# session-keyed behaviour that does not. /register-company is NOT a purchase
+# surface: free trial, no card, no price, no outbound link.
 web_headers = {"User-Agent": "Mozilla/5.0 (Macintosh) Chrome/120"}
 
 for label, headers in (("native", native_headers), ("web", web_headers)):
@@ -125,11 +133,12 @@ for label, headers in (("native", native_headers), ("web", web_headers)):
        f"{label}: signed-out 404 does not link to the marketing site")
 
 for path in ("/login", "/forgot-password", "/privacy", "/terms", "/support",
-             "/offline", "/order", "/delete-account", "/no-such-page-exists"):
+             "/offline", "/order", "/delete-account", "/register-company",
+             "/no-such-page-exists"):
     page = client.get(path, headers=native_headers)
     if page.status_code != 200:
         continue
-    ok(b'href="/"' not in page.data and b'href="/register-company"' not in page.data,
+    ok(b'href="/"' not in page.data,
        f"native signed-out {path} links to no purchase surface")
 
 print("\nALL STORE COMPLIANCE TESTS PASSED")

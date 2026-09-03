@@ -8970,10 +8970,17 @@ def login():
         flash("Username or password incorrect.", "error")
         return redirect(url_for("login"))
 
-    signup_prompt = "" if is_native_app() else """
+    # Shown in the browser AND inside the native shells. /register-company
+    # creates a free 14-day trial: no credit card, no pricing on the page, no
+    # link off-app. That makes it a registration surface, not a purchase
+    # surface, so Guideline 3.1.1 does not apply - and hiding it is what got
+    # v1.0 rejected under Guideline 2.1, because App Review could not exercise
+    # the account-registration flow. Link straight to /register-company;
+    # /signup is only a legacy redirect and reads like a store-steering path.
+    signup_prompt = """
                 <div style="margin-top:10px;text-align:center;" class="small muted">
                 Need an account?
-                <a href="/signup">Create one here</a>
+                <a href="/register-company">Create one here</a>
                 </div>
     """
 
@@ -21490,9 +21497,12 @@ def onboarding_parser_page():
 @app.route("/register-company", methods=["GET", "POST"])
 def company_register():
     init_db()
-    if is_native_app():
-        flash("Company account setup is handled outside the mobile app.", "info")
-        return redirect(url_for("login"))
+    # Deliberately reachable from the native shells. This page creates a free
+    # 14-day trial - it collects no payment details, renders no prices, and
+    # links only to /login - so it is not an in-app path to an external
+    # payment flow. App Review needs it to record the registration flow
+    # required by Guideline 2.1. The paid upgrade path (/settings#subscription
+    # and /create-checkout-session) stays hidden and blocked natively.
 
     if request.method == "POST":
         company_name = request.form.get("company_name", "").strip()
