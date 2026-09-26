@@ -18596,7 +18596,13 @@ def edit_stop(stop_id):
 # DELETE ROUTE
 # =========================================================
 def _detach_stop_references(conn, stop_ids):
-    """Detach optional references before deliberately removing stop history."""
+    """Detach optional references before deliberately removing stop history.
+
+    Every caller deletes the stops immediately after, and PRAGMA foreign_keys
+    is ON, so anything still pointing at those rows makes the DELETE fail with
+    "FOREIGN KEY constraint failed" — a 500 the user sees as the page crashing,
+    with the route still listed.
+    """
     if not stop_ids:
         return
     for offset in range(0, len(stop_ids), 500):
@@ -18619,6 +18625,17 @@ def _detach_stop_references(conn, stop_ids):
         )
         conn.execute(
             f"UPDATE bins SET drop_stop_id=NULL WHERE drop_stop_id IN ({placeholders})",
+            part,
+        )
+        # Exceptions are deleted, not detached: route_exceptions carries a CHECK
+        # that exactly one of stop_id / disposal_site_id is set, so nulling
+        # stop_id trades the FK failure for a CHECK failure. An exception is a
+        # record of something that happened AT a stop and means nothing once
+        # that stop is gone — same reasoning as the messages, photos and dump
+        # tickets the callers already delete. Exceptions logged against a
+        # disposal site carry no stop_id and are untouched.
+        conn.execute(
+            f"DELETE FROM route_exceptions WHERE stop_id IN ({placeholders})",
             part,
         )
 
@@ -33474,57 +33491,78 @@ def verify_app_review_demo(repair=True):
                     bin_id = bin_row["id"]
                 demo_customers.append((customer_id, site_id, bin_id, business, address, size))
 
-            # One route per action code the reviewer should see. A demo that is
-            # three identical Delivery stops doesn't show what the app does, and
-            # App Review asked for a walkthrough of the core flow. The dump leg
-            # on the PR route also makes the pre-flight DUMPS tile non-zero —
-            # a permanent 0 there reads as a broken counter.
-            # `dump` names a row in the global dump_locations seed so every code
-            # path that resolves a dump site by name finds it.
-            route_specs = (
-                ("Review North Route",   demo_customers[0], "D",  "Delivery",           ""),
-                ("Review Central Route", demo_customers[1], "PR", "Pickup and Return",  "SPSA Landfill"),
-                ("Review Harbor Route",  demo_customers[2], "S",  "Swap",               ""),
+            # ONE route for the demo driver, carrying one stop per action code
+            # the reviewer should see.
+            #
+            # It has to be one route, not three. _merge_duplicate_open_routes()
+            # folds every open route sharing (company, driver, date) into a
+            # single lane, because one driver runs one route per day. Three
+            # routes for one driver on one date is a shape the product
+            # deliberately collapses: it merged them on the first sign-in, and
+            # because this pass looked each route up by NAME, the next repair
+            # recreated the two that had been merged away — each with a fresh
+            # stop — so the surviving lane grew by two stops on every cycle.
+            #
+            # Stops are therefore matched by customer across the tenant's open
+            # routes, not by position within one route: after a merge a stop
+            # lives on whichever lane absorbed it, and looking only at this
+            # route would create a second copy of one that already exists.
+            #
+            # `dump` names a row in the global dump_locations seed, so every
+            # code path that resolves a dump site by name finds it.
+            route_name = "Review North Route"
+            stop_specs = (
+                (demo_customers[0], "D",  "Delivery",          ""),
+                (demo_customers[1], "PR", "Pickup and Return", "SPSA Landfill"),
+                (demo_customers[2], "S",  "Swap",              ""),
             )
-            route_ids = []
+            raw_text = "\n".join(
+                f"{code} {spec[4]} {spec[5]}" for spec, code, _a, _d in stop_specs
+            )
+
+            route = conn.execute(
+                "SELECT id FROM routes WHERE company_id=? AND route_name=? LIMIT 1",
+                (company_id, route_name),
+            ).fetchone()
+            if not route:
+                cur = conn.execute(
+                    """INSERT INTO routes
+                       (route_date,route_name,raw_text,assigned_to,created_by,status,notes,created_at,company_id)
+                       VALUES (?,?,?,?,?,'open','Fictional App Review route',?,?)""",
+                    (today_str(), route_name, raw_text, driver_id, boss_id, now_ts(), company_id),
+                )
+                route_id = cur.lastrowid
+                repaired = True
+            else:
+                route_id = route["id"]
+                # Re-date to today on every repair pass. Without this the demo
+                # route keeps whatever date it was first seeded with and a
+                # reviewer opens the app to a route weeks in the past, which
+                # reads as dead data.
+                conn.execute(
+                    "UPDATE routes SET assigned_to=?,status='open',route_date=?,raw_text=? "
+                    "WHERE id=? AND company_id=?",
+                    (driver_id, today_str(), raw_text, route_id, company_id),
+                )
+
+            route_ids = [route_id]
             stop_ids = []
-            for route_name, spec, code, action, dump in route_specs:
+            for order, (spec, code, action, dump) in enumerate(stop_specs, start=1):
                 customer_id, site_id, bin_id, business, address, size = spec
-                raw_text = f"{code} {address} {size}"
-                route = conn.execute(
-                    "SELECT id FROM routes WHERE company_id=? AND route_name=? LIMIT 1",
-                    (company_id, route_name),
-                ).fetchone()
-                if not route:
-                    cur = conn.execute(
-                        """INSERT INTO routes
-                           (route_date,route_name,raw_text,assigned_to,created_by,status,notes,created_at,company_id)
-                           VALUES (?,?,?,?,?,'open','Fictional App Review route',?,?)""",
-                        (today_str(), route_name, raw_text, driver_id, boss_id, now_ts(), company_id),
-                    )
-                    route_id = cur.lastrowid
-                    repaired = True
-                else:
-                    route_id = route["id"]
-                    # Re-date to today on every repair pass. Without this the
-                    # demo route keeps whatever date it was first seeded with and
-                    # a reviewer opens the app to a route weeks in the past, which
-                    # reads as dead data.
-                    conn.execute(
-                        "UPDATE routes SET assigned_to=?,status='open',route_date=?,raw_text=? "
-                        "WHERE id=? AND company_id=?",
-                        (driver_id, today_str(), raw_text, route_id, company_id),
-                    )
                 stop = conn.execute(
-                    "SELECT id FROM stops WHERE route_id=? ORDER BY id LIMIT 1", (route_id,)
+                    """SELECT s.id FROM stops s JOIN routes r ON r.id = s.route_id
+                        WHERE r.company_id=? AND r.status='open' AND s.customer_id=?
+                        ORDER BY s.id LIMIT 1""",
+                    (company_id, customer_id),
                 ).fetchone()
                 if not stop:
                     cur = conn.execute(
                         """INSERT INTO stops
                            (route_id,stop_order,customer_name,address,city,state,zip_code,
                             action,container_size,dump_location,status,created_at,customer_id)
-                           VALUES (?,1,?,?,'Review City','VA','00000',?,?,?,'open',?,?)""",
-                        (route_id, business, address, action, size, dump, now_ts(), customer_id),
+                           VALUES (?,?,?,?,'Review City','VA','00000',?,?,?,'open',?,?)""",
+                        (route_id, order, business, address, action, size, dump,
+                         now_ts(), customer_id),
                     )
                     stop_id = cur.lastrowid
                     repaired = True
@@ -33537,9 +33575,8 @@ def verify_app_review_demo(repair=True):
                         "UPDATE stops SET action=?,container_size=?,dump_location=? WHERE id=?",
                         (action, size, dump, stop_id),
                     )
-                _apply_route_chains(conn, route_id)
-                route_ids.append(route_id)
                 stop_ids.append(stop_id)
+            _apply_route_chains(conn, route_id)
 
             exception = conn.execute(
                 "SELECT id FROM route_exceptions WHERE company_id=? AND client_uuid='app-review-open-exception'",
@@ -33658,10 +33695,25 @@ def verify_app_review_demo(repair=True):
         required_counts = {
             "customers": conn.execute("SELECT COUNT(*) n FROM customers WHERE company_id=? AND is_active=1", (company_id,)).fetchone()["n"],
             "routes": conn.execute("SELECT COUNT(*) n FROM routes WHERE company_id=? AND status='open'", (company_id,)).fetchone()["n"],
+            # Stops, not route rows, are what a reviewer actually walks.
+            # _merge_duplicate_open_routes() folds every open route that shares
+            # (company, driver, date) into one lane, because one driver has one
+            # route per day — so the three seeded routes become a single route
+            # with three stops as soon as anyone signs in. Counting route rows
+            # here demanded a shape the product deliberately forbids: the tenant
+            # reported not-ready after the first login, and every repair pass
+            # rebuilt routes the next login merged away again.
+            "stops": conn.execute(
+                """SELECT COUNT(*) n FROM stops s JOIN routes r ON r.id = s.route_id
+                    WHERE r.company_id=? AND r.status='open'""",
+                (company_id,),
+            ).fetchone()["n"],
             "exceptions": conn.execute("SELECT COUNT(*) n FROM route_exceptions WHERE company_id=? AND resolution IS NULL", (company_id,)).fetchone()["n"],
             "dvir": conn.execute("SELECT COUNT(*) n FROM inspections WHERE company_id=?", (company_id,)).fetchone()["n"],
         }
-        if required_counts["customers"] < 3 or required_counts["routes"] < 3:
+        if (required_counts["customers"] < 3
+                or required_counts["routes"] < 1
+                or required_counts["stops"] < 3):
             missing.append("fictional_dataset")
         if required_counts["exceptions"] < 1:
             missing.append("route_exception")
