@@ -15601,6 +15601,14 @@ def driver_route_detail(route_id):
         var originalLabel = btn ? btn.textContent : '';
         camera.getPhoto({{
             quality: 85,
+            // Downscale before encoding. A full-resolution iPhone capture is
+            // ~3-4 MB, and base64 inflates it by a third: a real upload from
+            // a truck took roughly 45 seconds on 5G with the button stuck on
+            // "Uploading…". 1600px is well beyond what proof of service needs
+            // (a container, a gate, a driveway) and cuts the payload about
+            // tenfold. Capacitor scales proportionally when only width is set.
+            width: 1600,
+            correctOrientation: true,
             allowEditing: false,
             // base64, NOT 'uri'. capacitor.config.json points the shell at
             // https://haultra-systems.com, so the page origin is the remote

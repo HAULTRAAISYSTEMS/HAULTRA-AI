@@ -141,6 +141,11 @@ ok(
     "no cross-origin fetch of photo.webPath (the bug: it always rejected)",
 )
 ok("atob(photo.base64String)" in html, "the blob is built from base64 in the page")
+ok(
+    "width: 1600" in html,
+    "capture is downscaled before encoding — a full-resolution photo took "
+    "~45s to upload from a truck",
+)
 upload_call = html[html.find("triggerAddPhoto"):]
 upload_call = upload_call[:upload_call.find("</script>")]
 ok("if (!r.ok) throw" in upload_call, "a failed POST raises instead of reloading")
