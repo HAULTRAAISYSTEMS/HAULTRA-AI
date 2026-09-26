@@ -33440,15 +33440,23 @@ def verify_app_review_demo(repair=True):
                     bin_id = bin_row["id"]
                 demo_customers.append((customer_id, site_id, bin_id, business, address, size))
 
+            # One route per action code the reviewer should see. A demo that is
+            # three identical Delivery stops doesn't show what the app does, and
+            # App Review asked for a walkthrough of the core flow. The dump leg
+            # on the PR route also makes the pre-flight DUMPS tile non-zero —
+            # a permanent 0 there reads as a broken counter.
+            # `dump` names a row in the global dump_locations seed so every code
+            # path that resolves a dump site by name finds it.
             route_specs = (
-                ("Review North Route", demo_customers[0]),
-                ("Review Central Route", demo_customers[1]),
-                ("Review Harbor Route", demo_customers[2]),
+                ("Review North Route",   demo_customers[0], "D",  "Delivery",           ""),
+                ("Review Central Route", demo_customers[1], "PR", "Pickup and Return",  "SPSA Landfill"),
+                ("Review Harbor Route",  demo_customers[2], "S",  "Swap",               ""),
             )
             route_ids = []
             stop_ids = []
-            for route_name, spec in route_specs:
+            for route_name, spec, code, action, dump in route_specs:
                 customer_id, site_id, bin_id, business, address, size = spec
+                raw_text = f"{code} {address} {size}"
                 route = conn.execute(
                     "SELECT id FROM routes WHERE company_id=? AND route_name=? LIMIT 1",
                     (company_id, route_name),
@@ -33458,15 +33466,20 @@ def verify_app_review_demo(repair=True):
                         """INSERT INTO routes
                            (route_date,route_name,raw_text,assigned_to,created_by,status,notes,created_at,company_id)
                            VALUES (?,?,?,?,?,'open','Fictional App Review route',?,?)""",
-                        (today_str(), route_name, f"D {address} {size}", driver_id, boss_id, now_ts(), company_id),
+                        (today_str(), route_name, raw_text, driver_id, boss_id, now_ts(), company_id),
                     )
                     route_id = cur.lastrowid
                     repaired = True
                 else:
                     route_id = route["id"]
+                    # Re-date to today on every repair pass. Without this the
+                    # demo route keeps whatever date it was first seeded with and
+                    # a reviewer opens the app to a route weeks in the past, which
+                    # reads as dead data.
                     conn.execute(
-                        "UPDATE routes SET assigned_to=?,status='open' WHERE id=? AND company_id=?",
-                        (driver_id, route_id, company_id),
+                        "UPDATE routes SET assigned_to=?,status='open',route_date=?,raw_text=? "
+                        "WHERE id=? AND company_id=?",
+                        (driver_id, today_str(), raw_text, route_id, company_id),
                     )
                 stop = conn.execute(
                     "SELECT id FROM stops WHERE route_id=? ORDER BY id LIMIT 1", (route_id,)
@@ -33475,14 +33488,21 @@ def verify_app_review_demo(repair=True):
                     cur = conn.execute(
                         """INSERT INTO stops
                            (route_id,stop_order,customer_name,address,city,state,zip_code,
-                            action,container_size,status,created_at,customer_id)
-                           VALUES (?,1,?,?,'Review City','VA','00000','Delivery',?,'open',?,?)""",
-                        (route_id, business, address, size, now_ts(), customer_id),
+                            action,container_size,dump_location,status,created_at,customer_id)
+                           VALUES (?,1,?,?,'Review City','VA','00000',?,?,?,'open',?,?)""",
+                        (route_id, business, address, action, size, dump, now_ts(), customer_id),
                     )
                     stop_id = cur.lastrowid
                     repaired = True
                 else:
                     stop_id = stop["id"]
+                    # The demo tenant already exists in production, so the action
+                    # and dump leg have to be written on the repair path too or
+                    # this change never reaches the reviewer's account.
+                    conn.execute(
+                        "UPDATE stops SET action=?,container_size=?,dump_location=? WHERE id=?",
+                        (action, size, dump, stop_id),
+                    )
                 _apply_route_chains(conn, route_id)
                 route_ids.append(route_id)
                 stop_ids.append(stop_id)
