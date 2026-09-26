@@ -8113,7 +8113,7 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .lane-sub {{ font-size: 11.5px; color: var(--text-muted); margin-top: 4px; line-height: 1.5; }}
 .lane-actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }}
 .lane-add-stops {{
-    display: inline-flex; align-items: center; min-height: 30px;
+    display: inline-flex; align-items: center; min-height: 44px;
     padding: 5px 12px; font-size: 11px; font-weight: 700;
     color: var(--cyan); background: var(--cyan-dim);
     border: 1px solid rgba(255,107,26,0.35); border-radius: 20px;
@@ -8121,7 +8121,7 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 }}
 .lane-add-stops:hover {{ background: rgba(255,107,26,0.24); color: #FFB37A; }}
 .lane-message-btn {{
-    display: inline-flex; align-items: center; gap: 5px; min-height: 30px;
+    display: inline-flex; align-items: center; gap: 5px; min-height: 44px;
     padding: 5px 12px; font-size: 11px; font-weight: 700;
     color: #C9C9C0; background: rgba(255,255,255,0.06);
     border: 1px solid rgba(255,255,255,0.14); border-radius: 20px;
@@ -8337,6 +8337,29 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 </script>
 
 <script>
+/* ── Sticky-offset variable ────────────────────────────────────────────
+   .topnav is position:sticky;top:0 at z-index 200 with an opaque background.
+   Any other sticky bar inside .content that also pins to top:0 slides
+   underneath it on scroll and its controls become unreachable — the cab
+   view's STOP n OF m / END ROUTE bar did exactly that. Publish the topnav's
+   real height, safe-area padding included, so those bars pin below it.
+   Falls back to 0px when there is no topnav (signed out), which is the
+   pre-existing behaviour. */
+(function(){{
+  var nav = document.querySelector('.topnav');
+  if (!nav) return;
+  function setH() {{
+    document.documentElement.style.setProperty(
+      '--haul-topnav-h', nav.getBoundingClientRect().height + 'px');
+  }}
+  setH();
+  window.addEventListener('resize', setH);
+  /* Rotation reports the old height until the relayout settles. */
+  window.addEventListener('orientationchange', function(){{ setTimeout(setH, 250); }});
+}})();
+</script>
+
+<script>
 /* ── HAULTRA offline support: SW registration, queue, sync ─────────── */
 (function(){{
 
@@ -8365,12 +8388,19 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
   /* ── Style constants ─────────────────────────────────────────────── */
   var _BTN_STYLE = (
     'background:none;border:1px solid currentColor;border-radius:6px;' +
-    'padding:4px 12px;cursor:pointer;font-size:12px;font-weight:700;' +
-    'color:inherit;flex-shrink:0;'
+    // 44pt minimum tap target (Apple HIG); 4px padding computed to ~25pt.
+    'padding:4px 12px;min-height:44px;cursor:pointer;font-size:12px;' +
+    'font-weight:700;color:inherit;flex-shrink:0;'
   );
   var _BASE_CSS = (
     'position:fixed;top:0;left:0;right:0;z-index:10000;' +
-    'padding:10px 20px;display:flex;align-items:center;' +
+    // Own the status-bar strip. This banner outranks .topnav (z-index 200),
+    // so the topnav's own safe-area padding does nothing for it: without this
+    // the banner and its Sync/Retry/Log In button are drawn over the clock,
+    // inside the strip where iOS swallows touches. cssText is reassigned
+    // wholesale on every state change, so the inset has to live here.
+    'padding:calc(10px + env(safe-area-inset-top, 0px)) 20px 10px;' +
+    'display:flex;align-items:center;' +
     'justify-content:space-between;gap:12px;' +
     'font-size:13px;font-weight:600;'
   );
@@ -8389,7 +8419,11 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
   var _conflictBox = document.createElement('div');
   _conflictBox.id  = 'haul-conflict-box';
   _conflictBox.style.cssText = (
-    'display:none;position:fixed;top:44px;left:0;right:0;z-index:9998;' +
+    // top tracks the banner above, which is 44px of content plus the status-bar
+    // inset it now reserves; without the inset here the strip rides up under
+    // the banner and its Dismiss buttons land in the status-bar strip.
+    'display:none;position:fixed;top:calc(44px + env(safe-area-inset-top, 0px));' +
+    'left:0;right:0;z-index:9998;' +
     'background:#1a0010;border-bottom:2px solid rgba(255,60,60,.4);' +
     'padding:8px 20px;font-size:12px;color:#ff9a9a;line-height:1.8;'
   );
@@ -15186,7 +15220,7 @@ def driver_route_detail(route_id):
 <style>
   /* Running-state sticky bar: keeps progress + END ROUTE pinned so nothing
      important sits below the fold while the driver works a stop. */
-  .cab-sticky-bar {{ position: sticky; top: 0; z-index: 50; display:flex; align-items:center;
+  .cab-sticky-bar {{ position: sticky; top: var(--haul-topnav-h, 0px); z-index: 50; display:flex; align-items:center;
       justify-content:space-between; gap:10px; padding:8px 14px; margin-bottom:8px;
       background: var(--bg-0, #121212); border-bottom:1px solid rgba(255,255,255,0.08); }}
   .cab-sticky-progress {{ font-weight:800; letter-spacing:1px; font-size:.98rem; }}
@@ -16085,7 +16119,7 @@ _PASTE_ROUTE_CSS = """<style>
 .pr-tip-item:last-child{border-bottom:none}
 .pr-tip-item strong{color:#FF9D5C}
 .pr-tip-code{font-family:monospace;background:rgba(0,0,0,.3);border-radius:4px;padding:2px 6px;color:#FF9D5C;font-size:11px}
-#pr-mobile-bar{display:none;position:fixed;bottom:0;left:0;right:0;z-index:1200;background:rgba(20,20,20,.97);border-top:1px solid rgba(255,107,26,.24);padding:12px 16px;gap:10px}
+#pr-mobile-bar{display:none;position:fixed;bottom:0;left:0;right:0;z-index:1200;background:rgba(20,20,20,.97);border-top:1px solid rgba(255,107,26,.24);padding:12px 16px calc(12px + env(safe-area-inset-bottom, 0px));gap:10px}
 @media(max-width:820px){ #pr-mobile-bar.pr-show{display:flex} }
 </style>"""
 

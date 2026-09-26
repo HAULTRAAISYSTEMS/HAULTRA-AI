@@ -74,7 +74,7 @@
     .empty-state { text-align: center; padding: 60px 24px; color: var(--text-muted); }
     .empty-state .icon { font-size: 3.5rem; margin-bottom: 16px; }
     .empty-state h3 { font-size: 1.1rem; margin-bottom: 8px; color: var(--text); }
-    .bottom-bar { position: fixed; bottom: 0; left: 0; right: 0; background: var(--surface); border-top: 1px solid #1e1e30; padding: 12px 16px; display: flex; align-items: center; justify-content: space-between; }
+    .bottom-bar { position: fixed; bottom: 0; left: 0; right: 0; background: var(--surface); border-top: 1px solid #1e1e30; padding: 12px 16px calc(12px + env(safe-area-inset-bottom, 0px)); display: flex; align-items: center; justify-content: space-between; }
     .driver-name { font-weight: 600; font-size: 0.9rem; }
     .logout-btn { background: none; border: 1px solid #3a3a5a; color: var(--text-muted); padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 0.85rem; min-height: 40px; }
   </style>
