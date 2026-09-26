@@ -15602,24 +15602,45 @@ def driver_route_detail(route_id):
         camera.getPhoto({{
             quality: 85,
             allowEditing: false,
-            resultType: 'uri',
+            // base64, NOT 'uri'. capacitor.config.json points the shell at
+            // https://haultra-systems.com, so the page origin is the remote
+            // site while photo.webPath is a capacitor://localhost/... URL.
+            // fetch()ing that from an https origin is cross-scheme and always
+            // rejects, which landed in the catch below and restored the button
+            // with no error and no upload — the photo just never saved.
+            resultType: 'base64',
             source: 'PROMPT',
         }}).then(function(photo) {{
             if (btn) {{ btn.disabled = true; btn.textContent = 'Uploading…'; }}
-            return fetch(photo.webPath).then(function(r) {{ return r.blob(); }}).then(function(blob) {{
-                var fd = new FormData();
-                var csrf = (document.querySelector('meta[name="csrf-token"]') || {{}}).content || '';
-                fd.append('_csrf_token', csrf);
-                fd.append('photos', blob, 'photo.' + (photo.format || 'jpeg'));
-                return fetch(photoForm.action, {{ method: 'POST', body: fd }});
+            var fmt = String(photo.format || 'jpeg').toLowerCase();
+            if (fmt === 'jpg') fmt = 'jpeg';
+            var binary = atob(photo.base64String);
+            var bytes = new Uint8Array(binary.length);
+            for (var i = 0; i < binary.length; i++) {{ bytes[i] = binary.charCodeAt(i); }}
+            var blob = new Blob([bytes], {{ type: 'image/' + fmt }});
+            var fd = new FormData();
+            var csrf = (document.querySelector('meta[name="csrf-token"]') || {{}}).content || '';
+            fd.append('_csrf_token', csrf);
+            fd.append('photos', blob, 'photo.' + fmt);
+            return fetch(photoForm.action, {{
+                method: 'POST',
+                body: fd,
+                credentials: 'same-origin',
+            }}).then(function(r) {{
+                // Never reload on a failed POST: doing so wiped the pending
+                // photo and looked exactly like a successful save.
+                if (!r.ok) throw new Error('upload failed with status ' + r.status);
+                window.location.reload();
             }});
-        }}).then(function() {{
-            window.location.reload();
-        }}).catch(function() {{
-            // Driver cancelled the native camera sheet, or capture failed —
-            // stay silent and restore the button, same as cancelling the
-            // web file picker does nothing either.
+        }}).catch(function(err) {{
             if (btn) {{ btn.disabled = false; btn.textContent = originalLabel; }}
+            // Cancelling the native sheet is not an error — Capacitor rejects
+            // with a "cancelled" message and the web file picker does nothing
+            // either. Anything else is a real failure the driver has to know
+            // about, or they drive off believing they left proof of service.
+            var msg = (err && err.message ? err.message : String(err || '')).toLowerCase();
+            if (msg.indexOf('cancel') !== -1 || msg.indexOf('no image') !== -1) return;
+            alert('Photo did not upload — check your connection and try again.');
         }});
     }};
 
