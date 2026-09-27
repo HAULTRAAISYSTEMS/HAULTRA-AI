@@ -9986,6 +9986,13 @@ def flush_alert_emails(company_id=None, limit=20):
             "FROM alerts WHERE %s ORDER BY id DESC LIMIT ?" % where, params + [limit]
         ).fetchall()
         for row in rows:
+            # Recipients first: stamping emailed_at when there is nobody to send
+            # to marks the alert delivered without delivering anything, and a
+            # re-opened alert would never become eligible again. Leave it
+            # un-stamped so a later sweep picks it up once a boss has an email.
+            recipients = _alert_email_recipients(conn, row["company_id"])
+            if not recipients:
+                continue
             claimed = conn.execute(
                 "UPDATE alerts SET emailed_at=? WHERE id=? AND emailed_at IS NULL",
                 (now_ts(), row["id"]),
@@ -9993,9 +10000,6 @@ def flush_alert_emails(company_id=None, limit=20):
             conn.commit()
             if not claimed:
                 continue          # another worker got there first
-            recipients = _alert_email_recipients(conn, row["company_id"])
-            if not recipients:
-                continue
             _icon, _sev, label = ALERT_KINDS.get(row["kind"], ("bell", "info", row["kind"]))
             html = _alert_email_html(row["title"], row["body"] or "", label,
                                      _ago(row["created_at"]), row["link"])
