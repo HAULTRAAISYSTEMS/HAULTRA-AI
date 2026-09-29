@@ -14212,6 +14212,53 @@ def _cab_cancel_ui(route_id, stop_id, csrf, stop_label=""):
         .replace("__STOP_ID__", str(stop_id) if stop_id else "null")
 
 
+def _chain_deliver_step(term, gives_addr, takes_from_set, head_addr, delivery_addr):
+    """Post-dump empty-can button for a chained stop sitting at need_box_in.
+
+    ``term`` is the raw chain_terminal ("", "none", "yard", "delivery", "head");
+    the addresses are plain (unescaped) strings. ``takes_from_set`` is True
+    when this stop takes an empty from a chain neighbor (i.e. it is not the
+    chain head).
+
+    Returns (action, label_html, css_class) or None when no delivery step
+    applies. A tail with no explicit terminal defaults to "head" — the final
+    empty goes back to the first stop of the chain — matching the chain
+    resolver's documented default.
+    """
+    if term == "none":
+        return None
+    if term == "yard":
+        return ("box_in", "&#128666; Empty to Yard", "btn-driver btn-driver-complete")
+    if term == "delivery":
+        return ("box_in", "&#128666; Deliver Empty to %s" % e(delivery_addr or "the delivery stop"),
+                "btn-driver btn-driver-complete")
+    if term == "head" or (not term and takes_from_set):
+        _addr = (gives_addr if term == "head" else None) or head_addr or "the first stop"
+        return ("box_in", "&#128666; Return Empty to %s" % e(_addr),
+                "btn-driver btn-driver-complete")
+    return ("box_in", "&#128666; Deliver Empty to %s" % e(gives_addr or "the next stop"),
+            "btn-driver btn-driver-complete")
+
+
+def _chain_carry_dest_id(chained, gives_id, takes_from_set, term, head_id):
+    """Stop id the empty can is physically heading to after a deliver/carry
+    tap, or None when the can goes nowhere from here.
+
+    Covers chained middles (gives_id = next stop), an explicit head terminal
+    (gives_id = head stop), and a tail with no explicit terminal — which
+    defaults to the chain head. Returns None for the head's own card only
+    when it has no onward link, and for non-chained stops (those are handled
+    by the pickup-and-return plan instead).
+    """
+    if not chained:
+        return None
+    if gives_id:
+        return gives_id
+    if takes_from_set and term in ("", "head"):
+        return head_id
+    return None
+
+
 @app.route("/driver/route/<int:route_id>")
 @driver_required
 def driver_route_detail(route_id):
@@ -14587,10 +14634,21 @@ def driver_route_detail(route_id):
     # Neighbor addresses come from the already-loaded route stops (conn is closed
     # by now) so the chain workflow can name where the empty goes.
     _c_nbr = {}
+    _c_head_id = None
     if _chained:
+        _c_gid = _s.get("chain_group_id")
         for _row in stops:
             _rid = _row["id"]
             if _rid in (_c_gives, _c_takes, _c_delivery):
+                _c_nbr[_rid] = ((_row["address"] or _row["customer_name"] or "the stop") or "").strip()
+            # Head of this chain (takes from nobody): the documented default
+            # return target when a tail has no explicit terminal.
+            _rkeys = _row.keys()
+            if (_c_head_id is None and "chain_group_id" in _rkeys
+                    and _row["chain_group_id"] == _c_gid
+                    and "chain_takes_from_stop_id" in _rkeys
+                    and not _row["chain_takes_from_stop_id"]):
+                _c_head_id = _rid
                 _c_nbr[_rid] = ((_row["address"] or _row["customer_name"] or "the stop") or "").strip()
 
     # ── Reuse the exact existing workflow state machine (arrived / box out /
@@ -14598,24 +14656,21 @@ def driver_route_detail(route_id):
     #    as before, just rendered inside the new single-stop card. ──────────
     workflow_btn_html = ""
     if _chained:
-        _gives_addr = e(_c_nbr.get(_c_gives, "the next stop"))
         # First on-site step: the head has no incoming empty (just box out its
         # full); every other chain member arrives carrying an empty to set off.
         _first_step = ("box_out", "&#128230; Box Out &mdash; Remove Container", "btn-driver btn-driver-complete") \
             if _c_takes is None else \
             ("box_out", "&#128230; Set Off Empty &amp; Box Out Full", "btn-driver btn-driver-complete")
         # Post-dump delivery of the now-empty can, from the terminal / FKs.
-        if _c_term == "none":
-            _deliver_step = None
-        elif _c_term == "yard":
-            _deliver_step = ("box_in", "&#128666; Empty to Yard", "btn-driver btn-driver-complete")
-        elif _c_term == "delivery":
-            _dlv_addr = e(_c_nbr.get(_c_delivery, "the delivery stop"))
-            _deliver_step = ("box_in", f"&#128666; Deliver Empty to {_dlv_addr}", "btn-driver btn-driver-complete")
-        elif _c_term == "head":
-            _deliver_step = ("box_in", f"&#128666; Return Empty to {_gives_addr}", "btn-driver btn-driver-complete")
-        else:  # middle — deliver the empty to the next chain stop
-            _deliver_step = ("box_in", f"&#128666; Deliver Empty to {_gives_addr}", "btn-driver btn-driver-complete")
+        # A tail with no explicit terminal defaults to "head" (the final
+        # empty returns to the first stop of the chain).
+        _deliver_step = _chain_deliver_step(
+            _c_term,
+            _c_nbr.get(_c_gives),
+            _c_takes is not None,
+            _c_nbr.get(_c_head_id),
+            _c_nbr.get(_c_delivery),
+        )
         wf_map = {
             "pending":  ("arrived",       "&#128666; Arrived at Stop",    "btn-driver btn-driver-complete"),
             "arrived":  _first_step,
@@ -14711,6 +14766,46 @@ def driver_route_detail(route_id):
             nav_html = (f'<div class="small muted" style="margin-bottom:10px;padding:8px;'
                         f'background:rgba(255,255,255,0.06);border-radius:8px;">Dump location not set for this stop.</div>')
         workflow_btn_html = nav_html + dump_ticket_link
+
+    # -- Next-stop handoff --
+    # After the driver taps a chained "Deliver Empty to ..." (or the chain-less
+    # PR "Load Empty - carry to next stop"), the physical work here is done
+    # but the stop stays open until Complete Stop. The card used to sit on the
+    # stale address with no way forward - hand the driver the next address
+    # with its own Navigate button so they can roll immediately.
+    _next_handoff_html = ""
+    if driver_status == "box_in":
+        _dest_row = None
+        _carry_id = _chain_carry_dest_id(
+            _chained, _c_gives, _c_takes is not None, _c_term, _c_head_id)
+        if _carry_id:
+            _dest_row = next((_nr for _nr in stops if _nr["id"] == _carry_id), None)
+        elif (not _chained and is_pr and not is_swap_pr
+              and (_s.get("empty_can_plan") or "").strip() == "carry_next"):
+            # Chain-less PR carrying the empty onward: the next live stop in
+            # route order.
+            _sids = [_nr["id"] for _nr in stops]
+            if stop_id in _sids:
+                for _nr in stops[_sids.index(stop_id) + 1:]:
+                    if not stop_is_cancelled(_nr):
+                        _dest_row = _nr
+                        break
+        if _dest_row is not None:
+            _d_full = " ".join(filter(None, [
+                _dest_row["address"] or "", _dest_row["city"] or "",
+                _dest_row["state"] or "", _dest_row["zip_code"] or ""])).strip()
+            if _d_full:
+                _d_name = (_dest_row["customer_name"] or "").strip() or _d_full
+                _next_handoff_html = (
+                    '<div class="cab-next-handoff">'
+                    '<div class="cab-next-handoff-label">&#9650; Next stop</div>'
+                    '<div class="cab-next-handoff-addr">' + e(_d_name) + '</div>'
+                    '<a class="cab-primary cab-next-handoff-nav" href="#" '
+                    'onclick="return openNavStop(event, ' + _nav_pref_js + ', '
+                    + e(json.dumps(_d_full)) + ')">'
+                    '&#128205; Navigate</a>'
+                    '</div>'
+                )
 
     # ── Photo proof: Off / Encouraged (nudge) / Required (hard gate) ───────
     stop_photos = photos_by_stop.get(stop_id, [])
@@ -15196,6 +15291,7 @@ def driver_route_detail(route_id):
         {_msg_boss_html}
         <div class="cab-workzone">
             {workflow_btn_html}
+            {_next_handoff_html}
             {empty_can_picker_html}
             {upload_widget}
             {after_dump_summary_html}
@@ -15290,6 +15386,15 @@ def driver_route_detail(route_id):
       background: var(--cab-neutral-bg, #161616) !important; color: var(--text, #F5F5F0) !important;
       border:1px solid var(--cab-neutral-border, #2A2A2A) !important; box-shadow:none !important; text-shadow:none !important; }}
   .cab-workzone .btn, .cab-workzone .btn-driver {{ min-height:52px; }}
+  /* Next-stop handoff: appears where the deliver/carry button was after the
+     tap, so the driver can roll to the next address immediately. */
+  .cab-next-handoff {{ margin:0 0 10px; padding:12px 14px; border:1px solid var(--cab-neutral-border, #2A2A2A);
+      border-radius:12px; background:rgba(255,255,255,0.04); }}
+  .cab-next-handoff-label {{ font-size:.78rem; font-weight:800; letter-spacing:.06em; text-transform:uppercase;
+      color:var(--orange, #FF6B1A); margin-bottom:4px; }}
+  .cab-next-handoff-addr {{ font-size:1.02rem; font-weight:700; margin-bottom:10px; }}
+  .cab-next-handoff .cab-next-handoff-nav {{ display:block; text-align:center; text-decoration:none;
+      padding:14px 16px; border-radius:12px; font-weight:700; min-height:52px; }}
   /* The one orange button in phase 2 — Complete Stop. */
   .cab-primary-zone {{ margin-top:14px; }}
   .cab-primary-zone .btn, .cab-primary-zone button, .cab-primary-zone form button {{
