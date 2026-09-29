@@ -14625,6 +14625,7 @@ def driver_route_detail(route_id):
             <form method="POST" action="{url_for('toggle_stop_complete', stop_id=stops[-1]['id'])}"
                   onsubmit="return confirm('Reopen the last stop? Its progress will reset and it will become your current stop again.');">
                 <input type="hidden" name="_csrf_token" value="{_csrf}">
+                <input type="hidden" name="intent" value="reopen">
                 <button type="submit" class="btn secondary" style="min-height:48px;">&#8592; Fix Last Stop</button>
             </form>
             ''' if total_count > 0 else ''}
@@ -14918,6 +14919,7 @@ def driver_route_detail(route_id):
     <form method="POST" action="{url_for('toggle_stop_complete', stop_id=stop_id)}" id="cab-complete-form"
           data-has-photo="{'1' if has_photo else '0'}" data-photo-mode="{e(photo_proof_mode)}">
         <input type="hidden" name="_csrf_token" value="{_csrf}">
+        <input type="hidden" name="intent" value="complete">
         <button class="cab-complete-btn" type="submit" {"disabled" if required_locked else ""}>&#9989; Complete Stop</button>
     </form>
     {'<div class="cab-photo-status">Take at least one photo to unlock Complete Stop</div>' if required_locked else ''}
@@ -15523,6 +15525,7 @@ def driver_route_detail(route_id):
     <form method="POST" action="{url_for('toggle_stop_complete', stop_id=prev_stop['id'])}" style="margin-bottom:14px;"
           onsubmit="return confirm('Reopen the previous stop? Its progress will reset and it will become your current stop again.');">
         <input type="hidden" name="_csrf_token" value="{_csrf}">
+        <input type="hidden" name="intent" value="reopen">
         <button type="submit" class="cab-neutral" style="min-height:48px;margin-top:0;">&#8592; Previous Stop</button>
     </form>
     ''' if prev_stop else ''}
@@ -17416,6 +17419,7 @@ def view_route(route_id):
         return redirect(url_for("dashboard"))
 
     stops = conn.execute("SELECT * FROM stops WHERE route_id = ? ORDER BY stop_order ASC, id ASC", (route_id,)).fetchall()
+    _csrf = get_csrf_token()
 
     # can_state_before is populated by write operations (add/edit/reorder/optimize).
     # Legacy routes with null values are repaired on the next explicit write, not here.
@@ -17777,6 +17781,8 @@ def view_route(route_id):
         # A cancelled stop keeps its number and its place in the list so the
         # driver's stop numbers never shuffle mid-route.
         _complete_btn = "" if _cancelled else f"""<form class="inline" method="POST" action="{url_for('toggle_stop_complete', stop_id=s['id'])}">
+                        <input type="hidden" name="_csrf_token" value="{_csrf}">
+                        <input type="hidden" name="intent" value="{'reopen' if s['status']=='completed' else 'complete'}">
                         <button class="btn green" type="submit">{'Reopen Stop' if s['status']=='completed' else 'Complete Stop'}</button>
                     </form>"""
         stop_cards += f"""
@@ -19052,7 +19058,34 @@ def toggle_stop_complete(stop_id):
     # Conflict detection for offline sync replays
     is_replay = (request.headers.get("X-Sync-Replay") == "1" or
                  request.headers.get("X-Requested-With") == "XMLHttpRequest")
+    intent = request.form.get("intent", "").strip()  # "complete" | "reopen" | "" (legacy)
     expected_status = request.form.get("expected_status", "").strip()
+
+    # ── Idempotent completion ──
+    # A "complete" tap on an already-completed stop (double-tap on a bumpy
+    # road, or a retry after the first tap succeeded but its response was
+    # lost) must NOT silently reopen the stop. Only an explicit reopen intent
+    # ("Previous Stop", "Fix Last Stop", boss "Reopen Stop" — all behind
+    # confirm dialogs / deliberate labels) flips completed -> open.
+    if stop["status"] == "completed" and intent != "reopen":
+        prog = conn.execute(
+            "SELECT COUNT(*) AS total, SUM(status='completed') AS completed FROM stops WHERE route_id=?",
+            (stop["route_id"],)).fetchone()
+        total, completed = prog["total"], prog["completed"] or 0
+        conn.close()
+        if is_replay:
+            return jsonify({
+                "success": True,
+                "stop_id": stop_id,
+                "new_status": "completed",
+                "completed_at": stop["completed_at"] or "",
+                "progress": {"completed": completed, "total": total},
+            })
+        flash("That stop is already completed.", "success")
+        if session.get("role") != "boss":
+            return redirect(url_for("driver_route_detail", route_id=stop["route_id"]))
+        return redirect(url_for("view_route", route_id=stop["route_id"]))
+
     if is_replay and expected_status and stop["status"] != expected_status:
         conn.close()
         return jsonify({
