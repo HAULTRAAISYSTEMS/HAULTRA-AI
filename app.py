@@ -14259,6 +14259,53 @@ def _chain_carry_dest_id(chained, gives_id, takes_from_set, term, head_id):
     return None
 
 
+def _chain_head_id(conn, route_id, chain_group_id):
+    """Id of the chain head (the member that takes an empty from nobody), or
+    None. Same falsy-takes_from test the card uses, scoped to this route."""
+    for _r in conn.execute(
+            "SELECT id, chain_takes_from_stop_id FROM stops WHERE route_id=? AND chain_group_id=?",
+            (route_id, chain_group_id)).fetchall():
+        if not _r["chain_takes_from_stop_id"]:
+            return _r["id"]
+    return None
+
+
+def _deliver_handoff_dest_id(conn, stop, route_id):
+    """Stop id the empty can is physically heading to after a post-dump
+    deliver/carry tap, or None when it stays here / goes nowhere trackable.
+
+    Mirrors the card's next-stop handoff strip resolution so the auto-advance
+    can point the driver at the right address: chained stops use the chain
+    FKs (middle -> next stop, unterminated tail -> head), and a chain-less
+    pickup-and-return stop with a "carry to next stop" plan resolves to the
+    next live stop in route order. Yard / none / leave-on-site / return-here
+    have no onward stop and return None.
+    """
+    _keys = stop.keys()
+    _chained = bool(stop["chain_group_id"]) if "chain_group_id" in _keys else False
+    if _chained:
+        return _chain_carry_dest_id(
+            True,
+            stop["chain_gives_to_stop_id"] if "chain_gives_to_stop_id" in _keys else None,
+            bool(stop["chain_takes_from_stop_id"]) if "chain_takes_from_stop_id" in _keys else False,
+            (stop["chain_terminal"] or "").strip() if "chain_terminal" in _keys else "",
+            _chain_head_id(conn, route_id, stop["chain_group_id"]),
+        )
+    _al = (stop["action"] or "").lower()
+    _is_pr = "pickup and return" in _al or ("swap" in _al and "pull" not in _al)
+    if _is_pr and (stop["empty_can_plan"] or "").strip() == "carry_next":
+        # Walk the stops after this one in route order; first live stop wins.
+        _after = False
+        for _r in conn.execute(
+                "SELECT id, cancelled_at FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
+                (route_id,)).fetchall():
+            if _after and not stop_is_cancelled(_r):
+                return _r["id"]
+            if _r["id"] == stop["id"]:
+                _after = True
+    return None
+
+
 @app.route("/driver/route/<int:route_id>")
 @driver_required
 def driver_route_detail(route_id):
@@ -14465,6 +14512,46 @@ def driver_route_detail(route_id):
     # ALL STOPS DONE — celebration screen
     # ══════════════════════════════════════════════════════════
     _nav_pref = route["nav_preference"] or ""
+
+    # ── One-time handoff banner ──
+    # A post-dump deliver/carry tap auto-completes the stop, so the card
+    # advances — but the empty can is physically headed somewhere that may
+    # NOT be the new current card (e.g. a chain tail returning the final
+    # empty to the already-completed head). The tap redirects here with
+    # ?handoff=<stop_id>; show that destination once with its own Navigate
+    # button. Suppressed when the destination IS the new current card, whose
+    # own Navigate button already covers it.
+    _handoff_banner_html = ""
+    _handoff_arg = (request.args.get("handoff") or "").strip()
+    if _handoff_arg.isdigit():
+        _h_dest = next((r for r in stops if r["id"] == int(_handoff_arg)), None)
+        if (_h_dest is not None
+                and (current_stop is None or _h_dest["id"] != current_stop["id"])):
+            _h_name = (_h_dest["customer_name"] or "").strip()
+            _h_full = " ".join(filter(None, [
+                _h_dest["address"] or "", _h_dest["city"] or "",
+                _h_dest["state"] or "", _h_dest["zip_code"] or ""])).strip()
+            if _h_full:
+                _h_enc = urllib.parse.quote_plus(_h_full)
+                # openNavStop (nav-preference aware) only exists on the
+                # current-stop card's scripts; the all-done screen gets a
+                # plain Maps web link, which never depends on page JS.
+                _h_nav = (
+                    '<a class="cab-primary cab-next-handoff-nav" href="#" '
+                    'onclick="return openNavStop(event, ' + e(json.dumps(_nav_pref)) + ', '
+                    + e(json.dumps(_h_full)) + ')">&#128205; Navigate</a>'
+                    if current_stop is not None else
+                    '<a class="cab-primary cab-next-handoff-nav" '
+                    'href="https://www.google.com/maps/dir/?api=1&destination=' + _h_enc + '" '
+                    'target="_blank" rel="noopener">&#128205; Navigate</a>'
+                )
+                _handoff_banner_html = (
+                    '<div class="cab-next-handoff">'
+                    '<div class="cab-next-handoff-label">&#9650; Empty can goes to</div>'
+                    '<div class="cab-next-handoff-addr">' + e(_h_name or _h_full) + '</div>'
+                    + _h_nav +
+                    '</div>'
+                )
     _nav_pref_options = "".join(
         f'<label style="display:flex;align-items:center;gap:10px;min-height:48px;cursor:pointer;">'
         f'<input type="radio" name="nav_preference" value="{val}" {"checked" if _nav_pref == val else ""} '
@@ -14524,6 +14611,7 @@ def driver_route_detail(route_id):
     </div>
     {nav_pref_modal_html}
     {urgent_banner_html}
+    {_handoff_banner_html}
     <div class="cab-progress-label">{e(route['route_name'])} &middot; {e(route['route_date'])}</div>
     <div class="cab-progress-track"><div class="cab-progress-fill" style="width:100%;"></div></div>
 
@@ -15422,6 +15510,7 @@ def driver_route_detail(route_id):
     </div>
     {nav_pref_modal_html}
     {urgent_banner_html}
+    {_handoff_banner_html}
 
     <div id="route-updated-banner" class="route-updated-banner" hidden>
         <span id="route-updated-text"></span>
@@ -19302,12 +19391,77 @@ def stop_driver_action(stop_id):
     # Customer Request System: a driver starting/advancing the stop moves a
     # linked request to 'in_progress' (no-op for normal stops).
     cascade_request_from_stop(conn, stop_id)
-    conn.commit()
     route_id = stop["rid"]
+
+    # ── Post-dump deliver/carry tap advances the card ──
+    # Tapping "Deliver Empty to …", "Return Empty to …", "Empty to Yard",
+    # "Load Empty — carry to next stop" or "Leave Empty On Site" (box_in from
+    # need_box_in) finishes this stop's physical work: the empty can is on the
+    # truck or placed, and the driver needs the NEXT stop's card — not this
+    # one sitting on a stale address. Complete the stop here so the card
+    # advances; a mis-tap can still be undone via Previous Stop reopen.
+    # Excluded: swap-PR (there box_in = "Confirm Box In" is followed by
+    # going_to_dump, so the stop is NOT done), held stops (the boss must
+    # release them first), and photo-proof "required" companies when the stop
+    # has no photo yet (that gate stays exactly as strict as the manual
+    # Complete Stop button).
+    _auto_completed = False
+    _handoff_stop_id = None
+    if action == "box_in" and current_status == "need_box_in":
+        _skeys = stop.keys()
+        _al = (stop["action"] or "").lower()
+        _is_pr = "pickup and return" in _al or ("swap" in _al and "pull" not in _al)
+        _is_swap = (_is_pr and bool(stop["swap_with_prev_pull"])
+                    if "swap_with_prev_pull" in _skeys else False)
+        _chained = bool(stop["chain_group_id"]) if "chain_group_id" in _skeys else False
+        _held = bool(stop["held_at"]) if "held_at" in _skeys else False
+        if (_chained or _is_pr) and not _is_swap and not _held:
+            _pmode_row = conn.execute(
+                "SELECT photo_proof_mode FROM companies WHERE id=?",
+                (stop["company_id"],)).fetchone()
+            _pmode = (_pmode_row["photo_proof_mode"]
+                      if _pmode_row and _pmode_row["photo_proof_mode"] else "encouraged")
+            _has_photo = bool(load_stop_photos(conn, [stop_id]).get(stop_id))
+            if not (_pmode == "required" and not _has_photo):
+                _handoff_stop_id = _deliver_handoff_dest_id(conn, stop, route_id)
+                conn.execute(
+                    "UPDATE stops SET status='completed', completed_at=?, "
+                    "driver_status='completed' WHERE id=?",
+                    (ts, stop_id))
+                update_container_flow(conn, stop_id)
+                # Re-mirror onto a linked customer request now that the stop
+                # reads completed (idempotent; no-op for normal stops).
+                cascade_request_from_stop(conn, stop_id)
+                _auto_completed = True
+
+    # Confirmation flash for the auto-advance (skipped for sync replays —
+    # those have no page load to show it on). Built before conn closes so
+    # the destination name resolves on the already-open connection.
+    _flash_msg = None
+    if _auto_completed and not is_replay:
+        _done_name = ((stop["customer_name"] or "").strip() or "Stop")
+        if _handoff_stop_id:
+            _dest = conn.execute("SELECT customer_name, address FROM stops WHERE id=?",
+                                 (_handoff_stop_id,)).fetchone()
+            _dest_name = ((_dest["customer_name"] or _dest["address"] or "").strip()
+                          if _dest else "")
+            _flash_msg = ("✓ %s complete — empty can to %s."
+                          % (_done_name, _dest_name or "the next stop"))
+        else:
+            _flash_msg = "✓ %s complete." % _done_name
+
+    conn.commit()
     conn.close()
 
     if is_replay:
-        return jsonify({"success": True, "stop_id": stop_id, "new_status": action})
+        return jsonify({"success": True, "stop_id": stop_id,
+                        "new_status": ("completed" if _auto_completed else action),
+                        "auto_completed": _auto_completed})
+    if _flash_msg:
+        flash(_flash_msg, "success")
+    if _handoff_stop_id:
+        return redirect(url_for("driver_route_detail", route_id=route_id,
+                                handoff=_handoff_stop_id))
     return redirect(url_for("driver_route_detail", route_id=route_id))
 
 
