@@ -14513,6 +14513,59 @@ def driver_route_detail(route_id):
     # ══════════════════════════════════════════════════════════
     _nav_pref = route["nav_preference"] or ""
 
+    # ── Navigate-to-Yard (shown once every stop is done) ──
+    # The driver usually has to get the truck (and often the last empty can)
+    # back to the yard after the final stop, so the all-done screen offers a
+    # one-tap navigation link. The yard address comes from Company Settings
+    # (boss sets it). openNavStop() isn't rendered on this screen, so the
+    # destination URL is built server-side honoring the same nav preference.
+    _yard_nav_html = ""
+    # NOTE: the request's main conn is already closed by this point, so the
+    # yard lookup uses its own short-lived connection.
+    _yconn = get_db()
+    try:
+        _yrow = _yconn.execute(
+            "SELECT yard_address, yard_city, yard_state, yard_zip FROM companies WHERE id=?",
+            (cid(),)).fetchone()
+    except Exception:
+        _yrow = None
+    finally:
+        _yconn.close()
+    _yard_full = ""
+    if _yrow:
+        _yard_full = ", ".join(p for p in [
+            (_yrow["yard_address"] or "").strip(), (_yrow["yard_city"] or "").strip(),
+            (_yrow["yard_state"] or "").strip(), (_yrow["yard_zip"] or "").strip()] if p)
+    if _yard_full:
+        _y_enc = urllib.parse.quote_plus(_yard_full)
+        _ua = (request.headers.get("User-Agent") or "").lower()
+        if _nav_pref == "google":
+            _y_href = "https://maps.google.com/?daddr=" + _y_enc
+        elif _nav_pref == "apple":
+            _y_href = "https://maps.apple.com/?daddr=" + _y_enc
+        elif _nav_pref == "waze":
+            _y_href = "https://waze.com/ul?q=" + _y_enc + "&navigate=yes"
+        elif _nav_pref == "device_default":
+            if "android" in _ua:
+                _y_href = "geo:0,0?q=" + _y_enc
+            elif any(t in _ua for t in ("iphone", "ipad", "ipod")):
+                _y_href = "https://maps.apple.com/?daddr=" + _y_enc
+            else:
+                _y_href = "https://maps.google.com/?daddr=" + _y_enc
+        else:
+            # No preference set — plain Google Maps web link, matching the
+            # handoff banner's fallback on this same screen.
+            _y_href = "https://www.google.com/maps/dir/?api=1&destination=" + _y_enc
+        _yard_nav_html = (
+            '<a class="btn green" style="min-height:48px;" href="' + e(_y_href) + '" '
+            'target="_blank" rel="noopener">&#128205; Navigate to Yard</a>'
+        )
+    else:
+        _yard_nav_html = (
+            '<div style="color:var(--text-muted);font-size:13px;margin-top:4px;">'
+            'Yard address not set — ask the boss to add it in Company Settings.</div>'
+        )
+
     # ── One-time handoff banner ──
     # A post-dump deliver/carry tap auto-completes the stop, so the card
     # advances — but the empty can is physically headed somewhere that may
@@ -14629,6 +14682,7 @@ def driver_route_detail(route_id):
                 <button type="submit" class="btn secondary" style="min-height:48px;">&#8592; Fix Last Stop</button>
             </form>
             ''' if total_count > 0 else ''}
+            {_yard_nav_html}
             <a class="btn secondary" href="{url_for('driver_dashboard')}">&#8592; Back to My Routes</a>
         </div>
     </div>
