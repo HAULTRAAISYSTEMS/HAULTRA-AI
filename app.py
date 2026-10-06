@@ -18,6 +18,7 @@ from flask import (
 import sqlite3
 import os
 import re
+import difflib
 import io
 import csv
 import html
@@ -655,6 +656,7 @@ _PARSE_CITY_MAP = {
     "suff":         "Suffolk",
     "hampton":      "Hampton",
     "nn":           "Newport News",
+    "newpt":        "Newport News",
     "portsmouth":   "Portsmouth",
     "ports":        "Portsmouth",
     "port":         "Portsmouth",
@@ -671,6 +673,7 @@ def parse_route_text(text, conn, company_id):
     """
     results      = []
     use_for_next = False  # carries swap-trigger past non-PR stops until consumed
+    pending_placement = ""  # ordering directive ("before final delivery") for the NEXT stop
 
     input_lines = [l.strip() for l in text.splitlines() if l.strip()]
     print(f"[PARSER] Input lines: {len(input_lines)}", flush=True)
@@ -688,46 +691,68 @@ def parse_route_text(text, conn, company_id):
             print(f"[PARSER] Annotation line → attached to previous stop: {raw!r}", flush=True)
             continue
 
-        try:
-            parsed = _parse_one_line(raw, conn, company_id)
-        except Exception as exc:
-            print(f"[PARSER] ERROR parsing {raw!r}: {exc}", flush=True)
+        # ── Ordering-directive lines: not stops — they place the NEXT stop ──
+        # e.g. "One addition today. Before final delivery". Guarded by "no street
+        # number and no container size" so real stops never get swallowed.
+        _dm = _ORDER_DIRECTIVE_RE.search(raw)
+        if _dm and not _STREET_NUM_RE.search(raw) and not _CONTAINER_RE.search(raw):
+            pending_placement = _dm.group(0).strip().rstrip(".")
+            print(f"[PARSER] Directive line → placement for next stop: {pending_placement!r}", flush=True)
             continue
 
-        if not parsed:
-            print(f"[PARSER] SKIP (unparseable): {raw!r}", flush=True)
-            continue
+        # ── "and then <action>" — one pasted line holding TWO stops ──
+        # e.g. "... dump dominion and then deliver garwood to end the day"
+        parts = [p for p in _AND_THEN_SPLIT_RE.split(raw) if p.strip()]
+        if len(parts) > 1:
+            print(f"[PARSER] Split 'and then' line into {len(parts)} parts", flush=True)
 
-        action_lc = (parsed.get("action") or "").lower()
-        notes     = parsed.get("notes") or ""
-        notes_lc  = notes.lower()
-        is_pr     = "pickup and return" in action_lc
+        for part in parts:
+            part = part.strip()
+            try:
+                parsed = _parse_one_line(part, conn, company_id)
+            except Exception as exc:
+                print(f"[PARSER] ERROR parsing {part!r}: {exc}", flush=True)
+                continue
 
-        # Apply pending swap from a previous stop to this PR stop
-        if use_for_next and is_pr:
-            parsed["pr_mode"]                  = "swap"
-            parsed["swap_with_prev_pull"]      = 1
-            parsed["swap_with_previous_empty"] = True
-            use_for_next = False
+            if not parsed:
+                print(f"[PARSER] SKIP (unparseable): {part!r}", flush=True)
+                continue
 
-        # Detect swap trigger phrase in this stop's notes
-        if _PENDING_EMPTY_RE.search(notes_lc):
-            parsed["pending_empty_can_for_next_pr"] = True
-            use_for_next = True
+            if pending_placement:
+                parsed["placement_note"] = pending_placement
+                pending_placement = ""
+                print(f"[PARSER] Applied placement note: {parsed['placement_note']!r}", flush=True)
 
-        # Detect "return to <dest>"
-        rt = _RETURN_TO_RE.search(notes)
-        if rt:
-            parsed["return_destination"] = rt.group(1).strip().rstrip(".")
+            action_lc = (parsed.get("action") or "").lower()
+            notes     = parsed.get("notes") or ""
+            notes_lc  = notes.lower()
+            is_pr     = "pickup and return" in action_lc
 
-        results.append(parsed)
-        print(
-            f"[PARSER] Stop {len(results)}: action={parsed.get('action')!r}"
-            f"  addr={parsed.get('address')!r}"
-            f"  customer={parsed.get('customer_name')!r}"
-            f"  conf={parsed.get('confidence')}",
-            flush=True,
-        )
+            # Apply pending swap from a previous stop to this PR stop
+            if use_for_next and is_pr:
+                parsed["pr_mode"]                  = "swap"
+                parsed["swap_with_prev_pull"]      = 1
+                parsed["swap_with_previous_empty"] = True
+                use_for_next = False
+
+            # Detect swap trigger phrase in this stop's notes
+            if _PENDING_EMPTY_RE.search(notes_lc):
+                parsed["pending_empty_can_for_next_pr"] = True
+                use_for_next = True
+
+            # Detect "return to <dest>"
+            rt = _RETURN_TO_RE.search(notes)
+            if rt:
+                parsed["return_destination"] = rt.group(1).strip().rstrip(".")
+
+            results.append(parsed)
+            print(
+                f"[PARSER] Stop {len(results)}: action={parsed.get('action')!r}"
+                f"  addr={parsed.get('address')!r}"
+                f"  customer={parsed.get('customer_name')!r}"
+                f"  conf={parsed.get('confidence')}",
+                flush=True,
+            )
 
     print(f"[PARSER] Total parsed stops: {len(results)}", flush=True)
     return results
@@ -854,6 +879,24 @@ def _parse_one_line(raw, conn, company_id):
     work = re.sub(r'\s+-\s+', ' ', work)
     work = re.sub(r'\s+', ' ', work).strip()
 
+    # ── 0b. trailing "to end the day" / "end of day" → placement note ─────────
+    # ("deliver garwood to end the day" → notes "end of day", pinned last by optimize)
+    notes_eod = ""
+    _eod_m = _EOD_SUFFIX_RE.search(work)
+    if _eod_m:
+        notes_eod = "end of day"
+        work = re.sub(r'\s+', ' ', work[:_eod_m.start()]).strip()
+        conf_reasons.append("eod-note")
+
+    # ── 0c. trailing "and then return it to <dest>" → return leg ────────────
+    # ("... dump holland and then return it to paragon" stays ONE stop)
+    return_dest = ""
+    _rtm = re.search(r'\band\s+then\s+return\s+(?:it\s+)?to\s+(.+?)\s*$', work, re.I)
+    if _rtm:
+        return_dest = _rtm.group(1).strip().rstrip(".")
+        work = re.sub(r'\s+', ' ', work[:_rtm.start()]).strip()
+        conf_reasons.append("return-leg")
+
     # ── 0. extract ticket / reference number ─────────────────────────────────
     ticket_number = ""
     tm = _TICKET_RE.search(work)
@@ -886,26 +929,33 @@ def _parse_one_line(raw, conn, company_id):
         conf_reasons.append("container")
 
     # ── 3. extract dump location ─────────────────────────────────────────────
-    # Check two-word phrases first (e.g. "sb cox") before single-token loop
+    # Check two-word phrases first (e.g. "sb cox") before single-token loop.
+    # Boundaries are comma-aware: dispatchers write "blvd,newpt," / "rd,port,".
+    # A leftover "dump" introducer ("dump dominion") is swallowed with the site.
+    def _strip_dump_token(work, m):
+        _start = m.start()
+        _pm = re.search(r'\bdump\s+$', work[:_start], re.I)
+        if _pm:
+            _start = _pm.start()
+        return re.sub(r'\s+', ' ', work[:_start] + " " + work[m.end():]).strip()
+
     dump_location = ""
     for phrase, fullname in _TWO_WORD_DUMP_MAP.items():
-        pat = re.compile(r'(?:(?<=\s)|^)' + re.escape(phrase) + r'(?=\s|$)', re.I)
+        pat = re.compile(r'(?:(?<=[\s,])|^)' + re.escape(phrase) + r'(?=[\s,.;]|$)', re.I)
         m = pat.search(work)
         if m:
             dump_location = fullname
-            work = work[:m.start()] + " " + work[m.end():]
-            work = re.sub(r'\s+', ' ', work).strip()
+            work = _strip_dump_token(work, m)
             conf += 10
             conf_reasons.append("dump")
             break
     if not dump_location:
         for token, fullname in _PARSE_DUMP_MAP.items():
-            pat = re.compile(r'(?:(?<=\s)|^)' + re.escape(token) + r'(?=\s|$)', re.I)
+            pat = re.compile(r'(?:(?<=[\s,])|^)' + re.escape(token) + r'(?=[\s,.;]|$)', re.I)
             m = pat.search(work)
             if m:
                 dump_location = fullname
-                work = work[:m.start()] + " " + work[m.end():]
-                work = re.sub(r'\s+', ' ', work).strip()
+                work = _strip_dump_token(work, m)
                 conf += 10
                 conf_reasons.append("dump")
                 break
@@ -913,7 +963,7 @@ def _parse_one_line(raw, conn, company_id):
     # ── 4. extract city abbreviation/name ────────────────────────────────────
     city = ""
     for token, fullname in _PARSE_CITY_MAP.items():
-        pat = re.compile(r'(?:(?<=\s)|^)' + re.escape(token) + r'(?=\s|$)', re.I)
+        pat = re.compile(r'(?:(?<=[\s,])|^)' + re.escape(token) + r'(?=[\s,.;]|$)', re.I)
         m = pat.search(work)
         if m:
             city = fullname
@@ -928,15 +978,38 @@ def _parse_one_line(raw, conn, company_id):
     work = work.strip()
     customer_name = ""
     address = ""
-    notes   = ""
+    notes   = notes_eod
 
     if "," in work:
-        # "Customer Name, 123 Street" explicit CSV split
-        parts = work.split(",", 1)
-        customer_name = parts[0].strip()
-        address = parts[1].strip()
-        conf += 15
-        conf_reasons.append("csv-split")
+        # "Customer Name, 123 Street" — but dispatchers also write
+        # "123 Street,City, Customer". If the first segment starts with a street
+        # number it's the ADDRESS and the customer is the last segment.
+        _cparts = [p.strip() for p in work.split(",")]
+        _cparts = [p for p in _cparts if p]
+        if len(_cparts) >= 2 and re.match(r'^\d+\s+\w', _cparts[0]):
+            address = _cparts[0]
+            customer_name = _cparts[-1]
+            # a middle segment may name the city (in case step 4 missed it)
+            if not city:
+                for _mid in _cparts[1:-1]:
+                    _ml = _mid.lower()
+                    for _tok, _full in _PARSE_CITY_MAP.items():
+                        if _ml == _tok or _ml == _full.lower():
+                            city = _full
+                            state = "VA"
+                            conf_reasons.append("city-csv")
+                            break
+                    if city:
+                        break
+            conf += 15
+            conf_reasons.append("csv-split-addr-first")
+        else:
+            # "Customer Name, 123 Street" explicit CSV split
+            parts = work.split(",", 1)
+            customer_name = parts[0].strip()
+            address = parts[1].strip() if len(parts) > 1 else ""
+            conf += 15
+            conf_reasons.append("csv-split")
     else:
         # Find first occurrence of a street number (digit(s) + space + word)
         m = re.search(r'(?:(?<=\s)|^)(\d+\s+\w)', work)
@@ -955,7 +1028,7 @@ def _parse_one_line(raw, conn, company_id):
                 address  = address[:sfx_m.end()].strip()
                 # Only promote to notes if it looks like free text, not a unit/apt
                 if trailing and not re.match(r'^(?:apt|unit|ste|#)\s*\w+', trailing, re.I):
-                    notes = trailing
+                    notes = (notes + " " + trailing).strip() if notes else trailing
         else:
             customer_name = work
             conf += 5
@@ -976,6 +1049,34 @@ def _parse_one_line(raw, conn, company_id):
                        ORDER BY times_used DESC LIMIT 1""",
                     (company_id, "%" + _esc_like(customer_name.lower()) + "%")
                 ).fetchone()
+            _fuzzy_name = ""
+            if not saved and customer_name and len(customer_name) >= 4:
+                # Typo tolerance: "757 restorstion" → "757 Restoration".
+                # Runs BEFORE the address fallback so a misspelled name resolves
+                # to the right customer instead of latching onto an address
+                # match under the wrong name. Conservative cutoff so short
+                # names never fuzzy-match the wrong customer.
+                try:
+                    _known = [r[0] for r in conn.execute(
+                        """SELECT DISTINCT customer_name FROM saved_addresses
+                           WHERE company_id=? AND TRIM(COALESCE(customer_name,'')) != ''""",
+                        (company_id,)).fetchall()]
+                    _lowmap = {}
+                    for _n in _known:
+                        _lowmap.setdefault((_n or "").lower(), _n)
+                    _best = difflib.get_close_matches(
+                        customer_name.lower(), list(_lowmap.keys()), n=1, cutoff=0.8)
+                    if _best:
+                        saved = conn.execute(
+                            """SELECT * FROM saved_addresses
+                               WHERE company_id=? AND customer_name=?
+                               ORDER BY times_used DESC LIMIT 1""",
+                            (company_id, _lowmap[_best[0]])).fetchone()
+                        if saved:
+                            _fuzzy_name = _lowmap[_best[0]]
+                            conf_reasons.append("saved-fuzzy")
+                except Exception:
+                    pass
             if not saved and address:
                 saved = conn.execute(
                     """SELECT * FROM saved_addresses
@@ -991,7 +1092,10 @@ def _parse_one_line(raw, conn, company_id):
                     city  = saved["city"]  or ""
                     state = saved["state"] or ""
                 zip_code = saved["zip"] or ""
-                if not customer_name and saved["customer_name"]:
+                if _fuzzy_name:
+                    # Adopt the known spelling for the typo'd name
+                    customer_name = _fuzzy_name
+                elif not customer_name and saved["customer_name"]:
                     customer_name = saved["customer_name"]
                 if not address and saved["address"]:
                     address = saved["address"]
@@ -1031,7 +1135,7 @@ def _parse_one_line(raw, conn, company_id):
         "from_city":                    "",
         "to_address":                   "",
         "to_city":                      "",
-        "return_destination":           "",
+        "return_destination":           return_dest,
         "pr_mode":                      "",
         "swap_with_previous_empty":     False,
         "pending_empty_can_for_next_pr": False,
@@ -6073,8 +6177,28 @@ _ANNOTATION_LINE_RE = re.compile(
     r"|leave\s+(?:the\s+)?(?:can|empty)\b)",
     re.I,
 )
-# Pattern for "return to <destination>" in notes
-_RETURN_TO_RE = re.compile(r"\breturn\s+to\s+(.+)", re.I)
+# Pattern for "return to <destination>" / "return it to <destination>" in notes
+_RETURN_TO_RE = re.compile(r"\breturn\s+(?:it\s+)?to\s+(.+)", re.I)
+# Ordering-directive lines: not stops — they place the NEXT stop(s).
+# e.g. "One addition today. Before final delivery", "do this one after the pull"
+_ORDER_DIRECTIVE_RE = re.compile(
+    r"\bbefore\s+(?:the\s+)?(?:final\s+)?(?:delivery|deliver|drop(?:\s*off)?|pickup|pull)\b"
+    r"|\bafter\s+(?:the\s+)?(?:\w+\s+){0,3}?(?:delivery|deliver|drop(?:\s*off)?|pickup|pull)\b"
+    r"|\bdo\s+this\s+(?:one\s+)?first\b",
+    re.I,
+)
+# Street number: "980 meander" — used to tell real stop lines from directive lines
+_STREET_NUM_RE = re.compile(r"(?:(?<=\s)|^)(\d+\s+[A-Za-z])")
+# "and then <action>" — one pasted line holding TWO stops.
+# e.g. "... dump dominion and then deliver garwood to end the day"
+# Only splits when "and then" is followed by an action word, so dump/return legs
+# ("... and then return it to paragon") stay one stop.
+_AND_THEN_SPLIT_RE = re.compile(
+    r"\s+and\s+then\s+(?=(?:deliver(?:y)?|del\b|drop(?:\s+off)?|pick\s*up|pickup|pull|pr\b|swap|relocate|move)\b)",
+    re.I,
+)
+# Trailing "to end the day" / "end of day" — placement hint, pinned last by optimize
+_EOD_SUFFIX_RE = re.compile(r"\bto\s+end\s+the\s+day\b\.?\s*$|\bend\s+of\s+day\b\.?\s*$", re.I)
 
 
 def _apply_swap_inference(stops):
@@ -21400,6 +21524,12 @@ to the action code, don't treat them as customer/site names):
   a separate action. Company-specific shorthand beyond this list comes from the KNOWN LOCATIONS &
   VOCABULARY block below (per company) — never assume one company's shorthand applies to another.
 
+CITY SHORTHAND (universal across this region — expand inside addresses, never treat as a
+customer/site name; they often arrive glued to commas, e.g. "527 j clyde morris blvd,newpt,"):
+  port / ports / prt → Portsmouth · vb → Virginia Beach · ches → Chesapeake ·
+  norf / norfolk → Norfolk · suff → Suffolk · newpt / nn → Newport News ·
+  hampton / hamp → Hampton · smithfield → Smithfield · williamsburg → Williamsburg.
+
 MULTI-LEG STOPS (important): a single job can have up to three legs but is still ONE stop:
   1. the primary action + address (where the container is),
   2. an optional DUMP leg — haul the pulled container to a dump/landfill site,
@@ -21408,10 +21538,32 @@ MULTI-LEG STOPS (important): a single job can have up to three legs but is still
   action PR, address <addr>, dump_leg "<site>", return_leg "<yard>". Never split the dump
   or return into their own stops.
 
+NEW STOP vs LEG (important): "and then <action> <place>" starts a NEW stop, not a leg.
+  A dump leg hauls to a KNOWN DUMP SITE ("dump dominion"); a return leg says "return it to
+  <yard/site>". But "and then deliver <named site>" / "and then drop <place>" is a separate
+  D stop with its own address — resolve the site name via KNOWN LOCATIONS. Example:
+  "PR 980 meander rd, port, 757 restorstion 30yd dump dominion and then deliver garwood"
+  → TWO stops: (1) PR, "980 Meander Rd, Portsmouth", customer "757 Restoration" (typo
+  tolerated via KNOWN LOCATIONS), container_size "30yd", dump_leg "Dominion";
+  (2) D, address resolved from "garwood" via KNOWN LOCATIONS
+  (e.g. "1405 Garwood Ave, Virginia Beach"), notes "end of day" if the text says so.
+
 PREAMBLE: a leading fragment that sets up the next instruction (e.g. "Before you return
 paragon use it to ...") is CONTEXT for the stop that follows, not its own stop. Fold it
 into that stop (as a return_leg/note as appropriate). Do NOT emit a separate stop for it
 and do NOT lower confidence just because the text opens with a preamble.
+
+ORDERING DIRECTIVES: phrases like "before final delivery", "after <stop>", "do this first",
+  "to end the day" / "end of day" are PLACEMENT instructions, not stops. Put them VERBATIM
+  in that stop's notes ("before final delivery", "end of day") — the app pins "end of day"
+  stops last when optimizing. A leading line that is ONLY such a directive ("One addition
+  today. Before final delivery") is context for the stops that follow: do NOT emit it as
+  its own stop; attach the directive to the next stop's notes instead.
+
+NAME TOLERANCE: dispatchers mistype names ("restorstion" for "Restoration"). Match a
+  misspelled customer/location to the closest KNOWN CUSTOMERS / KNOWN LOCATIONS entry and
+  use the KNOWN spelling in customer/address — never invent a new customer for an obvious
+  typo.
 
 For every stop extract:
   action          one of PR, P, D, S, R
@@ -21476,6 +21628,15 @@ Input:
   PR 5125 ballahack rd,ches, RES 30yd dump dominion
 Output:
   {"stops":[{"action":"PR","address":"1351 Virginia Beach Blvd","customer":"REAP","container_size":"30yd","dump_leg":"Dominion","return_leg":null,"empty_can_plan":null,"raw":"PR 1351 Virginia Beach blvd, VB, REAP 30yd dump dominion note use to swap","confidence":"high","notes":"","chain_hint":{"kind":"next"}},{"action":"PR","address":"5125 Ballahack Rd","customer":"RES","container_size":"30yd","dump_leg":"Dominion","return_leg":null,"empty_can_plan":null,"raw":"PR 5125 ballahack rd,ches, RES 30yd dump dominion","confidence":"high","notes":"","chain_hint":null}]}
+
+WORKED EXAMPLE (addition before final delivery — directive line, two stops, typo tolerance)
+Input:
+  One addition today. Before final delivery
+  Pr 980 meander rd,port, 757 restorstion 30yd dump dominion and then deliver garwood to end the day
+Output:
+  {"stops":[
+    {"action":"PR","address":"980 Meander Rd, Portsmouth","customer":"757 Restoration","container_size":"30yd","dump_leg":"Dominion","return_leg":null,"empty_can_plan":null,"raw":"Pr 980 meander rd,port, 757 restorstion 30yd dump dominion","confidence":"high","notes":"before final delivery","chain_hint":null},
+    {"action":"D","address":"1405 Garwood Ave, Virginia Beach","customer":"Garwood","container_size":null,"dump_leg":null,"return_leg":null,"empty_can_plan":null,"raw":"and then deliver garwood to end the day","confidence":"high","notes":"end of day","chain_hint":null}]}
 """
 
 
