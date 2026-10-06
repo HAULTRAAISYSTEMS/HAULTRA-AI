@@ -1,18 +1,18 @@
 {
-  "_about": "Permanent parser regression fixtures — REAL dispatch texts, keyed by company so the suite scales to any tenant. Company 1 holds OUR three real texts. Add a new company object (or append to an existing company's \"fixtures\") whenever a real text surfaces a case worth guarding. The suite (tests/test_parser_real_texts.py) runs each text through the live /api/parse LLM parser under that company's session and asserts the structured output. Strict when ANTHROPIC_API_KEY is set; skips cleanly otherwise. Never delete a fixture — that's the point (permanent regression guard).",
+  "_about": "Permanent parser regression fixtures \u2014 REAL dispatch texts, keyed by company so the suite scales to any tenant. Company 1 holds OUR three real texts. Add a new company object (or append to an existing company's \"fixtures\") whenever a real text surfaces a case worth guarding. The suite (tests/test_parser_real_texts.py) runs each text through the live /api/parse LLM parser under that company's session and asserts the structured output. Strict when ANTHROPIC_API_KEY is set; skips cleanly otherwise. Never delete a fixture \u2014 that's the point (permanent regression guard).",
   "_matchers": {
     "equals_ci": "case-insensitive equality after trim",
-    "contains_ci": "list — every substring must appear (case-insensitive)",
-    "oneof_ci": "list — the value must equal one of these (case-insensitive)",
+    "contains_ci": "list \u2014 every substring must appear (case-insensitive)",
+    "oneof_ci": "list \u2014 the value must equal one of these (case-insensitive)",
     "regex": "case-insensitive re.search over the field value",
-    "empty": "true → field must be empty/absent",
-    "nonempty": "true → field must be non-empty",
-    "_note": "A field's matchers ALL must pass. 'fields' are hard (fail the suite). 'advisory' matchers are reported with a ⚠ but never fail — used for LLM-nuance we want to watch but not gate on yet."
+    "empty": "true \u2192 field must be empty/absent",
+    "nonempty": "true \u2192 field must be non-empty",
+    "_note": "A field's matchers ALL must pass. 'fields' are hard (fail the suite). 'advisory' matchers are reported with a \u26a0 but never fail \u2014 used for LLM-nuance we want to watch but not gate on yet."
   },
   "companies": [
     {
       "company_key": "haultra-1",
-      "label": "HAULTRA (company 1 — our real dispatch texts)",
+      "label": "HAULTRA (company 1 \u2014 our real dispatch texts)",
       "fixtures": [
         {
           "id": "harbor-view-ew-40",
@@ -121,7 +121,7 @@
               }
             },
             "advisory": {
-              "_why": "The preamble asks to bring the empty from the Paragon pull to this stop. Whether the model encodes that as empty_can_plan is a nuance we watch but don't gate on yet — promote to a hard field once confirmed against a live key.",
+              "_why": "The preamble asks to bring the empty from the Paragon pull to this stop. Whether the model encodes that as empty_can_plan is a nuance we watch but don't gate on yet \u2014 promote to a hard field once confirmed against a live key.",
               "fields": {
                 "empty_can_plan": {
                   "nonempty": true
@@ -192,6 +192,41 @@
               "581-2464",
               "gunter"
             ]
+          }
+        },
+        {
+          "id": "tim-1006-addition-before-final-delivery",
+          "_note": "Tim 10/6 real dispatch text: directive line + PR with typo'd customer + 'and then deliver' second stop. Guards the ordering-directive, new-stop-vs-leg, and name-tolerance prompt rules.",
+          "text": "One addition today. Before final delivery\nPr 980 meander rd,port, 757 restorstion 30yd dump dominion and then deliver garwood to end the day",
+          "expect": {
+            "stop_count": 2,
+            "fields": {
+              "action": {
+                "equals_ci": "PR"
+              },
+              "address": {
+                "regex": "980.*meander",
+                "contains_ci": [
+                  "portsmouth"
+                ]
+              },
+              "container_size": {
+                "equals_ci": "30yd"
+              },
+              "dump_leg": {
+                "equals_ci": "dominion"
+              }
+            },
+            "advisory": {
+              "fields": {
+                "customer": {
+                  "equals_ci": "757 Restoration"
+                }
+              },
+              "any_field_contains_ci": [
+                "before final delivery"
+              ]
+            }
           }
         }
       ]
