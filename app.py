@@ -21789,6 +21789,110 @@ def _normalize_manual_stops(stops_in):
     return out
 
 
+# ── LLM reply salvage + rule-based fallback ──────────────────────────────
+# The model is instructed to return ONLY {"stops": [...]}, but occasionally it
+# returns prose, a bare array, or a differently-shaped envelope. Rather than
+# failing the whole parse with "invalid format", we (1) try to salvage the
+# stops list from whatever came back, and (2) if that fails, run the local
+# deterministic rule-based parser as a degraded-but-usable fallback.
+def _salvage_parse_response(raw_reply):
+    """Best-effort extraction of the stops list from a wayward LLM reply.
+    Returns a list of stop dicts (possibly empty) or None if unsalvageable."""
+    cleaned = (raw_reply or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+
+    parsed = None
+    try:
+        parsed = json.loads(cleaned)
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+    if parsed is None:
+        # Prose-wrapped JSON ("Here you go: {...} hope this helps"): try the
+        # largest {...}/[...] span first, then the smallest.
+        for pat in (r"(\{.*\}|\[.*\])", r"(\{.*?\}|\[.*?\])"):
+            m = re.search(pat, cleaned, re.S)
+            if not m:
+                continue
+            try:
+                parsed = json.loads(m.group(1))
+                break
+            except (json.JSONDecodeError, ValueError):
+                continue
+    if parsed is None:
+        return None
+
+    if isinstance(parsed, list):
+        stops = parsed                       # bare array — wrap it
+    elif isinstance(parsed, dict):
+        stops = parsed.get("stops")
+        if not isinstance(stops, list):
+            # Differently-shaped envelope, e.g. {"route": {"stops": [...]}}.
+            for alt in ("route", "data", "result"):
+                inner = parsed.get(alt)
+                if isinstance(inner, dict) and isinstance(inner.get("stops"), list):
+                    stops = inner["stops"]
+                    break
+            else:
+                return None
+    else:
+        return None
+    return [s for s in stops if isinstance(s, dict)]
+
+
+# Rule-based action phrase → the code the AI parser (and the confirm sheet)
+# use. Reverse of _PARSER_ACTION_MAP, plus the rule parser's extra "Move".
+_RULE_ACTION_TO_CODE = {
+    "pickup and return": "PR",
+    "pull": "P",
+    "delivery": "D",
+    "swap": "S",
+    "relocate": "R",
+    "move": "R",
+    "live load": "LL",
+    "yard": "YARD",
+}
+
+# "<customer> <can#> at <location>" — the can's physical location rides along
+# in the customer field ("napo 3075 at 1001 serene rd"). Split it: clean name
+# for the customer, can + location folded into notes.
+_AT_CAN_RE = re.compile(r"^(?P<name>.{1,40}?)\s+(?P<num>\d{3,6})\s+at\s+(?P<loc>.+)$", re.I)
+
+
+def _rule_stop_to_llm_shape(s):
+    """Map one rule-based parse_route_text() stop dict into the LLM stop shape
+    the parser confirm sheet renders (action code, customer, dump_leg, ...)."""
+    if not isinstance(s, dict):
+        return None
+    action = _RULE_ACTION_TO_CODE.get((s.get("action") or "").strip().lower(), "")
+    address = (s.get("address") or "").strip()
+    city = (s.get("city") or "").strip()
+    if address and city and city.lower() not in address.lower():
+        address = "%s, %s" % (address, city)
+    customer = (s.get("customer_name") or "").strip()
+    notes = (s.get("notes") or "").strip()
+    m = _AT_CAN_RE.match(customer)
+    if m:
+        customer = m.group("name").strip()
+        can_note = "can %s at %s" % (m.group("num"), m.group("loc").strip())
+        notes = (notes + " " + can_note).strip() if notes else can_note
+    return {
+        "action": action,
+        "address": address,
+        "customer": customer,
+        "container_size": (s.get("container_size") or "").strip(),
+        "dump_leg": (s.get("dump_location") or "").strip(),
+        "return_leg": (s.get("return_destination") or "").strip(),
+        "empty_can_plan": None,
+        "raw": s.get("original_line") or "",
+        "confidence": s.get("confidence_label") or "low",
+        "notes": notes,
+        "chain_hint": None,
+        "source": "rule",
+    }
+
+
 @app.route("/api/parse", methods=["POST"])
 @roles_required("dispatcher", api=True)
 def api_parse_dispatch():
@@ -21857,18 +21961,28 @@ def api_parse_dispatch():
         app.logger.warning("api_parse_dispatch: unexpected error: %s", ex)
         return _ai_unavailable("Something went wrong parsing that text — try again.", 500)
 
-    cleaned = raw_reply.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-        cleaned = re.sub(r"\s*```\s*$", "", cleaned)
-
-    try:
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError:
-        return _ai_unavailable("Parser returned invalid format — try re-parsing", 502)
-
-    stops = parsed.get("stops") if isinstance(parsed, dict) else None
-    if not isinstance(stops, list):
+    stops = _salvage_parse_response(raw_reply)
+    if stops is None:
+        app.logger.warning("api_parse_dispatch: unusable LLM reply (first 300 chars): %r",
+                           (raw_reply or "")[:300])
+        # Deterministic fallback: the local rule-based parser never returns
+        # garbage — a degraded parse the dispatcher can review beats a dead
+        # end that forces a manual re-parse (which often fails the same way).
+        _fb = get_db()
+        try:
+            fb_stops = parse_route_text(text, _fb, cid())
+        finally:
+            _fb.close()
+        mapped = [m for m in (_rule_stop_to_llm_shape(s) for s in fb_stops) if m]
+        if mapped:
+            return jsonify({
+                "stops": manual_stops + mapped,
+                "partial_failure": True,
+                "fallback": "rule-based",
+                "warning": "The AI parser returned an unusable response, so the"
+                           " built-in parser handled it instead — please review"
+                           " the stops before dispatching.",
+            })
         return _ai_unavailable("Parser returned invalid format — try re-parsing", 502)
 
     # Tag provenance so the client renders AI stops with the teal treatment and
