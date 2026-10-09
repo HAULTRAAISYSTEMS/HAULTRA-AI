@@ -167,10 +167,13 @@ def detect_chain_hint(text):
     m = _EXPLICIT_RE.search(t)
     if m:
         target = m.group(1).strip(" .,-").strip()
-        # An explicit target only counts when there's a real address after the
-        # phrase (a house number + street). "use to swap" with nothing usable
-        # after it falls through to the bare 'next' form below.
-        if target and address_key(target) is not None:
+        if target:
+            # Explicit, even when the target isn't a house-number address
+            # ("return to Peterson", "use to swap paragon"). The resolver
+            # matches what it can and reports the rest via needs_link — it
+            # must NOT degrade to a positional "next", which would fabricate
+            # a link to the wrong stop (2026-10-09: "use to swap paragon"
+            # silently chained to the following stop instead of flagging).
             return {"kind": "explicit", "target_text": target}
     if _NEXT_RE.search(t):
         return {"kind": "next"}
@@ -443,9 +446,15 @@ def resolve_chain(stops):
         ri = i + 1
         if ri >= n or not producer[i] or not producer[ri] or claimed_taker[ri]:
             continue
-        # This is positional inference, so a size mismatch simply means no link;
-        # only boss-selected manual/explicit links produce a blocking error.
-        if normalize_size(stops[i].get("container_size")) != normalize_size(stops[ri].get("container_size")):
+        # A KNOWN size mismatch means no link — this is positional inference,
+        # so the app guessed; only boss-selected manual/explicit links produce
+        # a blocking error. But an UNKNOWN size on either side can't prove a
+        # mismatch: the boss explicitly said "use it [at the next stop]", so
+        # the link stands and the driver/boss sees it. (2026-10-09: a "use to
+        # swap" note silently vanished because the next stop's size was blank.)
+        _si = normalize_size(stops[i].get("container_size"))
+        _sj = normalize_size(stops[ri].get("container_size"))
+        if _si and _sj and _si != _sj:
             continue
         _set_link(i, ri, "positional")
 
@@ -618,5 +627,29 @@ def resolve_chain(stops):
         if stops[i]["_chain_gives_to"] == id_by_index[i]:
             errors.append({"stop_id": id_by_index[i], "kind": "self", "msg": "A stop can't swap with itself."})
             stops[i]["_chain_gives_to"] = None
+
+    # An explicit "return to <head site>" ("then return to Peterson") just
+    # restates the default head terminal — the tail→head closure already links
+    # it. Drop those needs_link entries so the boss isn't nagged to manually
+    # link what's already linked. Anything else unmatched still warns.
+    if needs_link:
+        _kept = []
+        for _nl in needs_link:
+            _si = index_by_id.get(_nl.get("stop_id"))
+            _drop = False
+            if _si is not None:
+                _gid = stops[_si].get("_chain_group_id")
+                if _gid:
+                    for _k in range(n):
+                        if (stops[_k].get("_chain_group_id") == _gid
+                                and stops[_k].get("_chain_seq") == 0):
+                            _ttoks = set(_tokens(_nl.get("target_text") or ""))
+                            _hatoks = set(_tokens(stops[_k].get("address") or ""))
+                            if _ttoks and _hatoks and (_ttoks <= _hatoks or _hatoks <= _ttoks):
+                                _drop = True
+                            break
+            if not _drop:
+                _kept.append(_nl)
+        needs_link[:] = _kept
 
     return {"errors": errors, "infos": infos, "needs_link": needs_link}
