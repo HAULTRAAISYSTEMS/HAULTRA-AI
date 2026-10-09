@@ -3401,6 +3401,11 @@ def init_db():
     _add_column_if_missing(conn, "stops", "chain_delivery_stop_id", "chain_delivery_stop_id INTEGER")
     _add_column_if_missing(conn, "stops", "chain_target_ref", "chain_target_ref TEXT")
     _add_column_if_missing(conn, "stops", "chain_source", "chain_source TEXT")
+    # Workflow state preserved across a reopen ("Previous Stop"): the
+    # driver_status the stop had when it was completed, so reopening puts the
+    # driver back where he was instead of forcing the whole ticket over.
+    _add_column_if_missing(conn, "stops", "driver_status_before_complete",
+                           "driver_status_before_complete TEXT")
     # Retired two-role columns from the earlier pair-only model (#88). Kept as
     # inert/nullable so the live /data volume needs no risky table rebuild; the
     # two-FK columns above supersede them and nothing reads chain_role now.
@@ -14800,7 +14805,7 @@ def driver_route_detail(route_id):
             {route_action_buttons}
             {f'''
             <form method="POST" action="{url_for('toggle_stop_complete', stop_id=stops[-1]['id'])}"
-                  onsubmit="return confirm('Reopen the last stop? Its progress will reset and it will become your current stop again.');">
+                  onsubmit="return confirm('Reopen the last stop? It will become your current stop again, right where you left off.');">
                 <input type="hidden" name="_csrf_token" value="{_csrf}">
                 <input type="hidden" name="intent" value="reopen">
                 <button type="submit" class="btn secondary" style="min-height:48px;">&#8592; Fix Last Stop</button>
@@ -15732,7 +15737,7 @@ def driver_route_detail(route_id):
 
     {f'''
     <form method="POST" action="{url_for('toggle_stop_complete', stop_id=prev_stop['id'])}" style="margin-bottom:14px;"
-          onsubmit="return confirm('Reopen the previous stop? Its progress will reset and it will become your current stop again.');">
+          onsubmit="return confirm('Reopen the previous stop? It will become your current stop again, right where you left off.');">
         <input type="hidden" name="_csrf_token" value="{_csrf}">
         <input type="hidden" name="intent" value="reopen">
         <button type="submit" class="cab-neutral" style="min-height:48px;margin-top:0;">&#8592; Previous Stop</button>
@@ -17452,7 +17457,7 @@ def vendor_complete(stop_id):
     note = str(data.get("note") or "").strip()[:500]
     conn = get_db()
     stop = conn.execute(
-        """SELECT s.id, s.route_id, s.defect_item_id, r.assigned_to
+        """SELECT s.id, s.route_id, s.defect_item_id, s.driver_status, r.assigned_to
              FROM stops s JOIN routes r ON s.route_id = r.id
             WHERE s.id=? AND r.company_id=?""",
         (stop_id, cid())
@@ -17466,8 +17471,9 @@ def vendor_complete(stop_id):
 
     ts = now_ts()
     conn.execute(
-        "UPDATE stops SET status='completed', driver_status='completed', completed_at=? WHERE id=?",
-        (ts, stop_id)
+        "UPDATE stops SET status='completed', driver_status='completed', "
+        "driver_status_before_complete=?, completed_at=? WHERE id=?",
+        ((stop["driver_status"] or "pending"), ts, stop_id)
     )
     did = stop["defect_item_id"]
     if did:
@@ -19305,7 +19311,18 @@ def toggle_stop_complete(stop_id):
 
     new_status = "completed" if stop["status"] == "open" else "open"
     completed_at = now_ts() if new_status == "completed" else None
-    new_driver_status = "completed" if new_status == "completed" else "pending"
+    _skeys = stop.keys()
+    _prev_ds = (stop["driver_status_before_complete"]
+                if "driver_status_before_complete" in _skeys else None)
+    if new_status == "completed":
+        # Remember where the workflow was, so a later reopen ("Previous
+        # Stop") puts the driver back here instead of forcing the whole
+        # ticket over from pending. (2026-10-09)
+        new_driver_status = "completed"
+        _save_before = stop["driver_status"]
+    else:
+        new_driver_status = _prev_ds or "pending"
+        _save_before = _prev_ds  # keep the breadcrumb for another reopen cycle
 
     # Optional GPS stamp from the driver's device at the moment of
     # completion — purely best-effort evidence, never required. Bad/missing
@@ -19328,9 +19345,10 @@ def toggle_stop_complete(stop_id):
 
     conn.execute("""
         UPDATE stops SET status=?, completed_at=?, driver_status=?,
+               driver_status_before_complete=?,
                gps_lat=?, gps_lng=?, gps_accuracy=?, gps_captured_at=?
         WHERE id=?
-    """, (new_status, completed_at, new_driver_status,
+    """, (new_status, completed_at, new_driver_status, _save_before,
           gps_lat, gps_lng, gps_accuracy, (now_ts() if got_gps else None),
           stop_id))
     if new_status == "completed":
@@ -19668,8 +19686,9 @@ def stop_driver_action(stop_id):
                 _handoff_stop_id = _deliver_handoff_dest_id(conn, stop, route_id)
                 conn.execute(
                     "UPDATE stops SET status='completed', completed_at=?, "
-                    "driver_status='completed' WHERE id=?",
-                    (ts, stop_id))
+                    "driver_status='completed', driver_status_before_complete=? "
+                    "WHERE id=?",
+                    (ts, current_status, stop_id))
                 update_container_flow(conn, stop_id)
                 # Re-mirror onto a linked customer request now that the stop
                 # reads completed (idempotent; no-op for normal stops).
@@ -20133,7 +20152,8 @@ def dump_ticket(stop_id):
                 # Chain tail 'none', positional swap PR, Pull, Dump, or other —
                 # complete after dump (nothing left to deliver / set off already).
                 conn.execute(
-                    "UPDATE stops SET driver_status='completed', status='completed', completed_at=? WHERE id=?",
+                    "UPDATE stops SET driver_status='completed', status='completed', "
+                    "driver_status_before_complete='going_to_dump', completed_at=? WHERE id=?",
                     (now_ts(), stop_id)
                 )
                 update_container_flow(conn, stop_id)

@@ -118,10 +118,13 @@ ok(r.get_json().get("new_status") == "completed" and row(s1)["status"] == "compl
    "missing intent on completed stop is a safe no-op")
 
 # ── 5. Explicit reopen intent still reopens (Previous Stop flow) ───────
+# 2026-10-09: reopen now RESTORES the pre-completion workflow state
+# (need_box_in here) instead of resetting to pending — the driver lands back
+# where he was, no ticket redo.
 r = post_toggle(s1, intent="reopen")
 ok(r.status_code == 302, "reopen intent redirects")
-ok(row(s1)["status"] == "open" and row(s1)["driver_status"] == "pending",
-   "reopen intent flips completed -> open (Previous Stop still works)")
+ok(row(s1)["status"] == "open" and row(s1)["driver_status"] == "need_box_in",
+   "reopen intent flips completed -> open and restores pre-completion state")
 
 # ── 6. And completing the reopened stop works again ────────────────────
 r = post_toggle(s1, intent="complete")
