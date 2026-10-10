@@ -7993,7 +7993,10 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .cab-action-badge {{
     min-width: 50px; min-height: 50px; display: flex; align-items: center; justify-content: center;
     font-family: var(--font-head); font-size: 20px; border-radius: 12px; flex-shrink: 0;
+    padding: 6px 12px; text-align: center; line-height: 1.1; max-width: 45%;
 }}
+/* 2026-10-10: long action names (e.g. PICKUP AND RETURN) shrink to fit instead of clipping */
+.cab-action-badge.badge-pr {{ font-size: 15px; }}
 .cab-action-badge.pickup {{ background: var(--cyan-dim); color: var(--cyan); border: 1px solid rgba(255,107,26,0.5); }}
 .cab-action-badge.dropswap {{ background: rgba(140,160,179,0.16); color: #8CA0B3; border: 1px solid rgba(140,160,179,0.45); }}
 .cab-action-badge.vendor {{ background: rgba(245,180,60,0.16); color: #F5B43C; border: 1px solid rgba(245,180,60,0.5); font-size: 13px; letter-spacing: .5px; }}
@@ -8073,8 +8076,9 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .cab-ro-wrap {{ margin-top: 12px; }}
 .cab-ro-toggle {{
     width: 100%; min-height: 48px; border-radius: 12px; cursor: pointer;
-    background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.12);
-    color: var(--text, #F5F5F0); font-weight: 700; font-size: 14px;
+    background: rgba(255,255,255,0.04) !important; border: 1px solid rgba(255,255,255,0.12) !important;
+    color: var(--text, #F5F5F0) !important; font-weight: 700; font-size: 14px;
+    box-shadow: none !important;
 }}
 .cab-ro-row {{
     display: flex; align-items: center; gap: 8px;
@@ -13908,6 +13912,10 @@ _VENDOR_STOP_JS = """
 
 
 _BREAKDOWN_DRIVER_JS = """
+window.toggleCabMore = function() {
+    var m = document.getElementById('cab-more-menu');
+    if (m) m.hidden = !m.hidden;
+};
 window.openTruckIssue = function() {
     document.getElementById('bk-overlay').hidden = false;
     document.getElementById('bk-modal').hidden = false;
@@ -15976,9 +15984,10 @@ def driver_route_detail(route_id):
     _addr_display = nav_addr or (_curleg["name"] or "") or "No address on file"
     if _multileg:
         _active_idx = next((i for i, l in enumerate(_legs) if l["key"] == _curleg["key"]), 0)
+        # 2026-10-10: simplified — the leg chips below already name each leg,
+        # so the head is just a quiet counter, not a third repeat of the action.
         _leg_head_html = (
-            f'<div class="cab-leg-head" id="cab-leg-head">LEG {_active_idx + 1} OF {len(_legs)} '
-            f'&middot; {e(_curleg["label"])}</div>'
+            f'<div class="cab-leg-head" id="cab-leg-head">Leg {_active_idx + 1} of {len(_legs)}</div>'
         )
         # Label and value are SEPARATE spans; the "·" separator + spacing are
         # CSS-owned (see .cab-leg-chip-sub::before), never a literal space.
@@ -16157,7 +16166,24 @@ def driver_route_detail(route_id):
       padding:14px 16px; border-radius:12px; font-weight:700; min-height:52px; }}
   /* The one orange button in phase 2 — Complete Stop. */
   .cab-primary-zone {{ margin-top:14px; }}
-  .cab-primary-zone .btn, .cab-primary-zone button, .cab-primary-zone form button {{
+  .cab-more-btn {{
+    width: 100%; min-height: 56px; margin-top: 12px;
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.14);
+    border-radius: 14px; color: #fff; font-size: 1.05rem; font-weight: 700;
+    cursor: pointer;
+}}
+.cab-more-menu {{
+    margin-top: 8px; background: #1A1A1E; border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 14px; padding: 8px; display: flex; flex-direction: column; gap: 6px;
+}}
+.cab-more-item {{
+    min-height: 52px; background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.10); border-radius: 10px;
+    color: #fff; font-size: 1rem; font-weight: 600; cursor: pointer; text-align: left;
+    padding: 0 16px;
+}}
+.cab-more-item.cab-more-danger {{ color: #FF7A7A; border-color: rgba(255,82,82,0.35); }}
+.cab-more-item:active {{ background: rgba(255,255,255,0.10); }}
       background: var(--orange, #FF6B1A) !important; color:#0A0A0A !important; border:none !important;
       box-shadow:none !important; min-height:64px !important; font-weight:800 !important; font-size:1.12rem !important; }}
   .cab-primary-zone button:disabled, .cab-primary-zone .btn:disabled {{ opacity:.5; }}
@@ -16172,8 +16198,7 @@ def driver_route_detail(route_id):
             <button type="submit" class="cab-sticky-end">END ROUTE</button>
         </form>
     </div>
-    <div class="cab-header">
-        <div class="cab-title">MY ROUTE</div>
+    <div class="cab-header" style="justify-content:flex-end;">
         <div style="display:flex;align-items:center;gap:10px;">
             {cab_map_toggle_btn}
             {gear_button_html}
@@ -16218,10 +16243,16 @@ def driver_route_detail(route_id):
 
     {_reorder_html}
 
-    <button type="button" id="cab-issue-btn" class="cab-issue-btn" onclick="openTruckIssue()">&#9888; Truck Issue</button>
-    <button type="button" id="cab-vendor-btn" class="cab-vendor-btn" onclick="openVendorGo()">&#128666; Headed to Vendor</button>
-    {f'<button type="button" class="cab-cancel-btn" style="border-color:rgba(255,183,77,.5);color:#FFB74D;" onclick="cabBlocked({s["id"]})">&#128683; Can\'t Get In</button>' if not s["blocked_at"] else f'<button type="button" class="cab-cancel-btn" style="border-color:rgba(61,220,132,.5);color:#3DDC84;" onclick="cabUnblock({s["id"]})">&#9989; I\'m In — Clear</button>'}
-    <button type="button" id="cab-cancel-btn" class="cab-cancel-btn">&#10005; Can't run this</button>
+    <!-- 2026-10-10: secondary actions collapsed into a More menu. The card above
+         holds the one primary action; everything else lives here. -->
+    <button type="button" id="cab-more-btn" class="cab-more-btn" onclick="toggleCabMore()">&#183;&#183;&#183; More</button>
+    <div id="cab-more-menu" class="cab-more-menu" hidden>
+        <button type="button" class="cab-more-item" onclick="openTruckIssue()">&#9888; Truck Issue</button>
+        <button type="button" class="cab-more-item" onclick="openVendorGo()">&#128666; Headed to Vendor</button>
+        {f'<button type="button" class="cab-more-item" onclick="cabBlocked({s["id"]})">&#128683; Can\'t Get In</button>' if not s["blocked_at"] else f'<button type="button" class="cab-more-item" onclick="cabUnblock({s["id"]})">&#9989; I\'m In — Clear</button>'}
+        <button type="button" class="cab-more-item cab-more-danger" id="cab-cancel-btn">&#10005; Can't run this</button>
+        <button type="button" class="cab-more-item" onclick="document.getElementById('cab-more-menu').hidden=true;">&#10005; Close</button>
+    </div>
 </div>
 {cab_map_panel}
 
