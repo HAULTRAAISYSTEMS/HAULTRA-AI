@@ -7,7 +7,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="csrf-token" content="__CSRF_TOKEN__">
-<title>HAULTRA — AI Route Parser</title>
+<title>HAULTRA — Roll-Off Dispatch</title>
 <link rel="manifest" href="/static/manifest.json">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -16,26 +16,31 @@
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
   :root {
-    --bg-0: #121212;
-    --bg-1: #171717;
-    --bg-2: #1A1A1A;
+    --bg-0: #0B0B0D;
+    --bg-1: #141417;
+    --bg-2: #1A1A1F;
     --text: #F5F5F0;
     --text-dim: #A6A69E;
     --text-faint: #78786F;
     --orange: #FF6B1A;
+    --orange2: #FF8A3D;
     --orange-dim: rgba(255, 107, 26, 0.14);
     --orange-border: rgba(255, 107, 26, 0.55);
     --teal: #00E5CC;
     --teal-dim: rgba(0, 229, 204, 0.10);
     --teal-border: rgba(0, 229, 204, 0.45);
-    --red: #FF5252;
-    --red-dim: rgba(255, 82, 82, 0.14);
+    --red: #FF6B6B;
+    --red-dim: rgba(255, 107, 107, 0.14);
     --green: #3DDC84;
+    --blue: #8FB8FF;
+    --purple: #CFA8FF;
+    --amber: #FFB74D;
     --slate: #8CA0B3;
     --slate-dim: rgba(140, 160, 179, 0.16);
     --slate-border: rgba(140, 160, 179, 0.45);
-    --radius: 14px;
-    --radius-sm: 9px;
+    --line: rgba(255,255,255,.08);
+    --radius: 16px;
+    --radius-sm: 12px;
     --font-head: 'Bebas Neue', 'Anton', sans-serif;
     --font-body: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
     --font-mono: 'JetBrains Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
@@ -52,7 +57,7 @@
 
   .topbar {
     position: sticky; top: 0; z-index: 90;
-    display: flex; align-items: center; justify-content: space-between;
+    display: flex; align-items: center; gap: 12px;
     /* Own the status-bar strip in CSS. This page declares
        apple-mobile-web-app-status-bar-style=black-translucent, so the WebView
        draws content from y=0 and iOS swallows every touch inside the status
@@ -60,22 +65,25 @@
        tap in portrait — it only worked in landscape, where the strip shrinks
        out of the way. Pairs with viewport-fit=cover above; env() reports 0
        without it. */
-    padding: calc(14px + env(safe-area-inset-top, 0px)) 18px 14px;
-    background: var(--bg-1);
-    border-bottom: 1px solid rgba(255,255,255,0.07);
+    padding: calc(12px + env(safe-area-inset-top, 0px)) 16px 12px;
+    background: rgba(11,11,13,.92);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--line);
   }
   .back-link {
-    color: var(--text-dim); text-decoration: none; font-size: 0.85rem; font-weight: 600;
-    min-height: 48px; display: flex; align-items: center;
+    display: inline-flex; align-items: center; gap: 6px;
+    min-height: 44px; padding: 0 16px; border-radius: 12px;
+    border: 1px solid var(--line); background: var(--bg-1);
+    color: var(--text); font-size: 15px; font-weight: 700; text-decoration: none;
   }
-  .back-link:hover { color: var(--text); }
+  .back-link:active { background: #222; }
   .page-title {
-    font-family: var(--font-head);
-    font-size: 1.6rem;
-    letter-spacing: 1.5px;
+    font-size: 18px;
+    font-weight: 800;
     color: var(--text);
+    flex: 1;
   }
-  .page-title .accent { color: var(--teal); }
+  .page-title .accent { color: var(--orange); }
 
   .error-banner {
     display: flex; align-items: center; justify-content: space-between; gap: 12px;
@@ -127,9 +135,10 @@
   }
 
   .col-header {
-    font-family: var(--font-head);
-    font-size: 1.05rem;
-    letter-spacing: 1.5px;
+    font-size: 13px;
+    font-weight: 800;
+    letter-spacing: 1px;
+    text-transform: uppercase;
     color: var(--text-dim);
     margin-bottom: 12px;
   }
@@ -350,11 +359,13 @@
     color: var(--orange);
   }
   .btn-orange-solid {
-    background: var(--orange);
-    border-color: var(--orange);
-    color: #1A1000;
+    background: linear-gradient(135deg, var(--orange), var(--orange2));
+    border-color: transparent;
+    color: #1a0d02;
+    box-shadow: 0 4px 20px rgba(255,107,26,.35);
   }
-  .btn-orange-solid:hover:not(:disabled) { background: #ff7a2e; }
+  .btn-orange-solid:hover:not(:disabled) { filter: brightness(1.08); }
+  .btn-orange-solid:active:not(:disabled) { transform: scale(.99); }
 
   .flag-pill {
     background: var(--orange-dim);
@@ -630,9 +641,8 @@
 <body>
 
 <div class="topbar">
-  <a class="back-link" href="/">&larr; HAULTRA</a>
-  <div class="page-title"><span class="accent">✦</span> AI ROUTE PARSER</div>
-  <div style="width:70px;"></div>
+  <a class="back-link" href="/routes">&larr; Board</a>
+  <div class="page-title"><span class="accent">▦</span> Roll-Off Dispatch</div>
 </div>
 
 <div id="error-banner" class="error-banner" role="alert" hidden>
