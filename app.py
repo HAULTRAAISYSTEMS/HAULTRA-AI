@@ -15593,6 +15593,34 @@ def driver_route_detail(route_id):
                     '</div>'
                 )
 
+    # ── Next-stop fallback ──────────────────────────────────────────────
+    # 2026-10-10: If the boss redirects via text (not through the app), the
+    # chain/carry logic above finds nothing. But the driver still needs to
+    # know where he's going next. Fall back to the next live stop in route
+    # order so he always has an address + Navigate button.
+    if not _next_handoff_html and not _predeliver_nav_html and driver_status in ("need_box_in", "box_in"):
+        _sids_fb = [_nr["id"] for _nr in stops]
+        if stop_id in _sids_fb:
+            for _nr in stops[_sids_fb.index(stop_id) + 1:]:
+                if not stop_is_cancelled(_nr):
+                    _fb_full = " ".join(filter(None, [
+                        _nr["address"] or "", _nr["city"] or "",
+                        _nr["state"] or "", _nr["zip_code"] or ""])).strip()
+                    if _fb_full:
+                        _fb_name = (_nr["customer_name"] or "").strip() or _fb_full
+                        _next_handoff_html = (
+                            '<div class="cab-next-handoff">'
+                            '<div class="cab-next-handoff-label">&#9650; Next stop</div>'
+                            '<div class="cab-next-handoff-addr">' + e(_fb_name) + '</div>'
+                            '<div class="cab-next-handoff-addr" style="font-size:0.85rem;color:rgba(255,255,255,0.6);">' + e(_fb_full) + '</div>'
+                            '<a class="cab-primary cab-next-handoff-nav" href="#" '
+                            'onclick="return openNavStop(event, ' + _nav_pref_js + ', '
+                            + e(json.dumps(_fb_full)) + ')">'
+                            '&#128205; Navigate</a>'
+                            '</div>'
+                        )
+                    break
+
     # ── Photo proof: Off / Encouraged (nudge) / Required (hard gate) ───────
     stop_photos = photos_by_stop.get(stop_id, [])
     has_photo = len(stop_photos) > 0
