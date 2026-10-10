@@ -15426,6 +15426,7 @@ def driver_route_detail(route_id):
     dump_ticket_html = ""
     return_bin_html = ""
     go_to_dump_html = ""
+    _hide_complete_btn = False
     if _chained:
         # First on-site step: the head has no incoming empty (just box out its
         # full); every other chain member arrives carrying an empty to set off.
@@ -15449,6 +15450,9 @@ def driver_route_detail(route_id):
         }
         if _deliver_step:
             wf_map["need_box_in"] = _deliver_step
+            # 2026-10-10: The Deliver/Return Empty button completes the stop,
+            # so hide the standalone Complete Stop button when it's shown.
+            _hide_complete_btn = True
     elif is_swap_pr:
         wf_map = {
             "pending":     ("arrived",       "&#128666; Arrived at Stop",               "btn-driver btn-driver-complete"),
@@ -15715,6 +15719,12 @@ def driver_route_detail(route_id):
         <div id="vendor-done-err" hidden style="color:#FF5252;font-size:12px;margin-top:8px;"></div>
     </div>
     """
+
+    # 2026-10-10: For chained Deliver/Return Empty routes, the workflow button
+    # IS the completion — hide the standalone Complete Stop to avoid duplicates.
+    # Only when the driver is at need_box_in where that button shows.
+    if _hide_complete_btn and driver_status == "need_box_in":
+        complete_section = ""
 
     # Held current stop (a not-yet-released stop surfaced as current after a
     # vendor visit that did NOT repair the truck) — the driver can't work it
