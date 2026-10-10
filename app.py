@@ -7610,6 +7610,21 @@ tr:hover td {{ background: rgba(255,107,26,0.025); }}
     padding: 3px 10px;
     border-radius: 999px;
     font-size: 10px;
+/* 2026-10-10: History route cards — match cab design language */
+.hist-routes-list {{ display: flex; flex-direction: column; gap: 12px; }}
+.hist-route-card {{
+    background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 14px; padding: 16px;
+}}
+.hist-route-top {{
+    display: flex; justify-content: space-between; align-items: flex-start;
+    gap: 12px; margin-bottom: 12px;
+}}
+.hist-route-name {{ font-size: 1.1rem; font-weight: 800; margin-bottom: 4px; }}
+.hist-route-name a {{ color: #fff; text-decoration: none; }}
+.hist-route-name a:hover {{ color: #FF8C42; }}
+.hist-route-meta {{ font-size: 0.85rem; color: rgba(255,255,255,0.6); }}
+.hist-route-actions {{ display: flex; gap: 8px; flex-wrap: wrap; }}
     font-weight: 700;
     letter-spacing: .6px;
     text-transform: uppercase;
@@ -13335,6 +13350,12 @@ def _build_route_board_html(user):
                 f'onclick="openMessageThread({_lane_route_id}, {e(json.dumps(display_name))})">'
                 f'&#128172; Message{_lane_msg_badge}</button>'
             )
+            # 2026-10-10: Daily Log for easy access — the paper Daily Route Log
+            # as a printable web page.
+            message_html += (
+                f'<a class="lane-message-btn" href="/route/{_lane_route_id}/report" '
+                f'style="text-decoration:none;display:inline-block;">&#128203; Daily Log</a>'
+            )
             # Truck parked at a vendor (Go NOW) → offer a manual hold release.
             if any(dict(x).get("held_at") and x["stop_status"] != "completed" for x in stops):
                 message_html += (
@@ -13688,9 +13709,11 @@ def routes_page():
             sql += " AND r.assigned_to = ?"
             params.append(user["id"])
         if q:
-            sql += " AND (r.route_name LIKE ? ESCAPE '\\' OR r.notes LIKE ? ESCAPE '\\' OR r.raw_text LIKE ? ESCAPE '\\')"
+            # 2026-10-10: Search stop addresses too — boss workstation needs to
+            # find routes by address, not just route name/notes.
+            sql += " AND (r.route_name LIKE ? ESCAPE '\\' OR r.notes LIKE ? ESCAPE '\\' OR r.raw_text LIKE ? ESCAPE '\\' OR EXISTS (SELECT 1 FROM stops s WHERE s.route_id = r.id AND (s.address LIKE ? ESCAPE '\\' OR s.customer_name LIKE ? ESCAPE '\\' OR s.city LIKE ? ESCAPE '\\')))"
             like_q = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-            params.extend([like_q, like_q, like_q])
+            params.extend([like_q, like_q, like_q, like_q, like_q, like_q])
         if status in ("open", "in_progress", "completed"):
             sql += " AND r.status = ?"
             params.append(status)
@@ -13700,15 +13723,17 @@ def routes_page():
 
         rows = ""
         for r in routes:
+            # 2026-10-10: Card layout instead of table rows — matches cab design language.
             rows += f"""
-            <tr>
-                <td>{e(r['route_date'])}</td>
-                <td><a href="{url_for('view_route', route_id=r['id'])}">{e(r['route_name'])}</a></td>
-                <td>{e(r['assigned_username'] or 'Unassigned')}</td>
-                <td>{e(r['created_username'] or '')}</td>
-                <td><span class="badge {e(r['status'])}">{e(r['status'])}</span></td>
-                <td>
-                    <div class="row">
+            <div class="hist-route-card">
+                <div class="hist-route-top">
+                    <div>
+                        <div class="hist-route-name"><a href="{url_for('view_route', route_id=r['id'])}">{e(r['route_name'])}</a></div>
+                        <div class="hist-route-meta">{e(r['route_date'])} &middot; {e(r['assigned_username'] or 'Unassigned')}</div>
+                    </div>
+                    <span class="badge {e(r['status'])}">{e(r['status'])}</span>
+                </div>
+                <div class="hist-route-actions">
                         <a class="btn secondary" href="{url_for('view_route', route_id=r['id'])}">Open</a>
                         <a class="btn green" href="{url_for('export_route_csv', route_id=r['id'])}">CSV</a>
                         {f'''
@@ -13719,8 +13744,7 @@ def routes_page():
                         </form>
                         ''' if user['role'] == 'boss' else ''}
                     </div>
-                </td>
-            </tr>
+            </div>
             """
 
         main_panel = f"""
@@ -13755,11 +13779,8 @@ def routes_page():
             <div class="row between">
                 <h2 style="margin:0;">All Routes</h2>
             </div>
-            <div class="table-wrap">
-                <table>
-                    <thead><tr><th>Date</th><th>Route</th><th>Assigned</th><th>Created By</th><th>Status</th><th>Actions</th></tr></thead>
-                    <tbody>{rows if rows else '<tr><td colspan="6">No routes found.</td></tr>'}</tbody>
-                </table>
+            <div class="hist-routes-list">
+                {rows if rows else '<div class="empty">No routes found.</div>'}
             </div>
         </div>
         """
@@ -36189,9 +36210,9 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,
 border-bottom:1px solid var(--line);padding:12px 16px;display:flex;align-items:center;gap:12px;}
 .backbtn{display:inline-flex;align-items:center;gap:6px;min-height:44px;padding:0 16px;border-radius:12px;
 border:1px solid var(--line);background:var(--card);color:var(--text);font-size:15px;font-weight:700;
-text-decoration:none;}
+text-decoration:none;white-space:nowrap;flex-shrink:0;}
 .backbtn:active{background:#222;}
-.toptitle{font-size:18px;font-weight:800;flex:1;}
+.toptitle{font-size:18px;font-weight:800;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .reloadbtn{display:inline-flex;align-items:center;justify-content:center;min-width:44px;min-height:44px;
 border-radius:12px;border:1px solid var(--line);background:var(--card);color:var(--text);
 font-size:20px;cursor:pointer;}
