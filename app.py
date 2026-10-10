@@ -15414,10 +15414,11 @@ def driver_route_detail(route_id):
     #    as before, just rendered inside the new single-stop card. ──────────
     workflow_btn_html = ""
     dump_ticket_html = ""
+    return_bin_html = ""
     if _chained:
         # First on-site step: the head has no incoming empty (just box out its
         # full); every other chain member arrives carrying an empty to set off.
-        _first_step = ("box_out", "&#128230; Box Out &mdash; Remove Container", "btn-driver btn-driver-complete") \
+        _first_step = ("box_out", "&#128230; Bin Out &mdash; Remove Container", "btn-driver btn-driver-complete") \
             if _c_takes is None else \
             ("box_out", "&#128230; Set Off Empty &amp; Box Out Full", "btn-driver btn-driver-complete")
         # Post-dump delivery of the now-empty can, from the terminal / FKs.
@@ -15440,9 +15441,9 @@ def driver_route_detail(route_id):
     elif is_swap_pr:
         wf_map = {
             "pending":     ("arrived",       "&#128666; Arrived at Stop",               "btn-driver btn-driver-complete"),
-            "arrived":     ("box_out",       "&#128230; Box Out &mdash; Remove Old Container", "btn-driver btn-driver-complete"),
-            "box_out":     ("need_box_in",   "&#128230; Box In &mdash; Place Empty Can",       "btn-driver btn-driver-complete"),
-            "need_box_in": ("box_in",        "&#9989; Confirm Box In",                 "btn-driver btn-driver-complete"),
+            "arrived":     ("box_out",       "&#128230; Bin Out &mdash; Remove Old Container", "btn-driver btn-driver-complete"),
+            "box_out":     ("need_box_in",   "&#128230; Bin In &mdash; Place Empty Bin",       "btn-driver btn-driver-complete"),
+            "need_box_in": ("box_in",        "&#9989; Confirm Bin In",                 "btn-driver btn-driver-complete"),
             "box_in":      ("going_to_dump", "&#128465;&#65039; Go To Dump",                    "btn-driver btn-driver-dump"),
         }
     elif is_pr:
@@ -15456,7 +15457,7 @@ def driver_route_detail(route_id):
         elif _plan == "leave_site":
             _empty_step = ("box_in", "&#128230; Leave Empty On Site",                    "btn-driver btn-driver-complete")
         else:
-            _empty_step = ("box_in", "&#128260; Return &amp; Box In &mdash; Place Empty Can", "btn-driver btn-driver-complete")
+            _empty_step = ("box_in", "&#128260; Return Bin &mdash; Place Empty Bin", "btn-driver btn-driver-complete")
         wf_map = {
             "pending":     ("arrived",       "&#128666; Arrived at Stop",                      "btn-driver btn-driver-complete"),
             "arrived":     ("box_out",       "&#128230; Box Out &mdash; Remove Container",            "btn-driver btn-driver-complete"),
@@ -15471,6 +15472,21 @@ def driver_route_detail(route_id):
         }
     else:
         wf_map = {"pending": ("arrived", "&#128666; Arrived at Stop", "btn-driver btn-driver-complete")}
+
+    # 2026-10-10: The "Return Bin" (need_box_in → box_in) button lives with the
+    # dump section, not buried under Message Boss. Extract it separately.
+    return_bin_html = ""
+    if driver_status == "need_box_in" and "need_box_in" in wf_map:
+        _nxt, _lbl, _cls = wf_map["need_box_in"]
+        return_bin_html = (
+            f'<form method="POST" action="{url_for("stop_driver_action", stop_id=stop_id)}" style="margin:8px 0;">'
+            f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
+            f'<input type="hidden" name="action" value="{_nxt}">'
+            f'<button class="{_cls}" type="submit" style="width:100%;min-height:52px;">{_lbl}</button>'
+            f'</form>'
+        )
+        # Remove from wf_map so it doesn't render twice
+        del wf_map["need_box_in"]
 
     if driver_status in wf_map:
         nxt, lbl, cls = wf_map[driver_status]
@@ -16108,6 +16124,7 @@ def driver_route_detail(route_id):
         </div>
         {_noaddr_html}
         {dump_ticket_html}
+        {return_bin_html}
         <!-- 2026-10-10: 'Not here yet' is an undo — small back button, top-right of card -->
         <form method="POST" action="{_arrive_action}" class="inline" style="margin:0;padding:0;">
             <input type="hidden" name="_csrf_token" value="{_csrf}">
