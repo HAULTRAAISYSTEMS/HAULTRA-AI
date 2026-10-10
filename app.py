@@ -14182,7 +14182,7 @@ _CAB_LEG_SWITCH_JS = """
       chips[i].classList.toggle('active', on);
       chips[i].setAttribute('aria-pressed', on ? 'true' : 'false');
     }
-    if (head) head.textContent = 'LEG ' + (r.idx+1) + ' OF ' + LEGS.length + ' \\u00b7 ' + (leg.label || '');
+    if (head) head.textContent = 'Leg ' + (r.idx+1) + ' of ' + LEGS.length;
     if (addrEl) addrEl.textContent = leg.address || leg.name || 'No address on file';
     var has = !!leg.address;
     var gurl = has ? 'https://www.google.com/maps/dir/?api=1&destination=' + enc(leg.address) : '#';
@@ -14580,9 +14580,12 @@ def _deliver_handoff_dest_id(conn, stop, route_id):
 _GARBAGE_CAB_CSS = """
 .gbadge{display:inline-block;font-weight:800;font-size:.78rem;letter-spacing:1px;
   padding:6px 12px;border-radius:8px;}
-.gbadge-toter{background:rgba(66,135,245,.18);border:1px solid rgba(66,135,245,.5);color:#8FB8FF;}
-.gbadge-hpu{background:rgba(178,102,255,.16);border:1px solid rgba(178,102,255,.5);color:#CFA8FF;}
-.gbadge-landfill{background:rgba(255,171,64,.14);border:1px solid rgba(255,171,64,.5);color:#FFB74D;}
+.gbadge-toter{background:rgba(66,135,245,.18);border:1px solid rgba(66,135,245,.5);color:#8FB8FF;
+  box-shadow:0 0 12px rgba(66,135,245,.25);}
+.gbadge-hpu{background:rgba(178,102,255,.16);border:1px solid rgba(178,102,255,.5);color:#CFA8FF;
+  box-shadow:0 0 12px rgba(178,102,255,.25);}
+.gbadge-landfill{background:rgba(255,171,64,.14);border:1px solid rgba(255,171,64,.5);color:#FFB74D;
+  box-shadow:0 0 12px rgba(255,171,64,.25);}
 .g-addr{font-size:1.15rem;font-weight:700;margin:10px 0 4px;word-break:break-word;}
 .g-city{color:var(--text-muted);font-size:.92rem;margin-bottom:10px;}
 .g-notbefore{margin:10px 0;padding:10px 12px;border-radius:10px;font-size:.9rem;font-weight:700;
@@ -16116,15 +16119,23 @@ def driver_route_detail(route_id):
      fill. They stay on ONE row (horizontal scroll if they overflow) so the
      switcher never balloons to two rows and pushes the card below the fold.
      Label + value are separate spans; the "·" separator and its spacing are
-     CSS-owned (never a literal space) so label and value never run together. */
-  .cab-legs-switch {{ display:flex; gap:8px; flex-wrap:nowrap; margin-bottom:10px;
-      overflow-x:auto; -webkit-overflow-scrolling:touch; scrollbar-width:none; }}
-  .cab-legs-switch::-webkit-scrollbar {{ display:none; }}
-  .cab-leg-chip {{ flex:0 0 auto; min-height:48px; padding:0 12px; cursor:pointer;
-      display:inline-flex; align-items:center;
-      background: var(--bg-0, #121212); border:1px solid var(--cab-neutral-border, #2A2A2A); border-radius:10px;
-      color: var(--text-dim, #A6A69E); }}
-  .cab-leg-chip.active {{ background: rgba(255,107,26,0.14); border-color: var(--orange, #FF6B1A); color: var(--text, #F5F5F0); }}
+     CSS-owned (never a literal space) so label and value never run together.
+     2026-10-10: chips wrap to fit (no cutoff), active chip glows orange. */
+  .cab-legs-switch {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }}
+  .cab-leg-chip {{ flex:1 1 auto; min-width:0; min-height:52px; padding:8px 12px; cursor:pointer;
+      display:inline-flex; align-items:center; justify-content:center; text-align:center;
+      background: rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.10); border-radius:12px;
+      color: var(--text-dim, #A6A69E); transition: all .2s ease; }}
+  .cab-leg-chip.active {{
+      background: linear-gradient(135deg, rgba(255,107,26,0.22), rgba(255,107,26,0.10));
+      border-color: var(--orange, #FF6B1A); color: var(--text, #F5F5F0);
+      box-shadow: 0 0 16px rgba(255,107,26,0.25);
+      animation: cab-chip-pulse 2.5s ease-in-out infinite;
+  }}
+  @keyframes cab-chip-pulse {{
+      0%, 100% {{ box-shadow: 0 0 12px rgba(255,107,26,0.20); }}
+      50% {{ box-shadow: 0 0 20px rgba(255,107,26,0.35); }}
+  }}
   .cab-leg-chip-lbl {{ font-weight:800; letter-spacing:.6px; font-size:.72rem; text-transform:uppercase; }}
   .cab-leg-chip.active .cab-leg-chip-lbl {{ color: var(--orange, #FF6B1A); }}
   .cab-leg-chip-sub {{ font-size:.85rem; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:130px; }}
