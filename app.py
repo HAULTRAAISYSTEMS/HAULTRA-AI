@@ -35767,6 +35767,10 @@ border:1px solid var(--line);background:var(--card);color:var(--text);font-size:
 text-decoration:none;}
 .backbtn:active{background:#222;}
 .toptitle{font-size:18px;font-weight:800;flex:1;}
+.reloadbtn{display:inline-flex;align-items:center;justify-content:center;min-width:44px;min-height:44px;
+border-radius:12px;border:1px solid var(--line);background:var(--card);color:var(--text);
+font-size:20px;cursor:pointer;}
+.reloadbtn:active{background:#222;transform:rotate(40deg);transition:transform .2s;}
 .wrap{max-width:680px;margin:0 auto;padding:16px;}
 .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;margin-bottom:14px;}
 .card h2{font-size:13px;font-weight:800;letter-spacing:1px;color:var(--muted);margin:0 0 12px;text-transform:uppercase;}
@@ -35831,6 +35835,7 @@ font-size:18px;font-weight:800;cursor:pointer;margin-top:10px;}
 <div class="topbar">
   <a class="backbtn" href="/routes">&#8592; Board</a>
   <div class="toptitle">&#128666; Garbage Dispatch</div>
+  <button class="reloadbtn" id="reload-btn" type="button" title="Reload page">&#10227;</button>
 </div>
 <div class="wrap">
   <div class="mode">__MODE__</div>
@@ -35964,7 +35969,7 @@ document.getElementById('gd-dispatch').addEventListener('click', function(){
   var url = APPEND_RID ? '/api/route/' + APPEND_RID + '/insert-stops' : '/api/dispatch';
   var payload = APPEND_RID ? {stops: c.stops}
     : {route_type:'garbage', driver_id: parseInt(drv,10), route_date: date, stops: c.stops};
-  fetch(url, {method:'POST', credentials:'same-origin',
+  fetchT(url, {method:'POST', credentials:'same-origin',
     headers:{'Content-Type':'application/json','X-CSRF-Token':GD_CSRF},
     body: JSON.stringify(payload)
   }).then(function(r){ return r.json().then(function(j){ return {s:r.status, j:j}; }); })
@@ -35984,7 +35989,7 @@ document.getElementById('gd-save-tpl').addEventListener('click', function(){
   if(!c.stops.length){ setStatus('Add at least one stop first.'); return; }
   var name = prompt('Name this route (e.g. "Friday — Michael"):');
   if(!name) return;
-  fetch('/api/garbage/templates', {method:'POST', credentials:'same-origin',
+  fetchT('/api/garbage/templates', {method:'POST', credentials:'same-origin',
     headers:{'Content-Type':'application/json','X-CSRF-Token':GD_CSRF},
     body: JSON.stringify({name: name, driver_id: document.getElementById('gd-driver').value || null, stops: c.stops})
   }).then(function(r){ return r.json().then(function(j){ return {s:r.status, j:j}; }); })
@@ -36001,7 +36006,7 @@ function stopToLine(s){
   return line;
 }
 function loadTemplates(){
-  fetch('/api/garbage/templates', {credentials:'same-origin'}).then(function(r){ return r.json(); })
+  fetchT('/api/garbage/templates', {credentials:'same-origin'}).then(function(r){ return r.json(); })
   .then(function(d){
     var el = document.getElementById('tpl-list');
     if(!d.templates || !d.templates.length){
@@ -36033,7 +36038,7 @@ function loadTemplates(){
         var date = document.getElementById('gd-date').value;
         if(!drv){ setStatus('Pick a driver first (top of page).'); return; }
         if(!confirm('Dispatch this route for '+date+'?')) return;
-        fetch('/api/garbage/templates/'+tid+'/dispatch', {method:'POST', credentials:'same-origin',
+        fetchT('/api/garbage/templates/'+tid+'/dispatch', {method:'POST', credentials:'same-origin',
           headers:{'Content-Type':'application/json','X-CSRF-Token':GD_CSRF},
           body: JSON.stringify({driver_id: parseInt(drv,10), route_date: date})
         }).then(function(r){ return r.json().then(function(j){ return {s:r.status, j:j}; }); })
@@ -36046,7 +36051,7 @@ function loadTemplates(){
     el.querySelectorAll('[data-del]').forEach(function(b){
       b.addEventListener('click', function(){
         if(!confirm('Delete this saved route?')) return;
-        fetch('/api/garbage/templates/'+b.getAttribute('data-del'), {method:'DELETE', credentials:'same-origin',
+        fetchT('/api/garbage/templates/'+b.getAttribute('data-del'), {method:'DELETE', credentials:'same-origin',
           headers:{'Content-Type':'application/json','X-CSRF-Token':GD_CSRF}, body: '{}'})
         .then(function(){ loadTemplates(); });
       });
@@ -36054,7 +36059,7 @@ function loadTemplates(){
   });
 }
 function loadRecent(){
-  fetch('/api/garbage/recent', {credentials:'same-origin'}).then(function(r){ return r.json(); })
+  fetchT('/api/garbage/recent', {credentials:'same-origin'}).then(function(r){ return r.json(); })
   .then(function(d){
     var el = document.getElementById('recent-list');
     if(!d.recent || !d.recent.length){ el.innerHTML = '<div class="empty">Nothing dispatched yet.</div>'; return; }
@@ -36107,10 +36112,10 @@ function loadRecent(){
         var cv = document.createElement('canvas'); cv.width = w; cv.height = h;
         cv.getContext('2d').drawImage(im, 0, 0, w, h);
         var dataUrl = cv.toDataURL('image/jpeg', 0.82);
-        fetch('/api/garbage/scan-sheet', {method:'POST', credentials:'same-origin',
+        fetchT('/api/garbage/scan-sheet', {method:'POST', credentials:'same-origin',
           headers:{'Content-Type':'application/json','X-CSRF-Token':GD_CSRF},
           body: JSON.stringify({image: dataUrl})
-        }).then(function(r){ return r.json().then(function(j){ return {s:r.status, j:j}; }); })
+        }, 90000).then(function(r){ return r.json().then(function(j){ return {s:r.status, j:j}; }); })
         .then(function(x){
           if(x.s===200 && x.j.success){
             document.getElementById('gd-lines').value = x.j.stops.map(stopToLine).join('\n');
@@ -36129,6 +36134,21 @@ function loadRecent(){
 loadTemplates();
 loadRecent();
 renderPreview();
+
+// Reload button — bails out of any stuck state.
+document.getElementById('reload-btn').addEventListener('click', function(){
+  location.reload();
+});
+
+// fetch with a timeout so a hung request fails fast instead of spinning forever.
+function fetchT(url, opts, ms){
+  ms = ms || 25000;
+  var ctrl = new AbortController();
+  var t = setTimeout(function(){ ctrl.abort(); }, ms);
+  opts = opts || {};
+  opts.signal = ctrl.signal;
+  return fetch(url, opts).finally(function(){ clearTimeout(t); });
+}
 </script></body></html>"""
     page = page.replace("__OPTS__", opts).replace("__CSRF__", csrf).replace("__TODAY__", today_str())
     page = page.replace("__MODE__", e(mode_note) if mode_note else "")
