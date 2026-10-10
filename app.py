@@ -14699,10 +14699,10 @@ def _garbage_cab_page(conn, route, stops, current_stop, current_stop_num,
             + (f'<div class="g-access">&#128273; {e(s["access_info"])}</div>' if s["access_info"] else "")
             + (f'<div class="g-blocked">&#128683; Reported blocked — boss notified.</div>' if s["blocked_at"] else "")
             + (f'<button type="button" class="cab-neutral" style="margin-top:8px;" ' 
-               f'onclick="gUnblock({s["id"]})">I\'m In — Clear</button>' if s["blocked_at"] else "")
+               f'onclick="gUnblock({s["id"]})">I&#39;m In — Clear</button>' if s["blocked_at"] else "")
             + nb_html + note_html + nav_html + flow
             + (f'<button type="button" class="cab-neutral" style="margin-top:10px;" '
-               f'onclick="gBlocked({s["id"]})">&#128683; Can\'t Get In</button>' if not s["blocked_at"] else "")
+               f'onclick="gBlocked({s["id"]})">&#128683; Can&#39;t Get In</button>' if not s["blocked_at"] else "")
             + f'<button type="button" class="cab-neutral" style="margin-top:10px;" '
             f'onclick="openMessageThread({route_id}, \'Boss\')">Message Boss'
             f'<span id="msg-boss-badge" {"hidden" if not unread_messages else ""}>'
@@ -16249,7 +16249,7 @@ def driver_route_detail(route_id):
     <div id="cab-more-menu" class="cab-more-menu" hidden>
         <button type="button" class="cab-more-item" onclick="openTruckIssue()">&#9888; Truck Issue</button>
         <button type="button" class="cab-more-item" onclick="openVendorGo()">&#128666; Headed to Vendor</button>
-        {f'<button type="button" class="cab-more-item" onclick="cabBlocked({s["id"]})">&#128683; Can\'t Get In</button>' if not s["blocked_at"] else f'<button type="button" class="cab-more-item" onclick="cabUnblock({s["id"]})">&#9989; I\'m In — Clear</button>'}
+        {f'<button type="button" class="cab-more-item" onclick="cabBlocked({s["id"]})">&#128683; Can&#39;t Get In</button>' if not s["blocked_at"] else f'<button type="button" class="cab-more-item" onclick="cabUnblock({s["id"]})">&#9989; I&#39;m In — Clear</button>'}
         <button type="button" class="cab-more-item cab-more-danger" id="cab-cancel-btn">&#10005; Can't run this</button>
         <button type="button" class="cab-more-item" onclick="document.getElementById('cab-more-menu').hidden=true;">&#10005; Close</button>
     </div>
