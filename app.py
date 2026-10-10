@@ -16152,7 +16152,6 @@ def driver_route_detail(route_id):
         {_msg_boss_html}
         <div class="cab-workzone">
             {workflow_btn_html}
-            {_next_handoff_html}
             {empty_can_picker_html}
             {upload_widget}
             {after_dump_summary_html}
