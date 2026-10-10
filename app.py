@@ -20588,17 +20588,20 @@ def stop_driver_action(stop_id):
             _has_photo = bool(load_stop_photos(conn, [stop_id]).get(stop_id))
             if not (_pmode == "required" and not _has_photo):
                 _handoff_stop_id = _deliver_handoff_dest_id(conn, stop, route_id)
-                # 2026-10-10: Don't auto-complete if the empty is going to a
-                # DIFFERENT stop. The driver still has to drive there and place
-                # it — tapping "Return Empty to X" is not the same as done.
-                # Only auto-complete when the empty stays here (dest is None
-                # or the current stop).
+                # 2026-10-10: When the empty goes to a DIFFERENT stop, tapping
+                # "Return/Deliver Empty to X" means the driver is DONE with this
+                # stop's work. Complete it here, then jump to X's card so they
+                # can finish the route there.
                 if _handoff_stop_id and _handoff_stop_id != stop_id:
-                    # Driver needs to drive to the dest — don't complete yet.
-                    # Keep the handoff ID so we redirect to show the dest stop's
-                    # card (via show_stop param). The stop stays open.
-                    # (driver_status already set to box_in by the earlier UPDATE.)
-                    pass
+                    conn.execute(
+                        "UPDATE stops SET status='completed', completed_at=?, "
+                        "driver_status='completed', driver_status_before_complete=? "
+                        "WHERE id=?",
+                        (ts, current_status, stop_id))
+                    update_container_flow(conn, stop_id)
+                    cascade_request_from_stop(conn, stop_id)
+                    _auto_completed = True
+                    # Keep _handoff_stop_id so we redirect to the dest card.
                 else:
                     _handoff_stop_id = None
                     conn.execute(
