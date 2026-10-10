@@ -6705,8 +6705,8 @@ def shell_page(title, body, extra_head=""):
 
             _parts = []
             if is_disp:
-                _parts.append(nav_link('/parser', icon('box') + 'Roll-Off', path))
                 _parts.append(nav_link(url_for("routes_page"), icon('board') + 'Route Board', path))
+                _parts.append(nav_link('/parser', icon('box') + 'Roll-Off', path))
                 _parts.append(nav_link('/garbage-dispatch', icon('truck') + 'Garbage', path))
                 _parts.append(nav_link(url_for("unassigned_work"),
                               icon('clipboard') + 'Unassigned' + _nav_badge('unassigned-nav-badge', _unassigned), path))
