@@ -7476,7 +7476,7 @@ a:hover {{ color: #FF9D5C; }}
    BUTTONS
    ══════════════════════════════════════════════════════════*/
 .btn,
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip) {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-topbar-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip) {{
     display: inline-block;
     border: none;
     cursor: pointer;
@@ -7494,7 +7494,7 @@ button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact
 }}
 
 .btn:hover,
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip):hover {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-topbar-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip):hover {{
     filter: brightness(1.1);
     transform: translateY(-1px);
     text-decoration: none;
@@ -16097,6 +16097,17 @@ def driver_route_detail(route_id):
       background:transparent; color: var(--red, #FF5252); border-radius:10px; font-weight:800;
       letter-spacing:.5px; cursor:pointer; }}
   .cab-sticky-end:active {{ background: rgba(255,82,82,0.12); }}
+  /* 2026-10-10: unified topbar — one row for stop counter + controls + quiet End */
+  .cab-topbar {{ justify-content: space-between !important; gap: 8px; padding: 8px 12px !important; }}
+  .cab-topbar-controls {{ display: flex; align-items: center; gap: 8px; margin-left: auto; }}
+  .cab-topbar-end {{
+      background: transparent !important; border: none !important; box-shadow: none !important;
+      color: rgba(255,122,122,0.75) !important; font-size: 0.85rem !important; font-weight: 600 !important;
+      padding: 8px 6px !important; min-height: 0 !important; cursor: pointer; letter-spacing: 0 !important;
+  }}
+  .cab-topbar-end:active {{ color: #FF7A7A !important; }}
+  .cab-topbar .cab-gear-btn {{ min-height: 40px !important; min-width: 40px !important; }}
+  .cab-topbar .cab-online-badge {{ font-size: 0.75rem !important; padding: 6px 10px !important; }}
 
   /* Active-leg switcher: which leg (customer / dump / return) drives navigation. */
   .cab-leg-head {{ font-weight:800; letter-spacing:1px; font-size:.78rem; color: var(--text-muted);
@@ -16200,20 +16211,19 @@ def driver_route_detail(route_id):
   .cab-nav-btn.is-disabled, .cab-copy-btn:disabled {{ opacity:.45; pointer-events:none; }}
 </style>
 <div class="cab-wrap">
-    <div class="cab-sticky-bar">
+    <!-- 2026-10-10: unified top bar — stop counter, controls, and a quiet End link in one row -->
+    <div class="cab-sticky-bar cab-topbar">
         <span class="cab-sticky-progress" id="cab-sticky-progress">STOP {current_stop_num} OF {total_count}</span>
-        <form method="POST" action="{url_for('mark_route_completed', route_id=route_id)}" class="inline"
-              onsubmit="return confirm('End this route now? Any stops not marked done will stay incomplete.');">
-            <input type="hidden" name="_csrf_token" value="{_csrf}">
-            <button type="submit" class="cab-sticky-end">END ROUTE</button>
-        </form>
-    </div>
-    <div class="cab-header" style="justify-content:flex-end;">
-        <div style="display:flex;align-items:center;gap:10px;">
+        <span class="cab-topbar-controls">
             {cab_map_toggle_btn}
             {gear_button_html}
             <span class="cab-online-badge" id="online-badge"><span class="cab-online-dot"></span>ONLINE</span>
-        </div>
+            <form method="POST" action="{url_for('mark_route_completed', route_id=route_id)}" class="inline"
+                  onsubmit="return confirm('End this route now? Any stops not marked done will stay incomplete.');">
+                <input type="hidden" name="_csrf_token" value="{_csrf}">
+                <button type="submit" class="cab-topbar-end">End</button>
+            </form>
+        </span>
     </div>
     {nav_pref_modal_html}
     {urgent_banner_html}
