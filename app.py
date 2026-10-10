@@ -13913,8 +13913,16 @@ _VENDOR_STOP_JS = """
 
 _BREAKDOWN_DRIVER_JS = """
 window.toggleCabMore = function() {
-    var m = document.getElementById('cab-more-menu');
+    var m = document.getElementById('cab-more-dropdown');
+    var r = document.getElementById('cab-reorder-dropdown');
+    if (r) r.hidden = true;
     if (m) m.hidden = !m.hidden;
+};
+window.toggleCabReorder = function() {
+    var r = document.getElementById('cab-reorder-dropdown');
+    var m = document.getElementById('cab-more-dropdown');
+    if (m) m.hidden = true;
+    if (r) r.hidden = !r.hidden;
 };
 window.openTruckIssue = function() {
     document.getElementById('bk-overlay').hidden = false;
@@ -14991,6 +14999,7 @@ def driver_route_detail(route_id):
                                  unread_messages, _csrf, route_id)
 
     _reorder_html = ""
+    _reorder_list_html = ""
     if _reorderable:
         _ro_rows = "".join(
             '<div class="cab-ro-row" data-sid="%d">'
@@ -15002,16 +15011,21 @@ def driver_route_detail(route_id):
             ' aria-label="Move down">&#8595;</button></div>'
             % (_r["id"], e(_r["name"]), e(_r["address"]))
             for _r in _reorderable)
+        # 2026-10-10: list only — the toggle lives in the top bar now.
+        _reorder_list_html = (
+            '<div id="cab-ro-list">'
+            + _ro_rows +
+            '<div id="cab-ro-status" class="cab-photo-status" hidden></div>'
+            '</div>'
+        )
         _reorder_html = (
             '<div class="cab-ro-wrap">'
             '<button type="button" class="cab-ro-toggle"'
             ' onclick="document.getElementById(\'cab-ro-list\').hidden='
             '!document.getElementById(\'cab-ro-list\').hidden">'
-            '&#8645; Upcoming Stops (%d) — tap to reorder</button>'
-            '<div id="cab-ro-list" hidden>' % len(_reorderable)
-            + _ro_rows +
-            '<div id="cab-ro-status" class="cab-photo-status" hidden></div>'
-            '</div></div>'
+            '&#8645; Upcoming Stops (%d) — tap to reorder</button>' % len(_reorderable)
+            + _reorder_list_html +
+            '</div>'
             '<script>(function(){'
             'var RO_CSRF=' + json.dumps(_csrf) + ';'
             'var RO_ROUTE=' + json.dumps(route_id) + ';'
@@ -15479,15 +15493,9 @@ def driver_route_detail(route_id):
                 dl_addr = " ".join(p for p in [dl_rec.get("address") or "", dl_rec.get("city") or "",
                                                 dl_rec.get("state") or "", dl_rec.get("zip_code") or ""] if p).strip()
         if dl_addr:
-            dl_enc = urllib.parse.quote_plus(dl_addr)
-            nav_html = (
-                f'<div style="display:flex;gap:8px;margin-bottom:10px;">'
-                f'<a class="btn-driver btn-driver-nav" target="_blank" style="flex:1;text-align:center;text-decoration:none;"'
-                f' href="https://www.google.com/maps/dir/?api=1&destination={dl_enc}&travelmode=driving">&#128205; Google Maps</a>'
-                f'<a class="btn-driver btn-driver-apple" target="_blank" style="flex:1;text-align:center;text-decoration:none;"'
-                f' href="http://maps.apple.com/?daddr={dl_enc}&dirflg=d">&#63743; Apple Maps</a>'
-                f'</div>'
-            )
+            # 2026-10-10: Google/Apple Maps buttons removed — the main Navigate
+            # button already respects the driver's nav preference in settings.
+            nav_html = ""
         elif dump_loc_text:
             # The site exists but has no address yet — point the driver's boss at
             # the editor that fills it in (Settings → Yard Setup → Dump Sites).
@@ -15869,9 +15877,20 @@ def driver_route_detail(route_id):
     # empty-can plan when the card's action doesn't match reality. The choice is
     # persisted on the stop and noted so the boss sees the change — no silent
     # mismatch. Swap-PR (empty already boxed in before the dump run) is excluded.
+    # 2026-10-10: picker removed from driver UI — plan auto-maps from action.
+    # Persist the default if not already set.
     empty_can_picker_html = ""
     if is_pr and not is_swap_pr and driver_status != "completed":
-        _cur_plan = (_s.get("empty_can_plan") or "").strip() or "return_here"
+        _cur_plan = (_s.get("empty_can_plan") or "").strip() or _default_can_plan(_s.get("action"))
+        if not (_s.get("empty_can_plan") or "").strip():
+            try:
+                _persist_conn = get_db()
+                _persist_conn.execute("UPDATE stops SET empty_can_plan=? WHERE id=?",
+                                      (_cur_plan, stop_id))
+                _persist_conn.commit()
+                _persist_conn.close()
+            except Exception:
+                pass
         # The selector governs a DIFFERENT can depending on context, so its title
         # and labels change to say which one:
         #  - a can carried on board from the previous stop → its fate here
@@ -16048,10 +16067,11 @@ def driver_route_detail(route_id):
             <button type="button" class="cab-navstrip-copy" id="cab-copy-btn" onclick="{_copy_onclick}"{_copy_dis}>&#128203;</button>
         </div>
         {_noaddr_html}
+        <!-- 2026-10-10: 'Not here yet' is an undo — small back button, not a full-width CTA -->
         <form method="POST" action="{_arrive_action}" class="inline" style="margin:6px 0 0;">
             <input type="hidden" name="_csrf_token" value="{_csrf}">
             <input type="hidden" name="action" value="unarrive">
-            <button type="submit" class="cab-neutral cab-unarrive">&#8592; Not here yet</button>
+            <button type="submit" class="cab-unarrive-mini" title="Undo arrival">&#8592;</button>
         </form>
         {can_on_board_html}
         {f'<div class="cab-meta-line">{meta_line}</div>' if meta_line else ''}
@@ -16111,6 +16131,36 @@ def driver_route_detail(route_id):
   .cab-topbar-end:active {{ color: #FF7A7A !important; }}
   .cab-topbar .cab-gear-btn {{ min-height: 40px !important; min-width: 40px !important; }}
   .cab-topbar .cab-online-badge {{ font-size: 0.75rem !important; padding: 6px 10px !important; }}
+  /* 2026-10-10: top bar icon buttons + dropdowns */
+  .cab-topbar-icon {{
+      background: rgba(255,255,255,0.06) !important; border: 1px solid rgba(255,255,255,0.14) !important;
+      border-radius: 10px !important; color: #fff !important;
+      width: 40px !important; height: 40px !important; min-height: 0 !important;
+      font-size: 1.2rem !important; cursor: pointer; padding: 0 !important;
+      box-shadow: none !important; display: inline-flex !important;
+      align-items: center !important; justify-content: center !important;
+  }}
+  .cab-topbar-icon:active {{ background: rgba(255,255,255,0.12) !important; }}
+  .cab-topbar-dropdown {{
+      position: sticky; top: 60px; z-index: 60;
+      background: #1A1A1E; border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 14px; padding: 10px; margin: 8px 12px 0;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+      max-height: 60vh; overflow-y: auto;
+  }}
+  .cab-topbar-dropdown-title {{
+      font-weight: 800; font-size: 0.9rem; color: #fff;
+      padding: 4px 8px 10px; letter-spacing: 0.5px;
+  }}
+  /* 2026-10-10: un-arrive is a subtle undo, not a CTA */
+  .cab-unarrive-mini {{
+      background: transparent !important; border: 1px solid rgba(255,255,255,0.14) !important;
+      border-radius: 8px !important; color: rgba(255,255,255,0.6) !important;
+      width: 36px !important; height: 36px !important; min-height: 0 !important;
+      font-size: 1.1rem !important; cursor: pointer; padding: 0 !important;
+      box-shadow: none !important;
+  }}
+  .cab-unarrive-mini:active {{ background: rgba(255,255,255,0.08) !important; }}
 
   /* Active-leg switcher: which leg (customer / dump / return) drives navigation. */
   .cab-leg-head {{ font-weight:800; letter-spacing:1px; font-size:.78rem; color: var(--text-muted);
@@ -16222,10 +16272,13 @@ def driver_route_detail(route_id):
   .cab-nav-btn.is-disabled, .cab-copy-btn:disabled {{ opacity:.45; pointer-events:none; }}
 </style>
 <div class="cab-wrap">
-    <!-- 2026-10-10: unified top bar — stop counter, controls, and a quiet End link in one row -->
+    <!-- 2026-10-10: unified top bar — stop counter, controls, and a quiet End link in one row.
+         2026-10-10: Reorder and More live here as dropdowns, not in the scroll body. -->
     <div class="cab-sticky-bar cab-topbar">
         <span class="cab-sticky-progress" id="cab-sticky-progress">STOP {current_stop_num} OF {total_count}</span>
         <span class="cab-topbar-controls">
+            {f'<button type="button" class="cab-topbar-icon" onclick="toggleCabReorder()" title="Rearrange route">&#8645;</button>' if _reorderable else ''}
+            <button type="button" class="cab-topbar-icon" onclick="toggleCabMore()" title="More">&#183;&#183;&#183;</button>
             {cab_map_toggle_btn}
             {gear_button_html}
             <span class="cab-online-badge" id="online-badge"><span class="cab-online-dot"></span>ONLINE</span>
@@ -16235,6 +16288,17 @@ def driver_route_detail(route_id):
                 <button type="submit" class="cab-topbar-end">End</button>
             </form>
         </span>
+    </div>
+    <!-- Dropdowns anchored to the top bar -->
+    <div id="cab-reorder-dropdown" class="cab-topbar-dropdown" hidden>
+        <div class="cab-topbar-dropdown-title">&#8645; Rearrange route</div>
+        {_reorder_list_html}
+    </div>
+    <div id="cab-more-dropdown" class="cab-topbar-dropdown" hidden>
+        <button type="button" class="cab-more-item" onclick="openTruckIssue()">&#9888; Truck Issue</button>
+        <button type="button" class="cab-more-item" onclick="openVendorGo()">&#128666; Headed to Vendor</button>
+        {f'<button type="button" class="cab-more-item" onclick="cabBlocked({s["id"]})">&#128683; Can&#39;t Get In</button>' if not s["blocked_at"] else f'<button type="button" class="cab-more-item" onclick="cabUnblock({s["id"]})">&#9989; I&#39;m In — Clear</button>'}
+        <button type="button" class="cab-more-item cab-more-danger" id="cab-cancel-btn">&#10005; Can't run this</button>
     </div>
     {nav_pref_modal_html}
     {urgent_banner_html}
@@ -16272,18 +16336,7 @@ def driver_route_detail(route_id):
         <a class="btn secondary" href="{url_for('driver_dashboard')}">&#8592; My Routes</a>
     </div>
 
-    {_reorder_html}
-
-    <!-- 2026-10-10: secondary actions collapsed into a More menu. The card above
-         holds the one primary action; everything else lives here. -->
-    <button type="button" id="cab-more-btn" class="cab-more-btn" onclick="toggleCabMore()">&#183;&#183;&#183; More</button>
-    <div id="cab-more-menu" class="cab-more-menu" hidden>
-        <button type="button" class="cab-more-item" onclick="openTruckIssue()">&#9888; Truck Issue</button>
-        <button type="button" class="cab-more-item" onclick="openVendorGo()">&#128666; Headed to Vendor</button>
-        {f'<button type="button" class="cab-more-item" onclick="cabBlocked({s["id"]})">&#128683; Can&#39;t Get In</button>' if not s["blocked_at"] else f'<button type="button" class="cab-more-item" onclick="cabUnblock({s["id"]})">&#9989; I&#39;m In — Clear</button>'}
-        <button type="button" class="cab-more-item cab-more-danger" id="cab-cancel-btn">&#10005; Can't run this</button>
-        <button type="button" class="cab-more-item" onclick="document.getElementById('cab-more-menu').hidden=true;">&#10005; Close</button>
-    </div>
+    <!-- 2026-10-10: Reorder and More moved to top bar dropdowns -->
 </div>
 {cab_map_panel}
 
@@ -20140,6 +20193,19 @@ _EMPTY_CAN_PLANS = {
     "carry_next":  "carry the empty to the next stop",
     "leave_site":  "leave the empty on site",
 }
+
+
+def _default_can_plan(action):
+    """2026-10-10: auto-map action -> can disposition so the driver never has
+    to pick. Pickup-and-return and swaps bring the empty back; deliveries leave
+    it; pulls carry it on the truck."""
+    a = (action or "").strip().lower()
+    if "deliver" in a:
+        return "leave_site"
+    if "pull" in a and "return" not in a:
+        return "carry_next"
+    # pickup and return, swap, live load, default
+    return "return_here"
 
 
 # Marker that identifies an auto-generated empty-can note line, so we can
