@@ -15273,7 +15273,6 @@ def driver_route_detail(route_id):
     <div class="cab-header">
         <div class="cab-title">MY ROUTE</div>
         <div style="display:flex;align-items:center;gap:10px;">
-            {gear_button_html}
             <span class="cab-online-badge" id="online-badge"><span class="cab-online-dot"></span>ONLINE</span>
         </div>
     </div>
@@ -15628,7 +15627,7 @@ def driver_route_detail(route_id):
     # chain/carry logic above finds nothing. But the driver still needs to
     # know where he's going next. Fall back to the next live stop in route
     # order so he always has an address + Navigate button.
-    if not _next_handoff_html and not _predeliver_nav_html and driver_status in ("need_box_in", "box_in"):
+    if not _next_handoff_html and driver_status in ("need_box_in", "box_in"):
         _sids_fb = [_nr["id"] for _nr in stops]
         if stop_id in _sids_fb:
             for _nr in stops[_sids_fb.index(stop_id) + 1:]:
@@ -16154,7 +16153,6 @@ def driver_route_detail(route_id):
         {phone_line}
         {_msg_boss_html}
         <div class="cab-workzone">
-            {_predeliver_nav_html}
             {workflow_btn_html}
             {_next_handoff_html}
             {empty_can_picker_html}
@@ -16393,7 +16391,6 @@ def driver_route_detail(route_id):
             {f'<button type="button" class="cab-topbar-icon" onclick="toggleCabReorder()" title="Rearrange route">&#8645;</button>' if _reorderable else ''}
             <button type="button" class="cab-topbar-icon" onclick="toggleCabMore()" title="More">&#183;&#183;&#183;</button>
             {cab_map_toggle_btn}
-            {gear_button_html}
             <span class="cab-online-badge" id="online-badge"><span class="cab-online-dot"></span>ONLINE</span>
             <form method="POST" action="{url_for('mark_route_completed', route_id=route_id)}" class="inline"
                   onsubmit="return confirm('End this route now? Any stops not marked done will stay incomplete.');">
