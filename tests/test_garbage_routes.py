@@ -219,6 +219,16 @@ ok("cans: 8" in rep and "bags: 132" in rep and "tons: 4.25" in rep,
 gp = cl.get("/garbage-dispatch").get_data(as_text=True)
 ok("Garbage Dispatch" in gp and "gd-lines" in gp, "garbage dispatch page renders")
 
+# ── Boss board visibility ────────────────────────────────────────────
+# Nav has the Garbage link; the board shows the GARBAGE badge, Report link,
+# and toter/HPU stop badges.
+login_as(boss, "boss")
+board = cl.get("/routes").get_data(as_text=True)
+ok('href="/garbage-dispatch"' in board, "nav has Garbage Dispatch link")
+ok("GARBAGE" in board, "board shows GARBAGE badge on the lane")
+ok(f"/route/{nb_rid}/report" in board, "board links the daily report")
+ok(">T<" in board or ">HPU<" in board, "board shows garbage stop badges")
+
 conn.close()
 print()
 if FAILURES:

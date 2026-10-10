@@ -6691,6 +6691,7 @@ def shell_page(title, body, extra_head=""):
             if is_disp:
                 _parts.append(nav_link('/parser', icon('spark') + 'Parser', path))
                 _parts.append(nav_link(url_for("routes_page"), icon('board') + 'Route Board', path))
+                _parts.append(nav_link('/garbage-dispatch', icon('truck') + 'Garbage', path))
                 _parts.append(nav_link(url_for("unassigned_work"),
                               icon('clipboard') + 'Unassigned' + _nav_badge('unassigned-nav-badge', _unassigned), path))
             if is_cm:
@@ -12544,6 +12545,13 @@ def _board_action_badge(action):
         return "D", "dropswap"
     if "relocate" in a or "move" in a:
         return "R", "neutral"
+    # Garbage routes (2026-10-10): toter / hand-pickup / landfill badges.
+    if a == "toter":
+        return "T", "pickup"
+    if "hand pickup" in a:
+        return "HPU", "dropswap"
+    if "landfill" in a:
+        return "L", "neutral"
     label = (action or "?").strip()[:1].upper() or "?"
     return label, "neutral"
 
@@ -13082,11 +13090,13 @@ def _build_route_board_html(user):
     params = [company_id, today]
     sql = """
         SELECT r.id AS route_id, r.route_name, r.assigned_to,
+               COALESCE(r.route_type, 'rolloff') AS route_type,
                u.username AS driver_username, u.full_name AS driver_full_name,
                u.avatar_path AS driver_avatar,
                s.id AS stop_id, s.stop_order, s.customer_name, s.address, s.city,
                s.action, s.container_size, s.status AS stop_status, s.driver_status,
                s.completed_at, s.held_at, s.empty_can_plan,
+               s.service_count, s.not_before, s.weight_tons,
                s.chain_group_id, s.chain_seq, s.chain_gives_to_stop_id, s.chain_takes_from_stop_id,
                s.chain_terminal, s.chain_start, s.chain_delivery_stop_id,
                ii.vendor_status AS vendor_status,
@@ -13175,11 +13185,13 @@ def _build_route_board_html(user):
             "driver_avatar": row["driver_avatar"],
             "route_names": [],
             "route_ids_seen": set(),
+            "route_types": set(),
             "stops": [],
         })
         if row["route_id"] not in lane["route_ids_seen"]:
             lane["route_ids_seen"].add(row["route_id"])
             lane["route_names"].append(row["route_name"])
+            lane["route_types"].add(row["route_type"] or "rolloff")
         if row["stop_id"] is not None:
             lane["stops"].append(row)
 
@@ -13233,13 +13245,30 @@ def _build_route_board_html(user):
 
         route_label = lane["route_names"][0] if len(lane["route_names"]) == 1 else f"{len(lane['route_names'])} routes"
         progress_label = f"{done}/{total} done" if total else "No stops"
+        # Garbage routes (2026-10-10): visible type badge + daily report link.
+        _is_garbage_lane = lane.get("route_types") == {"garbage"}
+        _garbage_badge = (
+            ' <span style="display:inline-block;padding:1px 8px;border-radius:999px;font-size:10px;'
+            'font-weight:800;letter-spacing:.5px;background:rgba(66,135,245,.16);color:#8FB8FF;'
+            'border:1px solid rgba(66,135,245,.5);">&#128666; GARBAGE</span>'
+        ) if _is_garbage_lane else ""
+        _report_html = ""
+        if _is_garbage_lane and user["role"] == "boss" and len(lane["route_ids_seen"]) == 1:
+            _rid = next(iter(lane["route_ids_seen"]))
+            _report_html = (
+                f'<a class="lane-message-btn" style="text-decoration:none;" '
+                f'href="{url_for("route_report", route_id=_rid)}">&#128203; Report</a>'
+            )
 
         add_stops_html = ""
         message_html = ""
         if user["role"] == "boss" and len(lane["route_ids_seen"]) == 1:
             _lane_route_id = next(iter(lane["route_ids_seen"]))
+            _is_g = lane.get("route_types") == {"garbage"}
+            _add_href = (f"/garbage-dispatch?route_id={_lane_route_id}"
+                         if _is_g else url_for("parser_view", route_id=_lane_route_id))
             add_stops_html = (
-                f'<a class="lane-add-stops" href="{url_for("parser_view", route_id=_lane_route_id)}">'
+                f'<a class="lane-add-stops" href="{_add_href}">'
                 f'+ Add Stops</a>'
             )
             _lane_unread = unread_by_route.get(_lane_route_id, 0)
@@ -13282,6 +13311,15 @@ def _build_route_board_html(user):
             addr_text = ", ".join(p for p in [s["address"] or "", s["city"] or ""] if p) or (s["customer_name"] or "Stop")
             addr_cls = "stop-mini-addr done" if stop_status == "completed" else "stop-mini-addr"
             size_label = size_bucket(s["container_size"]) or (s["container_size"] or "")
+            # Garbage stops (2026-10-10): show the can/bag count or tons instead
+            # of a container size.
+            _g_action = (s["action"] or "").strip().lower()
+            if _g_action in ("toter", "hand pickup"):
+                _cnt = s["service_count"]
+                size_label = (f'{_cnt} {"cans" if _g_action == "toter" else "bags"}'
+                              if _cnt else "—")
+            elif _g_action == "landfill" and s["weight_tons"]:
+                size_label = f'{float(s["weight_tons"]):.2f} tons'
 
             # Chained can-swap badge: "SWAP n of m" + the neighbor this can moves
             # to/from. The chain is the ONLY "where does the can go" story shown —
@@ -13405,10 +13443,11 @@ def _build_route_board_html(user):
                     <span class="lane-name">{e(display_name)}</span>
                     {timeoff_chip}
                 </div>
-                <div class="lane-sub">{e(route_label)}<br>{e(progress_label)}</div>
+                <div class="lane-sub">{e(route_label)}{_garbage_badge}<br>{e(progress_label)}</div>
                 <div class="lane-actions">
                     {add_stops_html}
                     {message_html}
+                    {_report_html}
                 </div>
             </div>
             <div class="lane-track">{cards_html}</div>
@@ -35505,17 +35544,32 @@ def garbage_scan_sheet():
 @roles_required("dispatcher")
 def garbage_dispatch_view():
     """Dead-simple garbage route dispatch (2026-10-10): pick a driver + date,
-    paste one stop per line, hit Dispatch. Replaces the printed route sheet."""
+    paste one stop per line, hit Dispatch. Replaces the printed route sheet.
+    ?route_id= appends to an existing garbage route (from the board's + Add Stops)."""
     conn = get_db()
     drivers = conn.execute(
         "SELECT id, username, full_name FROM users "
         "WHERE company_id=? AND role='driver' AND is_active=1 ORDER BY username",
         (cid(),)).fetchall()
+    route_id_arg = (request.args.get("route_id") or "").strip()
+    append_route_id = None
+    append_driver_id = None
+    if route_id_arg.isdigit():
+        r = conn.execute(
+            "SELECT id, assigned_to, COALESCE(route_type,'rolloff') AS rt FROM routes "
+            "WHERE id=? AND company_id=?", (int(route_id_arg), cid())).fetchone()
+        if r and r["rt"] == "garbage":
+            append_route_id = r["id"]
+            append_driver_id = r["assigned_to"]
     conn.close()
     csrf = get_csrf_token()
     opts = "".join(
-        '<option value="%d">%s</option>' % (d["id"], e(d["full_name"] or d["username"]))
+        '<option value="%d"%s>%s</option>'
+        % (d["id"], " selected" if append_driver_id and d["id"] == append_driver_id else "",
+           e(d["full_name"] or d["username"]))
         for d in drivers)
+    mode_note = ("Appending to the existing garbage route — new stops go at the end."
+                 if append_route_id else "")
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Garbage Dispatch — HAULTRA</title>
@@ -35524,6 +35578,7 @@ body{{background:#101010;color:#F5F5F0;font-family:system-ui,sans-serif;margin:0
 .wrap{{max-width:640px;margin:0 auto;}}
 h1{{font-size:1.4rem;}}
 .lbl{{display:block;margin:14px 0 6px;font-weight:700;font-size:.85rem;color:#A6A69E;}}
+.mode{{color:#8FB8FF;font-size:.85rem;margin-top:8px;}}
 select,input,textarea{{width:100%;box-sizing:border-box;background:#1c1c1c;border:1px solid #333;
   color:#F5F5F0;border-radius:10px;padding:12px;font-size:16px;}}
 textarea{{min-height:220px;font-family:monospace;}}
@@ -35535,6 +35590,7 @@ button.go{{width:100%;margin-top:16px;min-height:56px;border:none;border-radius:
   font-family:monospace;font-size:.82rem;color:#A6A69E;white-space:pre-wrap;}}
 </style></head><body><div class="wrap">
 <h1>&#128666; Garbage Dispatch</h1>
+<div class="mode">{mode_note}</div>
 <label class="lbl">Driver</label>
 <select id="gd-driver"><option value="">— pick a driver —</option>{opts}</select>
 <label class="lbl">Date</label>
@@ -35614,13 +35670,18 @@ function gdSend(){{
   }}
   if(!stops.length){{ st.textContent = 'Add at least one stop.'; return; }}
   st.textContent = 'Dispatching…';
-  fetch('/api/dispatch', {{method:'POST', credentials:'same-origin',
+  var APPEND_RID = {json.dumps(append_route_id)};
+  var url = APPEND_RID ? '/api/route/' + APPEND_RID + '/insert-stops' : '/api/dispatch';
+  var payload = APPEND_RID ? {{stops: stops}}
+    : {{route_type:'garbage', driver_id: parseInt(drv,10), route_date: date, stops: stops}};
+  fetch(url, {{method:'POST', credentials:'same-origin',
     headers:{{'Content-Type':'application/json','X-CSRF-Token':GD_CSRF}},
-    body: JSON.stringify({{route_type:'garbage', driver_id: parseInt(drv,10), route_date: date, stops: stops}})
+    body: JSON.stringify(payload)
   }}).then(function(r){{ return r.json().then(function(j){{ return {{s:r.status, j:j}}; }}); }})
   .then(function(x){{
     if(x.s===200 && x.j.success){{
-      st.textContent = '✓ Dispatched '+x.j.stop_count+' stops to '+x.j.driver+'.';
+      st.textContent = APPEND_RID ? '✓ Added '+x.j.stop_count+' stops to the route.'
+        : '✓ Dispatched '+x.j.stop_count+' stops to '+x.j.driver+'.';
       document.getElementById('gd-lines').value='';
     }} else st.textContent = (x.j && x.j.error) || 'Dispatch failed.';
   }}).catch(function(){{ st.textContent = 'Network error.'; }});
