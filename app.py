@@ -4173,6 +4173,12 @@ def init_db():
     safe_add_column(conn, "stops", "departed_at TEXT")
     safe_add_column(conn, "stops", "weight_tons REAL")
     safe_add_column(conn, "stops", "not_before TEXT")
+    # Site access (2026-10-10): gate codes, lockbox combos, "call ahead" —
+    # shown to the driver on the stop so "what's the code?" texts die.
+    # blocked_at/blocked_note: driver one-tap "can't get in" report.
+    safe_add_column(conn, "stops", "access_info TEXT")
+    safe_add_column(conn, "stops", "blocked_at TEXT")
+    safe_add_column(conn, "stops", "blocked_note TEXT")
     # Garbage route templates (2026-10-10): saved stop lists the boss reuses
     # instead of retyping every week. stops_json = [{service_type, address,
     # city, notes, not_before}].
@@ -13112,6 +13118,7 @@ def _build_route_board_html(user):
                s.id AS stop_id, s.stop_order, s.customer_name, s.address, s.city,
                s.action, s.container_size, s.status AS stop_status, s.driver_status,
                s.completed_at, s.held_at, s.empty_can_plan,
+               s.blocked_at, s.blocked_note, s.access_info,
                s.service_count, s.not_before, s.weight_tons,
                s.chain_group_id, s.chain_seq, s.chain_gives_to_stop_id, s.chain_takes_from_stop_id,
                s.chain_terminal, s.chain_start, s.chain_delivery_stop_id,
@@ -13383,6 +13390,13 @@ def _build_route_board_html(user):
             is_urgent = group == "pickup" and stop_status != "completed" and addr_key in overdue_addr_keys
             urgent_html = '<span class="stop-mini-urgent">&#9888; OVERDUE</span>' if is_urgent else ""
             photo_html = '<span class="stop-mini-photo" title="Has photo">&#128247;</span>' if s["has_photo"] else ""
+            # Blocked (2026-10-10): driver reported can't-get-in.
+            blocked_html = ""
+            if s["blocked_at"] and stop_status != "completed":
+                _bn = (s["blocked_note"] or "").strip()
+                blocked_html = ('<span class="stop-mini-urgent" style="color:#FFB74D;"'
+                                f' title="{e(_bn) if _bn else "Driver reported blocked"}">'
+                                '&#128683; BLOCKED</span>')
 
             # Vendor-visit stop carries the truck's live vendor lifecycle pill.
             vendor_pill = ""
@@ -13408,6 +13422,7 @@ def _build_route_board_html(user):
                     {hold_icon}
                     {vendor_pill}
                     {urgent_html}
+                    {blocked_html}
                     {photo_html}
                 </div>
                 <div class="{addr_cls}">{e(addr_text)}</div>
@@ -13900,6 +13915,30 @@ window.openTruckIssue = function() {
     if (typeof window.captureGpsStamp === 'function') {
         window.captureGpsStamp(function(g) { window.__bkGps = g; });
     }
+}
+window.cabUnblock = function(stopId) {
+    var csrf = (document.querySelector('meta[name="csrf-token"]')||{}).content || "";
+    fetch('/api/stops/' + stopId + '/report-blocked', {
+        method: 'POST', credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf},
+        body: JSON.stringify({clear: true})
+    }).then(function(r){ return r.json(); }).then(function(j){
+        if (j.success) location.reload();
+        else alert(j.error || 'Could not clear.');
+    }).catch(function(){ alert('Network error.'); });
+}
+window.cabBlocked = function(stopId) {
+    var note = prompt("What's blocking you? (e.g. locked gate, no answer)");
+    if (note === null) return;
+    var csrf = (document.querySelector('meta[name="csrf-token"]')||{}).content || "";
+    fetch('/api/stops/' + stopId + '/report-blocked', {
+        method: 'POST', credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf},
+        body: JSON.stringify({note: note || ''})
+    }).then(function(r){ return r.json(); }).then(function(j){
+        if (j.success) { alert('Boss notified — hang tight.'); location.reload(); }
+        else alert(j.error || 'Could not report.');
+    }).catch(function(){ alert('Network error.'); });
 };
 window.closeTruckIssue = function() {
     document.getElementById('bk-overlay').hidden = true;
@@ -14560,6 +14599,10 @@ _GARBAGE_CAB_CSS = """
 .g-up-addr{color:var(--text-muted);font-size:.82rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .g-done-wrap{text-align:center;padding:40px 20px;}
 .g-done-icon{font-size:48px;margin-bottom:14px;}
+.g-access{margin:10px 0;padding:10px 12px;border-radius:10px;font-size:.95rem;font-weight:700;
+  color:#8FB8FF;background:rgba(66,135,245,.10);border:1px solid rgba(66,135,245,.4);}
+.g-blocked{margin:10px 0;padding:10px 12px;border-radius:10px;font-size:.9rem;font-weight:700;
+  color:#FFB74D;background:rgba(255,171,64,.10);border:1px solid rgba(255,171,64,.4);}
 .cab-neutral{display:flex;align-items:center;justify-content:center;width:100%;
   min-height:52px;margin-top:8px;padding:0 16px;border:1px solid #2A2A2A;
   border-radius:12px;background:#161616;color:#F5F5F0;
@@ -14645,7 +14688,13 @@ def _garbage_cab_page(conn, route, stops, current_stop, current_stop_num,
             "</div>"
             f'<div class="g-addr">{e(addr) or "No address"}</div>'
             + (f'<div class="g-city">{e(city)}</div>' if city else "")
+            + (f'<div class="g-access">&#128273; {e(s["access_info"])}</div>' if s["access_info"] else "")
+            + (f'<div class="g-blocked">&#128683; Reported blocked — boss notified.</div>' if s["blocked_at"] else "")
+            + (f'<button type="button" class="cab-neutral" style="margin-top:8px;" ' 
+               f'onclick="gUnblock({s["id"]})">I\'m In — Clear</button>' if s["blocked_at"] else "")
             + nb_html + note_html + nav_html + flow
+            + (f'<button type="button" class="cab-neutral" style="margin-top:10px;" '
+               f'onclick="gBlocked({s["id"]})">&#128683; Can\'t Get In</button>' if not s["blocked_at"] else "")
             + f'<button type="button" class="cab-neutral" style="margin-top:10px;" '
             f'onclick="openMessageThread({route_id}, \'Boss\')">Message Boss'
             f'<span id="msg-boss-badge" {"hidden" if not unread_messages else ""}>'
@@ -14735,6 +14784,23 @@ def _garbage_cab_page(conn, route, stops, current_stop, current_stop_num,
         var t = (raw === '' || raw == null) ? null : (parseFloat(raw) || null);
         post('/api/stops/'+id+'/landfill-depart', {tons:t}).then(function(x){
             if(x.s===200 && x.j.success) location.reload(); else alert((x.j&&x.j.error)||'Could not depart.');
+        });
+    };
+    window.gUnblock = function(id){
+        post('/api/stops/'+id+'/report-blocked', {clear:true}).then(function(x){
+            if(x.s===200 && x.j.success) location.reload(); else alert('Could not clear.');
+        });
+    };
+    window.gBlocked = function(id){
+        post('/api/stops/'+id+'/report-blocked', {clear:true}).then(function(x){
+            if(x.s===200 && x.j.success) location.reload(); else alert('Could not clear.');
+        });
+    };
+        var note = prompt("What's blocking you? (e.g. locked gate, no answer)");
+        if(note === null) return;  // cancelled
+        post('/api/stops/'+id+'/report-blocked', {note:note||''}).then(function(x){
+            if(x.s===200 && x.j.success){ alert('Boss notified — hang tight.'); location.reload(); }
+            else alert((x.j&&x.j.error)||'Could not report.');
         });
     };
 })();
@@ -15756,6 +15822,10 @@ def driver_route_detail(route_id):
                 break
     meta_line = " &middot; ".join(meta_bits) if meta_bits else ""
     ticket_line = f'<div class="cab-meta-line"><strong>Ticket:</strong> {e(s["ticket_number"])}</div>' if s["ticket_number"] else ""
+    access_line = (f'<div class="cab-meta-line" style="color:#8FB8FF;font-weight:700;">'
+                   f'&#128273; {e(s["access_info"])}</div>' if s["access_info"] else "")
+    blocked_line = (f'<div class="cab-meta-line" style="color:#FFB74D;font-weight:700;">'
+                    f'&#128683; Reported blocked — boss notified.</div>' if s["blocked_at"] else "")
 
     # Multi-leg trip: show the dump + return legs compactly on the one card so
     # the driver sees the whole job (pull → dump → return) at a glance.
@@ -15974,6 +16044,8 @@ def driver_route_detail(route_id):
         {can_on_board_html}
         {f'<div class="cab-meta-line">{meta_line}</div>' if meta_line else ''}
         {ticket_line}
+        {access_line}
+        {blocked_line}
         {phone_line}
         {_msg_boss_html}
         <div class="cab-workzone">
@@ -16148,6 +16220,7 @@ def driver_route_detail(route_id):
 
     <button type="button" id="cab-issue-btn" class="cab-issue-btn" onclick="openTruckIssue()">&#9888; Truck Issue</button>
     <button type="button" id="cab-vendor-btn" class="cab-vendor-btn" onclick="openVendorGo()">&#128666; Headed to Vendor</button>
+    {f'<button type="button" class="cab-cancel-btn" style="border-color:rgba(255,183,77,.5);color:#FFB74D;" onclick="cabBlocked({s["id"]})">&#128683; Can\'t Get In</button>' if not s["blocked_at"] else f'<button type="button" class="cab-cancel-btn" style="border-color:rgba(61,220,132,.5);color:#3DDC84;" onclick="cabUnblock({s["id"]})">&#9989; I\'m In — Clear</button>'}
     <button type="button" id="cab-cancel-btn" class="cab-cancel-btn">&#10005; Can't run this</button>
 </div>
 {cab_map_panel}
@@ -19401,7 +19474,7 @@ def edit_stop(stop_id):
             UPDATE stops SET
                 customer_name=?, address=?, city=?, state=?, zip_code=?,
                 action=?, container_size=?, ticket_number=?, reference_number=?,
-                dump_location=?, notes=?
+                dump_location=?, notes=?, access_info=?
             WHERE id=?
         """, (
             expand_abbrev(request.form.get("customer_name")),
@@ -19415,6 +19488,7 @@ def edit_stop(stop_id):
             request.form.get("reference_number"),
             expand_abbrev(request.form.get("dump_location", "")),
             request.form.get("notes"),
+            request.form.get("access_info"),
             stop_id
         ))
         conn.commit()
@@ -19617,6 +19691,10 @@ def edit_stop(stop_id):
                 <div>
                     <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Dump Location</label>
                     {_dump_field}
+                </div>
+                <div style="grid-column:1/-1;">
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">🔑 Gate Code / Site Access</label>
+                    <input name="access_info" value="{e(_stop['access_info'] or '')}" placeholder="Gate code, lockbox, call-ahead — driver sees this on the stop" style="width:100%;padding:10px;border-radius:8px;border:1px solid var(--line);background:#1A1A1E;color:#fff;">
                 </div>
                 <div style="grid-column:1/-1;">
                     <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Notes</label>
@@ -33282,6 +33360,56 @@ def landfill_arrive(stop_id):
         conn.execute("UPDATE stops SET arrived_at=?, driver_status='arrived' WHERE id=?",
                      (now_ts(), stop_id))
         conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/stops/<int:stop_id>/report-blocked", methods=["POST"])
+@driver_required
+def report_blocked(stop_id):
+    """Driver one-tap "can't get in" (2026-10-10): marks the stop blocked,
+    alerts the boss with stop details so they can reroute without text tennis.
+    Send {"clear": true} to lift the blocked flag once the driver is in."""
+    """Driver one-tap "can't get in" (2026-10-10): marks the stop blocked,
+    alerts the boss with stop details so they can reroute without text tennis."""
+    data = request.get_json(silent=True) or {}
+    note = str(data.get("note") or "").strip()[:300]
+    conn = get_db()
+    stop = conn.execute(
+        "SELECT s.*, r.company_id, r.route_name FROM stops s"
+        " JOIN routes r ON s.route_id = r.id"
+        " WHERE s.id = ? AND r.assigned_to = ? AND r.company_id = ?",
+        (stop_id, session["user_id"], cid())).fetchone()
+    if not stop:
+        conn.close()
+        return jsonify({"error": "stop not found"}), 404
+    if stop["status"] == "completed":
+        conn.close()
+        return jsonify({"error": "stop already completed"}), 400
+    ts = now_ts()
+    if data.get("clear"):
+        conn.execute("UPDATE stops SET blocked_at = NULL, blocked_note = NULL WHERE id = ?",
+                     (stop_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True, "cleared": True})
+    conn.execute("UPDATE stops SET blocked_at = ?, blocked_note = ? WHERE id = ?",
+                 (ts, note, stop_id))
+    driver = conn.execute("SELECT full_name, username FROM users WHERE id = ?",
+                          (session["user_id"],)).fetchone()
+    addr = ", ".join(p for p in [stop["address"] or "", stop["city"] or ""] if p)
+    msg = (f"🚫 {(driver['full_name'] or driver['username'])} can't get in at "
+           f"{addr or 'stop #' + str(stop_id)}"
+           + (f" — {note}" if note else ""))
+    # Boss alert via the message thread on this route.
+    try:
+        conn.execute(
+            "INSERT INTO messages (route_id, sender_user_id, body, created_at)"
+            " VALUES (?,?,?,?)",
+            (stop["route_id"], session["user_id"], msg, ts))
+    except Exception:
+        pass
+    conn.commit()
     conn.close()
     return jsonify({"success": True})
 

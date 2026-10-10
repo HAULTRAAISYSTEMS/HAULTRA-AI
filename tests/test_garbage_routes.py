@@ -266,6 +266,39 @@ ok("GARBAGE" in board, "board shows GARBAGE badge on the lane")
 ok(f"/route/{nb_rid}/report" in board, "board links the daily report")
 ok(">T<" in board or ">HPU<" in board, "board shows garbage stop badges")
 
+# ── Blocked flow ─────────────────────────────────────────────────────
+# Driver reports can't-get-in; boss sees BLOCKED badge; driver clears it.
+login_as(boss, "boss")
+r = post("/api/dispatch", {"route_type": "garbage", "driver_id": drv,
+                           "route_date": "2026-10-10",
+                           "stops": [{"service_type": "toter", "address": "806 Curtis Saunders",
+                                      "city": "Ches", "notes": "", "not_before": ""}]})
+blk_sid = conn.execute("SELECT id FROM stops WHERE address='806 Curtis Saunders'").fetchone()["id"]
+login_as(drv, "driver")
+r = post(f"/api/stops/{blk_sid}/report-blocked", {"note": "locked gate"})
+ok(r.status_code == 200, "driver reports blocked")
+blk = conn.execute("SELECT blocked_at, blocked_note FROM stops WHERE id=?", (blk_sid,)).fetchone()
+ok(blk["blocked_at"] and blk["blocked_note"] == "locked gate", "blocked_at/note stored")
+# Boss message got the alert.
+msg = conn.execute("SELECT body FROM messages WHERE route_id = "
+                   "(SELECT route_id FROM stops WHERE id=?) ORDER BY id DESC LIMIT 1",
+                   (blk_sid,)).fetchone()
+ok(msg and "can't get in" in msg["body"] and "806 Curtis Saunders" in msg["body"],
+   "boss alerted via route message thread")
+# Board shows the BLOCKED badge.
+login_as(boss, "boss")
+board2 = cl.get("/routes").get_data(as_text=True)
+ok("BLOCKED" in board2, "board shows BLOCKED badge")
+# Driver clears once he's in.
+login_as(drv, "driver")
+r = post(f"/api/stops/{blk_sid}/report-blocked", {"clear": True})
+blk2 = conn.execute("SELECT blocked_at FROM stops WHERE id=?", (blk_sid,)).fetchone()
+ok(r.status_code == 200 and blk2["blocked_at"] is None, "driver clears blocked flag")
+# Wrong driver can't report.
+login_as(drv2, "driver")
+r = post(f"/api/stops/{blk_sid}/report-blocked", {"note": "x"})
+ok(r.status_code == 404, "other driver blocked from reporting")
+
 conn.close()
 print()
 if FAILURES:
