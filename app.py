@@ -15002,12 +15002,12 @@ def driver_route_detail(route_id):
     _reorder_list_html = ""
     if _reorderable:
         _ro_rows = "".join(
-            '<div class="cab-ro-row" data-sid="%d">'
-            '<div class="cab-ro-info"><div class="cab-ro-name">%s</div>'
-            '<div class="cab-ro-addr">%s</div></div>'
-            '<button type="button" class="cab-ro-btn" onclick="roMove(this,-1)"'
+            '<div class="haul-dropdown-item cab-ro-row" data-sid="%d">'
+            '<div class="haul-di-text"><div class="cab-ro-name">%s</div>'
+            '<div class="haul-di-sub">%s</div></div>'
+            '<button type="button" class="haul-ro-arrow" onclick="roMove(this,-1)"'
             ' aria-label="Move up">&#8593;</button>'
-            '<button type="button" class="cab-ro-btn" onclick="roMove(this,1)"'
+            '<button type="button" class="haul-ro-arrow" onclick="roMove(this,1)"'
             ' aria-label="Move down">&#8595;</button></div>'
             % (_r["id"], e(_r["name"]), e(_r["address"]))
             for _r in _reorderable)
@@ -15210,9 +15210,10 @@ def driver_route_detail(route_id):
                     '</div>'
                 )
     _nav_pref_options = "".join(
-        f'<label style="display:flex;align-items:center;gap:10px;min-height:48px;cursor:pointer;">'
+        f'<label class="haul-dropdown-item" style="cursor:pointer;">'
         f'<input type="radio" name="nav_preference" value="{val}" {"checked" if _nav_pref == val else ""} '
-        f'style="width:18px;height:18px;">{label}</label>'
+        f'style="width:20px;height:20px;accent-color:#FF6B1A;flex-shrink:0;">'
+        f'<span class="haul-di-text">{label}</span></label>'
         for val, label in [
             ("", "Default (current behavior)"), ("google", "Google Maps"), ("apple", "Apple Maps"),
             ("waze", "Waze"), ("device_default", "Device Default"),
@@ -15227,31 +15228,30 @@ def driver_route_detail(route_id):
     nav_pref_modal_html = f"""
     <div id="nav-pref-overlay" class="no-photo-confirm-overlay" hidden
          onclick="document.getElementById('nav-pref-overlay').hidden=true;document.getElementById('nav-pref-modal').hidden=true;"></div>
-    <div id="nav-pref-modal" class="no-photo-confirm-modal" hidden style="text-align:left;">
-        <div class="no-photo-confirm-title" style="margin-bottom:14px;">&#9881; Navigation App</div>
+    <div id="nav-pref-modal" class="no-photo-confirm-modal haul-dropdown" hidden style="text-align:left;max-width:420px;">
+        <div class="haul-dropdown-title">&#9881; Navigation App</div>
         <form method="POST" action="{url_for('set_nav_preference', user_id=session['user_id'])}">
             <input type="hidden" name="next" value="{e(request.path)}">
-            <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:16px;">
+            <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:14px;">
                 {_nav_pref_options}
             </div>
-            <button type="submit" class="btn orange" style="width:100%;min-height:48px;">Save</button>
+            <button type="submit" class="haul-dropdown-item" style="justify-content:center;background:rgba(255,107,26,.16) !important;border-color:rgba(255,107,26,.45) !important;"><span class="haul-di-text" style="text-align:center;color:#FF8C42;font-weight:800;">Save</span></button>
         </form>
 
-        <div class="no-photo-confirm-title" style="font-size:15px;margin:22px 0 8px;">&#128205; Location</div>
-        <div id="gps-status-line" class="no-photo-confirm-body" style="margin-bottom:12px;">
+        <div class="haul-dropdown-title" style="margin-top:18px;">&#128205; Location</div>
+        <div class="haul-di-sub" style="margin:0 12px 10px;">
             Used to record where containers are placed when you complete a stop.
         </div>
-        <button type="button" id="gps-enable-btn" class="btn secondary" style="width:100%;min-height:48px;">
-            Enable Location
+        <button type="button" id="gps-enable-btn" class="haul-dropdown-item" style="justify-content:center;">
+            <span class="haul-di-text" style="text-align:center;">Enable Location</span>
         </button>
 
-        <div class="no-photo-confirm-title" style="font-size:15px;margin:22px 0 8px;color:#f87171;">Delete Account</div>
-        <div class="no-photo-confirm-body" style="margin-bottom:12px;">
+        <div class="haul-dropdown-title" style="margin-top:18px;color:#f87171;">Delete Account</div>
+        <div class="haul-di-sub" style="margin:0 12px 10px;">
             Review what will be removed, then re-enter your password to continue.
         </div>
-        <a href="{url_for('delete_own_account')}" class="btn" style="display:block;text-align:center;
-                width:100%;min-height:48px;background:#f8717122;color:#f87171;border:1px solid #f8717155;">
-            Review Account Deletion
+        <a href="{url_for('delete_own_account')}" class="haul-dropdown-item danger" style="text-decoration:none;justify-content:center;">
+            <span class="haul-di-text" style="text-align:center;">Review Account Deletion</span>
         </a>
     </div>
     """
@@ -16152,6 +16152,44 @@ def driver_route_detail(route_id):
       font-weight: 800; font-size: 0.9rem; color: #fff;
       padding: 4px 8px 10px; letter-spacing: 0.5px;
   }}
+  /* 2026-10-10: UNIFIED dropdown design — one language for Rearrange, More,
+     and settings. Same container, same rows, same type. No more "different pages". */
+  .haul-dropdown {{
+      background: #1A1A1E; border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 14px; padding: 8px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+  }}
+  .haul-dropdown-title {{
+      font-weight: 800; font-size: 0.95rem; color: #fff; letter-spacing: 0.3px;
+      padding: 8px 12px 10px; display: flex; align-items: center; gap: 8px;
+  }}
+  .haul-dropdown-item {{
+      display: flex; align-items: center; gap: 12px; width: 100%;
+      min-height: 54px; padding: 10px 14px; margin: 0;
+      background: rgba(255,255,255,0.04) !important;
+      border: 1px solid rgba(255,255,255,0.08) !important;
+      border-radius: 10px !important; color: #fff !important;
+      font-size: 1rem !important; font-weight: 600 !important;
+      text-align: left !important; cursor: pointer;
+      box-shadow: none !important;
+  }}
+  .haul-dropdown-item + .haul-dropdown-item {{ margin-top: 6px; }}
+  .haul-dropdown-item:active {{ background: rgba(255,255,255,0.09) !important; }}
+  .haul-dropdown-item.danger {{ color: #FF7A7A !important; border-color: rgba(255,82,82,0.30) !important; }}
+  .haul-dropdown-item .haul-di-icon {{ font-size: 1.2rem; flex-shrink: 0; width: 28px; text-align: center; }}
+  .haul-dropdown-item .haul-di-text {{ flex: 1; min-width: 0; }}
+  .haul-dropdown-item .haul-di-sub {{ font-size: 0.82rem; color: rgba(255,255,255,0.55); font-weight: 400; margin-top: 2px; }}
+  /* reorder arrows: quiet icon buttons, not orange squares */
+  .haul-ro-arrow {{
+      background: rgba(255,255,255,0.06) !important; border: 1px solid rgba(255,255,255,0.12) !important;
+      border-radius: 8px !important; color: #fff !important;
+      width: 40px !important; height: 40px !important; min-height: 0 !important;
+      font-size: 1.1rem !important; cursor: pointer; padding: 0 !important;
+      box-shadow: none !important; flex-shrink: 0;
+  }}
+  .haul-ro-arrow:active {{ background: rgba(255,255,255,0.12) !important; }}
+  .cab-ro-row .haul-di-text {{ min-width: 0; }}
+  .cab-ro-name {{ font-weight: 700; font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
   /* 2026-10-10: un-arrive is a subtle undo, not a CTA */
   .cab-unarrive-mini {{
       background: transparent !important; border: 1px solid rgba(255,255,255,0.14) !important;
@@ -16290,15 +16328,15 @@ def driver_route_detail(route_id):
         </span>
     </div>
     <!-- Dropdowns anchored to the top bar -->
-    <div id="cab-reorder-dropdown" class="cab-topbar-dropdown" hidden>
-        <div class="cab-topbar-dropdown-title">&#8645; Rearrange route</div>
+    <div id="cab-reorder-dropdown" class="cab-topbar-dropdown haul-dropdown" hidden>
+        <div class="haul-dropdown-title">&#8645; Rearrange route</div>
         {_reorder_list_html}
     </div>
-    <div id="cab-more-dropdown" class="cab-topbar-dropdown" hidden>
-        <button type="button" class="cab-more-item" onclick="openTruckIssue()">&#9888; Truck Issue</button>
-        <button type="button" class="cab-more-item" onclick="openVendorGo()">&#128666; Headed to Vendor</button>
-        {f'<button type="button" class="cab-more-item" onclick="cabBlocked({s["id"]})">&#128683; Can&#39;t Get In</button>' if not s["blocked_at"] else f'<button type="button" class="cab-more-item" onclick="cabUnblock({s["id"]})">&#9989; I&#39;m In — Clear</button>'}
-        <button type="button" class="cab-more-item cab-more-danger" id="cab-cancel-btn">&#10005; Can't run this</button>
+    <div id="cab-more-dropdown" class="cab-topbar-dropdown haul-dropdown" hidden>
+        <button type="button" class="haul-dropdown-item" onclick="openTruckIssue()"><span class="haul-di-icon">&#9888;</span><span class="haul-di-text">Truck Issue</span></button>
+        <button type="button" class="haul-dropdown-item" onclick="openVendorGo()"><span class="haul-di-icon">&#128666;</span><span class="haul-di-text">Headed to Vendor</span></button>
+        {f'<button type="button" class="haul-dropdown-item" onclick="cabBlocked({s["id"]})"><span class="haul-di-icon">&#128683;</span><span class="haul-di-text">Can&#39;t Get In</span></button>' if not s["blocked_at"] else f'<button type="button" class="haul-dropdown-item" onclick="cabUnblock({s["id"]})"><span class="haul-di-icon">&#9989;</span><span class="haul-di-text">I&#39;m In — Clear</span></button>'}
+        <button type="button" class="haul-dropdown-item danger" id="cab-cancel-btn"><span class="haul-di-icon">&#10005;</span><span class="haul-di-text">Can&#39;t run this</span></button>
     </div>
     {nav_pref_modal_html}
     {urgent_banner_html}
