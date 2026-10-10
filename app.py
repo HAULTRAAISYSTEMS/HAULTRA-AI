@@ -11143,9 +11143,36 @@ def _anonymize_user_account(conn, user, company):
 @app.route("/account/settings")
 @login_required
 def account_settings():
+    _nav_pref = (session.get("nav_preference") or "").strip()
+    _nav_opts = "".join(
+        f'<label class="haul-dropdown-item" style="cursor:pointer;margin-bottom:6px;">'
+        f'<input type="radio" name="nav_preference" value="{val}" {"checked" if _nav_pref == val else ""} '
+        f'style="width:20px;height:20px;accent-color:#FF6B1A;flex-shrink:0;">'
+        f'<span class="haul-di-text">{label}</span></label>'
+        for val, label in [
+            ("", "Default (current behavior)"), ("google", "Google Maps"), ("apple", "Apple Maps"),
+            ("waze", "Waze"), ("device_default", "Device Default"),
+        ]
+    )
     body = f"""
     <div class="hero"><h1>Account Settings</h1>
         <p>Manage your personal HAULTRA login.</p></div>
+    <div class="card">
+        <h2>&#9881; Navigation App</h2>
+        <p class="muted small">Which maps app opens when you tap Navigate.</p>
+        <form method="POST" action="{url_for('set_nav_preference', user_id=session['user_id'])}">
+            <input type="hidden" name="next" value="{url_for('account_settings')}">
+            {_nav_opts}
+            <button type="submit" class="haul-dropdown-item" style="justify-content:center;background:rgba(255,107,26,.16) !important;border-color:rgba(255,107,26,.45) !important;margin-top:8px;"><span class="haul-di-text" style="text-align:center;color:#FF8C42;font-weight:800;">Save</span></button>
+        </form>
+    </div>
+    <div class="card">
+        <h2>&#128205; Location</h2>
+        <p class="muted small">Used to record where containers are placed when you complete a stop.</p>
+        <button type="button" id="gps-enable-btn" class="haul-dropdown-item" style="justify-content:center;">
+            <span class="haul-di-text" style="text-align:center;">Enable Location</span>
+        </button>
+    </div>
     <div class="card" id="delete-account">
         <h2>Delete Account</h2>
         <p class="muted small">Review exactly what is removed and retained before continuing.</p>
@@ -15237,22 +15264,6 @@ def driver_route_detail(route_id):
             </div>
             <button type="submit" class="haul-dropdown-item" style="justify-content:center;background:rgba(255,107,26,.16) !important;border-color:rgba(255,107,26,.45) !important;"><span class="haul-di-text" style="text-align:center;color:#FF8C42;font-weight:800;">Save</span></button>
         </form>
-
-        <div class="haul-dropdown-title" style="margin-top:18px;">&#128205; Location</div>
-        <div class="haul-di-sub" style="margin:0 12px 10px;">
-            Used to record where containers are placed when you complete a stop.
-        </div>
-        <button type="button" id="gps-enable-btn" class="haul-dropdown-item" style="justify-content:center;">
-            <span class="haul-di-text" style="text-align:center;">Enable Location</span>
-        </button>
-
-        <div class="haul-dropdown-title" style="margin-top:18px;color:#f87171;">Delete Account</div>
-        <div class="haul-di-sub" style="margin:0 12px 10px;">
-            Review what will be removed, then re-enter your password to continue.
-        </div>
-        <a href="{url_for('delete_own_account')}" class="haul-dropdown-item danger" style="text-decoration:none;justify-content:center;">
-            <span class="haul-di-text" style="text-align:center;">Review Account Deletion</span>
-        </a>
     </div>
     """
 
@@ -15402,6 +15413,7 @@ def driver_route_detail(route_id):
     #    go to dump / dump ticket / box in) — same _wf_map + same POST target
     #    as before, just rendered inside the new single-stop card. ──────────
     workflow_btn_html = ""
+    dump_ticket_html = ""
     if _chained:
         # First on-site step: the head has no incoming empty (just box out its
         # full); every other chain member arrives carrying an empty to set off.
@@ -15506,7 +15518,10 @@ def driver_route_detail(route_id):
         else:
             nav_html = (f'<div class="small muted" style="margin-bottom:10px;padding:8px;'
                         f'background:rgba(255,255,255,0.06);border-radius:8px;">Dump location not set for this stop.</div>')
-        workflow_btn_html = nav_html + dump_ticket_link
+        # 2026-10-10: ticket button sits directly under the dump site info,
+        # not buried below Message Boss.
+        workflow_btn_html = nav_html
+        dump_ticket_html = dump_ticket_link
 
     # -- Next-stop handoff --
     # After the driver taps a chained "Deliver Empty to ..." (or the chain-less
@@ -15891,6 +15906,9 @@ def driver_route_detail(route_id):
                 _persist_conn.close()
             except Exception:
                 pass
+        # 2026-10-10: picker UI removed — plan auto-maps from action.
+        # (The _pill_html/_picker_js generation below is dead; kept for reference
+        #  but empty_can_picker_html stays "".)
         # The selector governs a DIFFERENT can depending on context, so its title
         # and labels change to say which one:
         #  - a can carried on board from the previous stop → its fate here
@@ -15968,14 +15986,8 @@ def driver_route_detail(route_id):
 })();
 </script>
 """
-        empty_can_picker_html = (
-            f'<div class="cab-canplan-wrap" data-url="{_url}" data-csrf="{_csrf}" data-plan="{_cur_plan}">'
-            f'<div class="cab-canplan-lbl">{_cp_title}</div>'
-            f'<div class="cab-canplan-row">{_pill_html}</div>'
-            '<div class="cab-canplan-toast" role="status" hidden></div>'
-            '</div>'
-            + _picker_js
-        )
+        # 2026-10-10: picker HTML removed — empty_can_picker_html stays "".
+        # Plan auto-maps from action via _default_can_plan() above.
 
     # When a can is carried on board, the selector governs THAT can — so the
     # pulled can's fate (governed by the leg bar) is spelled out separately as a
@@ -16067,8 +16079,9 @@ def driver_route_detail(route_id):
             <button type="button" class="cab-navstrip-copy" id="cab-copy-btn" onclick="{_copy_onclick}"{_copy_dis}>&#128203;</button>
         </div>
         {_noaddr_html}
-        <!-- 2026-10-10: 'Not here yet' is an undo — small back button, not a full-width CTA -->
-        <form method="POST" action="{_arrive_action}" class="inline" style="margin:6px 0 0;">
+        {dump_ticket_html}
+        <!-- 2026-10-10: 'Not here yet' is an undo — small back button, top-right of card -->
+        <form method="POST" action="{_arrive_action}" class="inline" style="margin:0;padding:0;">
             <input type="hidden" name="_csrf_token" value="{_csrf}">
             <input type="hidden" name="action" value="unarrive">
             <button type="submit" class="cab-unarrive-mini" title="Undo arrival">&#8592;</button>
@@ -16190,13 +16203,15 @@ def driver_route_detail(route_id):
   .haul-ro-arrow:active {{ background: rgba(255,255,255,0.12) !important; }}
   .cab-ro-row .haul-di-text {{ min-width: 0; }}
   .cab-ro-name {{ font-weight: 700; font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-  /* 2026-10-10: un-arrive is a subtle undo, not a CTA */
+  /* 2026-10-10: un-arrive is a subtle undo, not a CTA — top-right of card */
+  .cab-card {{ position: relative; }}
   .cab-unarrive-mini {{
+      position: absolute !important; top: 12px !important; right: 12px !important;
       background: transparent !important; border: 1px solid rgba(255,255,255,0.14) !important;
       border-radius: 8px !important; color: rgba(255,255,255,0.6) !important;
       width: 36px !important; height: 36px !important; min-height: 0 !important;
       font-size: 1.1rem !important; cursor: pointer; padding: 0 !important;
-      box-shadow: none !important;
+      box-shadow: none !important; margin: 0 !important;
   }}
   .cab-unarrive-mini:active {{ background: rgba(255,255,255,0.08) !important; }}
 
