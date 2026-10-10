@@ -14544,6 +14544,11 @@ _GARBAGE_CAB_CSS = """
 .g-up-addr{color:var(--text-muted);font-size:.82rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .g-done-wrap{text-align:center;padding:40px 20px;}
 .g-done-icon{font-size:48px;margin-bottom:14px;}
+.cab-neutral{display:flex;align-items:center;justify-content:center;width:100%;
+  min-height:52px;margin-top:8px;padding:0 16px;border:1px solid #2A2A2A;
+  border-radius:12px;background:#161616;color:#F5F5F0;
+  font-size:1rem;font-weight:700;text-decoration:none;box-shadow:none;cursor:pointer;}
+.cab-neutral:active{background:#1c1c1c;}
 """
 
 
