@@ -88,25 +88,6 @@
 /* AI-touched elements — teal is reserved for these */
 .haultra-ai-accent { color: var(--teal); }
 
-/* ── Sidebar/nav: the AI Parser link is the one nav item allowed to be teal ── */
-.nav-item[href="/parser"] {
-  color: var(--teal);
-}
-.nav-item[href="/parser"]:hover {
-  background: var(--teal-dim);
-  border-color: var(--teal-border);
-  color: var(--teal);
-}
-.nav-item[href="/parser"].active {
-  background: var(--teal-dim);
-  border-color: var(--teal-border);
-  color: var(--teal);
-}
-.nav-item[href="/parser"].active::before {
-  background: var(--teal);
-  box-shadow: 0 0 8px var(--teal);
-}
-
 /* ── Action badge palette — solid fill + near-black ink, applied wherever a
    stop badge renders (.action-badge / .cab-action-badge / .stop-mini-badge /
    .qa-badge). One color per action so the mapping is learnable. ── */
