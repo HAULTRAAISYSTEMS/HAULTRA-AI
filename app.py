@@ -20600,16 +20600,30 @@ def stop_driver_action(stop_id):
             _has_photo = bool(load_stop_photos(conn, [stop_id]).get(stop_id))
             if not (_pmode == "required" and not _has_photo):
                 _handoff_stop_id = _deliver_handoff_dest_id(conn, stop, route_id)
-                conn.execute(
-                    "UPDATE stops SET status='completed', completed_at=?, "
-                    "driver_status='completed', driver_status_before_complete=? "
-                    "WHERE id=?",
-                    (ts, current_status, stop_id))
-                update_container_flow(conn, stop_id)
-                # Re-mirror onto a linked customer request now that the stop
-                # reads completed (idempotent; no-op for normal stops).
-                cascade_request_from_stop(conn, stop_id)
-                _auto_completed = True
+                # 2026-10-10: Don't auto-complete if the empty is going to a
+                # DIFFERENT stop. The driver still has to drive there and place
+                # it — tapping "Return Empty to X" is not the same as done.
+                # Only auto-complete when the empty stays here (dest is None
+                # or the current stop).
+                if _handoff_stop_id and _handoff_stop_id != stop_id:
+                    # Driver needs to drive to the dest — don't complete yet.
+                    # Clear the handoff so we don't redirect away; the driver
+                    # stays on this stop until they tap Complete Stop.
+                    _handoff_stop_id = None
+                    # Just update driver_status to box_in (empty on truck).
+                    # (Already done by the earlier UPDATE at line 20570.)
+                    pass
+                else:
+                    conn.execute(
+                        "UPDATE stops SET status='completed', completed_at=?, "
+                        "driver_status='completed', driver_status_before_complete=? "
+                        "WHERE id=?",
+                        (ts, current_status, stop_id))
+                    update_container_flow(conn, stop_id)
+                    # Re-mirror onto a linked customer request now that the stop
+                    # reads completed (idempotent; no-op for normal stops).
+                    cascade_request_from_stop(conn, stop_id)
+                    _auto_completed = True
 
     # Confirmation flash for the auto-advance (skipped for sync replays —
     # those have no page load to show it on). Built before conn closes so
