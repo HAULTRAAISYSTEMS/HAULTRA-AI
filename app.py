@@ -16900,14 +16900,8 @@ def driver_route_detail(route_id):
 
         completeForm.addEventListener('submit', function(ev) {{
             ev.preventDefault();
-            // Encouraged mode + zero photos: nudge once, one tap through either way.
-            // Off mode never prompts; Required mode's button is disabled server-side
-            // until a photo exists, so this branch only ever applies to Encouraged.
-            if (!hasPhoto && photoMode === 'encouraged') {{
-                if (overlay) overlay.hidden = false;
-                if (modal) modal.hidden = false;
-                return;
-            }}
+            // 2026-10-10: Temporarily bypass the no-photo modal to unblock drivers.
+            // The modal was preventing completion when it shouldn't.
             submitComplete();
         }});
     }}
