@@ -4173,6 +4173,22 @@ def init_db():
     safe_add_column(conn, "stops", "departed_at TEXT")
     safe_add_column(conn, "stops", "weight_tons REAL")
     safe_add_column(conn, "stops", "not_before TEXT")
+    # Garbage route templates (2026-10-10): saved stop lists the boss reuses
+    # instead of retyping every week. stops_json = [{service_type, address,
+    # city, notes, not_before}].
+    conn.execute("""CREATE TABLE IF NOT EXISTS garbage_templates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        driver_id INTEGER,
+        stops_json TEXT NOT NULL DEFAULT '[]',
+        created_by INTEGER,
+        created_at TEXT NOT NULL,
+        last_used_at TEXT,
+        use_count INTEGER NOT NULL DEFAULT 0
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_garbage_templates_co "
+                 "ON garbage_templates(company_id)")
 
     safe_add_column(conn, "bins", "label TEXT")
     safe_add_column(conn, "bins", "drop_photo_path TEXT")
@@ -35545,6 +35561,164 @@ def garbage_scan_sheet():
     return jsonify({"success": True, "stops": clean, "count": len(clean)})
 
 
+def _clean_garbage_stops(stops):
+    """Validate/normalize a list of garbage stop dicts for templates/dispatch."""
+    clean = []
+    for s in stops or []:
+        st = str(s.get("service_type") or "").strip().lower()
+        addr = str(s.get("address") or "").strip()
+        if st not in ("toter", "hpu", "landfill") or not addr:
+            continue
+        clean.append({
+            "service_type": st,
+            "address": addr[:200],
+            "city": str(s.get("city") or "").strip()[:60],
+            "notes": str(s.get("notes") or "").strip()[:300],
+            "not_before": str(s.get("not_before") or "").strip()[:20],
+        })
+    return clean
+
+
+@app.route("/api/garbage/templates", methods=["GET"])
+@roles_required("dispatcher", api=True)
+def garbage_templates_list():
+    """Saved garbage route templates for this company."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT gt.id, gt.name, gt.driver_id, gt.stops_json, gt.use_count, gt.last_used_at,"
+        " u.username AS driver_username, u.full_name AS driver_full_name"
+        " FROM garbage_templates gt LEFT JOIN users u ON gt.driver_id = u.id"
+        " WHERE gt.company_id = ? ORDER BY gt.use_count DESC, gt.id DESC",
+        (cid(),)).fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        try:
+            stops = json.loads(r["stops_json"] or "[]")
+        except (ValueError, TypeError):
+            stops = []
+        out.append({
+            "id": r["id"], "name": r["name"],
+            "driver_id": r["driver_id"],
+            "driver": r["driver_full_name"] or r["driver_username"] or "",
+            "stop_count": len(stops), "stops": stops,
+            "use_count": r["use_count"], "last_used_at": r["last_used_at"],
+        })
+    return jsonify({"templates": out})
+
+
+@app.route("/api/garbage/templates", methods=["POST"])
+@roles_required("dispatcher", api=True)
+def garbage_templates_save():
+    """Save the current stop list as a named template."""
+    data = request.get_json(force=True, silent=True) or {}
+    name = str(data.get("name") or "").strip()[:80]
+    stops = _clean_garbage_stops(data.get("stops"))
+    if not name:
+        return jsonify({"error": "give the route a name first"}), 400
+    if not stops:
+        return jsonify({"error": "add at least one stop first"}), 400
+    driver_id = data.get("driver_id")
+    try:
+        driver_id = int(driver_id) if driver_id else None
+    except (ValueError, TypeError):
+        driver_id = None
+    conn = get_db()
+    cur = conn.execute(
+        "INSERT INTO garbage_templates (company_id, name, driver_id, stops_json,"
+        " created_by, created_at) VALUES (?,?,?,?,?,?)",
+        (cid(), name, driver_id, json.dumps(stops),
+         get_current_user()["id"], now_ts()))
+    tid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "id": tid, "stop_count": len(stops)})
+
+
+@app.route("/api/garbage/templates/<int:tid>", methods=["DELETE"])
+@roles_required("dispatcher", api=True)
+def garbage_templates_delete(tid):
+    conn = get_db()
+    cur = conn.execute("DELETE FROM garbage_templates WHERE id=? AND company_id=?",
+                       (tid, cid()))
+    conn.commit()
+    conn.close()
+    if cur.rowcount:
+        return jsonify({"success": True})
+    return jsonify({"error": "not found"}), 404
+
+
+@app.route("/api/garbage/templates/<int:tid>/dispatch", methods=["POST"])
+@roles_required("dispatcher", api=True)
+def garbage_templates_dispatch(tid):
+    """One-tap dispatch from a template: creates today's (or given date)
+    garbage route for the template's driver (or an override)."""
+    data = request.get_json(force=True, silent=True) or {}
+    conn = get_db()
+    t = conn.execute("SELECT * FROM garbage_templates WHERE id=? AND company_id=?",
+                     (tid, cid())).fetchone()
+    if not t:
+        conn.close()
+        return jsonify({"error": "template not found"}), 404
+    try:
+        stops = json.loads(t["stops_json"] or "[]")
+    except (ValueError, TypeError):
+        stops = []
+    stops = _clean_garbage_stops(stops)
+    if not stops:
+        conn.close()
+        return jsonify({"error": "template has no stops"}), 400
+    driver_id = data.get("driver_id") or t["driver_id"]
+    try:
+        driver_id = int(driver_id)
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify({"error": "pick a driver"}), 400
+    route_date = str(data.get("route_date") or today_str())
+    drv = conn.execute("SELECT id, username, full_name FROM users WHERE id=? AND company_id=?",
+                       (driver_id, cid())).fetchone()
+    if not drv:
+        conn.close()
+        return jsonify({"error": "driver not found"}), 400
+    cur = conn.execute(
+        "INSERT INTO routes (company_id, route_date, route_name, assigned_to,"
+        " created_by, status, route_type, created_at) VALUES (?,?,?,?,?,'in_progress','garbage',?)",
+        (cid(), route_date, f"{drv['full_name'] or drv['username']} — {route_date}",
+         driver_id, get_current_user()["id"], now_ts()))
+    rid = cur.lastrowid
+    for i, s in enumerate(stops, start=1):
+        action = {"toter": "Toter", "hpu": "Hand Pickup", "landfill": "Landfill"}[s["service_type"]]
+        conn.execute(
+            "INSERT INTO stops (route_id, stop_order, customer_name, address, city, action,"
+            " notes, not_before, status, driver_status, created_at)"
+            " VALUES (?,?,?, ?,?,?,?,?, 'open','pending',?)",
+            (rid, i, "", s["address"], s["city"], action,
+             s["notes"], s["not_before"], now_ts()))
+    conn.execute("UPDATE garbage_templates SET use_count = use_count + 1,"
+                 " last_used_at = ? WHERE id = ?", (now_ts(), tid))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "route_id": rid, "stop_count": len(stops),
+                    "driver": drv["full_name"] or drv["username"]})
+
+
+@app.route("/api/garbage/recent", methods=["GET"])
+@roles_required("dispatcher", api=True)
+def garbage_recent_routes():
+    """Last few garbage dispatches — one-tap 'run it again'."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT r.id, r.route_date, r.route_name, r.assigned_to,"
+        " u.full_name AS driver_full_name, u.username AS driver_username,"
+        " (SELECT COUNT(*) FROM stops s WHERE s.route_id = r.id) AS stop_count"
+        " FROM routes r LEFT JOIN users u ON r.assigned_to = u.id"
+        " WHERE r.company_id = ? AND COALESCE(r.route_type,'rolloff') = 'garbage'"
+        " ORDER BY r.route_date DESC, r.id DESC LIMIT 5",
+        (cid(),)).fetchall()
+    conn.close()
+    return jsonify({"recent": [dict(r) for r in rows]})
+
+
 @app.route('/garbage-dispatch')
 @roles_required("dispatcher")
 def garbage_dispatch_view():
@@ -35575,123 +35749,392 @@ def garbage_dispatch_view():
         for d in drivers)
     mode_note = ("Appending to the existing garbage route — new stops go at the end."
                  if append_route_id else "")
-    return f"""<!doctype html><html><head><meta charset="utf-8">
+    mode_note = ("Appending to the existing garbage route — new stops go at the end."
+                 if append_route_id else "")
+    page = r"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Garbage Dispatch — HAULTRA</title>
 <style>
-body{{background:#101010;color:#F5F5F0;font-family:system-ui,sans-serif;margin:0;padding:16px;}}
-.wrap{{max-width:640px;margin:0 auto;}}
-h1{{font-size:1.4rem;}}
-.lbl{{display:block;margin:14px 0 6px;font-weight:700;font-size:.85rem;color:#A6A69E;}}
-.mode{{color:#8FB8FF;font-size:.85rem;margin-top:8px;}}
-select,input,textarea{{width:100%;box-sizing:border-box;background:#1c1c1c;border:1px solid #333;
-  color:#F5F5F0;border-radius:10px;padding:12px;font-size:16px;}}
-textarea{{min-height:220px;font-family:monospace;}}
-.hint{{color:#A6A69E;font-size:.82rem;margin-top:6px;}}
-button.go{{width:100%;margin-top:16px;min-height:56px;border:none;border-radius:12px;font-size:17px;
-  font-weight:800;background:linear-gradient(135deg,#3DDC84,#22B368);color:#06170D;cursor:pointer;}}
-#status{{margin-top:12px;text-align:center;min-height:24px;}}
-.ex{{background:#1c1c1c;border:1px solid #333;border-radius:10px;padding:10px;margin-top:8px;
-  font-family:monospace;font-size:.82rem;color:#A6A69E;white-space:pre-wrap;}}
-</style></head><body><div class="wrap">
-<h1>&#128666; Garbage Dispatch</h1>
-<div class="mode">{mode_note}</div>
-<label class="lbl">Driver</label>
-<select id="gd-driver"><option value="">— pick a driver —</option>{opts}</select>
-<label class="lbl">Date</label>
-<input id="gd-date" type="date" value="{today_str()}">
-<label class="lbl">Stops — one per line</label>
-<button type="button" id="gd-scan-btn" onclick="document.getElementById('gd-photo').click()"
-  style="width:100%;min-height:52px;margin-bottom:10px;border-radius:12px;cursor:pointer;
-  background:rgba(66,135,245,.12);border:1px solid rgba(66,135,245,.5);color:#8FB8FF;
-  font-weight:800;font-size:16px;">&#128247; Scan a paper route sheet</button>
-<input id="gd-photo" type="file" accept="image/*" capture="environment" hidden onchange="gdScan(this)">
-<textarea id="gd-lines" placeholder="toter 2545 Squadron Ct, VB&#10;hpu 800 Gas Light Ln, VB !7am&#10;landfill GFL Transfer, Chesapeake"></textarea>
-<div class="hint">Format: <b>toter</b> | <b>hpu</b> | <b>landfill</b> &nbsp;address, city &nbsp;optional <b>!7am</b> = not before, <b>#note</b></div>
-<div class="ex">toter 2545 Squadron Ct, VB&#10;toter 227 Mediterranean Ave, VB&#10;hpu 800 Gas Light Ln, VB !7am #132 units&#10;landfill GFL Transfer, Chesapeake</div>
-<button class="go" onclick="gdSend()">Dispatch Route</button>
-<div id="status"></div>
+:root{--bg:#0B0B0D;--card:#141417;--card2:#1A1A1F;--line:rgba(255,255,255,.08);
+--text:#F5F5F0;--muted:#A6A69E;--orange:#FF6B1A;--orange2:#FF8A3D;
+--blue:#8FB8FF;--purple:#CFA8FF;--amber:#FFB74D;--green:#3DDC84;--red:#FF6B6B;}
+*{box-sizing:border-box;}
+body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif;margin:0;padding:0 0 40px;}
+.topbar{position:sticky;top:0;z-index:10;background:rgba(11,11,13,.92);backdrop-filter:blur(8px);
+border-bottom:1px solid var(--line);padding:12px 16px;display:flex;align-items:center;gap:12px;}
+.backbtn{display:inline-flex;align-items:center;gap:6px;min-height:44px;padding:0 16px;border-radius:12px;
+border:1px solid var(--line);background:var(--card);color:var(--text);font-size:15px;font-weight:700;
+text-decoration:none;}
+.backbtn:active{background:#222;}
+.toptitle{font-size:18px;font-weight:800;flex:1;}
+.wrap{max-width:680px;margin:0 auto;padding:16px;}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;margin-bottom:14px;}
+.card h2{font-size:13px;font-weight:800;letter-spacing:1px;color:var(--muted);margin:0 0 12px;text-transform:uppercase;}
+.scanbtn{display:flex;align-items:center;gap:14px;width:100%;min-height:76px;border-radius:14px;border:1px dashed rgba(255,138,61,.5);
+background:linear-gradient(135deg,rgba(255,107,26,.12),rgba(255,138,61,.04));color:var(--text);font-size:16px;font-weight:700;cursor:pointer;padding:12px 16px;}
+.scanbtn .em{font-size:32px;}
+.scanbtn small{display:block;font-weight:400;color:var(--muted);font-size:13px;margin-top:2px;}
+.scanbtn:active{transform:scale(.99);}
+.row2{display:flex;gap:10px;}
+.field{flex:1;min-width:0;}
+.lbl{display:block;margin:0 0 6px;font-weight:700;font-size:12px;letter-spacing:.6px;color:var(--muted);text-transform:uppercase;}
+select,input[type=date],input[type=text]{width:100%;min-height:52px;border-radius:12px;font-size:16px;color:var(--text);
+background:var(--card2);border:1px solid var(--line);padding:0 14px;}
+select{appearance:none;}
+textarea{width:100%;min-height:170px;border-radius:12px;font-size:15px;line-height:1.5;color:var(--text);
+background:var(--card2);border:1px solid var(--line);padding:12px 14px;font-family:ui-monospace,monospace;resize:vertical;}
+textarea:focus{outline:none;border-color:var(--orange);}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;}
+.chip{min-height:40px;padding:0 14px;border-radius:999px;border:1px solid var(--line);background:var(--card2);
+color:var(--text);font-size:14px;font-weight:600;cursor:pointer;}
+.chip.on{border-color:var(--orange);color:var(--orange2);background:rgba(255,107,26,.1);}
+.hint{color:var(--muted);font-size:13px;margin-top:8px;line-height:1.5;}
+.hint code{color:var(--blue);font-size:12px;}
+.preview{margin-top:12px;display:flex;flex-direction:column;gap:8px;}
+.pv{display:flex;align-items:center;gap:10px;background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:10px 12px;}
+.pv.bad{border-color:rgba(255,107,107,.5);}
+.pv .n{font-weight:800;color:var(--muted);min-width:24px;font-size:13px;}
+.badge{display:inline-flex;align-items:center;justify-content:center;min-width:34px;height:26px;padding:0 8px;border-radius:8px;
+font-size:12px;font-weight:800;letter-spacing:.5px;}
+.b-t{background:rgba(66,135,245,.18);border:1px solid rgba(66,135,245,.5);color:var(--blue);}
+.b-h{background:rgba(178,102,255,.16);border:1px solid rgba(178,102,255,.5);color:var(--purple);}
+.b-l{background:rgba(255,171,64,.14);border:1px solid rgba(255,171,64,.5);color:var(--amber);}
+.pv .a{flex:1;min-width:0;font-size:14px;}
+.pv .a small{display:block;color:var(--muted);font-size:12px;}
+.pv .nb{font-size:11px;font-weight:800;color:var(--amber);white-space:nowrap;}
+.pv .err{color:var(--red);font-size:13px;flex:1;}
+.pv .ok{color:var(--green);font-size:16px;}
+.summary{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;}
+.sum{font-size:13px;font-weight:700;padding:6px 12px;border-radius:999px;background:rgba(255,255,255,.05);border:1px solid var(--line);}
+.btn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;min-height:60px;border:none;border-radius:14px;
+font-size:18px;font-weight:800;cursor:pointer;margin-top:10px;}
+.btn-go{background:linear-gradient(135deg,var(--orange),var(--orange2));color:#1a0d02;box-shadow:0 4px 20px rgba(255,107,26,.35);}
+.btn-go:active{transform:scale(.99);}
+.btn-save{background:var(--card2);border:1px solid var(--line);color:var(--text);min-height:52px;font-size:15px;}
+.btn-save:active{background:#222;}
+.status{min-height:24px;margin-top:10px;font-size:14px;color:var(--muted);text-align:center;}
+.status.ok{color:var(--green);}
+.tcard{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:10px;}
+.tcard .t{font-weight:800;font-size:15px;}
+.tcard .m{color:var(--muted);font-size:13px;margin-top:4px;}
+.tcard .row{display:flex;gap:8px;margin-top:10px;}
+.tbtn{flex:1;min-height:44px;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;border:1px solid var(--line);}
+.t-use{background:rgba(255,107,26,.14);border-color:rgba(255,107,26,.5);color:var(--orange2);}
+.t-quick{background:rgba(61,220,132,.1);border-color:rgba(61,220,132,.4);color:var(--green);}
+.t-del{background:transparent;color:var(--muted);flex:0 0 44px;}
+.empty{color:var(--muted);font-size:14px;text-align:center;padding:18px 0;}
+.mode{color:var(--blue);font-size:13px;margin-bottom:12px;}
+#scan-file{display:none;}
+.spin{display:inline-block;width:18px;height:18px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:sp 1s linear infinite;}
+@keyframes sp{to{transform:rotate(360deg);}}
+</style></head><body>
+<div class="topbar">
+  <a class="backbtn" href="/routes">&#8592; Board</a>
+  <div class="toptitle">&#128666; Garbage Dispatch</div>
 </div>
+<div class="wrap">
+  <div class="mode">__MODE__</div>
+
+  <div class="card">
+    <button class="scanbtn" id="scan-btn" type="button">
+      <span class="em">&#128247;</span>
+      <span>Scan a paper route sheet<small>Snap the daily log — stops fill in automatically</small></span>
+    </button>
+    <input type="file" id="scan-file" accept="image/*" capture="environment">
+    <div class="status" id="scan-status"></div>
+  </div>
+
+  <div class="card">
+    <h2>Route</h2>
+    <div class="row2">
+      <div class="field"><label class="lbl">Driver</label><select id="gd-driver"><option value="">— pick —</option>__OPTS__</select></div>
+      <div class="field"><label class="lbl">Date</label><input type="date" id="gd-date" value="__TODAY__"></div>
+    </div>
+    <div class="chips" id="day-chips"></div>
+  </div>
+
+  <div class="card">
+    <h2>Stops</h2>
+    <textarea id="gd-lines" placeholder="toter 2545 Squadron Ct, VB&#10;hpu 800 Gas Light Ln, VB !7am #132 units&#10;landfill GFL Transfer, Chesapeake"></textarea>
+    <div class="hint">One per line: <code>toter</code> · <code>hpu</code> · <code>landfill</code> &nbsp;+ address &nbsp;·&nbsp; <code>!7am</code> = not before &nbsp;·&nbsp; <code>#note</code></div>
+    <div class="summary" id="gd-summary"></div>
+    <div class="preview" id="gd-preview"></div>
+  </div>
+
+  <div class="card">
+    <button class="btn btn-go" id="gd-dispatch" type="button">&#128666; Dispatch Route</button>
+    <button class="btn btn-save" id="gd-save-tpl" type="button">&#128190; Save as reusable route</button>
+    <div class="status" id="status"></div>
+  </div>
+
+  <div class="card">
+    <h2>&#128190; Saved routes</h2>
+    <div id="tpl-list"><div class="empty">No saved routes yet — build one above, tap Save, and never retype it again.</div></div>
+  </div>
+
+  <div class="card">
+    <h2>&#128260; Recent dispatches</h2>
+    <div id="recent-list"><div class="empty">Nothing dispatched yet.</div></div>
+  </div>
+</div>
+
 <script>
-var GD_CSRF = {json.dumps(csrf)};
-function gdScan(input){{
-  var f = input.files && input.files[0];
-  var st = document.getElementById('status');
-  if(!f) return;
-  st.textContent = 'Reading the sheet…';
-  var img = new Image();
-  img.onload = function(){{
-    // Downscale so the upload stays fast on a weak signal (same trick as the driver photo flow).
-    var maxSide = 1600, w = img.width, h = img.height;
-    var scale = Math.min(1, maxSide / Math.max(w, h));
-    var cw = Math.round(w * scale), ch = Math.round(h * scale);
-    var c = document.createElement('canvas'); c.width = cw; c.height = ch;
-    c.getContext('2d').drawImage(img, 0, 0, cw, ch);
-    c.toBlob(function(blob){{
-      if(!blob){{ st.textContent = 'Could not read that photo.'; return; }}
-      var fd = new FormData(); fd.append('photo', blob, 'sheet.jpg');
-      fetch('/api/garbage/scan-sheet', {{method:'POST', credentials:'same-origin',
-        headers:{{'X-CSRF-Token': GD_CSRF}}, body: fd}})
-      .then(function(r){{ return r.json().then(function(j){{ return {{s:r.status, j:j}}; }}); }})
-      .then(function(x){{
-        if(x.s===200 && x.j.success){{
-          var lines = x.j.stops.map(function(s){{
-            var line = s.service_type + ' ' + s.address + (s.city ? ', ' + s.city : '');
-            if(s.not_before) line += ' !' + s.not_before;
-            if(s.notes) line += ' #' + s.notes;
-            return line;
-          }});
-          document.getElementById('gd-lines').value = lines.join('\\n');
-          st.textContent = '✓ Read ' + x.j.count + ' stops from the photo — review, edit if needed, then Dispatch.';
-        }} else st.textContent = (x.j && x.j.error) || 'Could not read the sheet.';
-      }}).catch(function(){{ st.textContent = 'Network error — try again.'; }});
-    }}, 'image/jpeg', 0.85);
-    URL.revokeObjectURL(img.src);
-  }};
-  img.onerror = function(){{ st.textContent = 'Could not read that photo.'; }};
-  img.src = URL.createObjectURL(f);
-  input.value = '';
-}}
-function gdSend(){{
-  var drv = document.getElementById('gd-driver').value;
-  var date = document.getElementById('gd-date').value;
-  var st = document.getElementById('status');
-  if(!drv){{ st.textContent = 'Pick a driver first.'; return; }}
-  var stops = [];
-  var lines = document.getElementById('gd-lines').value.split('\\n');
-  for(var i=0;i<lines.length;i++){{
+var GD_CSRF = "__CSRF__";
+var APPEND_RID = __APPENDRID__;
+
+function parseLine(line){
+  var m = line.match(/^(toter|hpu|landfill)\s+(.+)$/i);
+  if(!m) return {error: line ? 'start with toter, hpu, or landfill' : 'empty line'};
+  var rest = m[2], note='', not_before='';
+  var hm = rest.match(/#(.*)$/); if(hm){ note = hm[1].trim(); rest = rest.slice(0, hm.index).trim(); }
+  var tm = rest.match(/!(\S+)\s*$/); if(tm){ not_before = tm[1].trim(); rest = rest.slice(0, tm.index).trim(); }
+  var addr = rest, city = '';
+  var ci = rest.lastIndexOf(',');
+  if(ci > 0){ addr = rest.slice(0, ci).trim(); city = rest.slice(ci+1).trim(); }
+  if(!addr) return {error: 'missing address'};
+  return {service_type: m[1].toLowerCase(), address: addr, city: city, notes: note, not_before: not_before};
+}
+function badgeFor(st){
+  if(st==='toter') return '<span class="badge b-t">T</span>';
+  if(st==='hpu') return '<span class="badge b-h">HPU</span>';
+  return '<span class="badge b-l">L</span>';
+}
+function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function renderPreview(){
+  var lines = document.getElementById('gd-lines').value.split('\n');
+  var pv = document.getElementById('gd-preview'), sum = document.getElementById('gd-summary');
+  var html = '', counts = {toter:0, hpu:0, landfill:0}, n = 0, bad = 0;
+  for(var i=0;i<lines.length;i++){
     var line = lines[i].trim();
     if(!line) continue;
-    var m = line.match(/^(toter|hpu|landfill)\\s+(.+)$/i);
-    if(!m){{ st.textContent = 'Line '+(i+1)+': start with toter, hpu, or landfill.'; return; }}
-    var rest = m[2], note='', not_before='';
-    var hm = rest.match(/#(.*)$/); if(hm){{ note = hm[1].trim(); rest = rest.slice(0, hm.index).trim(); }}
-    var tm = rest.match(/!(\\S+)\\s*$/); if(tm){{ not_before = tm[1].trim(); rest = rest.slice(0, tm.index).trim(); }}
-    var addr = rest, city = '';
-    var ci = rest.lastIndexOf(',');
-    if(ci > 0){{ addr = rest.slice(0, ci).trim(); city = rest.slice(ci+1).trim(); }}
-    if(!addr){{ st.textContent = 'Line '+(i+1)+': missing address.'; return; }}
-    stops.push({{service_type: m[1].toLowerCase(), address: addr, city: city, notes: note, not_before: not_before}});
-  }}
-  if(!stops.length){{ st.textContent = 'Add at least one stop.'; return; }}
-  st.textContent = 'Dispatching…';
-  var APPEND_RID = {json.dumps(append_route_id)};
+    n++;
+    var p = parseLine(line);
+    if(p.error){
+      bad++;
+      html += '<div class="pv bad"><span class="n">'+n+'</span><span class="err">Line '+n+': '+esc(p.error)+'</span></div>';
+    } else {
+      counts[p.service_type]++;
+      var sub = esc(p.city) + (p.notes ? ' · '+esc(p.notes) : '');
+      html += '<div class="pv"><span class="n">'+n+'</span>'+badgeFor(p.service_type)+
+        '<span class="a">'+esc(p.address)+(sub?'<small>'+sub+'</small>':'')+'</span>'+
+        (p.not_before?'<span class="nb">!'+esc(p.not_before)+'</span>':'')+
+        '<span class="ok">&#10003;</span></div>';
+    }
+  }
+  pv.innerHTML = html;
+  var tot = counts.toter+counts.hpu+counts.landfill;
+  sum.innerHTML = tot
+    ? '<span class="sum">'+tot+' stops</span>'
+      +(counts.toter?'<span class="sum">'+counts.toter+' toter</span>':'')
+      +(counts.hpu?'<span class="sum">'+counts.hpu+' HPU</span>':'')
+      +(counts.landfill?'<span class="sum">'+counts.landfill+' landfill</span>':'')
+      +(bad?'<span class="sum" style="color:var(--red)">'+bad+' need fixing</span>':'')
+    : '';
+}
+document.getElementById('gd-lines').addEventListener('input', renderPreview);
+
+function collectStops(){
+  var lines = document.getElementById('gd-lines').value.split('\n');
+  var stops = [];
+  for(var i=0;i<lines.length;i++){
+    var line = lines[i].trim();
+    if(!line) continue;
+    var p = parseLine(line);
+    if(p.error) return {error: 'Line '+(i+1)+': '+p.error};
+    stops.push(p);
+  }
+  return {stops: stops};
+}
+
+function setStatus(msg, ok){
+  var st = document.getElementById('status');
+  st.textContent = msg;
+  st.className = 'status' + (ok ? ' ok' : '');
+}
+
+document.getElementById('gd-dispatch').addEventListener('click', function(){
+  var drv = document.getElementById('gd-driver').value;
+  var date = document.getElementById('gd-date').value;
+  if(!drv && !APPEND_RID){ setStatus('Pick a driver first.'); return; }
+  var c = collectStops();
+  if(c.error){ setStatus(c.error); return; }
+  if(!c.stops.length){ setStatus('Add at least one stop.'); return; }
+  setStatus('Dispatching…');
   var url = APPEND_RID ? '/api/route/' + APPEND_RID + '/insert-stops' : '/api/dispatch';
-  var payload = APPEND_RID ? {{stops: stops}}
-    : {{route_type:'garbage', driver_id: parseInt(drv,10), route_date: date, stops: stops}};
-  fetch(url, {{method:'POST', credentials:'same-origin',
-    headers:{{'Content-Type':'application/json','X-CSRF-Token':GD_CSRF}},
+  var payload = APPEND_RID ? {stops: c.stops}
+    : {route_type:'garbage', driver_id: parseInt(drv,10), route_date: date, stops: c.stops};
+  fetch(url, {method:'POST', credentials:'same-origin',
+    headers:{'Content-Type':'application/json','X-CSRF-Token':GD_CSRF},
     body: JSON.stringify(payload)
-  }}).then(function(r){{ return r.json().then(function(j){{ return {{s:r.status, j:j}}; }}); }})
-  .then(function(x){{
-    if(x.s===200 && x.j.success){{
-      st.textContent = APPEND_RID ? '✓ Added '+x.j.stop_count+' stops to the route.'
-        : '✓ Dispatched '+x.j.stop_count+' stops to '+x.j.driver+'.';
+  }).then(function(r){ return r.json().then(function(j){ return {s:r.status, j:j}; }); })
+  .then(function(x){
+    if(x.s===200 && x.j.success){
+      setStatus(APPEND_RID ? '✓ Added '+x.j.stop_count+' stops to the route.'
+        : '✓ Dispatched '+x.j.stop_count+' stops to '+x.j.driver+'.', true);
       document.getElementById('gd-lines').value='';
-    }} else st.textContent = (x.j && x.j.error) || 'Dispatch failed.';
-  }}).catch(function(){{ st.textContent = 'Network error.'; }});
-}}
+      renderPreview(); loadRecent();
+    } else setStatus((x.j && x.j.error) || 'Dispatch failed.');
+  }).catch(function(){ setStatus('Network error.'); });
+});
+
+document.getElementById('gd-save-tpl').addEventListener('click', function(){
+  var c = collectStops();
+  if(c.error){ setStatus(c.error); return; }
+  if(!c.stops.length){ setStatus('Add at least one stop first.'); return; }
+  var name = prompt('Name this route (e.g. "Friday — Michael"):');
+  if(!name) return;
+  fetch('/api/garbage/templates', {method:'POST', credentials:'same-origin',
+    headers:{'Content-Type':'application/json','X-CSRF-Token':GD_CSRF},
+    body: JSON.stringify({name: name, driver_id: document.getElementById('gd-driver').value || null, stops: c.stops})
+  }).then(function(r){ return r.json().then(function(j){ return {s:r.status, j:j}; }); })
+  .then(function(x){
+    if(x.s===200 && x.j.success){ setStatus('✓ Saved "'+name+'" — '+x.j.stop_count+' stops.', true); loadTemplates(); }
+    else setStatus((x.j && x.j.error) || 'Save failed.');
+  }).catch(function(){ setStatus('Network error.'); });
+});
+
+function stopToLine(s){
+  var line = s.service_type + ' ' + s.address + (s.city ? ', '+s.city : '');
+  if(s.not_before) line += ' !'+s.not_before;
+  if(s.notes) line += ' #'+s.notes;
+  return line;
+}
+function loadTemplates(){
+  fetch('/api/garbage/templates', {credentials:'same-origin'}).then(function(r){ return r.json(); })
+  .then(function(d){
+    var el = document.getElementById('tpl-list');
+    if(!d.templates || !d.templates.length){
+      el.innerHTML = '<div class="empty">No saved routes yet — build one above, tap Save, and never retype it again.</div>';
+      return;
+    }
+    el.innerHTML = d.templates.map(function(t){
+      return '<div class="tcard"><div class="t">'+esc(t.name)+'</div>'+
+        '<div class="m">'+t.stop_count+' stops'+(t.driver?' · '+esc(t.driver):'')+
+        (t.use_count?' · used '+t.use_count+'×':'')+'</div>'+
+        '<div class="row"><button class="tbtn t-use" data-use="'+t.id+'">Load</button>'+
+        '<button class="tbtn t-quick" data-quick="'+t.id+'">Dispatch now</button>'+
+        '<button class="tbtn t-del" data-del="'+t.id+'">&#128465;</button></div></div>';
+    }).join('');
+    el.querySelectorAll('[data-use]').forEach(function(b){
+      b.addEventListener('click', function(){
+        var t = d.templates.find(function(x){ return x.id == b.getAttribute('data-use'); });
+        document.getElementById('gd-lines').value = t.stops.map(stopToLine).join('\n');
+        if(t.driver_id) document.getElementById('gd-driver').value = t.driver_id;
+        renderPreview();
+        document.getElementById('gd-lines').scrollIntoView({behavior:'smooth', block:'center'});
+        setStatus('Loaded "'+t.name+'" — pick a date and hit Dispatch.', true);
+      });
+    });
+    el.querySelectorAll('[data-quick]').forEach(function(b){
+      b.addEventListener('click', function(){
+        var tid = b.getAttribute('data-quick');
+        var drv = document.getElementById('gd-driver').value;
+        var date = document.getElementById('gd-date').value;
+        if(!drv){ setStatus('Pick a driver first (top of page).'); return; }
+        if(!confirm('Dispatch this route for '+date+'?')) return;
+        fetch('/api/garbage/templates/'+tid+'/dispatch', {method:'POST', credentials:'same-origin',
+          headers:{'Content-Type':'application/json','X-CSRF-Token':GD_CSRF},
+          body: JSON.stringify({driver_id: parseInt(drv,10), route_date: date})
+        }).then(function(r){ return r.json().then(function(j){ return {s:r.status, j:j}; }); })
+        .then(function(x){
+          if(x.s===200 && x.j.success){ setStatus('✓ Dispatched '+x.j.stop_count+' stops to '+x.j.driver+'.', true); loadRecent(); loadTemplates(); }
+          else setStatus((x.j && x.j.error) || 'Dispatch failed.');
+        }).catch(function(){ setStatus('Network error.'); });
+      });
+    });
+    el.querySelectorAll('[data-del]').forEach(function(b){
+      b.addEventListener('click', function(){
+        if(!confirm('Delete this saved route?')) return;
+        fetch('/api/garbage/templates/'+b.getAttribute('data-del'), {method:'DELETE', credentials:'same-origin',
+          headers:{'Content-Type':'application/json','X-CSRF-Token':GD_CSRF}, body: '{}'})
+        .then(function(){ loadTemplates(); });
+      });
+    });
+  });
+}
+function loadRecent(){
+  fetch('/api/garbage/recent', {credentials:'same-origin'}).then(function(r){ return r.json(); })
+  .then(function(d){
+    var el = document.getElementById('recent-list');
+    if(!d.recent || !d.recent.length){ el.innerHTML = '<div class="empty">Nothing dispatched yet.</div>'; return; }
+    el.innerHTML = d.recent.map(function(r){
+      return '<div class="tcard"><div class="t">'+esc(r.route_date)+'</div>'+
+        '<div class="m">'+esc(r.driver_full_name||r.driver_username||'')+' · '+r.stop_count+' stops</div>'+
+        '<div class="row"><a class="tbtn t-use" style="display:flex;align-items:center;justify-content:center;text-decoration:none;" href="/route/'+r.id+'/report">View log</a></div></div>';
+    }).join('');
+  });
+}
+
+// Day quick chips
+(function(){
+  var wrap = document.getElementById('day-chips');
+  var dateEl = document.getElementById('gd-date');
+  function fmt(d){ return d.toISOString().slice(0,10); }
+  var today = new Date();
+  var chips = [{l:'Today', d:0}, {l:'Tomorrow', d:1}];
+  var names = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  for(var i=2;i<7;i++){ var dt = new Date(today); dt.setDate(dt.getDate()+i); chips.push({l:names[dt.getDay()], d:i}); }
+  chips.forEach(function(c){
+    var b = document.createElement('button');
+    b.type = 'button'; b.className = 'chip'; b.textContent = c.l;
+    b.addEventListener('click', function(){
+      var dt = new Date(today); dt.setDate(dt.getDate()+c.d);
+      dateEl.value = fmt(dt);
+      wrap.querySelectorAll('.chip').forEach(function(x){ x.classList.remove('on'); });
+      b.classList.add('on');
+    });
+    wrap.appendChild(b);
+  });
+})();
+
+// Scan
+(function(){
+  var file = document.getElementById('scan-file');
+  var btn = document.getElementById('scan-btn');
+  var st = document.getElementById('scan-status');
+  btn.addEventListener('click', function(){ file.click(); });
+  file.addEventListener('change', function(){
+    if(!file.files.length) return;
+    var img = file.files[0];
+    st.innerHTML = '<span class="spin"></span> Reading the sheet…';
+    var rdr = new FileReader();
+    rdr.onload = function(){
+      var im = new Image();
+      im.onload = function(){
+        var maxDim = 1600, w = im.width, h = im.height;
+        if(Math.max(w,h) > maxDim){ var k = maxDim/Math.max(w,h); w = Math.round(w*k); h = Math.round(h*k); }
+        var cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+        cv.getContext('2d').drawImage(im, 0, 0, w, h);
+        var dataUrl = cv.toDataURL('image/jpeg', 0.82);
+        fetch('/api/garbage/scan-sheet', {method:'POST', credentials:'same-origin',
+          headers:{'Content-Type':'application/json','X-CSRF-Token':GD_CSRF},
+          body: JSON.stringify({image: dataUrl})
+        }).then(function(r){ return r.json().then(function(j){ return {s:r.status, j:j}; }); })
+        .then(function(x){
+          if(x.s===200 && x.j.success){
+            document.getElementById('gd-lines').value = x.j.stops.map(stopToLine).join('\n');
+            renderPreview();
+            st.textContent = '✓ Read '+x.j.count+' stops — review and hit Dispatch.';
+          } else st.textContent = (x.j && x.j.error) || 'Could not read that photo.';
+        }).catch(function(){ st.textContent = 'Network error.'; });
+      };
+      im.src = rdr.result;
+    };
+    rdr.readAsDataURL(img);
+    file.value = '';
+  });
+})();
+
+loadTemplates();
+loadRecent();
+renderPreview();
 </script></body></html>"""
+    page = page.replace("__OPTS__", opts).replace("__CSRF__", csrf).replace("__TODAY__", today_str())
+    page = page.replace("__MODE__", e(mode_note) if mode_note else "")
+    page = page.replace("__APPENDRID__", json.dumps(append_route_id))
+    return page
+
 
 @app.route('/route')
 def route_view():

@@ -144,7 +144,7 @@ ok(r.status_code == 403, "driver blocked from scanning")
 # Dispatch page carries the scan button.
 login_as(boss, "boss")
 html = cl.get("/garbage-dispatch").get_data(as_text=True)
-ok("gd-scan-btn" in html and "scan-sheet" in html, "dispatch page has scan button")
+ok("scan-btn" in html and "scan-sheet" in html, "dispatch page has scan button")
 
 conn.close()
 print()
