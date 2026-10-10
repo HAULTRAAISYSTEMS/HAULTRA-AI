@@ -14612,11 +14612,13 @@ def _garbage_cab_page(conn, route, stops, current_stop, current_stop_num,
                 )
             else:
                 flow = (
-                    '<label class="g-count-lbl">Weight (tons)</label>'
+                    '<label class="g-count-lbl">Weight (tons) — optional</label>'
                     '<input id="g-tons" class="g-input" type="number" inputmode="decimal" '
-                    'step="0.01" min="0" placeholder="e.g. 4.25">'
+                    'step="0.01" min="0" placeholder="from scale ticket, if you got one">'
                     f'<button type="button" class="g-start-btn" onclick="gDepart({s["id"]})">'
                     "&#9989; Departed</button>"
+                    '<div class="g-note-line" style="text-align:center;margin-top:8px;">'
+                    "No ticket? Just tap Departed — we'll leave it blank.</div>"
                 )
         else:
             if not s["started_at"]:
@@ -14729,7 +14731,8 @@ def _garbage_cab_page(conn, route, stops, current_stop, current_stop_num,
         });
     };
     window.gDepart = function(id){
-        var t = parseFloat((document.getElementById('g-tons')||{}).value||'0') || 0;
+        var raw = (document.getElementById('g-tons')||{}).value;
+        var t = (raw === '' || raw == null) ? null : (parseFloat(raw) || null);
         post('/api/stops/'+id+'/landfill-depart', {tons:t}).then(function(x){
             if(x.s===200 && x.j.success) location.reload(); else alert((x.j&&x.j.error)||'Could not depart.');
         });
@@ -33286,13 +33289,16 @@ def landfill_arrive(stop_id):
 @app.route("/api/stops/<int:stop_id>/landfill-depart", methods=["POST"])
 @driver_required
 def landfill_depart(stop_id):
-    """Driver taps Departed — records tons and completes the landfill stop."""
+    """Driver taps Departed — records tons (optional, NULL when no scale
+    ticket) and completes the landfill stop."""
     data = request.get_json(silent=True) or {}
-    try:
-        tons = float(data.get("tons") or 0)
-    except (TypeError, ValueError):
-        tons = 0
-    tons = max(0, min(tons, 999))
+    raw_tons = data.get("tons")
+    tons = None
+    if raw_tons not in (None, ""):
+        try:
+            tons = max(0, min(float(raw_tons), 999))
+        except (TypeError, ValueError):
+            tons = None
     conn = get_db()
     stop, err = _garbage_stop_for_driver(conn, stop_id, session["user_id"], ("Landfill",))
     if err:

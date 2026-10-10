@@ -171,6 +171,43 @@ ok(sl["status"] == "completed" and abs(float(sl["weight_tons"]) - 4.25) < 0.001,
    "landfill tons recorded, stop completed")
 ok(sl["arrived_at"] and sl["departed_at"], "landfill timestamps stamped")
 
+# Landfill without a scale ticket: tons stays NULL (not 0).
+login_as(boss, "boss")
+r = post("/api/dispatch", {"route_type": "garbage", "driver_id": drv,
+                           "route_date": "2026-10-10",
+                           "stops": [{"service_type": "landfill", "address": "No Ticket Dump",
+                                      "city": "VB", "notes": "", "not_before": ""}]})
+s4 = conn.execute("SELECT id FROM stops WHERE address='No Ticket Dump'").fetchone()["id"]
+login_as(drv, "driver")
+r = post(f"/api/stops/{s4}/landfill-arrive", {})
+ok(r.status_code == 200, "landfill arrive works (no-ticket stop)")
+for payload in ({}, {"tons": None}, {"tons": ""}):
+    # fresh stop per payload
+    login_as(boss, "boss")
+    r = post("/api/dispatch", {"route_type": "garbage", "driver_id": drv,
+                               "route_date": "2026-10-10",
+                               "stops": [{"service_type": "landfill", "address": "Dump X",
+                                          "city": "VB", "notes": "", "not_before": ""}]})
+    sx = conn.execute("SELECT id FROM stops WHERE address='Dump X' ORDER BY id DESC LIMIT 1").fetchone()["id"]
+    login_as(drv, "driver")
+    post(f"/api/stops/{sx}/landfill-arrive", {})
+    r = post(f"/api/stops/{sx}/landfill-depart", payload)
+    slx = conn.execute("SELECT status, weight_tons FROM stops WHERE id=?", (sx,)).fetchone()
+    ok(r.status_code == 200 and slx["status"] == "completed" and slx["weight_tons"] is None,
+       f"landfill depart without tons -> NULL {payload}")
+# invalid tons also -> NULL, never a crash
+login_as(boss, "boss")
+r = post("/api/dispatch", {"route_type": "garbage", "driver_id": drv,
+                           "route_date": "2026-10-10",
+                           "stops": [{"service_type": "landfill", "address": "Dump Y",
+                                      "city": "VB", "notes": "", "not_before": ""}]})
+sy = conn.execute("SELECT id FROM stops WHERE address='Dump Y'").fetchone()["id"]
+login_as(drv, "driver")
+post(f"/api/stops/{sy}/landfill-arrive", {})
+r = post(f"/api/stops/{sy}/landfill-depart", {"tons": "abc"})
+sly = conn.execute("SELECT weight_tons FROM stops WHERE id=?", (sy,)).fetchone()
+ok(r.status_code == 200 and sly["weight_tons"] is None, "landfill garbage tons input -> NULL")
+
 # Wrong driver is blocked.
 login_as(drv2, "driver")
 r = post(f"/api/stops/{s1}/garbage-start", {})
