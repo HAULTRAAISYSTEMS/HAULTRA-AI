@@ -4162,6 +4162,18 @@ def init_db():
     # resolves (Repaired = yes) or the boss releases it manually.
     safe_add_column(conn, "stops", "held_at TEXT")
 
+    # Garbage routes (2026-10-10): route_type 'rolloff' (default) or 'garbage'.
+    # Garbage stops use action 'Toter' / 'Hand Pickup' / 'Landfill' with a fast
+    # Start -> Done+count flow: service_count = cans/bags, started_at/departed_at
+    # timestamps, weight_tons for landfill legs, not_before for time windows
+    # ("no HOA before 7am").
+    safe_add_column(conn, "routes", "route_type TEXT NOT NULL DEFAULT 'rolloff'")
+    safe_add_column(conn, "stops", "service_count INTEGER")
+    safe_add_column(conn, "stops", "started_at TEXT")
+    safe_add_column(conn, "stops", "departed_at TEXT")
+    safe_add_column(conn, "stops", "weight_tons REAL")
+    safe_add_column(conn, "stops", "not_before TEXT")
+
     safe_add_column(conn, "bins", "label TEXT")
     safe_add_column(conn, "bins", "drop_photo_path TEXT")
     safe_add_column(conn, "bins", "drop_stop_id INTEGER")
@@ -14462,6 +14474,213 @@ def _deliver_handoff_dest_id(conn, stop, route_id):
     return None
 
 
+# Garbage-route Cab View CSS (2026-10-10) — appended to the driver stylesheet.
+_GARBAGE_CAB_CSS = """
+.gbadge{display:inline-block;font-weight:800;font-size:.78rem;letter-spacing:1px;
+  padding:6px 12px;border-radius:8px;}
+.gbadge-toter{background:rgba(66,135,245,.18);border:1px solid rgba(66,135,245,.5);color:#8FB8FF;}
+.gbadge-hpu{background:rgba(178,102,255,.16);border:1px solid rgba(178,102,255,.5);color:#CFA8FF;}
+.gbadge-landfill{background:rgba(255,171,64,.14);border:1px solid rgba(255,171,64,.5);color:#FFB74D;}
+.g-addr{font-size:1.15rem;font-weight:700;margin:10px 0 4px;word-break:break-word;}
+.g-city{color:var(--text-muted);font-size:.92rem;margin-bottom:10px;}
+.g-notbefore{margin:10px 0;padding:10px 12px;border-radius:10px;font-size:.9rem;font-weight:700;
+  color:#FFB74D;background:rgba(255,171,64,.10);border:1px solid rgba(255,171,64,.4);}
+.g-note-line{color:var(--text-muted);font-size:.88rem;margin:6px 0;}
+.g-count-row{display:flex;align-items:center;gap:12px;margin:14px 0;}
+.g-count-btn{min-width:56px;min-height:56px;border-radius:14px;font-size:24px;font-weight:800;cursor:pointer;
+  background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.16);color:#F5F5F0;}
+.g-count-val{font-size:2rem;font-weight:800;min-width:64px;text-align:center;}
+.g-count-lbl{color:var(--text-muted);font-size:.85rem;}
+.g-input{width:100%;box-sizing:border-box;min-height:52px;border-radius:12px;font-size:16px;
+  background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.16);color:#F5F5F0;
+  padding:0 14px;margin-bottom:10px;}
+.g-start-btn{width:100%;min-height:60px;border:none;border-radius:12px;font-size:18px;font-weight:800;
+  cursor:pointer;background:linear-gradient(135deg,#3DDC84,#22B368);color:#06170D;margin-top:10px;}
+.g-upcoming{margin-top:16px;}
+.g-up-title{font-weight:800;letter-spacing:1px;font-size:.8rem;color:var(--text-muted);margin-bottom:8px;}
+.g-up-row{display:flex;gap:10px;align-items:center;padding:10px 4px;border-bottom:1px solid rgba(255,255,255,.06);}
+.g-up-num{font-weight:800;color:var(--text-muted);min-width:28px;}
+.g-up-info{flex:1;min-width:0;}
+.g-up-name{font-weight:700;font-size:.95rem;}
+.g-up-addr{color:var(--text-muted);font-size:.82rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.g-done-wrap{text-align:center;padding:40px 20px;}
+.g-done-icon{font-size:48px;margin-bottom:14px;}
+"""
+
+
+def _garbage_cab_page(conn, route, stops, current_stop, current_stop_num,
+                      prev_stop, completed_count, total_count, pct,
+                      unread_messages, csrf, route_id):
+    """Standalone Cab View for garbage routes (2026-10-10): fast Start -> Done
+    + count flow for toter/HPU, arrive/depart + tons for landfill. No photos,
+    no container tracking — seconds per stop."""
+
+    def maps_url(addr, city):
+        q = ", ".join(p for p in [addr, city] if p).strip()
+        return ("https://www.google.com/maps/search/?api=1&query=" + urllib.parse.quote(q)) if q else ""
+
+    # --- current stop card ---
+    if current_stop is None:
+        card = (
+            '<div class="g-done-wrap"><div class="g-done-icon">&#9989;</div>'
+            "<h2>Route complete</h2>"
+            f'<p style="color:var(--text-muted);">{completed_count} of {total_count} stops done.</p></div>'
+        )
+    else:
+        s = current_stop
+        action = s["action"] or ""
+        badge_cls = {"Toter": "gbadge-toter", "Hand Pickup": "gbadge-hpu",
+                     "Landfill": "gbadge-landfill"}.get(action, "gbadge-toter")
+        badge_lbl = {"Toter": "TOTER", "Hand Pickup": "HPU", "Landfill": "LANDFILL"}.get(action, action.upper())
+        addr = (s["address"] or "").strip()
+        city = (s["city"] or "").strip()
+        nb = (s["not_before"] or "").strip()
+        notes = (s["notes"] or "").strip()
+        nav = maps_url(addr, city)
+        nb_html = f'<div class="g-notbefore">&#9888; Not before {e(nb)} — wait to enter</div>' if nb else ""
+        note_html = f'<div class="g-note-line">{e(notes)}</div>' if notes else ""
+        nav_html = (
+            f'<a class="cab-complete-btn" style="display:flex;align-items:center;justify-content:center;'
+            f'text-decoration:none;" href="{nav}">&#128205; Navigate</a>'
+        ) if nav else ""
+
+        if action == "Landfill":
+            if not s["arrived_at"]:
+                flow = (
+                    f'<button type="button" class="g-start-btn" onclick="gArrive({s["id"]})">'
+                    "&#128666; Arrived at Landfill</button>"
+                )
+            else:
+                flow = (
+                    '<label class="g-count-lbl">Weight (tons)</label>'
+                    '<input id="g-tons" class="g-input" type="number" inputmode="decimal" '
+                    'step="0.01" min="0" placeholder="e.g. 4.25">'
+                    f'<button type="button" class="g-start-btn" onclick="gDepart({s["id"]})">'
+                    "&#9989; Departed</button>"
+                )
+        else:
+            if not s["started_at"]:
+                flow = (
+                    f'<button type="button" class="g-start-btn" onclick="gStart({s["id"]})">'
+                    "&#9654; Start Stop</button>"
+                )
+            else:
+                unit = "cans" if action == "Toter" else "bags"
+                flow = (
+                    '<div class="g-count-row">'
+                    '<button type="button" class="g-count-btn" onclick="gCount(-1)">−</button>'
+                    '<div><div class="g-count-val" id="g-count">0</div>'
+                    f'<div class="g-count-lbl">{unit}</div></div>'
+                    '<button type="button" class="g-count-btn" onclick="gCount(1)">+</button></div>'
+                    '<input id="g-note" class="g-input" maxlength="300" placeholder="Note (optional)">'
+                    f'<button type="button" class="g-start-btn" onclick="gDone({s["id"]})">'
+                    "&#9989; Done</button>"
+                )
+        card = (
+            '<div class="cab-card"><div class="cab-action-row">'
+            f'<span class="gbadge {badge_cls}">{badge_lbl}</span>'
+            f'<div class="cab-action-name">{e(s["customer_name"] or ("Stop " + str(current_stop_num)))}</div>'
+            "</div>"
+            f'<div class="g-addr">{e(addr) or "No address"}</div>'
+            + (f'<div class="g-city">{e(city)}</div>' if city else "")
+            + nb_html + note_html + nav_html + flow
+            + f'<button type="button" class="cab-neutral" style="margin-top:10px;" '
+            f'onclick="openMessageThread({route_id}, \'Boss\')">Message Boss'
+            f'<span id="msg-boss-badge" {"hidden" if not unread_messages else ""}>'
+            f'{unread_messages or ""}</span></button></div>'
+        )
+
+    prev_html = ""
+    if prev_stop:
+        prev_html = (
+            f'<form method="POST" action="{url_for("toggle_stop_complete", stop_id=prev_stop["id"])}" '
+            'style="margin-bottom:14px;" '
+            "onsubmit=\"return confirm('Reopen the previous stop? It will become your current stop again, "
+            "right where you left off.');\">"
+            f'<input type="hidden" name="_csrf_token" value="{csrf}">'
+            '<input type="hidden" name="intent" value="reopen">'
+            '<button type="submit" class="cab-neutral" style="min-height:48px;margin-top:0;">'
+            "&#8592; Previous Stop</button></form>"
+        )
+
+    up_rows = ""
+    for i, us in enumerate(stops, start=1):
+        if us["status"] == "completed" or (current_stop and us["id"] == current_stop["id"]):
+            continue
+        if stop_is_cancelled(us):
+            continue
+        ab = {"Toter": "T", "Hand Pickup": "H", "Landfill": "L"}.get(us["action"] or "", "•")
+        up_rows += (
+            f'<div class="g-up-row"><div class="g-up-num">{i}</div><div class="g-up-info">'
+            f'<div class="g-up-name">[{ab}] {e(us["customer_name"] or us["address"] or "Stop")}</div>'
+            f'<div class="g-up-addr">{e(us["address"] or "")}</div></div></div>'
+        )
+    upcoming = (
+        f'<div class="g-upcoming"><div class="g-up-title">UPCOMING STOPS</div>{up_rows}</div>'
+        if up_rows else ""
+    )
+
+    body = (
+        f"<style>{_GARBAGE_CAB_CSS}</style>"
+        '<div class="cab-wrap">'
+        '<div class="cab-sticky-bar"><div>'
+        '<div class="cab-title">MY ROUTE &#128666;</div>'
+        f'<div class="cab-progress-label">{e(route["route_name"])} &middot; {e(route["route_date"])}</div>'
+        "</div>"
+        f'<div class="cab-sticky-progress">{completed_count} / {total_count}</div></div>'
+        f'<div class="cab-progress-track"><div class="cab-progress-fill" style="width:{pct}%;"></div></div>'
+        f"{prev_html}{card}{upcoming}"
+        '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;">'
+        f'<a class="btn secondary" href="{url_for("driver_dashboard")}">&#8592; My Routes</a></div>'
+        '<button type="button" class="cab-issue-btn" onclick="openTruckIssue()">&#9888; Truck Issue</button>'
+        '<button type="button" class="cab-vendor-btn" onclick="openVendorGo()">&#128666; Headed to Vendor</button>'
+        "</div>"
+        + _message_thread_modal_html(show_quick_taps=True)
+        + _breakdown_driver_ui_html(route_id, "", csrf)
+        + """
+<script>
+(function(){
+    var CSRF = __CSRF__;
+    function post(url, data){
+        return fetch(url, {method:'POST', credentials:'same-origin',
+            headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
+            body: JSON.stringify(data||{})})
+            .then(function(r){ return r.json().then(function(j){ return {s:r.status,j:j}; }); });
+    }
+    window.gStart = function(id){
+        post('/api/stops/'+id+'/garbage-start').then(function(x){
+            if(x.s===200 && x.j.success) location.reload(); else alert((x.j&&x.j.error)||'Could not start.');
+        });
+    };
+    window.gCount = function(d){
+        var el = document.getElementById('g-count');
+        el.textContent = Math.max(0, parseInt(el.textContent||'0',10) + d);
+    };
+    window.gDone = function(id){
+        var c = parseInt((document.getElementById('g-count')||{}).textContent||'0',10) || 0;
+        var n = (document.getElementById('g-note')||{}).value || '';
+        post('/api/stops/'+id+'/garbage-complete', {count:c, note:n}).then(function(x){
+            if(x.s===200 && x.j.success) location.reload(); else alert((x.j&&x.j.error)||'Could not complete.');
+        });
+    };
+    window.gArrive = function(id){
+        post('/api/stops/'+id+'/landfill-arrive').then(function(x){
+            if(x.s===200 && x.j.success) location.reload(); else alert((x.j&&x.j.error)||'Could not mark arrival.');
+        });
+    };
+    window.gDepart = function(id){
+        var t = parseFloat((document.getElementById('g-tons')||{}).value||'0') || 0;
+        post('/api/stops/'+id+'/landfill-depart', {tons:t}).then(function(x){
+            if(x.s===200 && x.j.success) location.reload(); else alert((x.j&&x.j.error)||'Could not depart.');
+        });
+    };
+})();
+</script>""".replace("__CSRF__", json.dumps(csrf))
+    )
+    return render_template_string(shell_page("Cab View", body))
+
+
+
 @app.route("/driver/route/<int:route_id>")
 @driver_required
 def driver_route_detail(route_id):
@@ -14620,6 +14839,16 @@ def driver_route_detail(route_id):
                 prev_stop = _p
                 break
     _csrf = get_csrf_token()
+
+    # Garbage routes get the fast cab view (2026-10-10) — no roll-off phases.
+    if (route["route_type"] or "rolloff") == "garbage":
+        _live = [s for s in stops if not stop_is_cancelled(s)]
+        _done = sum(1 for s in _live if s["status"] == "completed")
+        _total = len(_live)
+        _pct = int(_done / _total * 100) if _total else 0
+        return _garbage_cab_page(conn, route, stops, current_stop, current_stop_num,
+                                 prev_stop, _done, _total, _pct,
+                                 unread_messages, _csrf, route_id)
 
     _reorder_html = ""
     if _reorderable:
@@ -17830,6 +18059,95 @@ def route_messages(route_id):
         }
         for r in rows
     ]})
+
+
+@app.route("/route/<int:route_id>/report")
+@login_required
+def route_report(route_id):
+    """Daily Route Log as a web page (2026-10-10) — the digital version of the
+    paper sheet the driver used to hand back. Per-stop times, counts, landfill
+    legs, and totals. Print-friendly."""
+    conn = get_db()
+    route = conn.execute(
+        """SELECT r.*, u.full_name AS driver_name, u.username AS driver_username,
+                  t.name AS truck_name
+           FROM routes r LEFT JOIN users u ON r.assigned_to = u.id
+           LEFT JOIN trucks t ON t.id = (
+               SELECT truck_id FROM inspections
+               WHERE driver_id = r.assigned_to AND company_id = r.company_id
+               ORDER BY id DESC LIMIT 1)
+           WHERE r.id=? AND r.company_id=?""",
+        (route_id, cid())).fetchone()
+    if not route:
+        conn.close()
+        abort(404)
+    stops = conn.execute(
+        "SELECT * FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
+        (route_id,)).fetchall()
+    conn.close()
+
+    def fmt_time(ts):
+        if not ts:
+            return ""
+        try:
+            # stored as "YYYY-MM-DD HH:MM:SS" — show h:MM AM/PM
+            import datetime as _dt
+            d = _dt.datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S")
+            return d.strftime("%-I:%M %p").lower()
+        except Exception:
+            return ts[11:16] if len(ts) > 16 else ts
+
+    rows = ""
+    total_cans = total_bags = 0
+    total_tons = 0.0
+    for i, s in enumerate(stops, start=1):
+        action = s["action"] or ""
+        typ = {"Toter": "toter", "Hand Pickup": "HPU", "Landfill": "LAND"}.get(action, action)
+        cnt = s["service_count"] or 0
+        if action == "Toter":
+            total_cans += cnt
+        elif action == "Hand Pickup":
+            total_bags += cnt
+        if s["weight_tons"]:
+            total_tons += float(s["weight_tons"])
+        rows += (
+            f"<tr><td>{typ}</td>"
+            f"<td>{e(s['address'] or '')}</td>"
+            f"<td>{e(s['city'] or '')}</td>"
+            f"<td>{fmt_time(s['started_at'])}</td>"
+            f"<td>{fmt_time(s['arrived_at'])}</td>"
+            f"<td>{fmt_time(s['departed_at'])}</td>"
+            f"<td>{fmt_time(s['completed_at'])}</td>"
+            f"<td>{cnt if cnt else ''}</td>"
+            f"<td>{('%.2f' % float(s['weight_tons'])) if s['weight_tons'] else ''}</td>"
+            f"<td>{e(s['notes'] or '')}</td></tr>"
+        )
+
+    driver = route["driver_name"] or route["driver_username"] or "—"
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Daily Route Log — {e(route["route_name"])}</title>
+<style>
+body{{font-family:system-ui,sans-serif;margin:0;padding:16px;background:#fff;color:#111;}}
+.wrap{{max-width:1000px;margin:0 auto;}}
+h1{{font-size:1.2rem;margin:0;}} .sub{{color:#555;margin:4px 0 12px;}}
+table{{width:100%;border-collapse:collapse;font-size:.82rem;}}
+th,td{{border:1px solid #999;padding:6px 8px;text-align:left;}}
+th{{background:#eee;}}
+.tot{{font-weight:800;margin-top:12px;}}
+button{{margin:12px 8px 0 0;padding:10px 18px;font-size:15px;cursor:pointer;}}
+@media print{{ button{{display:none;}} body{{padding:0;}} }}
+</style></head><body><div class="wrap">
+<h1>Daily Route Log — {e(route["route_name"])}</h1>
+<div class="sub">Driver: {e(driver)} &nbsp;·&nbsp; Date: {e(route["route_date"])} &nbsp;·&nbsp;
+Truck: {e(route["truck_name"] or "—")} &nbsp;·&nbsp; Type: {e(route["route_type"] or "rolloff")}</div>
+<table><tr><th>Work Order</th><th>Customer Site Address</th><th>City</th><th>Start</th>
+<th>Landfill Arrive</th><th>Landfill Depart</th><th>Finish</th><th>Count</th><th>Tons</th><th>Notes</th></tr>
+{rows}</table>
+<div class="tot">Totals — cans: {total_cans} &nbsp;·&nbsp; bags: {total_bags} &nbsp;·&nbsp; tons: {total_tons:.2f}</div>
+<button onclick="window.print()">Print</button>
+<button onclick="history.back()">Back</button>
+</div></body></html>"""
 
 
 @app.route("/route/<int:route_id>")
@@ -28097,6 +28415,37 @@ def api_chain_preview():
     })
 
 
+_GARBAGE_ACTION_MAP = {"toter": "Toter", "hpu": "Hand Pickup", "landfill": "Landfill"}
+
+
+def _validate_garbage_stops(stops_in):
+    """Validate boss-entered garbage stops (2026-10-10). Simple shape — no AI
+    parser, no container logic. Each stop: service_type (toter|hpu|landfill),
+    address, city, notes, not_before. Returns (clean_stops, error)."""
+    if not isinstance(stops_in, list) or not stops_in:
+        return None, "No stops to dispatch."
+    clean = []
+    for i, s in enumerate(stops_in, start=1):
+        if not isinstance(s, dict):
+            return None, f"Stop {i} is malformed."
+        st = (s.get("service_type") or "").strip().lower()
+        if st not in _GARBAGE_ACTION_MAP:
+            return None, f"Stop {i}: pick toter, hpu, or landfill."
+        address = (s.get("address") or "").strip()
+        if not address:
+            return None, f"Stop {i} is missing an address."
+        clean.append({
+            "address": address,
+            "action": _GARBAGE_ACTION_MAP[st],
+            "service_type": st,
+            "customer": (s.get("customer") or "").strip()[:120],
+            "city": (s.get("city") or "").strip()[:60],
+            "notes": (s.get("notes") or "").strip()[:500],
+            "not_before": (s.get("not_before") or "").strip()[:20],
+        })
+    return clean, None
+
+
 @app.route("/api/dispatch", methods=["POST"])
 @roles_required("dispatcher", api=True)
 def api_dispatch():
@@ -28104,8 +28453,14 @@ def api_dispatch():
     stops_in = data.get("stops")
     driver_id_raw = data.get("driver_id")
     route_date = (data.get("route_date") or today_str()).strip() or today_str()
+    route_type = (data.get("route_type") or "rolloff").strip().lower()
+    if route_type not in ("rolloff", "garbage"):
+        route_type = "rolloff"
 
-    clean_stops, err = _validate_parser_stops(stops_in)
+    if route_type == "garbage":
+        clean_stops, err = _validate_garbage_stops(stops_in)
+    else:
+        clean_stops, err = _validate_parser_stops(stops_in)
     if err:
         return jsonify({"error": err}), 400
 
@@ -28125,13 +28480,15 @@ def api_dispatch():
     # Never create a parallel route for a driver who already has an OPEN one
     # today — dispatching appends to it (stops at the end). A fresh route is
     # only created when there's no open/in_progress route for that driver+date.
+    # Garbage and rolloff never mix on one route (2026-10-10).
     cur = conn.cursor()
     existing = conn.execute(
         """SELECT id FROM routes
             WHERE company_id=? AND assigned_to=? AND route_date=?
               AND status IN ('open','in_progress')
+              AND COALESCE(route_type,'rolloff')=?
             ORDER BY id LIMIT 1""",
-        (cid(), driver_id, route_date)
+        (cid(), driver_id, route_date, route_type)
     ).fetchone()
     if existing:
         route_id = existing["id"]
@@ -28140,9 +28497,9 @@ def api_dispatch():
         route_name = f"{driver['username']} — {route_date}"
         cur.execute("""
             INSERT INTO routes (route_date, route_name, raw_text, assigned_to, created_by,
-                                 status, notes, company_id, created_at)
-            VALUES (?, ?, '', ?, ?, 'open', '', ?, ?)
-        """, (route_date, route_name, driver_id, session["user_id"], cid(), now_ts()))
+                                 status, notes, company_id, route_type, created_at)
+            VALUES (?, ?, '', ?, ?, 'open', '', ?, ?, ?)
+        """, (route_date, route_name, driver_id, session["user_id"], cid(), route_type, now_ts()))
         route_id = cur.lastrowid
         appended_to_existing = False
 
@@ -28152,6 +28509,17 @@ def api_dispatch():
     _new_ids = []
     for s in clean_stops:
         next_order += 1
+        if route_type == "garbage":
+            cur.execute("""
+                INSERT INTO stops (route_id, stop_order, customer_name, address, city, action,
+                                    notes, not_before, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+            """, (route_id, next_order, s.get("customer") or "", s["address"],
+                  s.get("city") or "", s["action"], s["notes"], s["not_before"], now_ts()))
+            _new_ids.append(cur.lastrowid)
+            learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
+                           action=s["action"])
+            continue
         cur.execute("""
             INSERT INTO stops (route_id, stop_order, customer_name, address, action, container_size,
                                 dump_location, return_destination, notes,
@@ -28173,6 +28541,17 @@ def api_dispatch():
     # stop's tail, so the resolver honors and keeps it (chain_source='manual').
     _persist_manual_delivery(conn, clean_stops, _new_ids)
     conn.commit()
+    if route_type == "garbage":
+        # No containers, no chains on a garbage route — dispatch is done.
+        conn.close()
+        return jsonify({
+            "success": True,
+            "route_id": route_id,
+            "driver": driver["username"],
+            "stop_count": len(clean_stops),
+            "appended": appended_to_existing,
+            "notices": [],
+        })
     try:
         compute_can_flow(conn, route_id)
     except Exception as exc:
@@ -28206,17 +28585,23 @@ def api_insert_stops(route_id):
     data = request.get_json(silent=True) or {}
     stops_in = data.get("stops")
 
-    clean_stops, err = _validate_parser_stops(stops_in)
-    if err:
-        return jsonify({"error": err}), 400
-
     conn = get_db()
     route = conn.execute(
-        "SELECT id FROM routes WHERE id=? AND company_id=?", (route_id, cid())
+        "SELECT id, COALESCE(route_type,'rolloff') AS route_type FROM routes WHERE id=? AND company_id=?",
+        (route_id, cid())
     ).fetchone()
     if not route:
         conn.close()
         return jsonify({"error": "Route not found."}), 404
+    is_garbage = route["route_type"] == "garbage"
+
+    if is_garbage:
+        clean_stops, err = _validate_garbage_stops(stops_in)
+    else:
+        clean_stops, err = _validate_parser_stops(stops_in)
+    if err:
+        conn.close()
+        return jsonify({"error": err}), 400
 
     existing = conn.execute(
         "SELECT id, status FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
@@ -28247,6 +28632,17 @@ def api_insert_stops(route_id):
     new_stops = []
     _chain_batch = []
     for s in clean_stops:
+        if is_garbage:
+            cur.execute("""
+                INSERT INTO stops (route_id, stop_order, customer_name, address, city, action,
+                                    notes, not_before, status, created_at)
+                VALUES (?, 0, ?, ?, ?, ?, ?, ?, 'open', ?)
+            """, (route_id, s.get("customer") or "", s["address"], s.get("city") or "",
+                  s["action"], s["notes"], s["not_before"], now_ts()))
+            new_stops.append((cur.lastrowid, s.get("insert_before", "end")))
+            learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
+                           action=s["action"])
+            continue
         cur.execute("""
             INSERT INTO stops (route_id, stop_order, customer_name, address, action, container_size,
                                 dump_location, return_destination, notes,
@@ -28278,6 +28674,14 @@ def api_insert_stops(route_id):
         cur.execute("UPDATE stops SET stop_order=? WHERE id=?", (pos, sid))
 
     conn.commit()
+    if is_garbage:
+        conn.close()
+        return jsonify({
+            "success": True,
+            "route_id": route_id,
+            "stop_count": len(clean_stops),
+            "notices": [],
+        })
     try:
         compute_can_flow(conn, route_id)
     except Exception as exc:
@@ -32730,6 +33134,122 @@ def driver_vendor_self_dispatch():
     return jsonify({"success": True, "vendor_stop_id": new_id, "held": held_n})
 
 
+def _garbage_stop_for_driver(conn, stop_id, driver_id, actions):
+    """Fetch an open garbage stop on the driver's own route, or (None, err)."""
+    stop = conn.execute(
+        """SELECT s.*, r.route_type FROM stops s JOIN routes r ON s.route_id = r.id
+            WHERE s.id=? AND r.company_id=? AND r.assigned_to=?""",
+        (stop_id, cid(), driver_id)).fetchone()
+    if not stop:
+        return None, ("not found", 404)
+    if (stop["route_type"] or "rolloff") != "garbage":
+        return None, ("not a garbage stop", 400)
+    if stop["action"] not in actions:
+        return None, ("wrong stop type", 400)
+    if stop["status"] == "completed":
+        return None, ("already completed", 400)
+    if stop["held_at"]:
+        return None, ("stop is held", 400)
+    return stop, None
+
+
+@app.route("/api/stops/<int:stop_id>/garbage-start", methods=["POST"])
+@driver_required
+def garbage_start(stop_id):
+    """Driver taps Start on a toter/HPU stop — stamps started_at. Fast, no photo."""
+    conn = get_db()
+    stop, err = _garbage_stop_for_driver(conn, stop_id, session["user_id"],
+                                         ("Toter", "Hand Pickup"))
+    if err:
+        conn.close()
+        return jsonify({"error": err[0]}), err[1]
+    if not stop["started_at"]:
+        conn.execute("UPDATE stops SET started_at=?, driver_status='started' WHERE id=?",
+                     (now_ts(), stop_id))
+        conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/stops/<int:stop_id>/garbage-complete", methods=["POST"])
+@driver_required
+def garbage_complete(stop_id):
+    """Driver taps Done on a toter/HPU stop — records the can/bag count and an
+    optional note. Saves driver_status_before_complete so Previous Stop reopens
+    right where the driver left off."""
+    data = request.get_json(silent=True) or {}
+    try:
+        count = int(data.get("count") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    count = max(0, min(count, 9999))
+    note = str(data.get("note") or "").strip()[:300]
+    conn = get_db()
+    stop, err = _garbage_stop_for_driver(conn, stop_id, session["user_id"],
+                                         ("Toter", "Hand Pickup"))
+    if err:
+        conn.close()
+        return jsonify({"error": err[0]}), err[1]
+    ts = now_ts()
+    conn.execute(
+        """UPDATE stops SET status='completed', driver_status='completed',
+                  driver_status_before_complete=?, service_count=?, completed_at=?,
+                  started_at=COALESCE(started_at, ?)
+           WHERE id=?""",
+        ((stop["driver_status"] or "pending"), count, ts, ts, stop_id))
+    if note:
+        conn.execute("UPDATE stops SET notes=? WHERE id=?",
+                     (((stop["notes"] or "") + (" — " if stop["notes"] else "") + note)[:500],
+                      stop_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/stops/<int:stop_id>/landfill-arrive", methods=["POST"])
+@driver_required
+def landfill_arrive(stop_id):
+    """Driver taps Arrived at the landfill stop."""
+    conn = get_db()
+    stop, err = _garbage_stop_for_driver(conn, stop_id, session["user_id"], ("Landfill",))
+    if err:
+        conn.close()
+        return jsonify({"error": err[0]}), err[1]
+    if not stop["arrived_at"]:
+        conn.execute("UPDATE stops SET arrived_at=?, driver_status='arrived' WHERE id=?",
+                     (now_ts(), stop_id))
+        conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/stops/<int:stop_id>/landfill-depart", methods=["POST"])
+@driver_required
+def landfill_depart(stop_id):
+    """Driver taps Departed — records tons and completes the landfill stop."""
+    data = request.get_json(silent=True) or {}
+    try:
+        tons = float(data.get("tons") or 0)
+    except (TypeError, ValueError):
+        tons = 0
+    tons = max(0, min(tons, 999))
+    conn = get_db()
+    stop, err = _garbage_stop_for_driver(conn, stop_id, session["user_id"], ("Landfill",))
+    if err:
+        conn.close()
+        return jsonify({"error": err[0]}), err[1]
+    ts = now_ts()
+    conn.execute(
+        """UPDATE stops SET status='completed', driver_status='completed',
+                  driver_status_before_complete=?, weight_tons=?, departed_at=?,
+                  completed_at=?, arrived_at=COALESCE(arrived_at, ?)
+           WHERE id=?""",
+        ((stop["driver_status"] or "pending"), tons, ts, ts, ts, stop_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
+
+
 @app.route("/api/breakdown/<int:item_id>/continue", methods=["POST"])
 @login_required
 def breakdown_continue(item_id):
@@ -34879,6 +35399,90 @@ def debug_db():
 @app.route('/dispatch')
 def dispatch_view():
     return send_from_directory('static', 'dispatch.html')
+
+
+@app.route('/garbage-dispatch')
+@roles_required("dispatcher")
+def garbage_dispatch_view():
+    """Dead-simple garbage route dispatch (2026-10-10): pick a driver + date,
+    paste one stop per line, hit Dispatch. Replaces the printed route sheet."""
+    conn = get_db()
+    drivers = conn.execute(
+        "SELECT id, username, full_name FROM users "
+        "WHERE company_id=? AND role='driver' AND is_active=1 ORDER BY username",
+        (cid(),)).fetchall()
+    conn.close()
+    csrf = get_csrf_token()
+    opts = "".join(
+        '<option value="%d">%s</option>' % (d["id"], e(d["full_name"] or d["username"]))
+        for d in drivers)
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Garbage Dispatch — HAULTRA</title>
+<style>
+body{{background:#101010;color:#F5F5F0;font-family:system-ui,sans-serif;margin:0;padding:16px;}}
+.wrap{{max-width:640px;margin:0 auto;}}
+h1{{font-size:1.4rem;}}
+.lbl{{display:block;margin:14px 0 6px;font-weight:700;font-size:.85rem;color:#A6A69E;}}
+select,input,textarea{{width:100%;box-sizing:border-box;background:#1c1c1c;border:1px solid #333;
+  color:#F5F5F0;border-radius:10px;padding:12px;font-size:16px;}}
+textarea{{min-height:220px;font-family:monospace;}}
+.hint{{color:#A6A69E;font-size:.82rem;margin-top:6px;}}
+button.go{{width:100%;margin-top:16px;min-height:56px;border:none;border-radius:12px;font-size:17px;
+  font-weight:800;background:linear-gradient(135deg,#3DDC84,#22B368);color:#06170D;cursor:pointer;}}
+#status{{margin-top:12px;text-align:center;min-height:24px;}}
+.ex{{background:#1c1c1c;border:1px solid #333;border-radius:10px;padding:10px;margin-top:8px;
+  font-family:monospace;font-size:.82rem;color:#A6A69E;white-space:pre-wrap;}}
+</style></head><body><div class="wrap">
+<h1>&#128666; Garbage Dispatch</h1>
+<label class="lbl">Driver</label>
+<select id="gd-driver"><option value="">— pick a driver —</option>{opts}</select>
+<label class="lbl">Date</label>
+<input id="gd-date" type="date" value="{today_str()}">
+<label class="lbl">Stops — one per line</label>
+<textarea id="gd-lines" placeholder="toter 2545 Squadron Ct, VB&#10;hpu 800 Gas Light Ln, VB !7am&#10;landfill GFL Transfer, Chesapeake"></textarea>
+<div class="hint">Format: <b>toter</b> | <b>hpu</b> | <b>landfill</b> &nbsp;address, city &nbsp;optional <b>!7am</b> = not before, <b>#note</b></div>
+<div class="ex">toter 2545 Squadron Ct, VB&#10;toter 227 Mediterranean Ave, VB&#10;hpu 800 Gas Light Ln, VB !7am #132 units&#10;landfill GFL Transfer, Chesapeake</div>
+<button class="go" onclick="gdSend()">Dispatch Route</button>
+<div id="status"></div>
+</div>
+<script>
+var GD_CSRF = {json.dumps(csrf)};
+function gdSend(){{
+  var drv = document.getElementById('gd-driver').value;
+  var date = document.getElementById('gd-date').value;
+  var st = document.getElementById('status');
+  if(!drv){{ st.textContent = 'Pick a driver first.'; return; }}
+  var stops = [];
+  var lines = document.getElementById('gd-lines').value.split('\\n');
+  for(var i=0;i<lines.length;i++){{
+    var line = lines[i].trim();
+    if(!line) continue;
+    var m = line.match(/^(toter|hpu|landfill)\\s+(.+)$/i);
+    if(!m){{ st.textContent = 'Line '+(i+1)+': start with toter, hpu, or landfill.'; return; }}
+    var rest = m[2], note='', not_before='';
+    var hm = rest.match(/#(.*)$/); if(hm){{ note = hm[1].trim(); rest = rest.slice(0, hm.index).trim(); }}
+    var tm = rest.match(/!(\\S+)\\s*$/); if(tm){{ not_before = tm[1].trim(); rest = rest.slice(0, tm.index).trim(); }}
+    var addr = rest, city = '';
+    var ci = rest.lastIndexOf(',');
+    if(ci > 0){{ addr = rest.slice(0, ci).trim(); city = rest.slice(ci+1).trim(); }}
+    if(!addr){{ st.textContent = 'Line '+(i+1)+': missing address.'; return; }}
+    stops.push({{service_type: m[1].toLowerCase(), address: addr, city: city, notes: note, not_before: not_before}});
+  }}
+  if(!stops.length){{ st.textContent = 'Add at least one stop.'; return; }}
+  st.textContent = 'Dispatching…';
+  fetch('/api/dispatch', {{method:'POST', credentials:'same-origin',
+    headers:{{'Content-Type':'application/json','X-CSRF-Token':GD_CSRF}},
+    body: JSON.stringify({{route_type:'garbage', driver_id: parseInt(drv,10), route_date: date, stops: stops}})
+  }}).then(function(r){{ return r.json().then(function(j){{ return {{s:r.status, j:j}}; }}); }})
+  .then(function(x){{
+    if(x.s===200 && x.j.success){{
+      st.textContent = '✓ Dispatched '+x.j.stop_count+' stops to '+x.j.driver+'.';
+      document.getElementById('gd-lines').value='';
+    }} else st.textContent = (x.j && x.j.error) || 'Dispatch failed.';
+  }}).catch(function(){{ st.textContent = 'Network error.'; }});
+}}
+</script></body></html>"""
 
 @app.route('/route')
 def route_view():
