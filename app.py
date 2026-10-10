@@ -16176,14 +16176,24 @@ def driver_route_detail(route_id):
     margin-top: 8px; background: #1A1A1E; border: 1px solid rgba(255,255,255,0.12);
     border-radius: 14px; padding: 8px; display: flex; flex-direction: column; gap: 6px;
 }}
+/* 2026-10-10: beat .cab-primary-zone button !important — menu items stay dark */
+.cab-primary-zone .cab-more-menu .cab-more-item,
 .cab-more-item {{
-    min-height: 52px; background: rgba(255,255,255,0.05);
-    border: 1px solid rgba(255,255,255,0.10); border-radius: 10px;
-    color: #fff; font-size: 1rem; font-weight: 600; cursor: pointer; text-align: left;
-    padding: 0 16px;
+    min-height: 52px; background: rgba(255,255,255,0.05) !important;
+    border: 1px solid rgba(255,255,255,0.10) !important; border-radius: 10px !important;
+    color: #fff !important; font-size: 1rem !important; font-weight: 600 !important;
+    cursor: pointer; text-align: left !important;
+    padding: 0 16px !important; box-shadow: none !important;
 }}
-.cab-more-item.cab-more-danger {{ color: #FF7A7A; border-color: rgba(255,82,82,0.35); }}
-.cab-more-item:active {{ background: rgba(255,255,255,0.10); }}
+.cab-primary-zone .cab-more-menu .cab-more-item.cab-more-danger,
+.cab-more-item.cab-more-danger {{ color: #FF7A7A !important; border-color: rgba(255,82,82,0.35) !important; }}
+.cab-more-item:active {{ background: rgba(255,255,255,0.10) !important; }}
+/* the More toggle itself stays subtle too */
+.cab-primary-zone #cab-more-btn.cab-more-btn {{
+    background: rgba(255,255,255,0.06) !important; color: #fff !important;
+    border: 1px solid rgba(255,255,255,0.14) !important; box-shadow: none !important;
+    min-height: 56px !important; font-size: 1.05rem !important;
+}}
       background: var(--orange, #FF6B1A) !important; color:#0A0A0A !important; border:none !important;
       box-shadow:none !important; min-height:64px !important; font-weight:800 !important; font-size:1.12rem !important; }}
   .cab-primary-zone button:disabled, .cab-primary-zone .btn:disabled {{ opacity:.5; }}
