@@ -8324,7 +8324,7 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     text-transform: uppercase; color: #F5F5F0;
 }}
 .lane-sub {{ font-size: 11.5px; color: var(--text-muted); margin-top: 4px; line-height: 1.5; }}
-.lane-actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }}
+.lane-actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; justify-content: center; }}
 .lane-add-stops {{
     display: inline-flex; align-items: center; min-height: 44px;
     padding: 5px 12px; font-size: 11px; font-weight: 700;
@@ -36207,7 +36207,7 @@ def garbage_dispatch_view():
 *{box-sizing:border-box;}
 body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif;margin:0;padding:0 0 40px;}
 .topbar{position:sticky;top:0;z-index:10;background:rgba(11,11,13,.92);backdrop-filter:blur(8px);
-border-bottom:1px solid var(--line);padding:12px 16px;display:flex;align-items:center;gap:12px;}
+border-bottom:1px solid var(--line);padding:12px 16px;padding-top:max(12px, env(safe-area-inset-top));display:flex;align-items:center;gap:12px;}
 .backbtn{display:inline-flex;align-items:center;gap:6px;min-height:44px;padding:0 16px;border-radius:12px;
 border:1px solid var(--line);background:var(--card);color:var(--text);font-size:15px;font-weight:700;
 text-decoration:none;white-space:nowrap;flex-shrink:0;}
