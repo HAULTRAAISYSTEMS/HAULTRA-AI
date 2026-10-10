@@ -8026,6 +8026,33 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .cab-copy-hint {{ font-size: 11.5px; color: var(--text-muted); text-align: center; margin-top: 8px; line-height: 1.5; }}
 
 /* Driver-initiated breakdown — always-visible ⚠ Truck Issue button. */
+.cab-vendor-btn {{
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    width: 100%; min-height: 48px; margin-top: 10px;
+    background: rgba(255,171,64,0.10); border: 1px solid rgba(255,171,64,0.40);
+    color: #FFB74D; font-weight: 700; font-size: 14px; letter-spacing: .3px;
+    border-radius: 12px; cursor: pointer;
+}}
+.cab-vendor-btn:hover {{ background: rgba(255,171,64,0.2); }}
+/* Driver reorder — upcoming stops list (2026-10-10). */
+.cab-ro-wrap {{ margin-top: 12px; }}
+.cab-ro-toggle {{
+    width: 100%; min-height: 48px; border-radius: 12px; cursor: pointer;
+    background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.12);
+    color: var(--text, #F5F5F0); font-weight: 700; font-size: 14px;
+}}
+.cab-ro-row {{
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 4px; border-bottom: 1px solid rgba(255,255,255,0.06);
+}}
+.cab-ro-info {{ flex: 1; min-width: 0; }}
+.cab-ro-name {{ font-weight: 700; font-size: 15px; }}
+.cab-ro-addr {{ color: var(--text-muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+.cab-ro-btn {{
+    min-width: 48px; min-height: 48px; border-radius: 12px; cursor: pointer;
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.16);
+    color: #E6E6E0; font-size: 18px; font-weight: 700;
+}}
 .cab-issue-btn {{
     display: flex; align-items: center; justify-content: center; gap: 8px;
     width: 100%; min-height: 48px; margin-top: 12px;
@@ -14568,6 +14595,20 @@ def driver_route_detail(route_id):
             current_stop_num = i
             break
 
+    # Driver reorder (2026-10-10): upcoming stops the driver may reshuffle.
+    # Completed, cancelled, held, and the current stop stay locked.
+    _reorderable = []
+    if current_stop is not None:
+        for s in stops:
+            if (stop_is_open(s) and s["id"] != current_stop["id"]
+                    and not s["held_at"]):
+                _reorderable.append({
+                    "id": s["id"],
+                    "name": (s["customer_name"] or s["address"] or "Stop").strip(),
+                    "address": (s["address"] or "").strip(),
+                })
+
+
     # The nearest completed stop behind current_stop, so a driver who tapped
     # Complete by mistake can reopen it instead of being stuck. Walks backwards
     # past any cancelled stops -- "reopen" is meaningless on a cancelled stop,
@@ -14579,6 +14620,57 @@ def driver_route_detail(route_id):
                 prev_stop = _p
                 break
     _csrf = get_csrf_token()
+
+    _reorder_html = ""
+    if _reorderable:
+        _ro_rows = "".join(
+            '<div class="cab-ro-row" data-sid="%d">'
+            '<div class="cab-ro-info"><div class="cab-ro-name">%s</div>'
+            '<div class="cab-ro-addr">%s</div></div>'
+            '<button type="button" class="cab-ro-btn" onclick="roMove(this,-1)"'
+            ' aria-label="Move up">&#8593;</button>'
+            '<button type="button" class="cab-ro-btn" onclick="roMove(this,1)"'
+            ' aria-label="Move down">&#8595;</button></div>'
+            % (_r["id"], e(_r["name"]), e(_r["address"]))
+            for _r in _reorderable)
+        _reorder_html = (
+            '<div class="cab-ro-wrap">'
+            '<button type="button" class="cab-ro-toggle"'
+            ' onclick="document.getElementById(\'cab-ro-list\').hidden='
+            '!document.getElementById(\'cab-ro-list\').hidden">'
+            '&#8645; Upcoming Stops (%d) — tap to reorder</button>'
+            '<div id="cab-ro-list" hidden>' % len(_reorderable)
+            + _ro_rows +
+            '<div id="cab-ro-status" class="cab-photo-status" hidden></div>'
+            '</div></div>'
+            '<script>(function(){'
+            'var RO_CSRF=' + json.dumps(_csrf) + ';'
+            'var RO_ROUTE=' + json.dumps(route_id) + ';'
+            'window.roMove=function(btn,dir){'
+            'var list=document.getElementById("cab-ro-list");'
+            'var rows=Array.prototype.slice.call(list.querySelectorAll(".cab-ro-row"));'
+            'var row=btn.closest(".cab-ro-row");'
+            'var i=rows.indexOf(row),j=i+dir;'
+            'if(j<0||j>=rows.length)return;'
+            'if(dir<0)list.insertBefore(row,rows[j]);else list.insertBefore(rows[j],row);'
+            'roSave();};'
+            'window.roSave=function(){'
+            'var ids=Array.prototype.map.call('
+            'document.querySelectorAll("#cab-ro-list .cab-ro-row"),'
+            'function(r){return parseInt(r.getAttribute("data-sid"),10);});'
+            'var st=document.getElementById("cab-ro-status");'
+            'st.hidden=false;st.textContent="Saving…";'
+            'fetch("/api/driver/route/"+RO_ROUTE+"/reorder",{method:"POST",'
+            'credentials:"same-origin",'
+            'headers:{"Content-Type":"application/json","X-CSRF-Token":RO_CSRF},'
+            'body:JSON.stringify({stop_ids:ids})})'
+            '.then(function(r){return r.json().then(function(j){return{s:r.status,j:j};});})'
+            '.then(function(x){'
+            'if(x.s===200&&x.j.success){st.textContent="Saved — the boss was notified.";return;}'
+            'st.textContent=(x.j&&x.j.error)||"Could not reorder.";})'
+            '.catch(function(){st.textContent="Network error — try again.";});'
+            '};})();</script>'
+        )
 
     # ══════════════════════════════════════════════════════════
     # CANCELLED ROUTE — terminal screen, before anything else
@@ -15760,7 +15852,10 @@ def driver_route_detail(route_id):
         <a class="btn secondary" href="{url_for('driver_dashboard')}">&#8592; My Routes</a>
     </div>
 
+    {_reorder_html}
+
     <button type="button" id="cab-issue-btn" class="cab-issue-btn" onclick="openTruckIssue()">&#9888; Truck Issue</button>
+    <button type="button" id="cab-vendor-btn" class="cab-vendor-btn" onclick="openVendorGo()">&#128666; Headed to Vendor</button>
     <button type="button" id="cab-cancel-btn" class="cab-cancel-btn">&#10005; Can't run this</button>
 </div>
 {cab_map_panel}
@@ -15768,6 +15863,78 @@ def driver_route_detail(route_id):
 {_message_thread_modal_html(show_quick_taps=True)}
 
 {breakdown_ui_html}
+
+<div id="vg-overlay" class="no-photo-confirm-overlay" hidden onclick="closeVendorGo()"></div>
+<div id="vg-modal" class="no-photo-confirm-modal" hidden style="max-width:440px;text-align:left;">
+    <div class="no-photo-confirm-title" style="color:#FFB74D;">&#128666; Headed to Vendor</div>
+    <p class="no-photo-confirm-body" style="margin-bottom:12px;">The boss is notified automatically — no approval needed. Your remaining stops are held until you're back in service.</p>
+    <label class="uw-lbl">Vendor</label>
+    <select id="vg-vendor" style="width:100%;min-height:48px;margin-bottom:10px;border-radius:12px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.16);color:#E6E6E0;">
+        <option value="">Loading vendors…</option>
+    </select>
+    <label class="uw-lbl">Or enter a vendor name</label>
+    <input id="vg-name" maxlength="120" placeholder="e.g. Hampton Roads Truck Repair"
+           style="width:100%;min-height:48px;margin-bottom:10px;">
+    <label class="uw-lbl">Note (optional)</label>
+    <input id="vg-note" maxlength="300" placeholder="e.g. check engine light, still drivable"
+           style="width:100%;min-height:48px;margin-bottom:8px;">
+    <div id="vg-status" class="cab-photo-status" hidden style="margin-top:4px;"></div>
+    <div class="no-photo-confirm-actions" style="margin-top:14px;">
+        <button type="button" class="btn orange" id="vg-go" style="flex:1;min-height:52px;" onclick="vgSubmit()">Go to Vendor</button>
+        <button type="button" class="btn secondary" style="min-height:52px;" onclick="closeVendorGo()">Cancel</button>
+    </div>
+</div>
+<script>
+(function() {{
+    var VG_CSRF = {json.dumps(_csrf)};
+    window.openVendorGo = function() {{
+        document.getElementById('vg-overlay').hidden = false;
+        document.getElementById('vg-modal').hidden = false;
+        var sel = document.getElementById('vg-vendor');
+        sel.innerHTML = '<option value="">Loading vendors…</option>';
+        fetch('/api/driver/vendors', {{credentials: 'same-origin'}})
+            .then(function(r) {{ return r.json(); }})
+            .then(function(j) {{
+                var opts = '<option value="">— pick a vendor —</option>';
+                (j.vendors || []).forEach(function(v) {{
+                    opts += '<option value="' + v.id + '">' + v.name.replace(/</g, '&lt;') + '</option>';
+                }});
+                opts += '<option value="other">Other (enter name below)</option>';
+                sel.innerHTML = opts;
+            }})
+            .catch(function() {{
+                sel.innerHTML = '<option value="other">Other (enter name below)</option>';
+            }});
+    }};
+    window.closeVendorGo = function() {{
+        document.getElementById('vg-overlay').hidden = true;
+        document.getElementById('vg-modal').hidden = true;
+    }};
+    window.vgSubmit = function() {{
+        var sel = document.getElementById('vg-vendor');
+        var name = document.getElementById('vg-name').value.trim();
+        var note = document.getElementById('vg-note').value.trim();
+        var st = document.getElementById('vg-status');
+        var payload = {{note: note}};
+        if (sel.value && sel.value !== 'other') payload.vendor_id = parseInt(sel.value, 10);
+        else if (name) payload.vendor_name = name;
+        else {{
+            st.hidden = false; st.textContent = 'Pick a vendor or enter a name.';
+            return;
+        }}
+        st.hidden = false; st.textContent = 'Sending…';
+        fetch('/api/driver/vendor-self-dispatch', {{
+            method: 'POST', credentials: 'same-origin',
+            headers: {{'Content-Type': 'application/json', 'X-CSRF-Token': VG_CSRF}},
+            body: JSON.stringify(payload)
+        }}).then(function(r) {{ return r.json().then(function(j) {{ return {{s: r.status, j: j}}; }}); }})
+        .then(function(x) {{
+            if (x.s === 200 && x.j.success) {{ location.reload(); return; }}
+            st.textContent = (x.j && x.j.error) || 'Could not start the vendor visit.';
+        }}).catch(function() {{ st.textContent = 'Network error — try again.'; }});
+    }};
+}})();
+</script>
 
 {_cab_cancel_block}
 
@@ -17457,7 +17624,8 @@ def vendor_complete(stop_id):
     note = str(data.get("note") or "").strip()[:500]
     conn = get_db()
     stop = conn.execute(
-        """SELECT s.id, s.route_id, s.defect_item_id, s.driver_status, r.assigned_to
+        """SELECT s.id, s.route_id, s.defect_item_id, s.driver_status, s.customer_name,
+                  r.assigned_to
              FROM stops s JOIN routes r ON s.route_id = r.id
             WHERE s.id=? AND r.company_id=?""",
         (stop_id, cid())
@@ -17476,7 +17644,42 @@ def vendor_complete(stop_id):
         ((stop["driver_status"] or "pending"), ts, stop_id)
     )
     did = stop["defect_item_id"]
-    if did:
+    if not did:
+        # Driver self-dispatch (no defect linked): "repaired" just means the
+        # driver is done at the vendor — release the parked stops and tell the
+        # boss he's back in service. "Not repaired" keeps the stops held and
+        # tells the boss, so the boss decides the next move. (2026-10-10)
+        _driver_name = _actor_name(conn) or "Driver"
+        _vname = (stop["customer_name"] or "vendor").strip()
+        if repaired:
+            _released = _release_holds(conn, stop["route_id"])
+            _back_body = ("✅ %s back in service from %s — %d held stop%s released."
+                          % (_driver_name, _vname, _released,
+                             "" if _released == 1 else "s"))
+            conn.execute(
+                "INSERT INTO messages (route_id, sender_user_id, body, created_at, priority)"
+                " VALUES (?,?,?,?,'urgent')",
+                (stop["route_id"], session["user_id"], _back_body[:500], ts))
+            notify(conn, cid(), "VENDOR_SELF_DISPATCH",
+                   _driver_name + " back in service",
+                   _back_body[:400],
+                   link=url_for("view_route", route_id=stop["route_id"]),
+                   actor_user_id=session["user_id"],
+                   entity_type="stop", entity_id=stop["id"])
+        else:
+            body = "\U0001F527 Vendor visit done — truck NOT repaired"
+            body += (": " + note) if note else "."
+            conn.execute(
+                "INSERT INTO messages (route_id, sender_user_id, body, created_at, priority)"
+                " VALUES (?,?,?,?,'urgent')",
+                (stop["route_id"], session["user_id"], body[:500], ts))
+            notify(conn, cid(), "VENDOR_SELF_DISPATCH",
+                   "Vendor visit — truck NOT repaired",
+                   body[:400],
+                   link=url_for("view_route", route_id=stop["route_id"]),
+                   actor_user_id=session["user_id"],
+                   entity_type="stop", entity_id=stop["id"])
+    elif did:
         if repaired:
             res_note = "Repaired at vendor (driver-confirmed)"
             if note:
@@ -17489,7 +17692,23 @@ def vendor_complete(stop_id):
             )
             # Truck is fixed → release the stops parked behind this vendor visit;
             # the stop that was current before the Go NOW resumes automatically.
-            _release_holds(conn, stop["route_id"])
+            # Tell the boss the driver is back in service (2026-10-10: driver
+            # autonomy — the boss was notified on the way in, now on the way out).
+            _released = _release_holds(conn, stop["route_id"])
+            _driver_name = _actor_name(conn) or "Driver"
+            _vname = (stop["customer_name"] or "vendor").strip()
+            _back_body = ("✅ %s back in service from %s — %d held stop%s released."
+                          % (_driver_name, _vname, _released, "" if _released == 1 else "s"))
+            conn.execute(
+                "INSERT INTO messages (route_id, sender_user_id, body, created_at, priority)"
+                " VALUES (?,?,?,?,'urgent')",
+                (stop["route_id"], session["user_id"], _back_body[:500], ts))
+            notify(conn, cid(), "VENDOR_SELF_DISPATCH",
+                   _driver_name + " back in service",
+                   _back_body[:400],
+                   link=url_for("view_route", route_id=stop["route_id"]),
+                   actor_user_id=session["user_id"],
+                   entity_type="stop", entity_id=stop["id"])
         else:
             # Not repaired — keep the defect OPEN and revert the truck to VENDOR
             # SCHEDULED (needs another trip); tell the boss on the thread.
@@ -20854,6 +21073,96 @@ def reorder_stops(route_id):
     conn.commit()
     conn.close()
 
+    return jsonify({"success": True})
+
+
+@app.route("/api/driver/route/<int:route_id>/reorder", methods=["POST"])
+@driver_required
+def driver_reorder_stops(route_id):
+    """Driver reorders his upcoming stops (2026-10-10: driver autonomy).
+
+    Guardrails: the route must be assigned to the driver and in progress.
+    Completed stops, the current stop, held stops, and cancelled stops stay
+    locked in place — only the remaining upcoming stops may move. The posted
+    stop_ids must be exactly the unlocked set, in the new order. Can flow and
+    can-swap chains are recomputed over the new order, and the boss is
+    notified with what changed.
+    """
+    data = request.get_json(silent=True) or {}
+    raw = data.get("stop_ids", [])
+    ids = [int(x) for x in raw if str(x).isdigit()]
+    if len(ids) != len(set(ids)):
+        return jsonify({"error": "duplicate stops"}), 400
+    conn = get_db()
+    route = conn.execute(
+        "SELECT * FROM routes WHERE id=? AND company_id=? AND assigned_to=?",
+        (route_id, cid(), session["user_id"])).fetchone()
+    if not route:
+        conn.close()
+        return jsonify({"error": "route not found"}), 404
+    if route["status"] != "in_progress":
+        conn.close()
+        return jsonify({"error": "route not in progress"}), 400
+    rows = conn.execute(
+        "SELECT id, status, held_at, cancelled_at, customer_name, address"
+        " FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
+        (route_id,)).fetchall()
+    if not rows:
+        conn.close()
+        return jsonify({"error": "no stops"}), 400
+
+    def _cancelled(r):
+        return bool(r["cancelled_at"])
+
+    # Current stop: first stop that is still work to do and not parked.
+    current_id = None
+    for r in rows:
+        if (r["status"] != "completed" and not _cancelled(r)
+                and not r["held_at"]):
+            current_id = r["id"]
+            break
+    locked = {r["id"] for r in rows
+              if r["status"] == "completed" or _cancelled(r)
+              or r["held_at"] or r["id"] == current_id}
+    unlocked = [r["id"] for r in rows if r["id"] not in locked]
+    if set(ids) != set(unlocked):
+        conn.close()
+        return jsonify({"error": "only upcoming stops can be reordered"}), 400
+    if ids == unlocked:
+        conn.close()
+        return jsonify({"success": True, "unchanged": True})
+
+    # Fill the unlocked slots with the posted order; locked stops keep place.
+    it = iter(ids)
+    new_order = [next(it) if r["id"] not in locked else r["id"] for r in rows]
+    for pos, sid in enumerate(new_order, start=1):
+        conn.execute("UPDATE stops SET stop_order=? WHERE id=? AND route_id=?",
+                     (pos, sid, route_id))
+    compute_can_flow(conn, route_id)
+    _apply_route_chains(conn, route_id)
+
+    # Boss visibility: what moved, in plain words.
+    _names = {r["id"]: ((r["customer_name"] or r["address"] or "stop").strip())
+              for r in rows}
+    _old_pos = {sid: i for i, sid in enumerate(unlocked)}
+    _moved = [_names[sid] for i, sid in enumerate(ids) if _old_pos[sid] != i]
+    _driver = _actor_name(conn) or "Driver"
+    _summary = ", ".join(_names[sid] for sid in ids)[:300]
+    body = ("🔀 %s reordered %d upcoming stop%s%s: %s"
+            % (_driver, len(ids), "" if len(ids) == 1 else "s",
+               (" (%s moved)" % ", ".join(_moved[:4])) if _moved else "",
+               _summary))
+    conn.execute(
+        "INSERT INTO messages (route_id, sender_user_id, body, created_at, priority)"
+        " VALUES (?,?,?,?,'urgent')",
+        (route_id, session["user_id"], body[:500], now_ts()))
+    notify(conn, cid(), "DRIVER_REORDER",
+           _driver + " reordered upcoming stops",
+           body[:400],
+           link=url_for("view_route", route_id=route_id),
+           actor_user_id=session["user_id"], entity_type="route", entity_id=route_id)
+    conn.commit()
+    conn.close()
     return jsonify({"success": True})
 
 
@@ -26465,6 +26774,9 @@ ALERT_KINDS = {
     "DRIVER_URGENT":      ("alert",     "critical", "Urgent from driver"),
     "TRUCK_ISSUE":        ("wrench",    "critical", "Truck issue"),
     "BREAKDOWN":          ("alert",     "critical", "Breakdown"),
+    # Driver autonomy (2026-10-10): self-dispatch to vendor + reorder, boss notified.
+    "VENDOR_SELF_DISPATCH": ("wrench",  "warning",  "Driver headed to vendor"),
+    "DRIVER_REORDER":     ("shuffle",   "info",     "Driver reordered stops"),
     "STOP_CANCELLED":     ("x",         "warning",  "Stop cancelled"),
     "ROUTE_CANCELLED":    ("x",         "critical", "Route cancelled"),
     "ROUTE_EXCEPTION":    ("alert",     "warning",  "Can't complete stop"),
@@ -32334,6 +32646,88 @@ def report_breakdown():
     conn.commit()
     conn.close()
     return jsonify({"success": True, "item_id": item_id, "issue": issue})
+
+
+@app.route("/api/driver/vendors", methods=["GET"])
+@driver_required
+def driver_vendors():
+    """Active company vendors for the driver self-dispatch picker."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, name, address, phone FROM vendors "
+        "WHERE company_id=? AND is_active=1 ORDER BY name",
+        (cid(),)).fetchall()
+    conn.close()
+    return jsonify({"vendors": [dict(r) for r in rows]})
+
+
+@app.route("/api/driver/vendor-self-dispatch", methods=["POST"])
+@driver_required
+def driver_vendor_self_dispatch():
+    """Driver heads to a vendor on his own call — no boss approval.
+
+    Inserts the vendor stop as the current stop, parks the rest of the route
+    (held), and notifies the boss (thread message + alert). The driver closes
+    it with the normal vendor-complete flow, which releases the holds.
+    (2026-10-10: driver autonomy — notify, don't gate.)
+    """
+    data = request.get_json(silent=True) or {}
+    vendor_id = data.get("vendor_id")
+    vendor_name = str(data.get("vendor_name") or "").strip()[:120]
+    note = str(data.get("note") or "").strip()[:300]
+    conn = get_db()
+    driver_id = session["user_id"]
+    route_id = driver_active_route_id(conn, driver_id)
+    route = (conn.execute(
+        "SELECT * FROM routes WHERE id=? AND company_id=? AND assigned_to=?",
+        (route_id, cid(), driver_id)).fetchone() if route_id else None)
+    if not route:
+        conn.close()
+        return jsonify({"error": "no active route"}), 404
+    if route["status"] != "in_progress":
+        conn.close()
+        return jsonify({"error": "start the route first"}), 400
+    if conn.execute(
+            "SELECT id FROM stops WHERE route_id=? AND action='Vendor' AND status != 'completed'",
+            (route_id,)).fetchone():
+        conn.close()
+        return jsonify({"error": "already headed to a vendor"}), 400
+    vname, address, vid = "", "", None
+    try:
+        vendor_id = int(vendor_id) if vendor_id is not None else None
+    except (TypeError, ValueError):
+        vendor_id = None
+    if vendor_id:
+        v = conn.execute(
+            "SELECT id, name, address FROM vendors WHERE id=? AND company_id=? AND is_active=1",
+            (vendor_id, cid())).fetchone()
+        if not v:
+            conn.close()
+            return jsonify({"error": "vendor not found"}), 404
+        vname, address, vid = v["name"], v["address"] or "", v["id"]
+    else:
+        if not vendor_name:
+            conn.close()
+            return jsonify({"error": "pick a vendor or enter a name"}), 400
+        vname = vendor_name
+    new_id = _insert_vendor_stop(conn, route_id, 0, vname, address, None, vid,
+                                 note or "Driver self-dispatch to vendor")
+    held_n = _reprioritize_for_vendor(conn, route_id, new_id)
+    driver_name = _actor_name(conn) or "Driver"
+    body = ("🚚 %s headed to %s — %d stop%s held, no approval needed."
+            % (driver_name, vname, held_n, "" if held_n == 1 else "s"))
+    conn.execute(
+        "INSERT INTO messages (route_id, sender_user_id, body, created_at, priority)"
+        " VALUES (?,?,?,?,'urgent')",
+        (route_id, driver_id, body[:500], now_ts()))
+    notify(conn, cid(), "VENDOR_SELF_DISPATCH",
+           driver_name + " headed to " + vname,
+           "%d stop(s) held on %s." % (held_n, route["route_name"] or "route"),
+           link=url_for("view_route", route_id=route_id),
+           actor_user_id=driver_id, entity_type="stop", entity_id=new_id)
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "vendor_stop_id": new_id, "held": held_n})
 
 
 @app.route("/api/breakdown/<int:item_id>/continue", methods=["POST"])
