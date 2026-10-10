@@ -14873,11 +14873,6 @@ def driver_route_detail(route_id):
         flash("Route not found.", "error")
         return redirect(url_for("driver_dashboard"))
 
-    # 2026-10-10: Clear detour if requested (driver tapped "Back to...")
-    if request.args.get("clear_detour"):
-        session.pop("detour_to", None)
-        session.pop("detour_from", None)
-
     stops = conn.execute("""
         SELECT *
         FROM stops
@@ -14988,25 +14983,11 @@ def driver_route_detail(route_id):
 
     current_stop = None
     current_stop_num = None
-    # 2026-10-10: Detour — if the driver tapped "Deliver Empty to X", show X
-    # as the current card so he can work the swap, then return.
-    _detour_id = request.args.get("detour", "").strip() or session.get("detour_to")
-    if _detour_id:
-        try:
-            _detour_id = int(_detour_id)
-            for i, s in enumerate(stops, start=1):
-                if s["id"] == _detour_id and stop_is_open(s):
-                    current_stop = s
-                    current_stop_num = i
-                    break
-        except (ValueError, TypeError):
-            pass
-    if not current_stop:
-        for i, s in enumerate(stops, start=1):
-            if stop_is_open(s):
-                current_stop = s
-                current_stop_num = i
-                break
+    for i, s in enumerate(stops, start=1):
+        if stop_is_open(s):
+            current_stop = s
+            current_stop_num = i
+            break
 
     # Driver reorder (2026-10-10): upcoming stops the driver may reshuffle.
     # Completed, cancelled, held, and the current stop stay locked.
@@ -15435,7 +15416,6 @@ def driver_route_detail(route_id):
     dump_ticket_html = ""
     return_bin_html = ""
     go_to_dump_html = ""
-    deliver_dest_id = None
     if _chained:
         # First on-site step: the head has no incoming empty (just box out its
         # full); every other chain member arrives carrying an empty to set off.
@@ -15459,9 +15439,6 @@ def driver_route_detail(route_id):
         }
         if _deliver_step:
             wf_map["need_box_in"] = _deliver_step
-            # 2026-10-10: track the destination for detour navigation
-            deliver_dest_id = _chain_carry_dest_id(
-                _chained, _c_gives, _c_takes is not None, _c_term, _c_head_id)
     elif is_swap_pr:
         wf_map = {
             "pending":     ("arrived",       "&#128666; Arrived at Stop",               "btn-driver btn-driver-complete"),
@@ -15512,8 +15489,7 @@ def driver_route_detail(route_id):
         # Remove from wf_map so it doesn't render twice
         del wf_map["need_box_in"]
 
-    # 2026-10-10: The "Go To Dump" (box_out → going_to_dump) button lives with
-    # the dump section, not buried under Message Boss. Extract it separately.
+    # 2026-10-10: Go To Dump lives with the dump section, not under Message Boss.
     go_to_dump_html = ""
     if driver_status == "box_out" and "box_out" in wf_map:
         _nxt, _lbl, _cls = wf_map["box_out"]
@@ -15528,13 +15504,10 @@ def driver_route_detail(route_id):
 
     if driver_status in wf_map:
         nxt, lbl, cls = wf_map[driver_status]
-        # 2026-10-10: pass dest ID for detour navigation on Deliver Empty
-        _dest_input = f'<input type="hidden" name="dest_stop_id" value="{deliver_dest_id}">' if deliver_dest_id and driver_status == "need_box_in" else ""
         workflow_btn_html = (
             f'<form method="POST" action="{url_for("stop_driver_action", stop_id=stop_id)}" style="margin-bottom:10px;">'
             f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
             f'<input type="hidden" name="action" value="{nxt}">'
-            f'{_dest_input}'
             f'<button class="{cls}" type="submit" style="width:100%;min-height:52px;">{lbl}</button>'
             f'</form>'
         )
@@ -16292,26 +16265,6 @@ def driver_route_detail(route_id):
   .cab-ro-name {{ font-weight: 700; font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
   /* 2026-10-10: un-arrive is a subtle undo, not a CTA — top-right of card */
   .cab-card {{ position: relative; }}
-  /* 2026-10-10: dump ticket form fits the page — single column on phones */
-  @media (max-width: 600px) {{
-      .dt-grid {{ grid-template-columns: 1fr !important; }}
-  }}
-  /* 2026-10-10: detour banner — swap destination */
-  .cab-detour-banner {{
-      background: rgba(255,107,26,0.12); border: 1px solid rgba(255,107,26,0.35);
-      border-radius: 12px; padding: 12px 14px; margin-bottom: 14px;
-  }}
-  .cab-detour-label {{
-      font-size: 0.8rem; font-weight: 800; color: #FF8C42;
-      text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;
-  }}
-  .cab-detour-text {{
-      font-size: 0.9rem; color: rgba(255,255,255,0.85); margin-bottom: 8px;
-  }}
-  .cab-detour-back {{
-      display: inline-block; color: #FF8C42; font-weight: 700;
-      text-decoration: none; font-size: 0.95rem;
-  }}
   .cab-unarrive-mini {{
       position: absolute !important; top: 12px !important; right: 12px !important;
       background: transparent !important; border: 1px solid rgba(255,255,255,0.14) !important;
@@ -16480,25 +16433,7 @@ def driver_route_detail(route_id):
     </form>
     ''' if prev_stop else ''}
 
-    # 2026-10-10: Detour banner — shows when driver is working a swap destination.
-    # Tapping "Back" returns to the original stop.
-    _detour_banner_html = ""
-    _detour_from_id = session.get("detour_from")
-    _detour_to_id = session.get("detour_to")
-    if _detour_from_id and _detour_to_id and current_stop and current_stop["id"] == _detour_to_id:
-        _orig = next((s for s in stops if s["id"] == _detour_from_id), None)
-        _orig_name = (_orig["customer_name"] or _orig["address"] or "previous stop").strip() if _orig else "previous stop"
-        _detour_banner_html = (
-            f'<div class="cab-detour-banner">'
-            f'<div class="cab-detour-label">&#8646; Swap detour</div>'
-            f'<div class="cab-detour-text">Working {_orig_name}&#39;s empty here, then you&#39;ll head back.</div>'
-            f'<a class="cab-detour-back" href="{url_for("driver_route_detail", route_id=route_id, clear_detour=1)}">'
-            f'&#8592; Back to {_orig_name}</a>'
-            f'</div>'
-        )
-
     <div class="cab-card cab-phase-{"2" if _arrived else "1"}">
-        {_detour_banner_html}
         <div class="cab-action-row">
             {cab_action_badge}
             <div class="cab-action-name">{e(s['customer_name'] or ('Stop ' + str(current_stop_num)))}</div>
@@ -20358,18 +20293,6 @@ def toggle_stop_complete(stop_id):
         })
 
     conn.close()
-    # 2026-10-10: If this was a detour stop being completed, clear the detour
-    # and return to the original stop. For chains, the next detour will be set
-    # when the driver taps the next "Deliver Empty".
-    if new_status == "completed" and session.get("detour_to") == stop_id:
-        _return_to = session.pop("detour_from", None)
-        session.pop("detour_to", None)
-        if _return_to:
-            # Stay on the detour completion, but the next page load will show
-            # the original stop (it's still open). Pass a flag to clear any
-            # stale detour state.
-            return redirect(url_for("driver_route_detail", route_id=stop["route_id"],
-                                    detour_cleared=1))
     if session.get("role") != "boss":
         return redirect(url_for("driver_route_detail", route_id=stop["route_id"]))
     return redirect(url_for("view_route", route_id=stop["route_id"]))
@@ -20663,11 +20586,7 @@ def stop_driver_action(stop_id):
     # Complete Stop button).
     _auto_completed = False
     _handoff_stop_id = None
-    _detour_dest_id = request.form.get("dest_stop_id", "").strip()
-    # 2026-10-10: If a dest is provided, this is a DETOUR not a completion.
-    # The driver goes to work the dest stop, then returns here.
-    _is_detour = bool(_detour_dest_id and _detour_dest_id.isdigit())
-    if action == "box_in" and current_status == "need_box_in" and not _is_detour:
+    if action == "box_in" and current_status == "need_box_in":
         _skeys = stop.keys()
         _al = (stop["action"] or "").lower()
         _is_pr = "pickup and return" in _al or ("swap" in _al and "pull" not in _al)
@@ -20720,15 +20639,6 @@ def stop_driver_action(stop_id):
                         "auto_completed": _auto_completed})
     if _flash_msg:
         flash(_flash_msg, "success")
-    # 2026-10-10: Detour — driver goes to work the dest stop, then returns.
-    # Store the return-to stop in session.
-    if _is_detour:
-        session["detour_to"] = int(_detour_dest_id)
-        session["detour_from"] = stop_id
-        # Update driver_status to box_in (empty is on truck heading to dest)
-        # but do NOT complete the stop.
-        return redirect(url_for("driver_route_detail", route_id=route_id,
-                                detour=int(_detour_dest_id)))
     if _handoff_stop_id:
         return redirect(url_for("driver_route_detail", route_id=route_id,
                                 handoff=_handoff_stop_id))
@@ -21245,9 +21155,9 @@ def dump_ticket(stop_id):
         <a class="btn secondary" href="javascript:history.back()" style="margin-top:10px;display:inline-block;">&#8592; Back</a>
     </div>
     <div class="card">
-        <form method="POST" enctype="multipart/form-data" id="dt-form" style="max-width:100%;overflow-x:hidden;">
+        <form method="POST" enctype="multipart/form-data" id="dt-form" style="max-width:100%;">
             <input type="hidden" name="_csrf_token" value="{csrf_tok}">
-            <div class="grid dt-grid">
+            <div class="grid" style="grid-template-columns:1fr;">
                 <div>
                     <label>Dump Site</label>
                     <select name="dump_site" id="f-site">
