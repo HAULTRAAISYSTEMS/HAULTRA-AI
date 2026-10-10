@@ -3425,6 +3425,9 @@ def init_db():
     # ai_prefilled: OCR successfully read this ticket's photo (informational).
     safe_add_column(conn, "dump_tickets", "fee_usd REAL")
     safe_add_column(conn, "dump_tickets", "material TEXT")
+    safe_add_column(conn, "dump_tickets", "material_type TEXT")
+    safe_add_column(conn, "dump_tickets", "cash_received REAL")
+    safe_add_column(conn, "dump_tickets", "container_scrapped INTEGER NOT NULL DEFAULT 0")
     safe_add_column(conn, "dump_tickets", "needs_review INTEGER NOT NULL DEFAULT 0")
     safe_add_column(conn, "dump_tickets", "ai_prefilled INTEGER NOT NULL DEFAULT 0")
     # Per-company daily cap on scale-ticket OCR calls — a stuck retry loop must
@@ -20962,6 +20965,9 @@ def dump_ticket(stop_id):
         net_tons       = _sf("net_tons")
         fee_usd        = _sf("fee_usd")
         material       = request.form.get("material", "").strip()
+        material_type  = request.form.get("material_type", "").strip()
+        cash_received  = _sf("cash_received")
+        container_scrapped = 1 if request.form.get("container_scrapped") == "1" else 0
         ticket_number  = request.form.get("ticket_number", "").strip()
         notes          = request.form.get("notes", "").strip()
         # needs_review = 1 only when a photo's OCR is still queued (captured
@@ -20994,7 +21000,11 @@ def dump_ticket(stop_id):
 
         _ticket_source = "site"
         if _completing:
-            if _issues_tickets:
+            # 2026-10-10: Chained stops don't block on tickets — the driver
+            # needs to keep moving through the chain. Tickets can be entered
+            # later or skipped if the site didn't issue one.
+            _is_chained = bool((dict(stop).get("chain_group_id") or "").strip())
+            if _issues_tickets and not _is_chained:
                 if not _has_ticket and not _has_photo:
                     msg = "This dump site issues tickets — enter the ticket number or add a photo of it to complete."
                     if request.headers.get("X-Requested-With") == "fetch":
@@ -21006,7 +21016,8 @@ def dump_ticket(stop_id):
                 _ticket_source = "site"
             else:
                 # Site issues no ticket: the photo IS the record. Require it.
-                if not _has_photo:
+                # (Chained stops exempt — driver keeps moving through the chain.)
+                if not _has_photo and not _is_chained:
                     msg = "This dump site issues no ticket — add a photo of the dump so there's a verifiable record."
                     if request.headers.get("X-Requested-With") == "fetch":
                         conn.close()
@@ -21038,10 +21049,12 @@ def dump_ticket(stop_id):
                 """INSERT INTO dump_tickets
                    (stop_id, route_id, company_id, dump_site, arrival_time, departure_time,
                     can_number, scale_in_weight, scale_out_weight, net_tons, fee_usd, material,
+                    material_type, cash_received, container_scrapped,
                     ticket_number, notes, needs_review, created_at, created_by)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (stop_id, route_id, cid(), dump_site, arrival_time, departure_time,
                  can_number, scale_in, scale_out, net_tons, fee_usd, material,
+                 material_type, cash_received, container_scrapped,
                  ticket_number, notes, needs_review, now_ts(), session["user_id"])
             )
 
@@ -21217,6 +21230,30 @@ def dump_ticket(stop_id):
                     <label>Material</label>
                     <input name="material" id="f-material" value="{_fv("material")}" placeholder="e.g. C&amp;D, MSW">
                 </div>
+                <div>
+                    <label>Material Type</label>
+                    <select name="material_type" id="f-material-type">
+                        <option value="">— Select —</option>
+                        <option value="trash">Trash / MSW</option>
+                        <option value="concrete">Concrete</option>
+                        <option value="metal">Metal / Scrap</option>
+                        <option value="cd">C&D</option>
+                        <option value="yard_waste">Yard Waste</option>
+                        <option value="other">Other</option>
+                    </select>
+                </div>
+                <div>
+                    <label>Cash Received ($)</label>
+                    <input name="cash_received" id="f-cash" type="number" step="0.01" min="0" value="{_fv("cash_received")}" placeholder="0.00">
+                    <div class="small muted" style="margin-top:4px;">For scrap metal payouts, etc.</div>
+                </div>
+                <div>
+                    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                        <input type="checkbox" name="container_scrapped" value="1" style="width:20px;height:20px;">
+                        Container Scrapped
+                    </label>
+                    <div class="small muted" style="margin-top:4px;">Whole bin was scrapped, not just dumped.</div>
+                </div>
             </div>
             <label>Notes</label>
             <textarea name="notes" placeholder="Issues, observations, gate info...">{_fv("notes")}</textarea>
@@ -21250,6 +21287,12 @@ def dump_ticket(stop_id):
                 <a class="btn secondary" href="javascript:history.back()"
                    style="flex:1;min-width:120px;text-align:center;padding:12px 16px;min-height:48px;">
                     &#8592; Back
+                </a>
+            </div>
+            <div style="margin-top:12px;text-align:center;">
+                <span class="small muted">No ticket issued at this site?</span><br>
+                <a href="{url_for('driver_route_detail', route_id=route_id)}" class="btn secondary" style="margin-top:6px;">
+                    Skip — Continue Without Ticket
                 </a>
             </div>
         </form>
