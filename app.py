@@ -35401,6 +35401,106 @@ def dispatch_view():
     return send_from_directory('static', 'dispatch.html')
 
 
+@app.route("/api/garbage/scan-sheet", methods=["POST"])
+@roles_required("dispatcher", api=True)
+def garbage_scan_sheet():
+    """Boss photographs a paper Daily Route Log -> Claude Vision reads the stop
+    table and returns the stops as JSON for review before dispatch.
+    (2026-10-10: zero-typing boss onboarding — snap the sheet, review, send.)"""
+    photo = request.files.get("photo")
+    if not photo:
+        return jsonify({"error": "no photo received"}), 400
+    raw = photo.read()
+    if len(raw) > 10 * 1024 * 1024:
+        return jsonify({"error": "photo too large (10MB max)"}), 400
+    if len(raw) < 2048:
+        return jsonify({"error": "photo looks empty — try again"}), 400
+    try:
+        import anthropic
+    except ImportError:
+        return jsonify({"error": "AI reader not installed"}), 500
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return jsonify({"error": "AI reader not configured"}), 500
+
+    import base64 as _b64
+    mime = (photo.mimetype or "").strip() or "image/jpeg"
+    if mime not in ("image/jpeg", "image/png", "image/webp", "image/gif"):
+        mime = "image/jpeg"
+    b64 = _b64.b64encode(raw).decode("ascii")
+
+    system_prompt = (
+        "You read a paper \"Daily Route Log\" from a residential garbage truck company "
+        "and return the route's stops as JSON.\n\n"
+        "The sheet has a table with columns: Work Order | Customer Site Address | City | "
+        "Dumpster Size | Start Time | Landfill Arrival Time | Landfill Depart Time | "
+        "Finish Time | Box In | Box Out | Weight of Load (tons) | Dump Site.\n\n"
+        "RULES:\n"
+        "- Each table row is one stop. Work Order is \"toter\" (96-gal cart tip) or "
+        "\"HPU\" (hand pick-up of bags). Map to service_type: \"toter\" -> \"toter\", "
+        "\"HPU\" -> \"hpu\".\n"
+        "- address = Customer Site Address exactly as printed. city = City as printed "
+        "(often abbreviated: VB, Ches).\n"
+        "- IGNORE all handwritten times (Start/Finish/Landfill columns) — they log a "
+        "past day, not the route itself.\n"
+        "- DO capture handwritten instructions:\n"
+        "  * \"do not enter X before 7am\" / \"dont enter X before 8am\" -> not_before "
+        "\"7am\"/\"8am\" on the matching stop (match by address fragment, e.g. "
+        "\"seashore cove\" -> the Seashore Cove stop; \"HOA communities\" applies to no "
+        "specific stop — put it in notes of the first stop).\n"
+        "  * A route-level note like \"dump @ GFL every friday\" -> append a final stop: "
+        "{\"service_type\": \"landfill\", \"address\": \"GFL\", \"city\": \"\", "
+        "\"notes\": \"dump here every Friday\", \"not_before\": \"\"}.\n"
+        "  * Box In/Box Out location notes like \"all behind building\" or \"all cans on "
+        "street\" -> notes on that stop. Skip pure counts like \"8 total\" (one day's count).\n"
+        "- Skip blank rows and the header row. If an address is unreadable, skip that "
+        "row — never guess an address.\n\n"
+        "Return ONLY valid JSON, no markdown fences, no prose:\n"
+        "{\"stops\": [{\"service_type\": \"toter|hpu|landfill\", \"address\": \"...\", "
+        "\"city\": \"...\", \"notes\": \"...\", \"not_before\": \"...\"}, ...]}"
+    )
+    try:
+        client = anthropic.Anthropic(api_key=api_key, timeout=60.0)
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
+            system=system_prompt,
+            messages=[{"role": "user", "content": [
+                {"type": "image",
+                 "source": {"type": "base64", "media_type": mime, "data": b64}},
+                {"type": "text",
+                 "text": "Extract the route stops from this Daily Route Log photo as JSON."},
+            ]}],
+        )
+        raw_reply = "".join(
+            block.text for block in resp.content if getattr(block, "type", None) == "text"
+        ).strip()
+    except Exception as ex:
+        app.logger.warning("garbage_scan_sheet: vision error: %s", ex)
+        return jsonify({"error": "couldn't read the photo — try again"}), 502
+
+    stops = _salvage_parse_response(raw_reply)
+    if not stops:
+        return jsonify({"error": "couldn't find stops on that sheet — try a clearer photo"}), 422
+    # Keep only well-formed garbage stops.
+    clean = []
+    for s in stops:
+        st = str(s.get("service_type") or "").strip().lower()
+        addr = str(s.get("address") or "").strip()
+        if st not in ("toter", "hpu", "landfill") or not addr:
+            continue
+        clean.append({
+            "service_type": st,
+            "address": addr,
+            "city": str(s.get("city") or "").strip()[:60],
+            "notes": str(s.get("notes") or "").strip()[:300],
+            "not_before": str(s.get("not_before") or "").strip()[:20],
+        })
+    if not clean:
+        return jsonify({"error": "couldn't find stops on that sheet — try a clearer photo"}), 422
+    return jsonify({"success": True, "stops": clean, "count": len(clean)})
+
+
 @app.route('/garbage-dispatch')
 @roles_required("dispatcher")
 def garbage_dispatch_view():
@@ -35440,6 +35540,11 @@ button.go{{width:100%;margin-top:16px;min-height:56px;border:none;border-radius:
 <label class="lbl">Date</label>
 <input id="gd-date" type="date" value="{today_str()}">
 <label class="lbl">Stops — one per line</label>
+<button type="button" id="gd-scan-btn" onclick="document.getElementById('gd-photo').click()"
+  style="width:100%;min-height:52px;margin-bottom:10px;border-radius:12px;cursor:pointer;
+  background:rgba(66,135,245,.12);border:1px solid rgba(66,135,245,.5);color:#8FB8FF;
+  font-weight:800;font-size:16px;">&#128247; Scan a paper route sheet</button>
+<input id="gd-photo" type="file" accept="image/*" capture="environment" hidden onchange="gdScan(this)">
 <textarea id="gd-lines" placeholder="toter 2545 Squadron Ct, VB&#10;hpu 800 Gas Light Ln, VB !7am&#10;landfill GFL Transfer, Chesapeake"></textarea>
 <div class="hint">Format: <b>toter</b> | <b>hpu</b> | <b>landfill</b> &nbsp;address, city &nbsp;optional <b>!7am</b> = not before, <b>#note</b></div>
 <div class="ex">toter 2545 Squadron Ct, VB&#10;toter 227 Mediterranean Ave, VB&#10;hpu 800 Gas Light Ln, VB !7am #132 units&#10;landfill GFL Transfer, Chesapeake</div>
@@ -35448,6 +35553,44 @@ button.go{{width:100%;margin-top:16px;min-height:56px;border:none;border-radius:
 </div>
 <script>
 var GD_CSRF = {json.dumps(csrf)};
+function gdScan(input){{
+  var f = input.files && input.files[0];
+  var st = document.getElementById('status');
+  if(!f) return;
+  st.textContent = 'Reading the sheet…';
+  var img = new Image();
+  img.onload = function(){{
+    // Downscale so the upload stays fast on a weak signal (same trick as the driver photo flow).
+    var maxSide = 1600, w = img.width, h = img.height;
+    var scale = Math.min(1, maxSide / Math.max(w, h));
+    var cw = Math.round(w * scale), ch = Math.round(h * scale);
+    var c = document.createElement('canvas'); c.width = cw; c.height = ch;
+    c.getContext('2d').drawImage(img, 0, 0, cw, ch);
+    c.toBlob(function(blob){{
+      if(!blob){{ st.textContent = 'Could not read that photo.'; return; }}
+      var fd = new FormData(); fd.append('photo', blob, 'sheet.jpg');
+      fetch('/api/garbage/scan-sheet', {{method:'POST', credentials:'same-origin',
+        headers:{{'X-CSRF-Token': GD_CSRF}}, body: fd}})
+      .then(function(r){{ return r.json().then(function(j){{ return {{s:r.status, j:j}}; }}); }})
+      .then(function(x){{
+        if(x.s===200 && x.j.success){{
+          var lines = x.j.stops.map(function(s){{
+            var line = s.service_type + ' ' + s.address + (s.city ? ', ' + s.city : '');
+            if(s.not_before) line += ' !' + s.not_before;
+            if(s.notes) line += ' #' + s.notes;
+            return line;
+          }});
+          document.getElementById('gd-lines').value = lines.join('\\n');
+          st.textContent = '✓ Read ' + x.j.count + ' stops from the photo — review, edit if needed, then Dispatch.';
+        }} else st.textContent = (x.j && x.j.error) || 'Could not read the sheet.';
+      }}).catch(function(){{ st.textContent = 'Network error — try again.'; }});
+    }}, 'image/jpeg', 0.85);
+    URL.revokeObjectURL(img.src);
+  }};
+  img.onerror = function(){{ st.textContent = 'Could not read that photo.'; }};
+  img.src = URL.createObjectURL(f);
+  input.value = '';
+}}
 function gdSend(){{
   var drv = document.getElementById('gd-driver').value;
   var date = document.getElementById('gd-date').value;
