@@ -14983,11 +14983,22 @@ def driver_route_detail(route_id):
 
     current_stop = None
     current_stop_num = None
-    for i, s in enumerate(stops, start=1):
-        if stop_is_open(s):
-            current_stop = s
-            current_stop_num = i
-            break
+    # 2026-10-10: show_stop param overrides — display a specific stop's card
+    # (e.g., after tapping "Return Empty to X", show X's card).
+    _show_stop_id = request.args.get("show_stop", "").strip()
+    if _show_stop_id and _show_stop_id.isdigit():
+        _show_id = int(_show_stop_id)
+        for i, s in enumerate(stops, start=1):
+            if s["id"] == _show_id:
+                current_stop = s
+                current_stop_num = i
+                break
+    if not current_stop:
+        for i, s in enumerate(stops, start=1):
+            if stop_is_open(s):
+                current_stop = s
+                current_stop_num = i
+                break
 
     # Driver reorder (2026-10-10): upcoming stops the driver may reshuffle.
     # Completed, cancelled, held, and the current stop stay locked.
@@ -15623,32 +15634,9 @@ def driver_route_detail(route_id):
                 )
 
     # ── Next-stop fallback ──────────────────────────────────────────────
-    # 2026-10-10: If the boss redirects via text (not through the app), the
-    # chain/carry logic above finds nothing. But the driver still needs to
-    # know where he's going next. Fall back to the next live stop in route
-    # order so he always has an address + Navigate button.
-    if not _next_handoff_html and driver_status in ("need_box_in", "box_in"):
-        _sids_fb = [_nr["id"] for _nr in stops]
-        if stop_id in _sids_fb:
-            for _nr in stops[_sids_fb.index(stop_id) + 1:]:
-                if not stop_is_cancelled(_nr):
-                    _fb_full = " ".join(filter(None, [
-                        _nr["address"] or "", _nr["city"] or "",
-                        _nr["state"] or "", _nr["zip_code"] or ""])).strip()
-                    if _fb_full:
-                        _fb_name = (_nr["customer_name"] or "").strip() or _fb_full
-                        _next_handoff_html = (
-                            '<div class="cab-next-handoff">'
-                            '<div class="cab-next-handoff-label">&#9650; Next stop</div>'
-                            '<div class="cab-next-handoff-addr">' + e(_fb_name) + '</div>'
-                            '<div class="cab-next-handoff-addr" style="font-size:0.85rem;color:rgba(255,255,255,0.6);">' + e(_fb_full) + '</div>'
-                            '<a class="cab-primary cab-next-handoff-nav" href="#" '
-                            'onclick="return openNavStop(event, ' + _nav_pref_js + ', '
-                            + e(json.dumps(_fb_full)) + ')">'
-                            '&#128205; Navigate</a>'
-                            '</div>'
-                        )
-                    break
+    # 2026-10-10: REMOVED — user wants the "Return/Deliver Empty to X" button
+    # to link directly to X's card, not show a separate "NEXT STOP" card.
+    # (The show_stop param in driver_route_detail handles the navigation.)
 
     # ── Photo proof: Off / Encouraged (nudge) / Required (hard gate) ───────
     stop_photos = photos_by_stop.get(stop_id, [])
@@ -20607,13 +20595,12 @@ def stop_driver_action(stop_id):
                 # or the current stop).
                 if _handoff_stop_id and _handoff_stop_id != stop_id:
                     # Driver needs to drive to the dest — don't complete yet.
-                    # Clear the handoff so we don't redirect away; the driver
-                    # stays on this stop until they tap Complete Stop.
-                    _handoff_stop_id = None
-                    # Just update driver_status to box_in (empty on truck).
-                    # (Already done by the earlier UPDATE at line 20570.)
+                    # Keep the handoff ID so we redirect to show the dest stop's
+                    # card (via show_stop param). The stop stays open.
+                    # (driver_status already set to box_in by the earlier UPDATE.)
                     pass
                 else:
+                    _handoff_stop_id = None
                     conn.execute(
                         "UPDATE stops SET status='completed', completed_at=?, "
                         "driver_status='completed', driver_status_before_complete=? "
@@ -20651,8 +20638,10 @@ def stop_driver_action(stop_id):
     if _flash_msg:
         flash(_flash_msg, "success")
     if _handoff_stop_id:
+        # 2026-10-10: Redirect to show the dest stop's card (not a handoff param,
+        # but show_stop to display that specific stop).
         return redirect(url_for("driver_route_detail", route_id=route_id,
-                                handoff=_handoff_stop_id))
+                                show_stop=_handoff_stop_id))
     return redirect(url_for("driver_route_detail", route_id=route_id))
 
 
