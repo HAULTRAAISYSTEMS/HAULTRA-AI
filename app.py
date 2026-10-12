@@ -19583,7 +19583,7 @@ def cancel_stop(stop_id):
     conn.execute(
         """UPDATE stops
               SET cancelled_at=?, cancelled_by=?, cancel_reason=?,
-                  cancel_source=?, cancel_client_uuid=?
+                  cancel_source=?, cancel_client_uuid=?, status='cancelled'
             WHERE id=? AND cancelled_at IS NULL""",
         (now_ts(), session["user_id"], reason, source, client_uuid, stop_id),
     )
@@ -19640,7 +19640,7 @@ def uncancel_stop(stop_id):
     conn.execute(
         """UPDATE stops SET cancelled_at=NULL, cancelled_by=NULL,
                             cancel_reason=NULL, cancel_source=NULL,
-                            cancel_client_uuid=NULL
+                            cancel_client_uuid=NULL, status='pending'
             WHERE id=?""",
         (stop_id,),
     )
