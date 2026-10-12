@@ -30923,9 +30923,8 @@ def customers_page():
         </div>
         {_export_link(url_for('export_customers_csv'), "⬇ Export CSV")}
     </div>
-    <div style="max-width:640px;margin-bottom:16px;display:flex;gap:10px;flex-wrap:wrap;">
-        <button class="btn green" id="add-cust-toggle" onclick="toggleAdd()">+ Add Customer</button>
-        <a class="btn secondary" href="{url_for('customer_import_page')}" style="text-decoration:none;">📥 Import Customers</a>
+    <div style="max-width:640px;margin-bottom:16px;">
+        <button class="btn green" id="add-cust-toggle" onclick="toggleAdd()">+ Add Customers</button>
     </div>
         <div id="add-cust-form" hidden class="bin-card" style="padding:16px;margin-top:12px;">
             <div id="add-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
@@ -30943,7 +30942,17 @@ def customers_page():
             <div id="ac-bins"></div>
             <button class="btn secondary" style="padding:6px 12px;font-size:12px;margin:4px 0 12px;" onclick="addBinRow()">+ Add another bin</button>
             <div style="display:flex;gap:8px;">
-                <button class="btn green" style="flex:1;" onclick="submitAdd()">Create customer</button>
+                
+        </form>
+        <form method="POST" action="/customers/import" style="margin:16px 0;padding:12px;background:rgba(255,255,255,0.03);border-radius:12px;">
+            <input type="hidden" name="_csrf_token" value="{e(get_csrf_token())}">
+            <label style="display:block;font-size:13px;font-weight:700;margin-bottom:8px;">Or paste multiple (one per line):</label>
+            <textarea name="bulk_text" rows="4" placeholder="Acme Co 7575550100 123 Main St - 2 30yd and 1 20yd"
+                style="width:100%;padding:10px;border-radius:8px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.15);color:#fff;font-size:14px;"></textarea>
+            <div style="font-size:12px;color:var(--slate);margin:4px 0 8px;">Messy is fine - AI figures out name, phone, address, bins.</div>
+            <button type="submit" class="btn secondary">Import Multiple</button>
+        <form>
+        <button class="btn green" style="flex:1;" onclick="submitAdd()">Create customer</button>
                 <button class="btn secondary" onclick="toggleAdd()">Cancel</button>
             </div>
             <template id="ac-bin-row-tpl">
