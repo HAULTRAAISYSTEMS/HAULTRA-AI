@@ -18547,7 +18547,7 @@ def route_report(route_id):
     stops = conn.execute(
         "SELECT * FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
         (route_id,)).fetchall()
-    conn.close()
+    # conn closed after loop (dump_tickets queried per stop)
 
     def fmt_time(ts):
         if not ts:
@@ -18571,8 +18571,34 @@ def route_report(route_id):
             total_cans += cnt
         elif action == "Hand Pickup":
             total_bags += cnt
-        if s["weight_tons"]:
-            total_tons += float(s["weight_tons"])
+        # 2026-10-12: Pull dump ticket data (tons, material, ticket#, can#)
+        dt = conn.execute(
+            "SELECT net_tons, material, ticket_number, can_number, notes FROM dump_tickets WHERE stop_id=?",
+            (s["id"],)).fetchone()
+        tons = 0.0
+        ticket_info = ""
+        if dt:
+            if dt["net_tons"]:
+                tons = float(dt["net_tons"])
+                total_tons += tons
+            # Build ticket info string
+            parts = []
+            if dt["ticket_number"]:
+                parts.append(f"Tkt#{dt['ticket_number']}")
+            if dt["material"]:
+                parts.append(dt["material"])
+            if dt["can_number"]:
+                parts.append(f"Can#{dt['can_number']}")
+            if dt["notes"]:
+                parts.append(dt["notes"])
+            ticket_info = " | ".join(parts)
+        elif s["weight_tons"]:
+            tons = float(s["weight_tons"])
+            total_tons += tons
+        # Combine stop notes with ticket info
+        all_notes = s["notes"] or ""
+        if ticket_info:
+            all_notes = f"{all_notes} [{ticket_info}]" if all_notes else ticket_info
         rows += (
             f"<tr><td>{typ}</td>"
             f"<td>{e(s['address'] or '')}</td>"
@@ -18582,11 +18608,12 @@ def route_report(route_id):
             f"<td>{fmt_time(s['departed_at'])}</td>"
             f"<td>{fmt_time(s['completed_at'])}</td>"
             f"<td>{cnt if cnt else ''}</td>"
-            f"<td>{('%.2f' % float(s['weight_tons'])) if s['weight_tons'] else ''}</td>"
-            f"<td>{e(s['notes'] or '')}</td></tr>"
+            f"<td>{('%.2f' % tons) if tons else ''}</td>"
+            f"<td>{e(all_notes)}</td></tr>"
         )
 
     driver = route["driver_name"] or route["driver_username"] or "—"
+    conn.close()
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Daily Route Log — {e(route["route_name"])}</title>
