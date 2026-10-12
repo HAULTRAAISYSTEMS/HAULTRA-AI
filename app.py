@@ -31016,190 +31016,117 @@ def api_parse_customer_import():
 
 @app.route("/customers/import", methods=["GET", "POST"])
 def customer_import_page():
-    """Bulk import existing customers with bins on site.
-    Paste: Name, Phone, Address, Bin Size (one per line).
-    Creates customer + site + bin, generates portal link."""
+    """Bulk import existing customers. Handles messy text via AI.
+    Paste anything - AI figures out name, phone, address, bins.
+    Saves, then redirects to Customers page."""
     if not _is_management():
         flash("Managers only.", "error")
         return redirect(url_for("customers_page"))
 
-    imported = []
     if request.method == "POST":
         raw = (request.form.get("bulk_text") or "").strip()
-        conn = get_db()
-        company_id = cid()
-        company_name = session.get("company_name") or "HAULTRA"
+        if not raw:
+            flash("Paste your customer list first.", "error")
+            return redirect(url_for("customer_import_page"))
+
+        # Parse: try simple CSV first, fall back to AI for messy lines
+        parsed = []
+        ai_needed = []
         for line in raw.split("\n"):
             line = line.strip()
             if not line:
                 continue
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 2:
+            if "," in line:
+                parts = [p.strip() for p in line.split(",")]
+                name = parts[0] if len(parts) > 0 else ""
+                phone = parts[1] if len(parts) > 1 else ""
+                address = parts[2] if len(parts) > 2 else ""
+                bins = []
+                if len(parts) > 3:
+                    for b in parts[3].split():
+                        b = b.strip()
+                        if b:
+                            bins.append(b if b.endswith("yd") else b + "yd")
+                if name:
+                    parsed.append({"name": name, "phone": phone, "address": address, "bins": bins})
+            else:
+                ai_needed.append(line)
+
+        # AI parse messy lines
+        if ai_needed:
+            import os as _os
+            api_key = _os.environ.get("ANTHROPIC_API_KEY", "")
+            if api_key:
+                try:
+                    import anthropic, json as _json
+                    client = anthropic.Anthropic(api_key=api_key, timeout=25.0)
+                    resp = client.messages.create(
+                        model="claude-sonnet-4-6", max_tokens=2000,
+                        messages=[{"role": "user", "content":
+                            "Parse into JSON array. Each: name, phone, address, bins (list like [\"30yd\",\"30yd\",\"20yd\"]). "
+                            "\"3 30yd\" = three 30yd bins. Return ONLY JSON array.\n\n" + "\n".join(ai_needed)}],
+                    )
+                    txt = resp.content[0].text.strip()
+                    s, e = txt.find("["), txt.rfind("]") + 1
+                    if s >= 0 and e > s:
+                        for c in _json.loads(txt[s:e]):
+                            bins = [b if b.endswith("yd") else b + "yd" for b in (c.get("bins") or [])]
+                            parsed.append({"name": c.get("name", ""), "phone": c.get("phone", ""),
+                                           "address": c.get("address", ""), "bins": bins})
+                except Exception as ex:
+                    app.logger.warning("AI import parse failed: %s", ex)
+
+        # Save all parsed customers
+        conn = get_db()
+        company_id = cid()
+        count = 0
+        for p in parsed:
+            if not p["name"]:
                 continue
-            name = parts[0]
-            phone = parts[1] if len(parts) > 1 else ""
-            address = parts[2] if len(parts) > 2 else ""
-            # Multiple bins: "20yd 30yd 30yd" -> list of sizes
-            bin_sizes = []
-            if len(parts) > 3:
-                for b in parts[3].split():
-                    b = b.strip()
-                    if b:
-                        if not b.endswith("yd"):
-                            b = b + "yd"
-                        bin_sizes.append(b)
             token = _new_portal_token(conn)
             cur = conn.execute(
-                """INSERT INTO customers
-                    (company_id, business_name, contact_name, phone, portal_token, is_active)
-                    VALUES (?, ?, ?, ?, ?, 1)""",
-                (company_id, name, name, phone, token),
-            )
+                """INSERT INTO customers (company_id, business_name, contact_name, phone, portal_token, is_active)
+                   VALUES (?, ?, ?, ?, ?, 1)""",
+                (company_id, p["name"], p["name"], p["phone"], token))
             cust_id = cur.lastrowid
             site_id = None
-            if address:
+            if p["address"]:
                 scur = conn.execute(
                     "INSERT INTO sites (customer_id, address, created_at) VALUES (?, ?, ?)",
-                    (cust_id, address, today_str()),
-                )
+                    (cust_id, p["address"], today_str()))
                 site_id = scur.lastrowid
-            for bin_size in bin_sizes:
-                if site_id:  # bins require a site
+            for bs in p["bins"]:
+                if site_id:
                     conn.execute(
-                        """INSERT INTO bins (customer_id, site_id, size, dropped_at)
-                            VALUES (?, ?, ?, ?)""",
-                        (cust_id, site_id, bin_size, today_str()),
-                    )
-            portal_url = _portal_url(token)
-            if bin_sizes:
-                bin_list = ", ".join(bin_sizes)
-                bin_msg = f" Your bins ({bin_list}) are already in the system."
-            else:
-                bin_msg = ""
-            sms_body = (f"Hi {name}, this is {company_name} - we're on HAULTRA now."
-                        f"{bin_msg} Tap to activate your portal: {portal_url}")
-            sms_href = "sms:" + (phone or "") + "?&body=" + urllib.parse.quote(sms_body)
-            imported.append({"name": name, "phone": phone, "bin_sizes": bin_sizes,
-                             "sms_href": sms_href})
+                        "INSERT INTO bins (customer_id, site_id, size, dropped_at) VALUES (?, ?, ?, ?)",
+                        (cust_id, site_id, bs, today_str()))
+            count += 1
         conn.commit()
         conn.close()
 
-    import_rows = ""
-    for imp in imported:
-        import_rows += (
-            '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.1);'
-            'border-radius:12px;padding:14px;margin-bottom:10px;">'
-            f'<div style="font-weight:700;">{e(imp["name"])}</div>'
-            f'<div style="font-size:13px;color:var(--slate);">{e(imp["phone"])} - {e(imp["bin_size"] or "No bin")}</div>'
-            f'<a href="{imp["sms_href"]}" class="btn secondary" '
-            'style="margin-top:8px;display:inline-block;text-decoration:none;">Invite via Text</a>'
-            '</div>'
-        )
-    result_html = ""
-    if imported:
-        result_html = (
-            '<div style="margin-top:20px;">'
-            f'<h2>Imported {len(imported)} customers</h2>'
-            '<p style="color:var(--slate);font-size:14px;">Tap Invite to text each customer their portal link.</p>'
-            f'{import_rows}</div>'
-        )
+        if count:
+            flash(f"Imported {count} customers. Tap any customer, then Invite to text them their portal link.", "success")
+        else:
+            flash("Could not parse any customers. Try one per line: Name, Phone, Address, Bin Sizes.", "error")
+        return redirect(url_for("customers_page"))
+
     body = (
         '<div class="hero"><h1>Import Customers</h1>'
-        '<p>Paste your existing customer list - everyone with a bin on site. '
-        'One per line: <code>Name, Phone, Address, Bin Size</code></p></div>'
+        '<p>Paste your customer list - messy is fine, AI figures it out.<br>'
+        'Example: <code>Rockkstaar xpress 757-556-8162 1384 Glyndon dr - 2 30yd and 1 20yd</code></p></div>'
         '<div style="max-width:640px;">'
         '<form method="POST">'
         f'<input type="hidden" name="_csrf_token" value="{e(get_csrf_token())}">'
-        '<textarea id="bulk-text" name="bulk_text" rows="10" placeholder="Dru Construction 7575550100 123 Main St - has 3 30yd and 2 20yd" '
+        '<textarea name="bulk_text" rows="10" '
         'style="width:100%;padding:12px;border-radius:12px;background:rgba(255,255,255,0.05);'
         'border:1px solid rgba(255,255,255,0.15);color:#fff;font-size:14px;"></textarea>'
-        '<div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap;">'
-        '<button type="button" class="btn secondary" onclick="aiParse()">AI Parse Messy Text</button>'
-        '<button type="submit" class="btn green">Import Customers</button> '
-        '</div>'
-        '<div id="ai-result" style="margin-top:12px;"></div>'
-        '<script>'
-        'function aiParse(){'
-        '  var text=document.getElementById("bulk-text").value;'
-        '  var out=document.getElementById("ai-result");'
-        '  out.innerHTML="<p>Parsing...</p>";'
-        '  var meta=document.querySelector(\'meta[name="csrf-token"]\');'
-        '  var csrf=meta?meta.getAttribute("content"):"";'
-        '  fetch("/api/customers/parse-import",{method:"POST",'
-        '    headers:{"Content-Type":"application/json","X-CSRF-Token":csrf},'
-        '    body:JSON.stringify({text:text})})'
-        '  .then(r=>r.json()).then(j=>{'
-        '    if(j.success){'
-        '      var html="<p><b>Found "+j.customers.length+" customers:</b></p>";'
-        '      j.customers.forEach(c=>{'
-        '        html+="<div style=\"padding:8px;background:rgba(255,255,255,0.03);border-radius:8px;margin-bottom:6px;\">"+c.name+" - "+(c.bins||[]).join(", ")+"</div>";'
-        '      });'
-        '      html+="<p>Review above, then hit Import Customers.</p>";'
-        '      // Convert to CSV format for the import'
-        '      var csv=j.customers.map(c=>c.name+", "+(c.phone||"")+", "+(c.address||"")+", "+(c.bins||[]).join(" ")).join("\n");'
-        '      document.getElementById("bulk-text").value=csv;'
-        '      out.innerHTML=html;'
-        '    } else { out.innerHTML="<p>Could not parse: "+(j.error||"unknown")+"</p>"; }'
-        '  }).catch(e=>{out.innerHTML="<p>Parse failed</p>";});'
-        '}'
-        '</script>'
-        f'<a href="{url_for("customers_page")}" class="btn secondary" style="margin-top:12px;text-decoration:none;">Back</a>'
-        '</form>'
-        f'{result_html}</div>'
+        '<div style="margin-top:12px;display:flex;gap:10px;">'
+        '<button type="submit" class="btn green">Import Customers</button>'
+        f'<a href="{url_for("customers_page")}" class="btn secondary" style="text-decoration:none;">Back</a>'
+        '</div></form></div>'
     )
     return render_template_string(shell_page("Import Customers", body))
 
-
-_CUSTOMERS_PAGE_JS = """
-<script>
-(function(){
-  var CSRF = (document.querySelector('meta[name=csrf-token]')||{}).content || '';
-  window.addBinRow=function(){
-    var tpl=document.getElementById('ac-bin-row-tpl');
-    var box=document.getElementById('ac-bins');
-    if(tpl && box){ box.appendChild(tpl.content.cloneNode(true)); }
-  };
-  window.delBinRow=function(btn){
-    var row=btn.closest('.ac-bin-row'); if(row) row.remove();
-  };
-  window.toggleAdd=function(){
-    var f=document.getElementById('add-cust-form');
-    if(!f) return;
-    f.hidden=!f.hidden;
-    // Seed one empty bin row on first open so the form matches the old
-    // single-bin layout (one size dropdown, empty by default).
-    var box=document.getElementById('ac-bins');
-    if(!f.hidden && box && !box.querySelector('.ac-bin-row')){ addBinRow(); }
-  };
-  function err(msg){ var e=document.getElementById('add-err'); if(e){ e.textContent=msg; e.hidden=false; } }
-  window.submitAdd=function(){
-    var bins=[];
-    document.querySelectorAll('#ac-bins .ac-bin-row').forEach(function(row){
-      var size=(row.querySelector('.ac-bin-size')||{}).value||'';
-      var label=(row.querySelector('.ac-bin-label')||{}).value||'';
-      if(size){ bins.push({size:size, label:label}); }
-    });
-    var body={
-      business_name:(document.getElementById('ac-business')||{}).value||'',
-      contact_name:(document.getElementById('ac-contact')||{}).value||'',
-      phone:(document.getElementById('ac-phone')||{}).value||'',
-      email:(document.getElementById('ac-email')||{}).value||'',
-      site_address:(document.getElementById('ac-address')||{}).value||'',
-      bins:bins
-    };
-    if(!body.business_name.trim() && !body.contact_name.trim()){ err('Enter a business or contact name.'); return; }
-    if(bins.length && !body.site_address.trim()){ err('Add a site address for the bins.'); return; }
-    fetch('/api/customers', {method:'POST',
-        headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
-        body:JSON.stringify(body)})
-      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok, j:j}; }); })
-      .then(function(res){ if(res.ok && res.j.id){ window.location='/customers/'+res.j.id; }
-                           else { err((res.j && res.j.error) || 'Could not create customer.'); } })
-      .catch(function(){ err('Network error — try again.'); });
-  };
-})();
-</script>
-"""
 
 
 @app.route("/api/customers", methods=["POST"])
