@@ -18564,6 +18564,7 @@ def route_report(route_id):
     total_cans = total_bags = 0
     total_tons = 0.0
     ticket_photos = []  # 2026-10-12: gallery of ticket photos
+    dash = '<span style="color:#999;">—</span>'
     for i, s in enumerate(stops, start=1):
         action = s["action"] or ""
         typ = {"Toter": "toter", "Hand Pickup": "HPU", "Landfill": "LAND"}.get(action, action)
@@ -18609,15 +18610,22 @@ def route_report(route_id):
             weight_display = "%.2f" % tons
         # Dumpster size from stop
         dumpster_size = s["container_size"] or ""
-        # Notes: combine stop notes + ticket number (tappable if photo exists)
-        all_notes = s["notes"] or ""
-        ticket_link = ""
+        # Ticket column: ticket number (tappable if photo exists), plus any notes
+        # 2026-10-12: Build as HTML, do NOT escape the link
+        ticket_cell = ""
         if ticket_no:
             if ticket_photo:
-                ticket_link = f'<a href="/{e(ticket_photo)}" target="_blank" style="color:#0066cc;">Tkt#{e(ticket_no)} 📷</a>'
+                ticket_cell = f'<a href="/{e(ticket_photo)}" target="_blank" style="color:#0066cc;">Tkt#{e(ticket_no)} \U0001F4F7</a>'
             else:
-                ticket_link = f"Tkt#{e(ticket_no)}"
-            all_notes = f"{all_notes} [{ticket_link}]" if all_notes else ticket_link
+                ticket_cell = f"Tkt#{e(ticket_no)}"
+        elif dt:
+            # Has ticket record but no ticket number (e.g. skipped) - show material or "No tkt"
+            ticket_cell = e(dt["material"] or "No tkt")
+        else:
+            ticket_cell = '<span style="color:#999;">—</span>'
+        # Append stop notes if any
+        if s["notes"]:
+            ticket_cell += f"<br><small>{e(s['notes'])}</small>"
         # Collect for photo gallery
         if ticket_photo:
             ticket_photos.append({
@@ -18634,11 +18642,11 @@ def route_report(route_id):
             f"<td>{fmt_time(s['arrived_at'])}</td>"
             f"<td>{fmt_time(s['departed_at'])}</td>"
             f"<td>{fmt_time(s['completed_at'])}</td>"
-            f"<td>{e(box_in)}</td>"
-            f"<td>{e(box_out)}</td>"
-            f"<td>{e(weight_display)}</td>"
-            f"<td>{e(dump_site)}</td>"
-            f"<td>{e(all_notes)}</td></tr>"
+            f"<td>{e(box_in) or dash}</td>"
+            f"<td>{e(box_out) or dash}</td>"
+            f"<td>{e(weight_display) or dash}</td>"
+            f"<td>{e(dump_site) or dash}</td>"
+            f"<td>{ticket_cell}</td></tr>"
         )
 
     driver = route["driver_name"] or route["driver_username"] or "—"
