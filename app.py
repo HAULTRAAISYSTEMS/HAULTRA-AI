@@ -18571,44 +18571,57 @@ def route_report(route_id):
             total_cans += cnt
         elif action == "Hand Pickup":
             total_bags += cnt
-        # 2026-10-12: Pull dump ticket data (tons, material, ticket#, can#)
+        # 2026-10-12: Match paper Daily Route Log columns + ticket data
+        # Paper: Work Order | Address | City | Dumpster Size | Start | Landfill Arrive |
+        #        Landfill Depart | Finish | Box In | Box Out | Weight (tons) | Dump Site
         dt = conn.execute(
-            "SELECT net_tons, material, ticket_number, can_number, notes FROM dump_tickets WHERE stop_id=?",
+            """SELECT net_tons, material, ticket_number, can_number, dump_site,
+                      scale_in_weight, scale_out_weight, fee_usd
+               FROM dump_tickets WHERE stop_id=?""",
             (s["id"],)).fetchone()
         tons = 0.0
-        ticket_info = ""
+        box_in = box_out = ""
+        dump_site = ""
+        ticket_no = ""
+        weight_display = ""
         if dt:
             if dt["net_tons"]:
                 tons = float(dt["net_tons"])
                 total_tons += tons
-            # Build ticket info string
-            parts = []
-            if dt["ticket_number"]:
-                parts.append(f"Tkt#{dt['ticket_number']}")
-            if dt["material"]:
-                parts.append(dt["material"])
+                weight_display = "%.2f" % tons
+            elif dt["material"]:
+                # e.g. "conc" written in weight column on paper
+                weight_display = dt["material"]
+            # Box In/Out: can_number is the box; same for in/out on pickup&return
             if dt["can_number"]:
-                parts.append(f"Can#{dt['can_number']}")
-            if dt["notes"]:
-                parts.append(dt["notes"])
-            ticket_info = " | ".join(parts)
+                box_in = box_out = dt["can_number"]
+            if dt["dump_site"]:
+                dump_site = dt["dump_site"]
+            if dt["ticket_number"]:
+                ticket_no = dt["ticket_number"]
         elif s["weight_tons"]:
             tons = float(s["weight_tons"])
             total_tons += tons
-        # Combine stop notes with ticket info
+            weight_display = "%.2f" % tons
+        # Dumpster size from stop
+        dumpster_size = s["container_size"] or ""
+        # Notes: combine stop notes + ticket number
         all_notes = s["notes"] or ""
-        if ticket_info:
-            all_notes = f"{all_notes} [{ticket_info}]" if all_notes else ticket_info
+        if ticket_no:
+            all_notes = f"{all_notes} [Tkt#{ticket_no}]" if all_notes else f"Tkt#{ticket_no}"
         rows += (
             f"<tr><td>{typ}</td>"
             f"<td>{e(s['address'] or '')}</td>"
             f"<td>{e(s['city'] or '')}</td>"
+            f"<td>{e(dumpster_size)}</td>"
             f"<td>{fmt_time(s['started_at'])}</td>"
             f"<td>{fmt_time(s['arrived_at'])}</td>"
             f"<td>{fmt_time(s['departed_at'])}</td>"
             f"<td>{fmt_time(s['completed_at'])}</td>"
-            f"<td>{cnt if cnt else ''}</td>"
-            f"<td>{('%.2f' % tons) if tons else ''}</td>"
+            f"<td>{e(box_in)}</td>"
+            f"<td>{e(box_out)}</td>"
+            f"<td>{e(weight_display)}</td>"
+            f"<td>{e(dump_site)}</td>"
             f"<td>{e(all_notes)}</td></tr>"
         )
 
@@ -18631,8 +18644,8 @@ button{{margin:12px 8px 0 0;padding:10px 18px;font-size:15px;cursor:pointer;}}
 <h1>Daily Route Log — {e(route["route_name"])}</h1>
 <div class="sub">Driver: {e(driver)} &nbsp;·&nbsp; Date: {e(route["route_date"])} &nbsp;·&nbsp;
 Truck: {e(route["truck_name"] or "—")} &nbsp;·&nbsp; Type: {e(route["route_type"] or "rolloff")}</div>
-<table><tr><th>Work Order</th><th>Customer Site Address</th><th>City</th><th>Start</th>
-<th>Landfill Arrive</th><th>Landfill Depart</th><th>Finish</th><th>Count</th><th>Tons</th><th>Notes</th></tr>
+<table><tr><th>Work Order</th><th>Customer Site Address</th><th>City</th><th>Dumpster Size</th><th>Start Time</th>
+<th>Landfill Arrival Time</th><th>Landfill Depart Time</th><th>Finish Time</th><th>Box In</th><th>Box Out</th><th>Weight of Load (tons)</th><th>Dump Site</th><th>Notes</th></tr>
 {rows}</table>
 <div class="tot">Totals — cans: {total_cans} &nbsp;·&nbsp; bags: {total_bags} &nbsp;·&nbsp; tons: {total_tons:.2f}</div>
 <button onclick="window.print()">Print</button>
