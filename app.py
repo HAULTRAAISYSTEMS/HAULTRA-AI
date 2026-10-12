@@ -8324,7 +8324,7 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     text-transform: uppercase; color: #F5F5F0;
 }}
 .lane-sub {{ font-size: 11.5px; color: var(--text-muted); margin-top: 4px; line-height: 1.5; }}
-.lane-actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; justify-content: center; }}
+.lane-actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; justify-content: center; width: 100%; }}
 .lane-add-stops {{
     display: inline-flex; align-items: center; min-height: 44px;
     padding: 5px 12px; font-size: 11px; font-weight: 700;
@@ -15450,6 +15450,7 @@ def driver_route_detail(route_id):
     dump_ticket_html = ""
     return_bin_html = ""
     go_to_dump_html = ""
+    box_out_html = ""
     _hide_complete_btn = False
     if _chained:
         # First on-site step: the head has no incoming empty (just box out its
@@ -15539,6 +15540,21 @@ def driver_route_detail(route_id):
             f'</form>'
         )
         del wf_map["box_out"]
+
+    # 2026-10-12: Box Out lives with the dump section too, above Message Boss.
+    box_out_html = ""
+    if driver_status == "arrived" and "arrived" in wf_map:
+        _nxt, _lbl, _cls = wf_map["arrived"]
+        # Only extract the Box Out step (not "Arrived at Stop").
+        if _nxt == "box_out":
+            box_out_html = (
+                f'<form method="POST" action="{url_for("stop_driver_action", stop_id=stop_id)}" style="margin:8px 0;">'
+                f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
+                f'<input type="hidden" name="action" value="{_nxt}">'
+                f'<button class="{_cls}" type="submit" style="width:100%;min-height:52px;">{_lbl}</button>'
+                f'</form>'
+            )
+            del wf_map["arrived"]
 
     if driver_status in wf_map:
         nxt, lbl, cls = wf_map[driver_status]
@@ -16161,6 +16177,7 @@ def driver_route_detail(route_id):
         {dump_ticket_html}
         {return_bin_html}
         {go_to_dump_html}
+        {box_out_html}
         <!-- 2026-10-10: 'Not here yet' is an undo — small back button, top-right of card -->
         <form method="POST" action="{_arrive_action}" class="inline" style="margin:0;padding:0;">
             <input type="hidden" name="_csrf_token" value="{_csrf}">
@@ -25863,11 +25880,10 @@ def update_address_book(sa_id):
         conn.commit()
         flash("Display name updated." if label else "Display name cleared.", "success")
     elif action == "toggle_hide":
-        new_hidden = 0 if (owned["hidden"] or 0) else 1
-        conn.execute("UPDATE saved_addresses SET hidden=? WHERE id=? AND company_id=?",
-                     (new_hidden, sa_id, cid()))
-        conn.commit()
-        flash("Location hidden from quick add." if new_hidden else "Location back in quick add.", "success")
+        # 2026-10-12: Disabled — X on Quick Add chips was hiding addresses from
+        # the address book. X should only remove from the current dispatch screen,
+        # never from the address book. Boss can delete via the address book UI.
+        flash("Hiding is disabled — use Delete in the address book to remove a location.", "info")
     elif action == "toggle_tickets":
         # Boss flips whether this dump site issues its own scale/weigh tickets.
         cur_it = conn.execute(
@@ -29172,9 +29188,10 @@ def address_suggestions():
     _ensure_address_book(conn, cid())
     like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
     # Match on customer name, street address, city, or the assembled full
-    # address so a fragment of any of them surfaces the location. Hidden
-    # locations (boss-hidden) never appear. label overrides customer_name for
-    # display. Ranked frequency-then-recency.
+    # address so a fragment of any of them surfaces the location.
+    # 2026-10-12: Hidden flag ignored — X on Quick Add was accidentally hiding
+    # addresses. All saved addresses appear; boss deletes via address book.
+    # label overrides customer_name for display. Ranked frequency-then-recency.
     rows = conn.execute("""
         SELECT COALESCE(NULLIF(sa.label, ''), sa.customer_name) AS customer_name,
                sa.address, sa.city, sa.state, sa.zip, sa.full_address,
@@ -29191,7 +29208,7 @@ def address_suggestions():
                       ORDER BY times_used DESC, last_used_at DESC
                       LIMIT 1
                   )
-        WHERE sa.company_id=? AND COALESCE(sa.hidden, 0) = 0
+        WHERE sa.company_id=?
           AND (sa.customer_name LIKE ? ESCAPE '\\'
                OR sa.label        LIKE ? ESCAPE '\\'
                OR sa.address      LIKE ? ESCAPE '\\'
