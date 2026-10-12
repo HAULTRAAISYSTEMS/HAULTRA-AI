@@ -6806,6 +6806,8 @@ def shell_page(title, body, extra_head=""):
                 <div class="topnav-links">
                     {primary_items}
                 </div>
+                <button onclick="window.location.reload()" title="Reload page"
+                    style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.14);border-radius:10px;color:#fff;font-size:18px;min-width:40px;min-height:40px;cursor:pointer;margin-left:8px;">&#10227;</button>
                 <div class="topnav-right">
                     <details class="topnav-more">
                         <summary class="nav-item">More &#9662;</summary>
@@ -30987,9 +30989,15 @@ def customer_import_page():
             name = parts[0]
             phone = parts[1] if len(parts) > 1 else ""
             address = parts[2] if len(parts) > 2 else ""
-            bin_size = parts[3] if len(parts) > 3 else ""
-            if bin_size and not bin_size.endswith("yd"):
-                bin_size = bin_size + "yd"
+            # Multiple bins: "20yd 30yd 30yd" -> list of sizes
+            bin_sizes = []
+            if len(parts) > 3:
+                for b in parts[3].split():
+                    b = b.strip()
+                    if b:
+                        if not b.endswith("yd"):
+                            b = b + "yd"
+                        bin_sizes.append(b)
             token = _new_portal_token(conn)
             cur = conn.execute(
                 """INSERT INTO customers
@@ -31001,22 +31009,27 @@ def customer_import_page():
             site_id = None
             if address:
                 scur = conn.execute(
-                    "INSERT INTO sites (customer_id, address) VALUES (?, ?)",
-                    (cust_id, address),
+                    "INSERT INTO sites (customer_id, address, created_at) VALUES (?, ?, ?)",
+                    (cust_id, address, today_str()),
                 )
                 site_id = scur.lastrowid
-            if bin_size:
-                conn.execute(
-                    """INSERT INTO bins (customer_id, site_id, size, dropped_at)
-                        VALUES (?, ?, ?, ?)""",
-                    (cust_id, site_id, bin_size, today_str()),
-                )
+            for bin_size in bin_sizes:
+                if site_id:  # bins require a site
+                    conn.execute(
+                        """INSERT INTO bins (customer_id, site_id, size, dropped_at)
+                            VALUES (?, ?, ?, ?)""",
+                        (cust_id, site_id, bin_size, today_str()),
+                    )
             portal_url = _portal_url(token)
-            bin_msg = f" Your {bin_size} bin is already in the system." if bin_size else ""
+            if bin_sizes:
+                bin_list = ", ".join(bin_sizes)
+                bin_msg = f" Your bins ({bin_list}) are already in the system."
+            else:
+                bin_msg = ""
             sms_body = (f"Hi {name}, this is {company_name} - we're on HAULTRA now."
                         f"{bin_msg} Tap to activate your portal: {portal_url}")
             sms_href = "sms:" + (phone or "") + "?&body=" + urllib.parse.quote(sms_body)
-            imported.append({"name": name, "phone": phone, "bin_size": bin_size,
+            imported.append({"name": name, "phone": phone, "bin_sizes": bin_sizes,
                              "sms_href": sms_href})
         conn.commit()
         conn.close()
