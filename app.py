@@ -30020,10 +30020,10 @@ _PORTAL_JS = r"""
   // 2026-10-12: Customer cancels a pending request (tapped wrong button)
   function cancelReq(reqId){
     if(!confirm('Cancel this request?')) return;
-    fetch('/api/c/'+st.token+'/requests/'+reqId+'/cancel', {method:'POST'})
+    fetch('/api/c/'+encodeURIComponent(TOKEN)+'/requests/'+reqId+'/cancel', {method:'POST'})
       .then(function(r){ return r.json(); })
       .then(function(d){
-        if(d.ok){ loadData(); }
+        if(d.ok){ load(); }
         else { alert(d.error || 'Could not cancel'); }
       });
   }
@@ -30038,7 +30038,7 @@ _PORTAL_JS = r"""
     // 2026-10-12: Let customer cancel a pending request (tapped wrong button)
     var cancelBtn = '';
     if(r.status==='pending'){
-      cancelBtn = '<button onclick="cancelReq('+r.id+')" style="margin-top:8px;padding:6px 12px;font-size:12px;background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.2);border-radius:8px;color:#fff;cursor:pointer;">Undo — I tapped the wrong one</button>';
+      cancelBtn = '<button onclick="cancelReq('+r.id+')" style="margin-top:8px;padding:8px 16px;font-size:13px;background:rgba(255,255,255,0.12);border:1px solid rgba(255,255,255,0.25);border-radius:8px;color:#fff;cursor:pointer;">Cancel</button>';
     }
     return '<div class="chip '+cls+'"><span style="opacity:.75;font-weight:800;">'+typ+':</span> '+txt+'<br>'+cancelBtn+'</div>';
   }
