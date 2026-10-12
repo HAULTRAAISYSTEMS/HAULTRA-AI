@@ -21198,7 +21198,9 @@ def dump_ticket(stop_id):
                 (dict(stop).get("dump_location") or "").strip(), stop_id, cid())
 
         _ticket_source = "site"
-        if _completing:
+        # 2026-10-12: Skip flag bypasses ticket requirement (driver tapped Skip)
+        _skipped = request.form.get("skip_ticket", "0") == "1"
+        if _completing and not _skipped:
             # 2026-10-10: Chained stops don't block on tickets — the driver
             # needs to keep moving through the chain. Tickets can be entered
             # later or skipped if the site didn't issue one.
