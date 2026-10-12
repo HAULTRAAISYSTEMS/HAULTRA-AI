@@ -30973,7 +30973,6 @@ def customer_import_page():
 
     imported = []
     if request.method == "POST":
-        _require_csrf()
         raw = (request.form.get("bulk_text") or "").strip()
         conn = get_db()
         company_id = cid()
@@ -31047,7 +31046,7 @@ def customer_import_page():
         'One per line: <code>Name, Phone, Address, Bin Size</code></p></div>'
         '<div style="max-width:640px;">'
         '<form method="POST">'
-        f'<input type="hidden" name="_csrf_token" value="{e(_csrf_token())}">'
+        f'<input type="hidden" name="_csrf_token" value="{e(get_csrf_token())}">'
         '<textarea name="bulk_text" rows="10" placeholder="Dru Construction, 7575550100, 123 Main St Norfolk VA, 20yd" '
         'style="width:100%;padding:12px;border-radius:12px;background:rgba(255,255,255,0.05);'
         'border:1px solid rgba(255,255,255,0.15);color:#fff;font-size:14px;"></textarea>'
