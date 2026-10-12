@@ -21062,6 +21062,7 @@ def dump_ticket(stop_id):
         arrival_time   = request.form.get("arrival_time", "").strip()
         departure_time = request.form.get("departure_time", "").strip()
         can_number     = request.form.get("can_number", "").strip()
+        skip_ticket    = request.form.get("skip_ticket", "0") == "1"
         scale_in       = _sf("scale_in_weight")
         scale_out      = _sf("scale_out_weight")
         net_tons       = _sf("net_tons")
@@ -21396,10 +21397,12 @@ def dump_ticket(stop_id):
             </div>
             <div style="margin-top:12px;text-align:center;">
                 <span class="small muted">No ticket issued at this site?</span><br>
-                <a href="{url_for('driver_route_detail', route_id=route_id)}" class="btn secondary" style="margin-top:6px;">
+                <button type="button" class="btn secondary" style="margin-top:6px;"
+                    onclick="document.getElementById('dt-skip').value='1';document.getElementById('dt-form').submit();">
                     Skip — Continue Without Ticket
-                </a>
+                </button>
             </div>
+        <input type="hidden" name="skip_ticket" id="dt-skip" value="0">
         </form>
     </div>
     <style>
