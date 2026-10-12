@@ -30921,8 +30921,10 @@ def customers_page():
         </div>
         {_export_link(url_for('export_customers_csv'), "⬇ Export CSV")}
     </div>
-    <div style="max-width:640px;margin-bottom:16px;">
+    <div style="max-width:640px;margin-bottom:16px;display:flex;gap:10px;flex-wrap:wrap;">
         <button class="btn green" id="add-cust-toggle" onclick="toggleAdd()">+ Add Customer</button>
+        <a class="btn secondary" href="{url_for('customer_import_page')}" style="text-decoration:none;">📥 Import Customers</a>
+    </div>
         <div id="add-cust-form" hidden class="bin-card" style="padding:16px;margin-top:12px;">
             <div id="add-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
             <label class="uw-lbl">Business name</label>
@@ -30958,6 +30960,103 @@ def customers_page():
     <style>.uw-lbl{{display:block;font-size:11px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;}}</style>
     """ + _CUSTOMERS_PAGE_JS
     return render_template_string(shell_page("Customers", body))
+
+
+@app.route("/customers/import", methods=["GET", "POST"])
+def customer_import_page():
+    """Bulk import existing customers with bins on site.
+    Paste: Name, Phone, Address, Bin Size (one per line).
+    Creates customer + site + bin, generates portal link."""
+    if not _is_management():
+        flash("Managers only.", "error")
+        return redirect(url_for("customers_page"))
+
+    imported = []
+    if request.method == "POST":
+        _require_csrf()
+        raw = (request.form.get("bulk_text") or "").strip()
+        conn = get_db()
+        company_id = cid()
+        company_name = session.get("company_name") or "HAULTRA"
+        for line in raw.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 2:
+                continue
+            name = parts[0]
+            phone = parts[1] if len(parts) > 1 else ""
+            address = parts[2] if len(parts) > 2 else ""
+            bin_size = parts[3] if len(parts) > 3 else ""
+            if bin_size and not bin_size.endswith("yd"):
+                bin_size = bin_size + "yd"
+            token = _new_portal_token(conn)
+            cur = conn.execute(
+                """INSERT INTO customers
+                    (company_id, business_name, contact_name, phone, portal_token, is_active)
+                    VALUES (?, ?, ?, ?, ?, 1)""",
+                (company_id, name, name, phone, token),
+            )
+            cust_id = cur.lastrowid
+            site_id = None
+            if address:
+                scur = conn.execute(
+                    "INSERT INTO sites (customer_id, address) VALUES (?, ?)",
+                    (cust_id, address),
+                )
+                site_id = scur.lastrowid
+            if bin_size:
+                conn.execute(
+                    """INSERT INTO bins (customer_id, site_id, size, dropped_at)
+                        VALUES (?, ?, ?, ?)""",
+                    (cust_id, site_id, bin_size, today_str()),
+                )
+            portal_url = _portal_url(token)
+            bin_msg = f" Your {bin_size} bin is already in the system." if bin_size else ""
+            sms_body = (f"Hi {name}, this is {company_name} - we're on HAULTRA now."
+                        f"{bin_msg} Tap to activate your portal: {portal_url}")
+            sms_href = "sms:" + (phone or "") + "?&body=" + urllib.parse.quote(sms_body)
+            imported.append({"name": name, "phone": phone, "bin_size": bin_size,
+                             "sms_href": sms_href})
+        conn.commit()
+        conn.close()
+
+    import_rows = ""
+    for imp in imported:
+        import_rows += (
+            '<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.1);'
+            'border-radius:12px;padding:14px;margin-bottom:10px;">'
+            f'<div style="font-weight:700;">{e(imp["name"])}</div>'
+            f'<div style="font-size:13px;color:var(--slate);">{e(imp["phone"])} - {e(imp["bin_size"] or "No bin")}</div>'
+            f'<a href="{imp["sms_href"]}" class="btn secondary" '
+            'style="margin-top:8px;display:inline-block;text-decoration:none;">Invite via Text</a>'
+            '</div>'
+        )
+    result_html = ""
+    if imported:
+        result_html = (
+            '<div style="margin-top:20px;">'
+            f'<h2>Imported {len(imported)} customers</h2>'
+            '<p style="color:var(--slate);font-size:14px;">Tap Invite to text each customer their portal link.</p>'
+            f'{import_rows}</div>'
+        )
+    body = (
+        '<div class="hero"><h1>Import Customers</h1>'
+        '<p>Paste your existing customer list - everyone with a bin on site. '
+        'One per line: <code>Name, Phone, Address, Bin Size</code></p></div>'
+        '<div style="max-width:640px;">'
+        '<form method="POST">'
+        f'<input type="hidden" name="_csrf_token" value="{e(_csrf_token())}">'
+        '<textarea name="bulk_text" rows="10" placeholder="Dru Construction, 7575550100, 123 Main St Norfolk VA, 20yd" '
+        'style="width:100%;padding:12px;border-radius:12px;background:rgba(255,255,255,0.05);'
+        'border:1px solid rgba(255,255,255,0.15);color:#fff;font-size:14px;"></textarea>'
+        '<button type="submit" class="btn green" style="margin-top:12px;">Import Customers</button> '
+        f'<a href="{url_for("customers_page")}" class="btn secondary" style="margin-top:12px;text-decoration:none;">Back</a>'
+        '</form>'
+        f'{result_html}</div>'
+    )
+    return render_template_string(shell_page("Import Customers", body))
 
 
 _CUSTOMERS_PAGE_JS = """
