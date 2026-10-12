@@ -18563,6 +18563,7 @@ def route_report(route_id):
     rows = ""
     total_cans = total_bags = 0
     total_tons = 0.0
+    ticket_photos = []  # 2026-10-12: gallery of ticket photos
     for i, s in enumerate(stops, start=1):
         action = s["action"] or ""
         typ = {"Toter": "toter", "Hand Pickup": "HPU", "Landfill": "LAND"}.get(action, action)
@@ -18576,13 +18577,14 @@ def route_report(route_id):
         #        Landfill Depart | Finish | Box In | Box Out | Weight (tons) | Dump Site
         dt = conn.execute(
             """SELECT net_tons, material, ticket_number, can_number, dump_site,
-                      scale_in_weight, scale_out_weight, fee_usd
+                      scale_in_weight, scale_out_weight, fee_usd, photo_path
                FROM dump_tickets WHERE stop_id=?""",
             (s["id"],)).fetchone()
         tons = 0.0
         box_in = box_out = ""
         dump_site = ""
         ticket_no = ""
+        ticket_photo = ""
         weight_display = ""
         if dt:
             if dt["net_tons"]:
@@ -18599,16 +18601,30 @@ def route_report(route_id):
                 dump_site = dt["dump_site"]
             if dt["ticket_number"]:
                 ticket_no = dt["ticket_number"]
+            if dt["photo_path"]:
+                ticket_photo = dt["photo_path"]
         elif s["weight_tons"]:
             tons = float(s["weight_tons"])
             total_tons += tons
             weight_display = "%.2f" % tons
         # Dumpster size from stop
         dumpster_size = s["container_size"] or ""
-        # Notes: combine stop notes + ticket number
+        # Notes: combine stop notes + ticket number (tappable if photo exists)
         all_notes = s["notes"] or ""
+        ticket_link = ""
         if ticket_no:
-            all_notes = f"{all_notes} [Tkt#{ticket_no}]" if all_notes else f"Tkt#{ticket_no}"
+            if ticket_photo:
+                ticket_link = f'<a href="/{e(ticket_photo)}" target="_blank" style="color:#0066cc;">Tkt#{e(ticket_no)} 📷</a>'
+            else:
+                ticket_link = f"Tkt#{e(ticket_no)}"
+            all_notes = f"{all_notes} [{ticket_link}]" if all_notes else ticket_link
+        # Collect for photo gallery
+        if ticket_photo:
+            ticket_photos.append({
+                'stop': f"{s['address'] or ''}",
+                'ticket': ticket_no,
+                'photo': ticket_photo,
+            })
         rows += (
             f"<tr><td>{typ}</td>"
             f"<td>{e(s['address'] or '')}</td>"
@@ -18627,6 +18643,23 @@ def route_report(route_id):
 
     driver = route["driver_name"] or route["driver_username"] or "—"
     conn.close()
+    # 2026-10-12: Ticket photo gallery (hidden when printing)
+    gallery = ""
+    if ticket_photos:
+        thumbs = ""
+        for p in ticket_photos:
+            thumbs += (
+                f'<a href="/{e(p["photo"])}" target="_blank" style="text-decoration:none;color:#111;">'
+                f'<div style="display:inline-block;margin:8px;text-align:center;">'
+                f'<img src="/{e(p["photo"])}" style="width:120px;height:120px;object-fit:cover;border-radius:8px;border:1px solid #999;">'
+                f'<div style="font-size:11px;margin-top:4px;">{e(p["ticket"] or "Ticket")}<br>{e(p["stop"][:25])}</div>'
+                f'</div></a>'
+            )
+        gallery = (
+            f'<div class="no-print" style="margin-top:20px;">'
+            f'<h3 style="font-size:1rem;">Ticket Photos ({len(ticket_photos)})</h3>'
+            f'<div>{thumbs}</div></div>'
+        )
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Daily Route Log — {e(route["route_name"])}</title>
@@ -18639,7 +18672,7 @@ th,td{{border:1px solid #999;padding:6px 8px;text-align:left;}}
 th{{background:#eee;}}
 .tot{{font-weight:800;margin-top:12px;}}
 button{{margin:12px 8px 0 0;padding:10px 18px;font-size:15px;cursor:pointer;}}
-@media print{{ button{{display:none;}} body{{padding:0;}} }}
+@media print{{ button{{display:none;}} body{{padding:0;}} .no-print{{display:none;}} }}
 </style></head><body><div class="wrap">
 <h1>Daily Route Log — {e(route["route_name"])}</h1>
 <div class="sub">Driver: {e(driver)} &nbsp;·&nbsp; Date: {e(route["route_date"])} &nbsp;·&nbsp;
@@ -18648,6 +18681,7 @@ Truck: {e(route["truck_name"] or "—")} &nbsp;·&nbsp; Type: {e(route["route_ty
 <th>Landfill Arrival Time</th><th>Landfill Depart Time</th><th>Finish Time</th><th>Box In</th><th>Box Out</th><th>Weight of Load (tons)</th><th>Dump Site</th><th>Notes</th></tr>
 {rows}</table>
 <div class="tot">Totals — cans: {total_cans} &nbsp;·&nbsp; bags: {total_bags} &nbsp;·&nbsp; tons: {total_tons:.2f}</div>
+{gallery}
 <button onclick="window.print()">Print</button>
 <button onclick="history.back()">Back</button>
 </div></body></html>"""
