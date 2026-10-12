@@ -30022,12 +30022,15 @@ _PORTAL_JS = r"""
   window.cancelReq = function(reqId){
     if(!confirm('Cancel this request?')) return;
     fetch('/api/c/'+encodeURIComponent(TOKEN)+'/requests/'+reqId+'/cancel', {method:'POST'})
-      .then(function(r){ return r.json(); })
+      .then(function(r){
+        if(!r.ok){ throw new Error('Server returned '+r.status); }
+        return r.json();
+      })
       .then(function(d){
         if(d.ok){ load(); }
         else { alert(d.error || 'Could not cancel'); }
       })
-      .catch(function(e){ alert('Network error — try again'); });
+      .catch(function(e){ alert('Error: '+e.message+' — try again in a minute'); });
   };
   function chip(r){
     var cls='gray', txt=esc(r.status);    if(r.status==='pending'){ cls='orange'; txt='Request received &mdash; waiting on confirmation'; }
