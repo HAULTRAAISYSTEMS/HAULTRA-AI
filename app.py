@@ -31231,10 +31231,10 @@ def customer_detail_page(customer_id):
     company_name = session.get("company_name") or "HAULTRA"
     name = e(cust["business_name"] or cust["contact_name"] or "Customer")
     contact = cust["contact_name"] or ""
-    # SMS body: greeting uses contact if we have one.
+    # SMS invite: onboarding-focused. Boss sends from his own number.
     greet = f"Hi {contact}, " if contact else "Hi, "
-    sms_body = (f"{greet}here's your {company_name} service portal — request pickups, "
-                f"swaps, or extra bins anytime: {portal_url}")
+    sms_body = (f"{greet}this is {company_name} — we're on HAULTRA now. "
+                f"Tap to set up your service going forward: {portal_url}")
     sms_href = ("sms:" + (e(cust["phone"]) if cust["phone"] else "")
                 + "?&body=" + urllib.parse.quote(sms_body))
 
@@ -31362,7 +31362,7 @@ def customer_detail_page(customer_id):
              background:rgba(255,255,255,0.03);border-radius:8px;padding:10px;">{e(portal_url)}</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">
             <button class="btn secondary" onclick="copyLink()" style="flex:1;min-width:110px;">Copy link</button>
-            <a class="btn secondary" href="{sms_href}" style="flex:1;min-width:110px;text-align:center;">Text link</a>
+            <a class="btn secondary" href="{sms_href}" style="flex:1;min-width:110px;text-align:center;">📩 Invite</a>
             <button class="btn secondary" onclick="regen()" style="flex:1;min-width:110px;">Regenerate</button>
         </div>
         <div id="portal-msg" hidden style="font-size:12px;margin-top:8px;color:var(--slate);"></div>
