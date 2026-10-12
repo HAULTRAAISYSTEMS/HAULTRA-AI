@@ -36936,7 +36936,9 @@ def apple_app_site_association():
             "details": [
                 {
                     "appID": f"{APPLE_TEAM_ID}.com.rockkstaar.haultra",
-                    "paths": ["*"],
+                    # 2026-10-12: Customer portal links (/c/*) must open in Safari,
+                    # not the app. Customers don't have the app or a login.
+                    "paths": ["*", "NOT /c/*"],
                 }
             ],
         }
