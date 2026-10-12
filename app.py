@@ -1282,7 +1282,7 @@ def send_email(to_email, subject, html_body):
 # customer_create_request is authenticated by the URL portal token, not a
 # session cookie, so there is no session for CSRF to protect and it must be
 # exempt (same rationale as the Stripe webhook).
-_CSRF_EXEMPT_ENDPOINTS = {"stripe_webhook", "customer_create_request", "customer_rename_bin"}
+_CSRF_EXEMPT_ENDPOINTS = {"stripe_webhook", "customer_create_request", "customer_rename_bin", "customer_cancel_request"}
 
 @app.before_request
 def _stamp_request_start():
