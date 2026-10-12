@@ -8311,8 +8311,16 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 
 .lane {{
     display: flex; gap: 18px; align-items: stretch;
-    background: rgba(20,20,20,0.68); border: 1px solid rgba(255,255,255,0.06);
-    border-radius: var(--radius); padding: 16px; margin-bottom: 14px;
+    background: linear-gradient(135deg, rgba(28,28,32,0.92), rgba(18,18,22,0.88));
+    border: 1px solid rgba(255,140,66,0.12);
+    border-radius: 18px; padding: 20px; margin-bottom: 16px;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.04);
+    position: relative; overflow: hidden;
+}}
+.lane::before {{
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+    background: linear-gradient(90deg, #FF8C42, #FFB37A, #FF8C42);
+    opacity: 0.7;
 }}
 .lane-driver {{ width: 170px; flex-shrink: 0; }}
 .lane-name-row {{ display: flex; align-items: center; gap: 8px; }}
@@ -8326,21 +8334,24 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .lane-sub {{ font-size: 11.5px; color: var(--text-muted); margin-top: 4px; line-height: 1.5; }}
 .lane-actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; justify-content: center; width: 100%; }}
 .lane-add-stops {{
-    display: inline-flex; align-items: center; min-height: 44px;
-    padding: 5px 12px; font-size: 11px; font-weight: 700;
-    color: var(--cyan); background: var(--cyan-dim);
-    border: 1px solid rgba(255,107,26,0.35); border-radius: 20px;
+    display: inline-flex; align-items: center; justify-content: center; min-height: 44px;
+    padding: 8px 18px; font-size: 12px; font-weight: 800; letter-spacing: 0.3px;
+    color: #FF8C42; background: linear-gradient(135deg, rgba(255,140,66,0.18), rgba(255,140,66,0.08));
+    border: 1px solid rgba(255,140,66,0.45); border-radius: 24px;
     text-decoration: none; white-space: nowrap;
+    box-shadow: 0 2px 12px rgba(255,140,66,0.15);
+    transition: all .2s ease;
 }}
-.lane-add-stops:hover {{ background: rgba(255,107,26,0.24); color: #FFB37A; }}
+.lane-add-stops:hover {{ background: rgba(255,140,66,0.28); color: #FFB37A; transform: translateY(-1px); box-shadow: 0 4px 18px rgba(255,140,66,0.25); }}
 .lane-message-btn {{
-    display: inline-flex; align-items: center; gap: 5px; min-height: 44px;
-    padding: 5px 12px; font-size: 11px; font-weight: 700;
-    color: #C9C9C0; background: rgba(255,255,255,0.06);
-    border: 1px solid rgba(255,255,255,0.14); border-radius: 20px;
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 44px;
+    padding: 8px 18px; font-size: 12px; font-weight: 700;
+    color: #E8E8E0; background: rgba(255,255,255,0.07);
+    border: 1px solid rgba(255,255,255,0.16); border-radius: 24px;
     cursor: pointer; white-space: nowrap;
+    transition: all .2s ease;
 }}
-.lane-message-btn:hover {{ background: rgba(255,255,255,0.1); }}
+.lane-message-btn:hover {{ background: rgba(255,255,255,0.12); transform: translateY(-1px); }}
 .lane-msg-badge {{
     display: inline-flex; align-items: center; justify-content: center;
     min-width: 16px; height: 16px; padding: 0 4px;
@@ -8353,23 +8364,29 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .lane-msg-badge[hidden] {{ display: none; }}
 
 .lane-track {{
-    display: flex; gap: 10px; overflow-x: auto; flex: 1; min-width: 0;
-    padding-bottom: 4px; scroll-snap-type: x proximity;
+    display: flex; gap: 12px; overflow-x: auto; flex: 1; min-width: 0;
+    padding: 4px 2px 8px; scroll-snap-type: x proximity;
 }}
 
 .stop-mini {{
     flex-shrink: 0; scroll-snap-align: start;
-    width: 190px; min-height: 48px;
-    background: rgba(26,26,26,0.85); border: 1px solid rgba(255,255,255,0.08);
-    border-left: 3px solid #55554C; border-radius: var(--radius-sm);
-    padding: 10px 12px; text-decoration: none; display: block;
-    transition: border-color .15s, transform .1s;
+    width: 200px; min-height: 64px;
+    background: linear-gradient(135deg, rgba(32,32,38,0.95), rgba(22,22,28,0.9));
+    border: 1px solid rgba(255,255,255,0.1);
+    border-left: 4px solid #55554C; border-radius: 12px;
+    padding: 12px 14px; text-decoration: none; display: block;
+    transition: all .2s ease;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.3);
 }}
-.stop-mini:hover {{ transform: translateY(-1px); border-color: rgba(255,107,26,0.4); }}
+.stop-mini:hover {{ transform: translateY(-2px); border-color: rgba(255,140,66,0.5); box-shadow: 0 4px 20px rgba(255,140,66,0.15); }}
 .stop-mini.st-done    {{ border-left-color: var(--green); }}
-.stop-mini.st-enroute {{ border-left-color: var(--cyan); }}
+.stop-mini.st-enroute {{ border-left-color: var(--cyan); box-shadow: 0 0 16px rgba(0,180,255,0.2); animation: enroute-pulse 2s ease-in-out infinite; }}
 .stop-mini.st-pending {{ border-left-color: #55554C; }}
 .stop-mini.st-held {{ border-left-color: #8CA0B3; }}
+@keyframes enroute-pulse {{
+    0%, 100% {{ box-shadow: 0 0 12px rgba(0,180,255,0.15); }}
+    50% {{ box-shadow: 0 0 24px rgba(0,180,255,0.35); }}
+}}
 .stop-mini.held {{ opacity: .5; }}
 .stop-mini-hold {{ font-size: 12px; line-height: 1; }}
 
@@ -13354,7 +13371,7 @@ def _build_route_board_html(user):
             # as a printable web page.
             message_html += (
                 f'<a class="lane-message-btn" href="/route/{_lane_route_id}/report" '
-                f'style="text-decoration:none;display:inline-block;">&#128203; Daily Log</a>'
+                f'style="text-decoration:none;">&#128203; Daily Log</a>'
             )
             # Truck parked at a vendor (Go NOW) → offer a manual hold release.
             if any(dict(x).get("held_at") and x["stop_status"] != "completed" for x in stops):
