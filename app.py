@@ -13161,6 +13161,58 @@ _STOP_DRAG_JS = """
     });
   };
   document.addEventListener('DOMContentLoaded', window.initStopSort);
+
+  // 2026-10-12: Long-press a stop card -> quick action menu (Cancel Stop).
+  (function() {
+    var pressTimer = null;
+    var LONG_PRESS_MS = 600;
+    function showStopMenu(stopId, stopLabel) {
+      var old = document.getElementById('stop-longpress-menu');
+      if (old) old.remove();
+      var overlay = document.createElement('div');
+      overlay.id = 'stop-longpress-menu';
+      overlay.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;padding:20px;';
+      overlay.innerHTML =
+        '<div style="background:#1E1E22;border:1px solid rgba(255,140,66,0.3);border-radius:16px;padding:24px;max-width:340px;width:100%;">' +
+        '<div style="font-size:16px;font-weight:800;margin-bottom:6px;color:#fff;">' + stopLabel + '</div>' +
+        '<div style="font-size:13px;color:rgba(255,255,255,0.6);margin-bottom:20px;">What do you want to do?</div>' +
+        '<button id="lp-cancel-stop" style="width:100%;padding:14px;border-radius:12px;border:1px solid rgba(255,80,80,0.4);background:rgba(255,80,80,0.12);color:#FF8080;font-size:15px;font-weight:700;margin-bottom:10px;cursor:pointer;">Cancel This Stop</button>' +
+        '<button id="lp-close" style="width:100%;padding:14px;border-radius:12px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.06);color:#fff;font-size:15px;font-weight:600;cursor:pointer;">Keep It</button>' +
+        '</div>';
+      document.body.appendChild(overlay);
+      document.getElementById('lp-close').onclick = function() { overlay.remove(); };
+      overlay.onclick = function(e) { if (e.target === overlay) overlay.remove(); };
+      document.getElementById('lp-cancel-stop').onclick = function() {
+        if (!confirm('Cancel this stop? It stays on the route marked cancelled.')) return;
+        var meta = document.querySelector('meta[name="csrf-token"]');
+        var csrf = meta ? meta.getAttribute('content') : '';
+        fetch('/stop/' + stopId + '/cancel', {
+          method: 'POST',
+          headers: { 'X-CSRF-Token': csrf },
+          credentials: 'same-origin'
+        }).then(function(r) {
+          overlay.remove();
+          if (window.refreshBoard) window.refreshBoard(); else window.location.reload();
+        }).catch(function() { alert('Could not cancel - try again'); });
+      };
+    }
+    function onPressStart(e) {
+      var card = e.target.closest('.stop-mini');
+      if (!card || card.dataset.locked === '1') return;
+      var sid = card.dataset.stopId;
+      pressTimer = setTimeout(function() {
+        var lblEl = card.querySelector('.stop-mini-addr');
+        var label = lblEl ? lblEl.textContent.trim().substring(0, 40) : 'Stop';
+        showStopMenu(sid, label);
+      }, LONG_PRESS_MS);
+    }
+    function onPressEnd() { if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; } }
+    document.addEventListener('touchstart', onPressStart, {passive: true});
+    document.addEventListener('touchend', onPressEnd);
+    document.addEventListener('touchmove', onPressEnd);
+    document.addEventListener('mousedown', onPressStart);
+    document.addEventListener('mouseup', onPressEnd);
+  })();
 })();
 </script>
 """
