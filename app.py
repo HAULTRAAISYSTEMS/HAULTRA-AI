@@ -30018,15 +30018,17 @@ _PORTAL_JS = r"""
     });
   }
   // 2026-10-12: Customer cancels a pending request (tapped wrong button)
-  function cancelReq(reqId){
+  // Attached to window so inline onclick works
+  window.cancelReq = function(reqId){
     if(!confirm('Cancel this request?')) return;
     fetch('/api/c/'+encodeURIComponent(TOKEN)+'/requests/'+reqId+'/cancel', {method:'POST'})
       .then(function(r){ return r.json(); })
       .then(function(d){
         if(d.ok){ load(); }
         else { alert(d.error || 'Could not cancel'); }
-      });
-  }
+      })
+      .catch(function(e){ alert('Network error — try again'); });
+  };
   function chip(r){
     var cls='gray', txt=esc(r.status);    if(r.status==='pending'){ cls='orange'; txt='Request received &mdash; waiting on confirmation'; }
     else if(r.status==='accepted'){ cls='green'; txt='Confirmed &mdash; we&rsquo;re scheduling it'; }
