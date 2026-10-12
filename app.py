@@ -21069,7 +21069,23 @@ def dump_ticket(stop_id):
         net_tons       = _sf("net_tons")
         fee_usd        = _sf("fee_usd")
         material       = request.form.get("material", "").strip()
-        material_type  = request.form.get("material_type", "").strip()
+        # 2026-10-12: Auto-derive material_type from the AI-scanned material text.
+        # Dropdown removed from UI — no need for driver to pick twice.
+        _ml = material.lower()
+        if any(k in _ml for k in ("c&d", "c & d", "construction", "demolition")):
+            material_type = "cd"
+        elif any(k in _ml for k in ("concrete",)):
+            material_type = "concrete"
+        elif any(k in _ml for k in ("metal", "scrap")):
+            material_type = "metal"
+        elif any(k in _ml for k in ("yard", "brush", "limb")):
+            material_type = "yard_waste"
+        elif any(k in _ml for k in ("trash", "msw", "garbage", "waste", "muni")):
+            material_type = "trash"
+        elif material:
+            material_type = "other"
+        else:
+            material_type = ""
         cash_received  = _sf("cash_received")
         container_scrapped = 1 if request.form.get("container_scrapped") == "1" else 0
         ticket_number  = request.form.get("ticket_number", "").strip()
@@ -21334,18 +21350,8 @@ def dump_ticket(stop_id):
                     <label>Material</label>
                     <input name="material" id="f-material" value="{_fv("material")}" placeholder="e.g. C&amp;D, MSW">
                 </div>
-                <div>
-                    <label>Material Type</label>
-                    <select name="material_type" id="f-material-type">
-                        <option value="">— Select —</option>
-                        <option value="trash">Trash / MSW</option>
-                        <option value="concrete">Concrete</option>
-                        <option value="metal">Metal / Scrap</option>
-                        <option value="cd">C&D</option>
-                        <option value="yard_waste">Yard Waste</option>
-                        <option value="other">Other</option>
-                    </select>
-                </div>
+                <!-- 2026-10-12: Material Type dropdown removed — AI fills the Material
+                     field from the ticket scan. Backend auto-derives the type. -->
                 <div>
                     <label>Cash Received ($)</label>
                     <input name="cash_received" id="f-cash" type="number" step="0.01" min="0" value="{_fv("cash_received")}" placeholder="0.00">
@@ -30923,8 +30929,9 @@ def customers_page():
         </div>
         {_export_link(url_for('export_customers_csv'), "⬇ Export CSV")}
     </div>
-    <div style="max-width:640px;margin-bottom:16px;">
-        <button class="btn green" id="add-cust-toggle" onclick="toggleAdd()">+ Add Customers</button>
+    <div style="max-width:640px;margin-bottom:16px;display:flex;gap:10px;flex-wrap:wrap;">
+        <button class="btn green" id="add-cust-toggle" onclick="toggleAdd()">+ Add Customer</button>
+        <a class="btn secondary" href="/customers/import" style="text-decoration:none;">Bulk Import</a>
     </div>
         <div id="add-cust-form" hidden class="bin-card" style="padding:16px;margin-top:12px;">
             <div id="add-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
@@ -30944,14 +30951,6 @@ def customers_page():
             <div style="display:flex;gap:8px;">
                 
         </form>
-        <form method="POST" action="/customers/import" style="margin:16px 0;padding:12px;background:rgba(255,255,255,0.03);border-radius:12px;">
-            <input type="hidden" name="_csrf_token" value="{e(get_csrf_token())}">
-            <label style="display:block;font-size:13px;font-weight:700;margin-bottom:8px;">Or paste multiple (one per line):</label>
-            <textarea name="bulk_text" rows="4" placeholder="Acme Co 7575550100 123 Main St - 2 30yd and 1 20yd"
-                style="width:100%;padding:10px;border-radius:8px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.15);color:#fff;font-size:14px;"></textarea>
-            <div style="font-size:12px;color:var(--slate);margin:4px 0 8px;">Messy is fine - AI figures out name, phone, address, bins.</div>
-            <button type="submit" class="btn secondary">Import Multiple</button>
-        <form>
         <button class="btn green" style="flex:1;" onclick="submitAdd()">Create customer</button>
                 <button class="btn secondary" onclick="toggleAdd()">Cancel</button>
             </div>
