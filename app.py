@@ -29805,9 +29805,8 @@ def customer_cancel_request(token, req_id):
     if r["status"] != "pending":
         conn.close()
         return jsonify({"error": "only pending requests can be cancelled"}), 400
-    conn.execute(
-        "UPDATE requests SET status='cancelled', updated_at=? WHERE id=?",
-        (now_ts(), req_id))
+    # Delete the pending request (customer tapped wrong button, start fresh)
+    conn.execute("DELETE FROM requests WHERE id=?", (req_id,))
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
