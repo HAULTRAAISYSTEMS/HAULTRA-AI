@@ -29786,6 +29786,32 @@ def _sanitize_bin_label(raw):
     return s[:40] or None
 
 
+
+@app.route("/api/c/<token>/requests/<int:req_id>/cancel", methods=["POST"])
+def customer_cancel_request(token, req_id):
+    """Customer cancels their own pending request. 2026-10-12."""
+    conn = get_db()
+    customer = _customer_by_token(conn, token)
+    if customer is None:
+        conn.close()
+        return _not_found()
+    # Only allow cancelling own pending requests
+    r = conn.execute(
+        "SELECT id, status FROM requests WHERE id=? AND customer_id=?",
+        (req_id, customer["id"])).fetchone()
+    if not r:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    if r["status"] != "pending":
+        conn.close()
+        return jsonify({"error": "only pending requests can be cancelled"}), 400
+    conn.execute(
+        "UPDATE requests SET status='cancelled', updated_at=? WHERE id=?",
+        (now_ts(), req_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
 @app.route("/api/c/<token>/bins/<int:bin_id>/label", methods=["POST"])
 def customer_rename_bin(token, bin_id):
     """Customer renames their own bin from the portal (token-authed, CSRF-exempt
@@ -29991,16 +30017,30 @@ _PORTAL_JS = r"""
       return r.bin_id ? (r.bin_id===binId) : (r.site_id===siteId);
     });
   }
+  // 2026-10-12: Customer cancels a pending request (tapped wrong button)
+  function cancelReq(reqId){
+    if(!confirm('Cancel this request?')) return;
+    fetch('/api/c/'+st.token+'/requests/'+reqId+'/cancel', {method:'POST'})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if(d.ok){ loadData(); }
+        else { alert(d.error || 'Could not cancel'); }
+      });
+  }
   function chip(r){
-    var cls='gray', txt=esc(r.status);
-    if(r.status==='pending'){ cls='orange'; txt='Request received &mdash; waiting on confirmation'; }
+    var cls='gray', txt=esc(r.status);    if(r.status==='pending'){ cls='orange'; txt='Request received &mdash; waiting on confirmation'; }
     else if(r.status==='accepted'){ cls='green'; txt='Confirmed &mdash; we&rsquo;re scheduling it'; }
     else if(r.status==='scheduled'){ cls='green'; txt='Scheduled &#10003;'+(r.scheduled_date?(' for '+esc(r.scheduled_date)):'')+(r.driver_name?' &middot; driver assigned':''); }
     else if(r.status==='in_progress'){ cls='blue'; txt='Driver is on it today'; }
     else if(r.status==='done'){ cls='green'; txt='Completed &#10003;'; }
     else if(r.status==='denied'){ cls='red'; txt='We couldn&rsquo;t do this one &mdash; call us'+(r.deny_reason?(': '+esc(r.deny_reason)):''); }
     var typ = r.type==='PR'?'Empty &amp; return':(r.type==='P'?'Pick up':(r.type==='S'?'Swap':'New bin'));
-    return '<div class="chip '+cls+'"><span style="opacity:.75;font-weight:800;">'+typ+':</span> '+txt+'</div>';
+    // 2026-10-12: Let customer cancel a pending request (tapped wrong button)
+    var cancelBtn = '';
+    if(r.status==='pending'){
+      cancelBtn = '<button onclick="cancelReq('+r.id+')" style="margin-top:8px;padding:6px 12px;font-size:12px;background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.2);border-radius:8px;color:#fff;cursor:pointer;">Undo — I tapped the wrong one</button>';
+    }
+    return '<div class="chip '+cls+'"><span style="opacity:.75;font-weight:800;">'+typ+':</span> '+txt+'<br>'+cancelBtn+'</div>';
   }
 
   function actionBtn(cls, type, label, sub, binId, siteId, onclickIdx){
