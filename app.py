@@ -30949,8 +30949,7 @@ def customers_page():
             <div id="ac-bins"></div>
             <button class="btn secondary" style="padding:6px 12px;font-size:12px;margin:4px 0 12px;" onclick="addBinRow()">+ Add another bin</button>
             <div style="display:flex;gap:8px;">
-                
-        </form>
+            </div>
         <button class="btn green" style="flex:1;" onclick="submitAdd()">Create customer</button>
                 <button class="btn secondary" onclick="toggleAdd()">Cancel</button>
             </div>
