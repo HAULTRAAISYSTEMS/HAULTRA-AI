@@ -30964,6 +30964,56 @@ def customers_page():
     return render_template_string(shell_page("Customers", body))
 
 
+@app.route("/api/customers/parse-import", methods=["POST"])
+def api_parse_customer_import():
+    """AI parses messy customer import text into structured JSON.
+    Handles: '3 30yd 2 20yd', 'three 30 yard bins', no commas, etc."""
+    if not _is_management():
+        return jsonify({"error": "Managers only"}), 403
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "No text provided"}), 400
+
+    import os as _os
+    api_key = _os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return jsonify({"error": "AI not configured"}), 500
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key, timeout=25.0)
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2000,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Parse this messy customer list into JSON. Each customer has: "
+                    "name, phone, address, and bins (list of sizes like '30yd', '20yd'). "
+                    "Handle messy formats: '3 30yd' means three 30yd bins. "
+                    "'three 30 yard' means three 30yd bins. No commas is fine.\n\n"
+                    "Return ONLY a JSON array like:\n"
+                    '[{"name": "Acme Co", "phone": "7575550100", '
+                    '"address": "123 Main St Norfolk VA", "bins": ["30yd", "30yd", "20yd"]}]\n\n'
+                    f"Text:\n{text}"
+                ),
+            }],
+        )
+        raw = resp.content[0].text.strip()
+        # Extract JSON array
+        import json as _json
+        start = raw.find("[")
+        end = raw.rfind("]") + 1
+        if start >= 0 and end > start:
+            customers = _json.loads(raw[start:end])
+            return jsonify({"success": True, "customers": customers})
+        return jsonify({"error": "Could not parse"}), 500
+    except Exception as e:
+        app.logger.warning("AI import parse failed: %s", e)
+        return jsonify({"error": "AI parse failed"}), 500
+
+
 @app.route("/customers/import", methods=["GET", "POST"])
 def customer_import_page():
     """Bulk import existing customers with bins on site.
@@ -31060,10 +31110,39 @@ def customer_import_page():
         '<div style="max-width:640px;">'
         '<form method="POST">'
         f'<input type="hidden" name="_csrf_token" value="{e(get_csrf_token())}">'
-        '<textarea name="bulk_text" rows="10" placeholder="Dru Construction, 7575550100, 123 Main St Norfolk VA, 20yd" '
+        '<textarea id="bulk-text" name="bulk_text" rows="10" placeholder="Dru Construction 7575550100 123 Main St - has 3 30yd and 2 20yd" '
         'style="width:100%;padding:12px;border-radius:12px;background:rgba(255,255,255,0.05);'
         'border:1px solid rgba(255,255,255,0.15);color:#fff;font-size:14px;"></textarea>'
-        '<button type="submit" class="btn green" style="margin-top:12px;">Import Customers</button> '
+        '<div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap;">'
+        '<button type="button" class="btn secondary" onclick="aiParse()">AI Parse Messy Text</button>'
+        '<button type="submit" class="btn green">Import Customers</button> '
+        '</div>'
+        '<div id="ai-result" style="margin-top:12px;"></div>'
+        '<script>'
+        'function aiParse(){'
+        '  var text=document.getElementById("bulk-text").value;'
+        '  var out=document.getElementById("ai-result");'
+        '  out.innerHTML="<p>Parsing...</p>";'
+        '  var meta=document.querySelector(\'meta[name="csrf-token"]\');'
+        '  var csrf=meta?meta.getAttribute("content"):"";'
+        '  fetch("/api/customers/parse-import",{method:"POST",'
+        '    headers:{"Content-Type":"application/json","X-CSRF-Token":csrf},'
+        '    body:JSON.stringify({text:text})})'
+        '  .then(r=>r.json()).then(j=>{'
+        '    if(j.success){'
+        '      var html="<p><b>Found "+j.customers.length+" customers:</b></p>";'
+        '      j.customers.forEach(c=>{'
+        '        html+="<div style=\"padding:8px;background:rgba(255,255,255,0.03);border-radius:8px;margin-bottom:6px;\">"+c.name+" - "+(c.bins||[]).join(", ")+"</div>";'
+        '      });'
+        '      html+="<p>Review above, then hit Import Customers.</p>";'
+        '      // Convert to CSV format for the import'
+        '      var csv=j.customers.map(c=>c.name+", "+(c.phone||"")+", "+(c.address||"")+", "+(c.bins||[]).join(" ")).join("\n");'
+        '      document.getElementById("bulk-text").value=csv;'
+        '      out.innerHTML=html;'
+        '    } else { out.innerHTML="<p>Could not parse: "+(j.error||"unknown")+"</p>"; }'
+        '  }).catch(e=>{out.innerHTML="<p>Parse failed</p>";});'
+        '}'
+        '</script>'
         f'<a href="{url_for("customers_page")}" class="btn secondary" style="margin-top:12px;text-decoration:none;">Back</a>'
         '</form>'
         f'{result_html}</div>'
