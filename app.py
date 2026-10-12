@@ -18678,7 +18678,7 @@ button{{margin:12px 8px 0 0;padding:10px 18px;font-size:15px;cursor:pointer;}}
 <div class="sub">Driver: {e(driver)} &nbsp;·&nbsp; Date: {e(route["route_date"])} &nbsp;·&nbsp;
 Truck: {e(route["truck_name"] or "—")} &nbsp;·&nbsp; Type: {e(route["route_type"] or "rolloff")}</div>
 <table><tr><th>Work Order</th><th>Customer Site Address</th><th>City</th><th>Dumpster Size</th><th>Start Time</th>
-<th>Landfill Arrival Time</th><th>Landfill Depart Time</th><th>Finish Time</th><th>Box In</th><th>Box Out</th><th>Weight of Load (tons)</th><th>Dump Site</th><th>Notes</th></tr>
+<th>Landfill Arrival Time</th><th>Landfill Depart Time</th><th>Finish Time</th><th>Box In</th><th>Box Out</th><th>Weight of Load (tons)</th><th>Dump Site</th><th>Ticket</th></tr>
 {rows}</table>
 <div class="tot">Totals — cans: {total_cans} &nbsp;·&nbsp; bags: {total_bags} &nbsp;·&nbsp; tons: {total_tons:.2f}</div>
 {gallery}
