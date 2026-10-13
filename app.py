@@ -16765,10 +16765,14 @@ def driver_route_detail(route_id):
                 f'<span class="cab-leg-chip-lbl">{e(l["label"])}</span>'
                 f'<span class="cab-leg-chip-sub">{e(_sub)}</span></button>'
             )
+        # 2026-10-13: LEG X OF Y header (was missing, test was failing)
+        _leg_idx = next((i for i, l in enumerate(_legs) if l["key"] == _curleg["key"]), 0)
+        _leg_total = len(_legs)
         _leg_switch_html = (
             f'<div class="cab-legs-switch" id="cab-legs-switch" role="group" aria-label="Active leg" '
             f'data-stop="{stop_id}" data-csrf="{_csrf}" data-active="{e(_curleg["key"])}" '
-            f'data-navpref="{e(_nav_pref)}" data-legs="{e(json.dumps(_legs))}">{_chip_btns}</div>'
+            f'data-navpref="{e(_nav_pref)}" data-legs="{e(json.dumps(_legs))}">'
+            f'<div class="cab-leg-header">LEG {_leg_idx + 1} OF {_leg_total}</div>{_chip_btns}</div>'
         )
         _noaddr_html = (
             f'<div class="cab-noaddr" id="cab-noaddr"{"" if not nav_has_addr else " hidden"}>'
@@ -16956,6 +16960,7 @@ def driver_route_detail(route_id):
      CSS-owned (never a literal space) so label and value never run together.
      2026-10-10: chips wrap to fit (no cutoff), active chip glows orange. */
   .cab-legs-switch {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }}
+  .cab-leg-header {{ width:100%; font-size:12px; font-weight:700; letter-spacing:1px; color:#FF8C42; margin-bottom:4px; }}
   .cab-leg-chip {{ flex:1 1 auto; min-width:0; min-height:52px; padding:8px 12px; cursor:pointer;
       display:inline-flex; align-items:center; justify-content:center; text-align:center;
       background: rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.10); border-radius:12px;
@@ -35574,7 +35579,7 @@ def _maintenance_entry_js(entry_id, truck_id):
     fetch('/api/maintenance/entries/'+EID+'/delete',{{method:'POST',
         headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},body:'{{}}'}})
       .then(function(r){{return r.json().then(function(j){{return {{ok:r.ok,j:j}};}});}})
-      .then(function(res){{ if(res.ok){{ window.location.href='{url_for('truck_detail_page', truck_id=entry['truck_id'])}'; }} else {{ alert((res.j&&res.j.error)||'Could not delete.'); }} }})
+      .then(function(res){{ if(res.ok){{ window.location.href='{truck_url}'; }} else {{ alert((res.j&&res.j.error)||'Could not delete.'); }} }})
       .catch(function(){{ alert('Network error — try again.'); }});
   }};
 }})();
