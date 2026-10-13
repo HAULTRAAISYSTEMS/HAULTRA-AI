@@ -7210,26 +7210,25 @@ a:hover {{ color: #FF9D5C; }}
     margin-left: auto;
 }}
 .topnav-reload {{
-    width: 36px;
-    height: 36px;
+    width: 34px;
+    height: 34px;
     border-radius: 50%;
-    background: rgba(255, 107, 26, 0.08);
-    border: 1px solid rgba(255, 107, 26, 0.25);
-    color: #FF8C42;
-    font-size: 18px;
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: rgba(255, 255, 255, 0.55);
+    font-size: 16px;
     cursor: pointer;
     display: flex;
     align-items: center;
     justify-content: center;
-    transition: all 0.2s;
+    transition: all 0.25s;
 }}
 .topnav-reload:hover {{
-    background: rgba(255, 107, 26, 0.15);
-    border-color: rgba(255, 107, 26, 0.5);
-    transform: rotate(45deg);
+    border-color: rgba(255, 255, 255, 0.3);
+    color: rgba(255, 255, 255, 0.9);
 }}
 .topnav-reload:active {{
-    transform: scale(0.9) rotate(90deg);
+    transform: rotate(180deg);
 }}
 .company-pill {{
     font-size: 12px;
@@ -7251,13 +7250,13 @@ a:hover {{ color: #FF9D5C; }}
     align-items: center;
 }}
 .lane-icon-btn {{
-    width: 36px;
-    height: 36px;
+    width: 34px;
+    height: 34px;
     border-radius: 50%;
-    background: rgba(255, 255, 255, 0.05);
+    background: transparent;
     border: 1px solid rgba(255, 255, 255, 0.1);
-    color: #fff;
-    font-size: 18px;
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 16px;
     cursor: pointer;
     display: inline-flex;
     align-items: center;
@@ -7267,47 +7266,56 @@ a:hover {{ color: #FF9D5C; }}
     transition: all 0.2s;
 }}
 .lane-icon-btn:hover {{
-    background: rgba(255, 107, 26, 0.12);
-    border-color: rgba(255, 107, 26, 0.4);
-    transform: scale(1.05);
+    border-color: rgba(255, 255, 255, 0.25);
+    color: #fff;
 }}
 .lane-icon-btn:active {{
-    transform: scale(0.95);
+    transform: scale(0.92);
 }}
 .lane-add-tile {{
     flex: 0 0 auto;
-    width: 120px;
-    min-height: 140px;
-    border: 2px dashed rgba(255, 107, 26, 0.4);
+    width: 140px;
+    align-self: stretch;
+    border: 1.5px dashed rgba(255, 255, 255, 0.18);
     border-radius: 16px;
-    background: rgba(255, 107, 26, 0.03);
+    background: rgba(255, 255, 255, 0.015);
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 8px;
+    gap: 6px;
     text-decoration: none;
     cursor: pointer;
     transition: all 0.25s;
+    margin: 4px 0;
 }}
 .lane-add-tile:hover {{
-    border-color: rgba(255, 107, 26, 0.8);
-    background: rgba(255, 107, 26, 0.08);
-    transform: scale(1.02);
-    box-shadow: 0 0 20px rgba(255, 107, 26, 0.2);
+    border-color: rgba(255, 140, 66, 0.5);
+    background: rgba(255, 107, 26, 0.04);
+}}
+.lane-add-tile:active {{
+    transform: scale(0.97);
 }}
 .lane-add-plus {{
-    font-size: 40px;
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    background: rgba(255, 107, 26, 0.1);
+    border: 1px solid rgba(255, 107, 26, 0.3);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 24px;
     font-weight: 300;
     color: #FF8C42;
     line-height: 1;
 }}
 .lane-add-label {{
-    font-size: 12px;
+    font-size: 11px;
     font-weight: 600;
-    color: #FF8C42;
+    color: rgba(255, 255, 255, 0.45);
     text-transform: uppercase;
-    letter-spacing: 1px;
+    letter-spacing: 1.5px;
 }}
 
 /* ── 2026-10-13: HAULTRA Bottom Tab Bar — AI-driven mobile nav ── */
