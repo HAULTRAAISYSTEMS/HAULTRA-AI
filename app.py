@@ -11774,6 +11774,7 @@ def account_settings():
         <a class="btn" style="background:#f8717122;color:#f87171;border:1px solid #f8717155;"
            href="{url_for('delete_own_account')}">Review Account Deletion</a>
     </div>
+    <script>{_gps_settings_js()}</script>
     """
     return render_template_string(shell_page("Account Settings", body))
 
