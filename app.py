@@ -6806,6 +6806,9 @@ def shell_page(title, body, extra_head=""):
                 <div class="topnav-links">
                     {primary_items}
                 </div>
+                <!-- 2026-10-13: Global reload button -->
+                <button onclick="window.location.reload()" title="Reload page"
+                    style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.14);border-radius:10px;color:#fff;font-size:18px;min-width:40px;min-height:40px;cursor:pointer;margin-left:8px;">&#10227;</button>
                 <div class="topnav-right">
                     <details class="topnav-more">
                         <summary class="nav-item">More &#9662;</summary>
