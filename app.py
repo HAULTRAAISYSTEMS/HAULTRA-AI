@@ -6798,11 +6798,7 @@ def shell_page(title, body, extra_head=""):
         sidebar = f"""
         <nav class="topnav">
             <div class="topnav-inner">
-                <a href="/" class="topnav-brand">
-                    {brand_mark(26)}
-                    <span class="topnav-wordmark"><span class="logo-h">H</span><span class="logo-rest">AULTRA</span></span>
-                    <span class="topnav-brand-sub">AI</span>
-                </a>
+                <!-- 2026-10-13: Brand removed from nav — tabs need the space -->
                 <div class="topnav-links">
                     {primary_items}
                 </div>
