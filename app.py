@@ -6583,6 +6583,22 @@ def nav_link(href, label, current_path):
     return f'<a class="nav-item {active}" href="{href}">{label}</a>'
 
 
+# 2026-10-13: Bottom tab bar helpers — HAULTRA mobile nav
+def _bottom_tab(href, icon_html, label, current_path, badge=""):
+    active = "active" if current_path == href else ""
+    return (f'<a class="haul-tab {active}" href="{href}">'
+            f'<span class="haul-tab-icon">{icon_html}{badge}</span>'
+            f'<span class="haul-tab-label">{label}</span>'
+            f'<span class="haul-tab-glow"></span></a>')
+
+
+def _bottom_tab_more():
+    return (f'<button class="haul-tab haul-tab-more" onclick="openMoreSheet()" type="button">'
+            f'<span class="haul-tab-icon">&#183;&#183;&#183;</span>'
+            f'<span class="haul-tab-label">More</span>'
+            f'<span class="haul-tab-glow"></span></button>')
+
+
 # Boss-only: keep the nav "Requests" badge live without a full reload. Plain
 # (non-f) string so its JS braces don't collide with the sidebar f-string.
 _REQ_BADGE_POLLER_JS = """
@@ -6736,6 +6752,17 @@ def shell_page(title, body, extra_head=""):
                 path,
             ))
             primary_items = "".join(_parts)
+            # 2026-10-13: Bottom tab bar — 4 primary + More (HAULTRA mobile nav)
+            _btabs = []
+            if is_disp:
+                _btabs.append(_bottom_tab(url_for("routes_page"), icon('board'), 'Board', path))
+                _btabs.append(_bottom_tab('/parser', icon('box'), 'Roll-Off', path))
+            if is_cm:
+                _btabs.append(_bottom_tab(url_for("requests_page"), icon('inbox'), 'Requests', path,
+                                          badge=_nav_badge('req-nav-badge', _pending_reqs)))
+                _btabs.append(_bottom_tab(url_for("customers_page"), icon('users'), 'Customers', path))
+            _btabs.append(_bottom_tab_more())
+            bottom_tabs = "".join(_btabs)
             # NOTE: unassigned_work + customers_page routes are defined in the
             # same module (sections 3 & 4); url_for resolves them at request
             # time, so ordering within the file doesn't matter.
@@ -6751,6 +6778,13 @@ def shell_page(title, body, extra_head=""):
                 nav_link(url_for("dashboard"), 'My Day', path)
                 + nav_link(cab_href, 'Cab View', path)
                 + nav_link(url_for("inspection_new"), icon('clipboard') + 'Inspection', path)
+            )
+            # 2026-10-13: Driver bottom tabs
+            bottom_tabs = (
+                _bottom_tab(url_for("dashboard"), icon('calendar'), 'My Day', path)
+                + _bottom_tab(cab_href, icon('truck'), 'Cab View', path)
+                + _bottom_tab(url_for("inspection_new"), icon('clipboard'), 'Inspect', path)
+                + _bottom_tab_more()
             )
 
         # ── Overflow "More" items (role-aware) ───────────────────────────
@@ -6824,6 +6858,35 @@ def shell_page(title, body, extra_head=""):
                 </div>
             </div>
         </nav>
+        <!-- 2026-10-13: Bottom tab bar — HAULTRA mobile nav -->
+        <nav class="haul-tabbar" id="haul-tabbar">
+            {bottom_tabs}
+        </nav>
+        <!-- 2026-10-13: More sheet (bottom sheet for overflow items) -->
+        <div class="haul-more-sheet" id="haul-more-sheet">
+            <div class="haul-more-backdrop" onclick="closeMoreSheet()"></div>
+            <div class="haul-more-panel">
+                <div class="haul-more-handle"></div>
+                <div class="haul-more-user">{e(user['username'])} &middot; {e(user['role'])}</div>
+                <div class="haul-more-items">
+                    {more_items}
+                    {superadmin_link}
+                </div>
+                <form method="POST" action="{url_for('logout')}" style="margin:0;padding:16px;">
+                    <button type="submit" class="haul-more-logout">{icon('power')} Logout</button>
+                </form>
+            </div>
+        </div>
+        <script>
+        function openMoreSheet() {{
+            document.getElementById('haul-more-sheet').classList.add('open');
+            document.body.style.overflow = 'hidden';
+        }}
+        function closeMoreSheet() {{
+            document.getElementById('haul-more-sheet').classList.remove('open');
+            document.body.style.overflow = '';
+        }}
+        </script>
         """
         # Live pending-requests badge poll (every 45s), boss only. Mirrors the
         # existing message-badge poll pattern; no-op if the badge isn't present.
@@ -7136,6 +7199,176 @@ a:hover {{ color: #FF9D5C; }}
        to leave this bar drawn under the status bar until the next page load. */
     padding-top: env(safe-area-inset-top, 0px);
     box-shadow: 0 1px 0 rgba(255,107,26,0.05), 0 2px 20px rgba(0,0,0,0.4);
+}}
+
+/* ── 2026-10-13: HAULTRA Bottom Tab Bar — AI-driven mobile nav ── */
+.haul-tabbar {{
+    display: none; /* Desktop: hidden, topnav owns nav */
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 300;
+    background: rgba(8, 8, 10, 0.92);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border-top: 1px solid rgba(255, 107, 26, 0.25);
+    box-shadow: 0 -8px 32px rgba(255, 107, 26, 0.08), 0 -2px 8px rgba(0, 0, 0, 0.5);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+}}
+.haul-tabbar::before {{
+    content: '';
+    position: absolute;
+    top: -1px;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: linear-gradient(90deg,
+        transparent 0%,
+        rgba(255, 107, 26, 0.6) 20%,
+        rgba(255, 140, 66, 0.9) 50%,
+        rgba(255, 107, 26, 0.6) 80%,
+        transparent 100%);
+    animation: haul-tabbar-pulse 3s ease-in-out infinite;
+}}
+@keyframes haul-tabbar-pulse {{
+    0%, 100% {{ opacity: 0.5; }}
+    50% {{ opacity: 1; }}
+}}
+.haul-tab {{
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 10px 4px 8px;
+    background: none;
+    border: none;
+    color: #8a8a8a;
+    text-decoration: none;
+    cursor: pointer;
+    position: relative;
+    transition: color 0.2s, transform 0.15s;
+    font-family: inherit;
+}}
+.haul-tab:active {{ transform: scale(0.93); }}
+.haul-tab-icon {{
+    font-size: 24px;
+    line-height: 1;
+    margin-bottom: 4px;
+    position: relative;
+    transition: transform 0.2s;
+}}
+.haul-tab-label {{
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+}}
+.haul-tab-glow {{
+    position: absolute;
+    bottom: 2px;
+    width: 24px;
+    height: 3px;
+    border-radius: 2px;
+    background: #FF6B1A;
+    box-shadow: 0 0 12px rgba(255, 107, 26, 0.8);
+    opacity: 0;
+    transform: scaleX(0);
+    transition: opacity 0.25s, transform 0.25s;
+}}
+.haul-tab.active {{ color: #FF8C42; }}
+.haul-tab.active .haul-tab-icon {{
+    transform: translateY(-2px);
+    filter: drop-shadow(0 0 8px rgba(255, 107, 26, 0.6));
+}}
+.haul-tab.active .haul-tab-glow {{
+    opacity: 1;
+    transform: scaleX(1);
+    animation: haul-glow-breathe 2s ease-in-out infinite;
+}}
+@keyframes haul-glow-breathe {{
+    0%, 100% {{ box-shadow: 0 0 8px rgba(255, 107, 26, 0.6); }}
+    50% {{ box-shadow: 0 0 16px rgba(255, 107, 26, 1); }}
+}}
+.haul-more-sheet {{
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 400;
+}}
+.haul-more-sheet.open {{ display: block; }}
+.haul-more-backdrop {{
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    backdrop-filter: blur(4px);
+    animation: haul-fade-in 0.25s;
+}}
+.haul-more-panel {{
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: #121214;
+    border-top: 1px solid rgba(255, 107, 26, 0.3);
+    border-radius: 20px 20px 0 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    max-height: 75vh;
+    overflow-y: auto;
+    animation: haul-slide-up 0.3s cubic-bezier(0.32, 0.72, 0, 1);
+    box-shadow: 0 -12px 48px rgba(255, 107, 26, 0.15);
+}}
+@keyframes haul-slide-up {{
+    from {{ transform: translateY(100%); }}
+    to {{ transform: translateY(0); }}
+}}
+@keyframes haul-fade-in {{
+    from {{ opacity: 0; }}
+    to {{ opacity: 1; }}
+}}
+.haul-more-handle {{
+    width: 40px;
+    height: 4px;
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 2px;
+    margin: 12px auto 8px;
+}}
+.haul-more-user {{
+    text-align: center;
+    color: #888;
+    font-size: 13px;
+    padding: 8px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    margin-bottom: 8px;
+}}
+.haul-more-items .nav-item {{
+    display: block;
+    padding: 14px 20px;
+    color: #fff;
+    text-decoration: none;
+    font-size: 16px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}}
+.haul-more-items .nav-item:active {{
+    background: rgba(255, 107, 26, 0.1);
+}}
+.haul-more-logout {{
+    width: 100%;
+    padding: 14px;
+    background: rgba(255, 80, 80, 0.1);
+    border: 1px solid rgba(255, 80, 80, 0.3);
+    border-radius: 12px;
+    color: #ff8080;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+}}
+@media (max-width: 768px) {{
+    .haul-tabbar {{ display: flex; }}
+    .topnav-links {{ display: none !important; }}
+    .topnav-more {{ display: none !important; }}
+    body {{ padding-bottom: calc(68px + env(safe-area-inset-bottom, 0px)); }}
 }}
 
 .topnav-inner {{
@@ -18683,7 +18916,7 @@ def route_report(route_id):
             f'<div>{thumbs}</div></div>'
         )
     return f"""<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Daily Route Log — {e(route["route_name"])}</title>
 <style>
 body{{font-family:system-ui,sans-serif;margin:0;padding:16px;background:#fff;color:#111;}}
@@ -36438,7 +36671,7 @@ def garbage_dispatch_view():
     mode_note = ("Appending to the existing garbage route — new stops go at the end."
                  if append_route_id else "")
     page = r"""<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Garbage Dispatch — HAULTRA</title>
 <style>
 :root{--bg:#0B0B0D;--card:#141417;--card2:#1A1A1F;--line:rgba(255,255,255,.08);

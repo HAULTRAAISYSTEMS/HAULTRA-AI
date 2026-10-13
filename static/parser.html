@@ -629,8 +629,8 @@
   .no-drivers-msg a { color: var(--teal); font-weight: 700; }
 
   .dispatch-row { display: flex; gap: 12px; }
-  .dispatch-row .btn-secondary { flex: 0 0 auto; min-width: 120px; }
-  .dispatch-row #confirm-btn { flex: 1; }
+  .dispatch-row .btn-secondary { flex: 0 0 auto; min-width: 100px; }
+  .dispatch-row #confirm-btn { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
   @media (max-width: 480px) {
     .page-title { font-size: 1.3rem; }
