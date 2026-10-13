@@ -7207,15 +7207,53 @@ a:hover {{ color: #FF9D5C; }}
 .card h2 {{ display: flex; align-items: center; gap: 9px; }}
 
 /* ── Auth screens ───────────────────────────────────────────*/
+/* 2026-10-13: Creative login — animated HAULTRA vibe */
 .auth-wrap {{
     min-height: calc(100vh - 60px);
     display: flex; align-items: center; justify-content: center;
     padding: 32px 24px 40px;
+    position: relative;
+    overflow: hidden;
 }}
-.auth-inner {{ width: 100%; max-width: 420px; }}
+/* Animated background orbs */
+.auth-wrap::before {{
+    content: '';
+    position: absolute;
+    width: 400px; height: 400px;
+    background: radial-gradient(circle, rgba(255,107,26,0.12) 0%, transparent 70%);
+    top: -100px; right: -100px;
+    animation: auth-orb-float 8s ease-in-out infinite;
+    pointer-events: none;
+}}
+.auth-wrap::after {{
+    content: '';
+    position: absolute;
+    width: 300px; height: 300px;
+    background: radial-gradient(circle, rgba(255,107,26,0.08) 0%, transparent 70%);
+    bottom: -80px; left: -80px;
+    animation: auth-orb-float 10s ease-in-out infinite reverse;
+    pointer-events: none;
+}}
+@keyframes auth-orb-float {{
+    0%, 100% {{ transform: translate(0, 0) scale(1); }}
+    50% {{ transform: translate(30px, -30px) scale(1.1); }}
+}}
+.auth-inner {{ width: 100%; max-width: 420px; position: relative; z-index: 1; }}
 .auth-brand {{
-    display: flex; align-items: center; justify-content: center; gap: 16px;
-    margin-bottom: 30px;
+    display: flex; align-items: center; justify-content: center;
+    margin-bottom: 32px;
+    animation: auth-logo-in 0.8s cubic-bezier(0.22, 1, 0.36, 1);
+}}
+@keyframes auth-logo-in {{
+    from {{ opacity: 0; transform: translateY(-20px) scale(0.95); }}
+    to {{ opacity: 1; transform: translateY(0) scale(1); }}
+}}
+.auth-brand img {{
+    animation: auth-logo-float 6s ease-in-out infinite;
+}}
+@keyframes auth-logo-float {{
+    0%, 100% {{ transform: translateY(0); }}
+    50% {{ transform: translateY(-8px); }}
 }}
 .auth-mark {{ filter: drop-shadow(0 0 18px rgba(255,107,26,0.28)); }}
 .auth-word {{
@@ -7229,7 +7267,69 @@ a:hover {{ color: #FF9D5C; }}
     font-size: 9.5px; font-weight: 400; letter-spacing: 3.4px;
     color: var(--text-muted); text-transform: uppercase; margin-top: 6px;
 }}
-.auth-card {{ background: #171719; border: 1px solid rgba(255,255,255,0.08); }}
+/* Glassmorphic card */
+.auth-card {{
+    background: rgba(23, 23, 25, 0.7);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 107, 26, 0.15);
+    border-radius: 20px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4),
+                0 0 0 1px rgba(255, 255, 255, 0.03),
+                inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    animation: auth-card-in 0.7s cubic-bezier(0.22, 1, 0.36, 1) 0.15s both;
+}}
+@keyframes auth-card-in {{
+    from {{ opacity: 0; transform: translateY(24px); }}
+    to {{ opacity: 1; transform: translateY(0); }}
+}}
+/* Glowing inputs */
+.auth-card input {{
+    transition: border-color 0.2s, box-shadow 0.2s;
+}}
+.auth-card input:focus {{
+    border-color: rgba(255, 107, 26, 0.6) !important;
+    box-shadow: 0 0 0 3px rgba(255, 107, 26, 0.15),
+                0 0 20px rgba(255, 107, 26, 0.1);
+    outline: none;
+}}
+.auth-card label {{
+    font-size: 11px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.5);
+    font-weight: 600;
+}}
+/* Login button with shine */
+.auth-card button[type="submit"] {{
+    position: relative;
+    overflow: hidden;
+    background: linear-gradient(135deg, #FF6B1A 0%, #FF8C42 100%);
+    border: none;
+    font-weight: 800;
+    letter-spacing: 1px;
+    box-shadow: 0 4px 24px rgba(255, 107, 26, 0.35);
+    transition: transform 0.2s, box-shadow 0.2s;
+}}
+.auth-card button[type="submit"]:hover {{
+    transform: translateY(-1px);
+    box-shadow: 0 6px 32px rgba(255, 107, 26, 0.45);
+}}
+.auth-card button[type="submit"]:active {{
+    transform: translateY(0) scale(0.98);
+}}
+.auth-card button[type="submit"]::after {{
+    content: '';
+    position: absolute;
+    top: 0; left: -100%;
+    width: 100%; height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.25), transparent);
+    animation: auth-shine 3s ease-in-out infinite;
+}}
+@keyframes auth-shine {{
+    0%, 60% {{ left: -100%; }}
+    100% {{ left: 100%; }}
+}}
 
 /* The toggle sits inside the field, vertically centred on the INPUT rather
    than stretched over the wrapper — the old top:0;bottom:0 also covered the
