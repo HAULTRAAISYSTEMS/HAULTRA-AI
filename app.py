@@ -19157,6 +19157,35 @@ def route_report(route_id):
     total_tons = 0.0
     ticket_photos = []  # 2026-10-12: gallery of ticket photos
     dash = '<span style="color:#999;">—</span>'
+    # 2026-10-13: Build can_number map for chain swap Box In/Out.
+    # Box Out = bin picked up at THIS stop (from this stop's ticket).
+    # Box In = bin dropped at THIS stop (from the chain giver's ticket).
+    _can_by_stop = {}
+    _gives_to = {}  # stop_id -> stop_id it gives its empty to
+    _takes_from = {}  # stop_id -> stop_id it takes empty from
+    for _s in stops:
+        _dt = conn.execute(
+            "SELECT can_number FROM dump_tickets WHERE stop_id=?", (_s["id"],)
+        ).fetchone()
+        if _dt and _dt["can_number"]:
+            _can_by_stop[_s["id"]] = _dt["can_number"]
+        _sk = _s.keys()
+        if "chain_gives_to_stop_id" in _sk and _s["chain_gives_to_stop_id"]:
+            _gives_to[_s["id"]] = _s["chain_gives_to_stop_id"]
+        if "chain_takes_from_stop_id" in _sk and _s["chain_takes_from_stop_id"]:
+            _takes_from[_s["id"]] = _s["chain_takes_from_stop_id"]
+        # Terminal head return: tail gives to head
+        if "chain_terminal" in _sk and (_s["chain_terminal"] or "") == "head":
+            # Find head of this chain (takes from nobody)
+            _gid = _s["chain_group_id"] if "chain_group_id" in _sk else None
+            if _gid:
+                for _h in stops:
+                    _hk = _h.keys()
+                    if ("chain_group_id" in _hk and _h["chain_group_id"] == _gid
+                            and not (_h["chain_takes_from_stop_id"] if "chain_takes_from_stop_id" in _hk else None)):
+                        _gives_to[_s["id"]] = _h["id"]
+                        _takes_from[_h["id"]] = _s["id"]
+                        break
     for i, s in enumerate(stops, start=1):
         action = s["action"] or ""
         typ = {"Toter": "toter", "Hand Pickup": "HPU", "Landfill": "LAND"}.get(action, action)
@@ -19187,9 +19216,25 @@ def route_report(route_id):
             elif dt["material"]:
                 # e.g. "conc" written in weight column on paper
                 weight_display = dt["material"]
-            # Box In/Out: can_number is the box; same for in/out on pickup&return
-            if dt["can_number"]:
-                box_in = box_out = dt["can_number"]
+            # 2026-10-13: Box Out = bin picked up HERE (this stop's ticket).
+            # Box In = bin dropped HERE (from chain giver's ticket).
+            # Swap example: Stop 1 picks up 3128, Stop 2 picks up 3116.
+            #   Stop 1: Box Out=3128 (picked up), Box In=3116 (returned from Stop 2)
+            #   Stop 2: Box Out=3116 (picked up), Box In=3128 (dropped from Stop 1)
+            if dt and dt["can_number"]:
+                box_out = dt["can_number"]
+                # Box In: who gives an empty to this stop?
+                _giver_id = _takes_from.get(s["id"])
+                if _giver_id and _giver_id in _can_by_stop:
+                    box_in = _can_by_stop[_giver_id]
+                else:
+                    # Not a chain swap (or giver has no ticket yet): same can
+                    # returned (normal pickup-and-return)
+                    box_in = dt["can_number"]
+            elif s["id"] in _can_by_stop:
+                box_out = _can_by_stop[s["id"]]
+                _giver_id = _takes_from.get(s["id"])
+                box_in = _can_by_stop.get(_giver_id, box_out) if _giver_id else box_out
             if dt["dump_site"]:
                 dump_site = dt["dump_site"]
             if dt["ticket_number"]:
@@ -19280,7 +19325,7 @@ Truck: {e(route["truck_name"] or "—")} &nbsp;·&nbsp; Type: {e(route["route_ty
 <table><tr><th>Work Order</th><th>Customer Site Address</th><th>City</th><th>Dumpster Size</th><th>Start Time</th>
 <th>Landfill Arrival Time</th><th>Landfill Depart Time</th><th>Finish Time</th><th>Box In</th><th>Box Out</th><th>Weight of Load (tons)</th><th>Dump Site</th><th>Ticket</th></tr>
 {rows}</table>
-<div class="tot">Totals — cans: {total_cans} &nbsp;·&nbsp; bags: {total_bags} &nbsp;·&nbsp; tons: {total_tons:.2f}</div>
+<div class="tot">Totals — {"" if (route["route_type"] or "rolloff").lower() == "rolloff" else f"cans: {total_cans} &nbsp;·&nbsp; bags: {total_bags} &nbsp;·&nbsp; "}tons: {total_tons:.2f}</div>
 {gallery}
 <button onclick="window.print()">Print</button>
 <button onclick="history.back()">Back</button>
