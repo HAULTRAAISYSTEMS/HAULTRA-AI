@@ -17492,11 +17492,18 @@ def driver_route_detail(route_id):
                 fd.append('gps_lng', gps.lng);
                 if (gps.accuracy != null) fd.append('gps_accuracy', gps.accuracy);
             }}
-            fetch(completeForm.action, {{
-                method: 'POST',
-                headers: {{ 'X-Requested-With': 'XMLHttpRequest' }},
-                body: fd,
-            }})
+            // 2026-10-13: 15s timeout so a hung request can't freeze the button
+            var fetchTimeout = new Promise(function(_, reject) {{
+                setTimeout(function() {{ reject(new Error('timeout')); }}, 15000);
+            }});
+            Promise.race([
+                fetch(completeForm.action, {{
+                    method: 'POST',
+                    headers: {{ 'X-Requested-With': 'XMLHttpRequest' }},
+                    body: fd,
+                }}),
+                fetchTimeout
+            ])
             .then(function(r) {{ return r.json(); }})
             .then(function(data) {{
                 if (data && data.success) {{
@@ -17520,10 +17527,29 @@ def driver_route_detail(route_id):
         function submitComplete() {{
             var btn = completeForm.querySelector('button');
             if (btn) {{ btn.disabled = true; btn.textContent = 'Saving…'; }}
-            if (typeof window.captureGpsStamp === 'function') {{
-                window.captureGpsStamp(function(gps) {{ doSubmit(gps); }});
-            }} else {{
-                doSubmit(null);
+            // 2026-10-13: GPS must never break or block completion.
+            // If capture throws or hangs, submit without GPS.
+            var submitted = false;
+            function safeSubmit(gps) {{
+                if (submitted) return;
+                submitted = true;
+                try {{
+                    doSubmit(gps || null);
+                }} catch (e) {{
+                    // Last resort: plain form submit
+                    completeForm.submit();
+                }}
+            }}
+            // Safety timeout: if GPS hasn't responded in 6s, submit anyway
+            setTimeout(function() {{ safeSubmit(null); }}, 6000);
+            try {{
+                if (typeof window.captureGpsStamp === 'function') {{
+                    window.captureGpsStamp(function(gps) {{ safeSubmit(gps); }});
+                }} else {{
+                    safeSubmit(null);
+                }}
+            }} catch (e) {{
+                safeSubmit(null);
             }}
         }}
 
