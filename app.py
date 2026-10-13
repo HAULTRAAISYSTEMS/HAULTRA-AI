@@ -7248,12 +7248,62 @@ a:hover {{ color: #FF9D5C; }}
     from {{ opacity: 0; transform: translateY(-20px) scale(0.95); }}
     to {{ opacity: 1; transform: translateY(0) scale(1); }}
 }}
-.auth-brand img {{
+.auth-brand {{
+    flex-direction: column;
+    gap: 20px;
+}}
+.auth-logo-wrap {{
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}}
+.auth-logo {{
+    width: 220px;
+    height: auto;
+    position: relative;
+    z-index: 2;
+    filter: drop-shadow(0 0 30px rgba(255, 107, 26, 0.5));
     animation: auth-logo-float 6s ease-in-out infinite;
+}}
+.auth-logo-glow {{
+    position: absolute;
+    width: 280px;
+    height: 280px;
+    background: radial-gradient(circle, rgba(255,107,26,0.25) 0%, rgba(255,107,26,0.08) 40%, transparent 70%);
+    border-radius: 50%;
+    z-index: 1;
+    animation: auth-glow-pulse 4s ease-in-out infinite;
 }}
 @keyframes auth-logo-float {{
     0%, 100% {{ transform: translateY(0); }}
-    50% {{ transform: translateY(-8px); }}
+    50% {{ transform: translateY(-10px); }}
+}}
+@keyframes auth-glow-pulse {{
+    0%, 100% {{ opacity: 0.6; transform: scale(1); }}
+    50% {{ opacity: 1; transform: scale(1.1); }}
+}}
+.auth-system-status {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 4px;
+    color: rgba(255, 107, 26, 0.8);
+    text-transform: uppercase;
+}}
+.auth-status-dot {{
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #4ade80;
+    box-shadow: 0 0 12px #4ade80;
+    animation: auth-dot-blink 2s ease-in-out infinite;
+}}
+@keyframes auth-dot-blink {{
+    0%, 100% {{ opacity: 1; }}
+    50% {{ opacity: 0.4; }}
 }}
 .auth-mark {{ filter: drop-shadow(0 0 18px rgba(255,107,26,0.28)); }}
 .auth-word {{
@@ -9932,9 +9982,15 @@ def login():
     body = f"""
     <div class="auth-wrap">
       <div class="auth-inner">
-        <div class="auth-brand" style="justify-content:center;">
-            <img src="/static/haultra-logo-full.jpg" alt="HAULTRA AI Systems"
-                 style="width:200px;height:auto;mix-blend-mode:screen;filter:drop-shadow(0 0 24px rgba(255,107,26,0.4));">
+        <div class="auth-brand">
+            <div class="auth-logo-wrap">
+                <img src="/static/haultra-logo-transparent.png" alt="HAULTRA AI Systems" class="auth-logo">
+                <div class="auth-logo-glow"></div>
+            </div>
+            <div class="auth-system-status">
+                <span class="auth-status-dot"></span>
+                <span>SYSTEM ONLINE</span>
+            </div>
         </div>
         <div class="card auth-card">
                 <form method="POST">
