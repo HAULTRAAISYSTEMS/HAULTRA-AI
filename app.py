@@ -14286,8 +14286,7 @@ def _build_route_board_html(user):
                     vendor_pill = ('<span style="display:inline-block;padding:1px 7px;border-radius:999px;'
                                    'font-size:9px;font-weight:800;letter-spacing:.4px;' + _vs + '">🔧 ' + _vl + '</span>')
 
-            link = (url_for("edit_stop", stop_id=s["stop_id"]) if user["role"] == "boss"
-                    else url_for("view_route", route_id=s["route_id"]))
+            link = url_for("view_route", route_id=s["route_id"])
             _lock_cls = " locked" if locked else ""
             cards_html += f"""
             <a class="stop-mini {card_cls}{held_cls}{_lock_cls}" href="{link}"
