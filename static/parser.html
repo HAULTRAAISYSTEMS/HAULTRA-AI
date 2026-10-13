@@ -594,8 +594,47 @@
   }
   .btn-mark-reviewed:hover { background: var(--orange-dim); }
 
+  /* 2026-10-13: Bottom tab bar (matches main app) */
+  .haul-tabbar {
+    display: flex;
+    position: fixed;
+    bottom: 0; left: 0; right: 0; z-index: 300;
+    background: rgba(8, 8, 10, 0.92);
+    backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+    border-top: 1px solid rgba(255, 107, 26, 0.25);
+    box-shadow: 0 -8px 32px rgba(255, 107, 26, 0.08);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  .haul-tab {
+    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 10px 4px 8px; background: none; border: none; color: #8a8a8a;
+    text-decoration: none; cursor: pointer; position: relative; font-family: inherit;
+  }
+  .haul-tab:active { transform: scale(0.93); }
+  .haul-tab-icon { font-size: 24px; line-height: 1; margin-bottom: 4px; }
+  .haul-tab-label { font-size: 10px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase; }
+  .haul-tab-glow {
+    position: absolute; bottom: 2px; width: 24px; height: 3px; border-radius: 2px;
+    background: #FF6B1A; box-shadow: 0 0 12px rgba(255, 107, 26, 0.8);
+    opacity: 0; transform: scaleX(0); transition: opacity 0.25s, transform 0.25s;
+  }
+  .haul-tab.active { color: #FF8C42; }
+  .haul-tab.active .haul-tab-glow { opacity: 1; transform: scaleX(1); }
+  .haul-more-sheet { display: none; position: fixed; inset: 0; z-index: 400; }
+  .haul-more-sheet.open { display: block; }
+  .haul-more-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,0.6); }
+  .haul-more-panel {
+    position: absolute; bottom: 0; left: 0; right: 0;
+    background: #121214; border-top: 1px solid rgba(255,107,26,0.3);
+    border-radius: 20px 20px 0 0; padding-bottom: env(safe-area-inset-bottom, 0px);
+    max-height: 70vh; overflow-y: auto;
+  }
+  .haul-more-handle { width: 40px; height: 4px; background: rgba(255,255,255,0.2); border-radius: 2px; margin: 12px auto 8px; }
+  .haul-more-items .nav-item { display: block; padding: 14px 20px; color: #fff; text-decoration: none; font-size: 16px; border-bottom: 1px solid rgba(255,255,255,0.05); }
+  /* 2026-10-13: Action bar sits above the tabs */
+  body { padding-bottom: calc(150px + env(safe-area-inset-bottom, 0px)); }
   .bottom-bar {
-    position: fixed; left: 0; right: 0; bottom: 0; z-index: 100;
+    position: fixed; left: 0; right: 0; bottom: calc(68px + env(safe-area-inset-bottom, 0px)); z-index: 100;
     display: flex; flex-direction: column; gap: 10px;
     /* Home-indicator inset, same as .sheet-foot above. contentInset is "never"
        in capacitor.config.json, so this bar really does reach the physical
@@ -1884,6 +1923,55 @@
     driverSelectEl.addEventListener('change', updateCounts);
   }
 })();
+</script>
+
+<!-- 2026-10-13: Bottom tab bar for standalone parser page -->
+<nav class="haul-tabbar" id="haul-tabbar">
+  <a class="haul-tab" href="/routes">
+    <span class="haul-tab-icon">&#x1F5C2;</span>
+    <span class="haul-tab-label">Board</span>
+    <span class="haul-tab-glow"></span>
+  </a>
+  <a class="haul-tab active" href="/parser">
+    <span class="haul-tab-icon">&#x1F4E6;</span>
+    <span class="haul-tab-label">Roll-Off</span>
+    <span class="haul-tab-glow"></span>
+  </a>
+  <a class="haul-tab" href="/requests">
+    <span class="haul-tab-icon">&#x1F4E5;</span>
+    <span class="haul-tab-label">Requests</span>
+    <span class="haul-tab-glow"></span>
+  </a>
+  <a class="haul-tab" href="/customers">
+    <span class="haul-tab-icon">&#x1F465;</span>
+    <span class="haul-tab-label">Customers</span>
+    <span class="haul-tab-glow"></span>
+  </a>
+  <button class="haul-tab" type="button" onclick="openMoreSheet()">
+    <span class="haul-tab-icon">&#x22EF;</span>
+    <span class="haul-tab-label">More</span>
+    <span class="haul-tab-glow"></span>
+  </button>
+</nav>
+<div class="haul-more-sheet" id="haul-more-sheet">
+  <div class="haul-more-backdrop" onclick="closeMoreSheet()"></div>
+  <div class="haul-more-panel">
+    <div class="haul-more-handle"></div>
+    <div class="haul-more-items">
+      <a class="nav-item" href="/team-hours">&#x1F552; Team Hours</a>
+      <a class="nav-item" href="/trucks">&#x1F69A; Trucks</a>
+      <a class="nav-item" href="/team">&#x1F465; Team</a>
+      <a class="nav-item" href="/settings">&#x2699; Settings</a>
+    </div>
+  </div>
+</div>
+<script>
+function openMoreSheet() {
+  document.getElementById('haul-more-sheet').classList.add('open');
+}
+function closeMoreSheet() {
+  document.getElementById('haul-more-sheet').classList.remove('open');
+}
 </script>
 </body>
 </html>
