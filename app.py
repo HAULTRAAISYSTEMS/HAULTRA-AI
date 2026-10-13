@@ -6836,9 +6836,11 @@ def shell_page(title, body, extra_head=""):
                 <div class="topnav-links">
                     {primary_items}
                 </div>
-                <!-- 2026-10-13: Global reload button -->
-                <button onclick="window.location.reload()" title="Reload page"
-                    style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.14);border-radius:10px;color:#fff;font-size:18px;min-width:40px;min-height:40px;cursor:pointer;margin-left:8px;">&#10227;</button>
+                <!-- 2026-10-13: Utility bar — reload + company, clean and intentional -->
+                <div class="topnav-utility">
+                    <button onclick="window.location.reload()" title="Reload page" class="topnav-reload">&#10227;</button>
+                    {co_pill}
+                </div>
                 <div class="topnav-right">
                     <details class="topnav-more">
                         <summary class="nav-item">More &#9662;</summary>
@@ -6854,7 +6856,6 @@ def shell_page(title, body, extra_head=""):
                             </form>
                         </div>
                     </details>
-                    {co_pill}
                 </div>
             </div>
         </nav>
@@ -7199,6 +7200,114 @@ a:hover {{ color: #FF9D5C; }}
        to leave this bar drawn under the status bar until the next page load. */
     padding-top: env(safe-area-inset-top, 0px);
     box-shadow: 0 1px 0 rgba(255,107,26,0.05), 0 2px 20px rgba(0,0,0,0.4);
+}}
+
+/* ── 2026-10-13: Top utility bar — clean, intentional ── */
+.topnav-utility {{
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-left: auto;
+}}
+.topnav-reload {{
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: rgba(255, 107, 26, 0.08);
+    border: 1px solid rgba(255, 107, 26, 0.25);
+    color: #FF8C42;
+    font-size: 18px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+}}
+.topnav-reload:hover {{
+    background: rgba(255, 107, 26, 0.15);
+    border-color: rgba(255, 107, 26, 0.5);
+    transform: rotate(45deg);
+}}
+.topnav-reload:active {{
+    transform: scale(0.9) rotate(90deg);
+}}
+.company-pill {{
+    font-size: 12px;
+    font-weight: 600;
+    color: #aaa;
+    letter-spacing: 0.5px;
+    padding: 6px 12px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 999px;
+    white-space: nowrap;
+}}
+
+/* ── 2026-10-13: Lane header actions + Add tile ── */
+.lane-header-actions {{
+    margin-left: auto;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}}
+.lane-icon-btn {{
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: #fff;
+    font-size: 18px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-decoration: none;
+    position: relative;
+    transition: all 0.2s;
+}}
+.lane-icon-btn:hover {{
+    background: rgba(255, 107, 26, 0.12);
+    border-color: rgba(255, 107, 26, 0.4);
+    transform: scale(1.05);
+}}
+.lane-icon-btn:active {{
+    transform: scale(0.95);
+}}
+.lane-add-tile {{
+    flex: 0 0 auto;
+    width: 120px;
+    min-height: 140px;
+    border: 2px dashed rgba(255, 107, 26, 0.4);
+    border-radius: 16px;
+    background: rgba(255, 107, 26, 0.03);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    text-decoration: none;
+    cursor: pointer;
+    transition: all 0.25s;
+}}
+.lane-add-tile:hover {{
+    border-color: rgba(255, 107, 26, 0.8);
+    background: rgba(255, 107, 26, 0.08);
+    transform: scale(1.02);
+    box-shadow: 0 0 20px rgba(255, 107, 26, 0.2);
+}}
+.lane-add-plus {{
+    font-size: 40px;
+    font-weight: 300;
+    color: #FF8C42;
+    line-height: 1;
+}}
+.lane-add-label {{
+    font-size: 12px;
+    font-weight: 600;
+    color: #FF8C42;
+    text-transform: uppercase;
+    letter-spacing: 1px;
 }}
 
 /* ── 2026-10-13: HAULTRA Bottom Tab Bar — AI-driven mobile nav ── */
@@ -13649,28 +13758,29 @@ def _build_route_board_html(user):
             )
 
         add_stops_html = ""
+        add_stops_tile = ""
         message_html = ""
         if user["role"] == "boss" and len(lane["route_ids_seen"]) == 1:
             _lane_route_id = next(iter(lane["route_ids_seen"]))
             _is_g = lane.get("route_types") == {"garbage"}
             _add_href = (f"/garbage-dispatch?route_id={_lane_route_id}"
                          if _is_g else url_for("parser_view", route_id=_lane_route_id))
-            add_stops_html = (
-                f'<a class="lane-add-stops" href="{_add_href}">'
-                f'+ Add Stops</a>'
+            # 2026-10-13: Add Stops as a + tile at the end of the stops track
+            add_stops_tile = (
+                f'<a class="lane-add-tile" href="{_add_href}" title="Add stops">'
+                f'<span class="lane-add-plus">+</span>'
+                f'<span class="lane-add-label">Add</span></a>'
             )
+            add_stops_html = ""  # No longer a pill in lane-actions
             _lane_unread = unread_by_route.get(_lane_route_id, 0)
             _lane_msg_badge = f'<span class="lane-msg-badge">{_lane_unread}</span>' if _lane_unread else ""
+            # 2026-10-13: Message & Daily Log as icon buttons in the lane header
             message_html = (
-                f'<button type="button" class="lane-message-btn" '
+                f'<button type="button" class="lane-icon-btn" title="Message driver" '
                 f'onclick="openMessageThread({_lane_route_id}, {e(json.dumps(display_name))})">'
-                f'&#128172; Message{_lane_msg_badge}</button>'
-            )
-            # 2026-10-10: Daily Log for easy access — the paper Daily Route Log
-            # as a printable web page.
-            message_html += (
-                f'<a class="lane-message-btn" href="/route/{_lane_route_id}/report" '
-                f'style="text-decoration:none;">&#128203; Daily Log</a>'
+                f'&#128172;{_lane_msg_badge}</button>'
+                f'<a class="lane-icon-btn" title="Daily Log" href="/route/{_lane_route_id}/report" '
+                f'style="text-decoration:none;">&#128203;</a>'
             )
             # Truck parked at a vendor (Go NOW) → offer a manual hold release.
             if any(dict(x).get("held_at") and x["stop_status"] != "completed" for x in stops):
@@ -13844,15 +13954,12 @@ def _build_route_board_html(user):
                     {_lane_avatar}
                     <span class="lane-name">{e(display_name)}</span>
                     {timeoff_chip}
+                    <!-- 2026-10-13: Icon buttons on the right -->
+                    <span class="lane-header-actions">{message_html}{_report_html}</span>
                 </div>
                 <div class="lane-sub">{e(route_label)}{_garbage_badge}<br>{e(progress_label)}</div>
-                <div class="lane-actions">
-                    {add_stops_html}
-                    {message_html}
-                    {_report_html}
-                </div>
             </div>
-            <div class="lane-track">{cards_html}</div>
+            <div class="lane-track">{cards_html}{add_stops_tile}</div>
         </div>"""
 
     return lanes_html
