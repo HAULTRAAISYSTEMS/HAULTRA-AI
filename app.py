@@ -7366,6 +7366,30 @@ a:hover {{ color: #FF9D5C; }}
 .lane-icon-btn:active {{
     transform: scale(0.92);
 }}
+/* 2026-10-13: Word buttons for Message/Daily Log (user preference) */
+.lane-word-btn {{
+    padding: 8px 14px;
+    border-radius: 10px;
+    background: rgba(255, 107, 26, 0.12);
+    border: 1px solid rgba(255, 107, 26, 0.3);
+    color: #FF8C42;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    text-decoration: none;
+    transition: all 0.2s;
+    white-space: nowrap;
+}}
+.lane-word-btn:hover {{
+    background: rgba(255, 107, 26, 0.2);
+    border-color: rgba(255, 107, 26, 0.5);
+}}
+.lane-word-btn:active {{
+    transform: scale(0.95);
+}}
 .lane-add-tile {{
     flex: 0 0 auto;
     width: 140px;
@@ -13958,13 +13982,13 @@ def _build_route_board_html(user):
             add_stops_html = ""  # No longer a pill in lane-actions
             _lane_unread = unread_by_route.get(_lane_route_id, 0)
             _lane_msg_badge = f'<span class="lane-msg-badge">{_lane_unread}</span>' if _lane_unread else ""
-            # 2026-10-13: Message & Daily Log as icon buttons in the lane header
+            # 2026-10-13: Message & Daily Log as word buttons (user preference)
             message_html = (
-                f'<button type="button" class="lane-icon-btn" title="Message driver" '
+                f'<button type="button" class="lane-word-btn" '
                 f'onclick="openMessageThread({_lane_route_id}, {e(json.dumps(display_name))})">'
-                f'&#128172;{_lane_msg_badge}</button>'
-                f'<a class="lane-icon-btn" title="Daily Log" href="/route/{_lane_route_id}/report" '
-                f'style="text-decoration:none;">&#128203;</a>'
+                f'Message{_lane_msg_badge}</button>'
+                f'<a class="lane-word-btn" href="/route/{_lane_route_id}/report" '
+                f'style="text-decoration:none;">Daily Log</a>'
             )
             # Truck parked at a vendor (Go NOW) → offer a manual hold release.
             if any(dict(x).get("held_at") and x["stop_status"] != "completed" for x in stops):
