@@ -19116,6 +19116,50 @@ def _city_for_log(s):
     return ""
 
 
+@app.route("/ticket-photo/<int:ticket_id>")
+@login_required
+def ticket_photo_view(ticket_id):
+    """Ticket photo viewer with back/print buttons (2026-10-13)."""
+    conn = get_db()
+    t = conn.execute(
+        """SELECT dt.*, s.customer_name, s.address, s.route_id,
+                  r.route_name, r.route_date
+           FROM dump_tickets dt
+           JOIN stops s ON s.id = dt.stop_id
+           JOIN routes r ON r.id = s.route_id
+           WHERE dt.id=? AND r.company_id=?""",
+        (ticket_id, cid())
+    ).fetchone()
+    conn.close()
+    if not t or not t["photo_path"]:
+        abort(404)
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Ticket #{t["ticket_number"] or ticket_id}</title>
+<style>
+body{{font-family:system-ui,sans-serif;margin:0;padding:0;background:#111;color:#fff;min-height:100vh;display:flex;flex-direction:column;}}
+.topbar{{display:flex;align-items:center;gap:12px;padding:12px 16px;background:#1a1a1a;border-bottom:1px solid #333;position:sticky;top:0;z-index:10;}}
+.topbar button,.topbar a{{padding:10px 18px;border-radius:10px;border:1px solid #444;background:#222;color:#fff;font-size:15px;cursor:pointer;text-decoration:none;}}
+.topbar .primary{{background:#FF6B1A;border-color:#FF6B1A;color:#000;font-weight:700;}}
+.info{{padding:12px 16px;font-size:14px;color:#aaa;}}
+.info strong{{color:#fff;}}
+.photo{{flex:1;display:flex;align-items:center;justify-content:center;padding:16px;}}
+.photo img{{max-width:100%;max-height:70vh;border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,0.5);}}
+@media print{{.topbar{{display:none;}}.info{{color:#000;}}body{{background:#fff;}}}}
+</style></head><body>
+<div class="topbar">
+<button onclick="history.back()">&larr; Back</button>
+<button class="primary" onclick="window.print()">Print</button>
+<a href="/{t["photo_path"]}" download>Save</a>
+</div>
+<div class="info">
+<strong>Ticket #{t["ticket_number"] or "—"}</strong> &middot; {t["customer_name"] or ""} &middot; {t["address"] or ""}<br>
+Route: {t["route_name"] or ""} &middot; {t["route_date"] or ""}
+</div>
+<div class="photo"><img src="/{t["photo_path"]}" alt="Ticket photo"></div>
+</body></html>"""
+
+
 @app.route("/route/<int:route_id>/report")
 @login_required
 def route_report(route_id):
@@ -19198,7 +19242,7 @@ def route_report(route_id):
         # Paper: Work Order | Address | City | Dumpster Size | Start | Landfill Arrive |
         #        Landfill Depart | Finish | Box In | Box Out | Weight (tons) | Dump Site
         dt = conn.execute(
-            """SELECT net_tons, material, ticket_number, can_number, dump_site,
+            """SELECT id, net_tons, material, ticket_number, can_number, dump_site,
                       scale_in_weight, scale_out_weight, fee_usd, photo_path
                FROM dump_tickets WHERE stop_id=?""",
             (s["id"],)).fetchone()
@@ -19207,6 +19251,7 @@ def route_report(route_id):
         dump_site = ""
         ticket_no = ""
         ticket_photo = ""
+        ticket_id = None
         weight_display = ""
         if dt:
             if dt["net_tons"]:
@@ -19239,6 +19284,7 @@ def route_report(route_id):
                 dump_site = dt["dump_site"]
             if dt["ticket_number"]:
                 ticket_no = dt["ticket_number"]
+            ticket_id = dt["id"]
             if dt["photo_path"]:
                 ticket_photo = dt["photo_path"]
         elif s["weight_tons"]:
@@ -19251,7 +19297,9 @@ def route_report(route_id):
         # 2026-10-12: Build as HTML, do NOT escape the link
         ticket_cell = ""
         if ticket_no:
-            if ticket_photo:
+            if ticket_photo and ticket_id:
+                ticket_cell = f'<a href="/ticket-photo/{ticket_id}" target="_blank" style="color:#0066cc;">Tkt#{e(ticket_no)} \U0001F4F7</a>'
+            elif ticket_photo:
                 ticket_cell = f'<a href="/{e(ticket_photo)}" target="_blank" style="color:#0066cc;">Tkt#{e(ticket_no)} \U0001F4F7</a>'
             else:
                 ticket_cell = f"Tkt#{e(ticket_no)}"
@@ -19269,6 +19317,7 @@ def route_report(route_id):
                 'stop': f"{s['address'] or ''}",
                 'ticket': ticket_no,
                 'photo': ticket_photo,
+                'ticket_id': ticket_id,
             })
         rows += (
             f"<tr><td>{typ}</td>"
@@ -19293,8 +19342,9 @@ def route_report(route_id):
     if ticket_photos:
         thumbs = ""
         for p in ticket_photos:
+            _thumb_href = f"/ticket-photo/{p['ticket_id']}" if p.get('ticket_id') else f"/{e(p['photo'])}"
             thumbs += (
-                f'<a href="/{e(p["photo"])}" target="_blank" style="text-decoration:none;color:#111;">'
+                f'<a href="{_thumb_href}" target="_blank" style="text-decoration:none;color:#111;">'
                 f'<div style="display:inline-block;margin:8px;text-align:center;">'
                 f'<img src="/{e(p["photo"])}" style="width:120px;height:120px;object-fit:cover;border-radius:8px;border:1px solid #999;">'
                 f'<div style="font-size:11px;margin-top:4px;">{e(p["ticket"] or "Ticket")}<br>{e(p["stop"][:25])}</div>'
