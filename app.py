@@ -14092,7 +14092,10 @@ def routes_page():
     """
 
     header_html = f"""
-    <div class="hero owner-header-row">
+    <div class="hero owner-header-row" style="position:relative;">
+        <!-- 2026-10-13: Reload lives inside the header card -->
+        <button onclick="window.location.reload()" title="Reload board"
+            style="position:absolute;top:14px;right:14px;width:34px;height:34px;border-radius:50%;background:transparent;border:1px solid rgba(255,255,255,0.12);color:rgba(255,255,255,0.55);font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;">&#10227;</button>
         <div>
             <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#55554C;margin-bottom:7px;">
                 {e(weekday)} &middot; {e(today)}
@@ -14266,7 +14269,10 @@ def routes_page():
         </div>
         """
 
+    # 2026-10-13: Hide the global topnav on Route Board — the header card IS the header
+    _hide_topnav = """<style>@media (max-width: 768px) { .topnav { display: none !important; } }</style>"""
     body = f"""
+    {_hide_topnav}
     {header_html}
     {tabs_html}
     {main_panel}
