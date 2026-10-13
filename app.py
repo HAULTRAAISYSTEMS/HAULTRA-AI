@@ -13703,7 +13703,7 @@ def routes_page():
             <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#55554C;margin-bottom:7px;">
                 {e(weekday)} &middot; {e(today)}
             </div>
-            <h1>Route Board <button type="button" onclick="window.location.reload()" title="Refresh" style="background:none;border:none;color:#FF8C42;font-size:24px;cursor:pointer;vertical-align:middle;">&#8635;</button></h1>
+            <h1>Route Board</h1>
         </div>
         <div class="row" style="align-items:center;gap:18px;">
             <div class="board-legend">
