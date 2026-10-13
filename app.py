@@ -11178,7 +11178,17 @@ def _anonymize_user_account(conn, user, company):
 @app.route("/account/settings")
 @login_required
 def account_settings():
+    # 2026-10-13: Load from DB (source of truth), fall back to session
     _nav_pref = (session.get("nav_preference") or "").strip()
+    try:
+        _db_pref = get_db().execute(
+            "SELECT nav_preference FROM users WHERE id=?", (session["user_id"],)
+        ).fetchone()
+        if _db_pref and _db_pref["nav_preference"] is not None:
+            _nav_pref = (_db_pref["nav_preference"] or "").strip()
+            session["nav_preference"] = _nav_pref
+    except Exception:
+        pass
     _nav_opts = "".join(
         f'<label class="haul-dropdown-item" style="cursor:pointer;margin-bottom:6px;">'
         f'<input type="radio" name="nav_preference" value="{val}" {"checked" if _nav_pref == val else ""} '
@@ -11196,6 +11206,7 @@ def account_settings():
         <h2>&#9881; Navigation App</h2>
         <p class="muted small">Which maps app opens when you tap Navigate.</p>
         <form method="POST" action="{url_for('set_nav_preference', user_id=session['user_id'])}">
+            <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
             <input type="hidden" name="next" value="{url_for('account_settings')}">
             {_nav_opts}
             <button type="submit" class="haul-dropdown-item" style="justify-content:center;background:rgba(255,107,26,.16) !important;border-color:rgba(255,107,26,.45) !important;margin-top:8px;"><span class="haul-di-text" style="text-align:center;color:#FF8C42;font-weight:800;">Save</span></button>
@@ -11425,6 +11436,10 @@ def set_nav_preference(user_id):
     conn.execute("UPDATE users SET nav_preference=? WHERE id=?", (pref, user_id))
     conn.commit()
     conn.close()
+
+    # 2026-10-13: Update session so the settings page shows the new value immediately
+    if user_id == session.get("user_id"):
+        session["nav_preference"] = pref or ""
 
     flash("Navigation preference saved.", "success")
     next_url = request.form.get("next") or url_for("team_page")
@@ -19580,10 +19595,13 @@ def cancel_stop(stop_id):
         return _cancel_redirect(route_id)
 
     reason = _cancel_reason_code(request.form.get("reason"), source)
+    # Status is deliberately untouched: the stops.status CHECK only allows
+    # ('open','completed'), and cancelled_at IS NULL is the single global
+    # definition of "work that still counts" (see live_stops()).
     conn.execute(
         """UPDATE stops
               SET cancelled_at=?, cancelled_by=?, cancel_reason=?,
-                  cancel_source=?, cancel_client_uuid=?, status='cancelled'
+                  cancel_source=?, cancel_client_uuid=?
             WHERE id=? AND cancelled_at IS NULL""",
         (now_ts(), session["user_id"], reason, source, client_uuid, stop_id),
     )
@@ -19637,10 +19655,13 @@ def uncancel_stop(stop_id):
         flash("That stop isn't cancelled.", "info")
         return _cancel_redirect(route_id)
 
+    # Restore to 'open' -- the only live stops.status value. ('pending' is a
+    # driver_status word; a stop restored to status='pending' would vanish
+    # from every WHERE status='open' work query.)
     conn.execute(
         """UPDATE stops SET cancelled_at=NULL, cancelled_by=NULL,
                             cancel_reason=NULL, cancel_source=NULL,
-                            cancel_client_uuid=NULL, status='pending'
+                            cancel_client_uuid=NULL, status='open'
             WHERE id=?""",
         (stop_id,),
     )
