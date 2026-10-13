@@ -26979,19 +26979,22 @@ def _site_locations_section_html():
             f'<button type="submit" class="site-addr-save">Save Address</button>'
             f'</form>'
         )
+        _toggle_label = "Add Address" if not has_addr else "Edit Address"
         _toggle_btn = (
-            f'<button type="button" class="site-addr-toggle" '
-            f'onclick="var f=document.getElementById(\'{_form_id}\');'
-            f'f.style.display=f.style.display===\'none\'?\'block\':\'none\';'
-            f'this.textContent=f.style.display===\'none\'?\'{"Add Address" if not has_addr else "Edit Address"}\":\'Cancel\';">'
-            f'{"Add Address" if not has_addr else "Edit Address"}</button>'
+            '<button type="button" class="site-addr-toggle" '
+            'onclick="var f=document.getElementById(' + "'" + _form_id + "'" + ');'
+            "f.style.display=f.style.display==='none'?'block':'none';"
+            "this.textContent=f.style.display==='none'?'"
+            + _toggle_label + "':'Cancel';\">"
+            + _toggle_label + '</button>'
         )
+        _addr_html = '<div class="site-card-addr">' + e(_full_addr) + '</div>' if has_addr else ''
         rows += (
             f'<div class="site-card" data-search="{e(search)}" data-kind="{e(kind)}">'
             f'<div class="site-card-head">'
             f'<div><div class="site-card-name">{e(name)}</div>'
             f'<div class="site-card-badges">{kind_badge} {need_badge} {tickets_toggle}</div>'
-            f'{f"<div class=\"site-card-addr\">{e(_full_addr)}</div>" if has_addr else ""}'
+            f'{_addr_html}'
             f'</div></div>'
             f'<div class="site-card-actions">{_toggle_btn}</div>'
             f'{_addr_form}'
