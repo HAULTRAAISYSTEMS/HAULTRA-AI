@@ -21437,6 +21437,13 @@ def stop_driver_action(stop_id):
         return redirect(url_for("driver_route_detail", route_id=stop["rid"]))
 
     ts = now_ts()
+    _stop_updated = None  # 2026-10-13: rowcount for col_map actions (conflict detection)
+    _col_map = {
+        "arrived":       "arrived_at",
+        "box_in":        "box_in_at",
+        "box_out":       "box_out_at",
+        "going_to_dump": "go_to_dump_at",
+    }
 
     if action == "unarrive":
         # Undo arrival — back to phase 1 (en route). Clear arrival + the
@@ -21452,27 +21459,32 @@ def stop_driver_action(stop_id):
             (stop_id, current_status)
         )
     else:
-        col_map = {
-            "arrived":       "arrived_at",
-            "box_in":        "box_in_at",
-            "box_out":       "box_out_at",
-            "going_to_dump": "go_to_dump_at",
-        }
-        time_col = col_map[action]
-        conn.execute(
+        time_col = _col_map[action]
+        _stop_cur = conn.execute(
             f"UPDATE stops SET driver_status=?, {time_col}=? WHERE id=? AND driver_status=?",
             (action, ts, stop_id, current_status)
         )
+        _stop_updated = _stop_cur.rowcount
         # 2026-10-13: Auto-start the route on first driver action.
         # Start Time on the daily log = when the driver started the route.
-        if action == "arrived":
+        # (Only if the stop update succeeded — don't mask conflicts.)
+        if action == "arrived" and _stop_updated > 0:
             conn.execute(
                 """UPDATE routes SET status='in_progress', started_at=?
                    WHERE id=? AND status='open'""",
                 (ts, stop["rid"])
             )
 
-    if conn.total_changes == 0:
+    # 2026-10-13: Check the STOP update specifically (not total_changes,
+    # which includes the route auto-start and would mask conflicts).
+    # For the col_map actions (arrived/box_in/box_out/going_to_dump), use
+    # _stop_updated. For others (unarrive/need_box_in/skip_to_box_in), fall
+    # back to total_changes.
+    if action in _col_map:
+        _no_change = (_stop_updated == 0)
+    else:
+        _no_change = (conn.total_changes == 0)
+    if _no_change:
         conn.close()
         if is_replay:
             return jsonify({"conflict": True, "current_status": current_status, "stop_id": stop_id}), 409
