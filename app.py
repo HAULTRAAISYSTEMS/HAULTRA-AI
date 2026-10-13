@@ -26053,6 +26053,7 @@ def _dump_locations_section_html():
     ).fetchall()
     conn.close()
 
+    # 2026-10-13: Cards instead of table — cleaner, more HAULTRA
     rows = ""
     for dl in locs:
         addr = ", ".join(p for p in [dl["address"], dl["city"], dl["state"], dl["zip_code"]] if p)
@@ -26062,35 +26063,31 @@ def _dump_locations_section_html():
             else '<span class="badge" style="opacity:0.5;">Inactive</span>'
         )
         toggle_label = "Deactivate" if dl["active"] else "Activate"
-        toggle_style = (
-            'background:transparent;color:#fbbf24;border:1px solid rgba(251,191,36,0.4);'
-            'border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;'
-        ) if dl["active"] else (
-            'background:transparent;color:#4ade80;border:1px solid rgba(74,222,128,0.4);'
-            'border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;'
-        )
+        toggle_class = "dl-toggle-off" if dl["active"] else "dl-toggle-on"
         _dlid   = dl["id"]
         _dlname = e(dl["name"])
+        _notes = e(dl['notes'] or '')
         rows += f"""
-        <tr>
-            <td><strong>{_dlname}</strong></td>
-            <td class="muted small">{e(addr)}</td>
-            <td class="muted small">{e(dl['notes'] or '')}</td>
-            <td>{active_badge}</td>
-            <td style="text-align:right;white-space:nowrap;">
-                <a href="{url_for('edit_dump_location', loc_id=_dlid)}"
-                   style="color:#FF9D5C;font-size:12px;margin-right:10px;">Edit</a>
+        <div class="dl-card">
+            <div class="dl-card-head">
+                <div>
+                    <div class="dl-card-name">{_dlname}</div>
+                    <div class="dl-card-addr">{e(addr) or '<span class="muted">No address</span>'}</div>
+                    {f'<div class="dl-card-notes">{_notes}</div>' if _notes else ''}
+                </div>
+                {active_badge}
+            </div>
+            <div class="dl-card-actions">
+                <a href="{url_for('edit_dump_location', loc_id=_dlid)}" class="dl-action">Edit</a>
                 <form method="POST" action="{url_for('toggle_dump_location', loc_id=_dlid)}" style="display:inline;">
-                    <button type="submit" style="{toggle_style}">{toggle_label}</button>
+                    <button type="submit" class="dl-action {toggle_class}">{toggle_label}</button>
                 </form>
-                <form method="POST" action="{url_for('delete_dump_location', loc_id=_dlid)}" style="display:inline;margin-left:6px;"
+                <form method="POST" action="{url_for('delete_dump_location', loc_id=_dlid)}" style="display:inline;"
                       onsubmit="return confirm('Delete {_dlname}?');">
-                    <button type="submit"
-                       style="background:transparent;color:#f87171;border:1px solid rgba(248,113,113,0.4);
-                              border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;">Delete</button>
+                    <button type="submit" class="dl-action dl-delete">Delete</button>
                 </form>
-            </td>
-        </tr>"""
+            </div>
+        </div>"""
 
     return f"""
     <div class="card" id="dump-locations">
@@ -26104,17 +26101,37 @@ def _dump_locations_section_html():
         <p class="muted small" style="margin-bottom:14px;">Disposal sites available for route assignment.
         New here? <a href="{url_for('onboarding_parser_page')}">Paste a few recent dispatch texts</a> and the
         parser learns your dump sites, customers and addresses automatically.</p>
-        <div class="table-wrap">
-            <table>
-                <thead>
-                    <tr><th>Name</th><th>Address</th><th>Notes</th><th>Status</th><th style="width:200px;"></th></tr>
-                </thead>
-                <tbody>
-                    {rows or '<tr><td colspan="5" class="muted">No dump locations found.</td></tr>'}
-                </tbody>
-            </table>
+        <div class="dl-grid">
+            {rows or '<p class="muted">No dump locations found.</p>'}
         </div>
     </div>
+    <style>
+    /* 2026-10-13: Dump location cards */
+    .dl-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }}
+    .dl-card {{
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 12px;
+        padding: 14px 16px;
+        transition: border-color 0.2s, transform 0.2s;
+    }}
+    .dl-card:hover {{ border-color: rgba(255,107,26,0.3); transform: translateY(-1px); }}
+    .dl-card-head {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 12px; }}
+    .dl-card-name {{ font-weight: 700; font-size: 15px; margin-bottom: 4px; }}
+    .dl-card-addr {{ font-size: 13px; color: var(--text-muted); }}
+    .dl-card-notes {{ font-size: 12px; color: var(--text-muted); margin-top: 4px; font-style: italic; }}
+    .dl-card-actions {{ display: flex; gap: 8px; align-items: center; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.06); }}
+    .dl-action {{
+        background: transparent; border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 8px; padding: 6px 14px; font-size: 12px; cursor: pointer;
+        color: #FF9D5C; text-decoration: none; transition: all 0.2s;
+    }}
+    .dl-action:hover {{ border-color: rgba(255,107,26,0.5); background: rgba(255,107,26,0.08); }}
+    .dl-toggle-off {{ color: #fbbf24; border-color: rgba(251,191,36,0.4); }}
+    .dl-toggle-on {{ color: #4ade80; border-color: rgba(74,222,128,0.4); }}
+    .dl-delete {{ color: #f87171; border-color: rgba(248,113,113,0.4); }}
+    .dl-delete:hover {{ background: rgba(248,113,113,0.08); border-color: rgba(248,113,113,0.6); }}
+    </style>
     """
 
 
@@ -26869,30 +26886,41 @@ def _site_locations_section_html():
                 f'style="{_tt_style}border-radius:999px;padding:2px 9px;font-size:10px;font-weight:700;'
                 f'cursor:pointer;margin-left:4px;">&#127903; {_tt_label}</button>'
                 f'</form>')
+        # 2026-10-13: Card layout with collapsible address form
         search = " ".join(p for p in [name, _a["address"] or "", _a["city"] or ""] if p).lower()
-        rows += (
-            f'<tr data-search="{e(search)}" data-kind="{e(kind)}">'
-            f'<td><strong>{e(name)}</strong> {kind_badge} {need_badge} {tickets_toggle}</td>'
-            f'<td>'
+        _full_addr = ", ".join(p for p in [_a["address"] or "", _a["city"] or "", _a["state"] or "", _a["zip"] or ""] if p)
+        _form_id = f"addr-form-{_a['id']}"
+        _addr_form = (
             f'<form method="POST" action="{url_for("update_address_book", sa_id=_a["id"])}" '
-            f'style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">'
+            f'id="{_form_id}" class="site-addr-form" style="display:none;">'
             f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
             f'<input type="hidden" name="action" value="address">'
-            f'<input name="address" value="{e(_a["address"] or "")}" placeholder="Street address" '
-            f'style="flex:2;min-width:150px;min-height:40px;padding:6px 10px;background:var(--bg-0);'
-            f'border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);font-size:13px;">'
-            f'<input name="city" value="{e(_a["city"] or "")}" placeholder="City" '
-            f'style="flex:1;min-width:90px;min-height:40px;padding:6px 10px;background:var(--bg-0);'
-            f'border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);font-size:13px;">'
-            f'<input name="state" value="{e(_a["state"] or "")}" placeholder="ST" size="3" '
-            f'style="width:56px;min-height:40px;padding:6px 8px;background:var(--bg-0);'
-            f'border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);font-size:13px;">'
-            f'<input name="zip" value="{e(_a["zip"] or "")}" placeholder="Zip" size="6" '
-            f'style="width:74px;min-height:40px;padding:6px 8px;background:var(--bg-0);'
-            f'border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);font-size:13px;">'
-            f'<button type="submit" style="min-height:40px;background:transparent;color:#FF9D5C;'
-            f'border:1px solid rgba(255,157,92,0.4);border-radius:6px;padding:4px 14px;font-size:12px;cursor:pointer;">Save</button>'
-            f'</form></td></tr>'
+            f'<div class="site-addr-grid">'
+            f'<input name="address" value="{e(_a["address"] or "")}" placeholder="Street address" class="site-addr-input site-addr-street">'
+            f'<input name="city" value="{e(_a["city"] or "")}" placeholder="City" class="site-addr-input">'
+            f'<input name="state" value="{e(_a["state"] or "")}" placeholder="ST" class="site-addr-input site-addr-st">'
+            f'<input name="zip" value="{e(_a["zip"] or "")}" placeholder="Zip" class="site-addr-input site-addr-zip">'
+            f'</div>'
+            f'<button type="submit" class="site-addr-save">Save Address</button>'
+            f'</form>'
+        )
+        _toggle_btn = (
+            f'<button type="button" class="site-addr-toggle" '
+            f'onclick="var f=document.getElementById(\'{_form_id}\');'
+            f'f.style.display=f.style.display===\'none\'?\'block\':\'none\';'
+            f'this.textContent=f.style.display===\'none\'?\'{"Add Address" if not has_addr else "Edit Address"}\":\'Cancel\';">'
+            f'{"Add Address" if not has_addr else "Edit Address"}</button>'
+        )
+        rows += (
+            f'<div class="site-card" data-search="{e(search)}" data-kind="{e(kind)}">'
+            f'<div class="site-card-head">'
+            f'<div><div class="site-card-name">{e(name)}</div>'
+            f'<div class="site-card-badges">{kind_badge} {need_badge} {tickets_toggle}</div>'
+            f'{f"<div class=\"site-card-addr\">{e(_full_addr)}</div>" if has_addr else ""}'
+            f'</div></div>'
+            f'<div class="site-card-actions">{_toggle_btn}</div>'
+            f'{_addr_form}'
+            f'</div>'
         )
     _need_line = (f'<span class="badge" style="background:rgba(255,82,82,0.16);color:#FF5252;">'
                   f'{need_count} need address</span>' if need_count else
@@ -26911,16 +26939,52 @@ def _site_locations_section_html():
             <button type="button" class="btn secondary" data-kf="dump" style="min-height:40px;" onclick="siteFilter('dump',this)">Dump</button>
             <button type="button" class="btn secondary" data-kf="yard" style="min-height:40px;" onclick="siteFilter('yard',this)">Yard</button>
         </div>
-        <div class="table-wrap">
-            <table>
-                <thead><tr><th style="width:260px;">Site</th><th>Address</th></tr></thead>
-                <tbody>{rows or '<tr><td colspan="2" class="muted">No dump sites or yards yet — parse a dispatch that names one and it&rsquo;ll appear here.</td></tr>'}</tbody>
-            </table>
+        <div class="site-grid">
+            {rows or '<p class="muted">No dump sites or yards yet — parse a dispatch that names one and it&rsquo;ll appear here.</p>'}
         </div>
     </div>
+    <style>
+    /* 2026-10-13: Site cards with collapsible address forms */
+    .site-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }}
+    .site-card {{
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 12px;
+        padding: 14px 16px;
+        transition: border-color 0.2s;
+    }}
+    .site-card:hover {{ border-color: rgba(255,107,26,0.25); }}
+    .site-card-name {{ font-weight: 700; font-size: 15px; margin-bottom: 6px; }}
+    .site-card-badges {{ display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-bottom: 6px; }}
+    .site-card-addr {{ font-size: 13px; color: var(--text-muted); margin-top: 6px; }}
+    .site-card-actions {{ margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.06); }}
+    .site-addr-toggle {{
+        background: transparent; color: #FF9D5C;
+        border: 1px solid rgba(255,157,92,0.4); border-radius: 8px;
+        padding: 8px 16px; font-size: 12px; font-weight: 600; cursor: pointer;
+        transition: all 0.2s;
+    }}
+    .site-addr-toggle:hover {{ background: rgba(255,107,26,0.1); border-color: rgba(255,107,26,0.6); }}
+    .site-addr-form {{ margin-top: 12px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.06); }}
+    .site-addr-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }}
+    .site-addr-input {{
+        min-height: 42px; padding: 8px 12px; background: var(--bg-0);
+        border: 1px solid rgba(255,255,255,0.12); border-radius: 8px;
+        color: var(--text); font-size: 13px;
+    }}
+    .site-addr-input:focus {{ border-color: rgba(255,107,26,0.5); outline: none; }}
+    .site-addr-street {{ grid-column: 1 / -1; }}
+    .site-addr-st, .site-addr-zip {{ max-width: 100%; }}
+    .site-addr-save {{
+        width: 100%; min-height: 42px; background: rgba(255,107,26,0.12);
+        color: #FF9D5C; border: 1px solid rgba(255,107,26,0.4); border-radius: 8px;
+        font-size: 13px; font-weight: 700; cursor: pointer; transition: all 0.2s;
+    }}
+    .site-addr-save:hover {{ background: rgba(255,107,26,0.2); }}
+    </style>
     <script>
     function siteFilter(kind, btn) {{
-        document.querySelectorAll('#site-locations tbody tr[data-kind]').forEach(function(r) {{
+        document.querySelectorAll('#site-locations .site-card[data-kind]').forEach(function(r) {{
             r.style.display = (kind === 'all' || r.getAttribute('data-kind') === kind) ? '' : 'none';
         }});
         document.querySelectorAll('#site-kind-filter button').forEach(function(b) {{ b.classList.remove('active'); }});
