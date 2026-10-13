@@ -8953,7 +8953,8 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     .topnav-brand-sub {{ display: none; }}
     .logo-h, .logo-rest {{ font-size: 16px; }}
     .cab-address {{ font-size: 18px; }}
-    .cab-card {{ padding: 14px 15px; }}
+    /* 2026-10-13: preserve right padding for un-arrive button */
+    .cab-card {{ padding: 14px 15px; padding-right: 52px; }}
 }}
 </style>
     </head>
@@ -11738,6 +11739,7 @@ def account_settings():
     <div class="card">
         <h2>&#128205; Location</h2>
         <p class="muted small">Used to record where containers are placed when you complete a stop.</p>
+        <p class="muted small" id="gps-status-line" style="margin-top:8px;"></p>
         <button type="button" id="gps-enable-btn" class="haul-dropdown-item" style="justify-content:center;">
             <span class="haul-di-text" style="text-align:center;">Enable Location</span>
         </button>
