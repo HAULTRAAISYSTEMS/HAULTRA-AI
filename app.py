@@ -23483,6 +23483,10 @@ Rules:
       later drop/delivery stop — code binds it to that D stop).
     * {"kind":"start","start":"yard"}         — "grab the first one from the yard", "start from yard".
     * null — no chain signal.
+  NOTE: You do NOT need to set chain_hint for consecutive Pickup-and-Return stops —
+  the system auto-links them as a swap chain (first bin → next stop, last bin →
+  returns to first stop). Only set chain_hint when the text EXPLICITLY describes
+  a different chain (yard start, no return, delivery end, specific target).
   Do NOT put any swap phrase in `notes` — the readable chain text is DERIVED in code from the
   structured link, so a swap phrase in notes would double-render. A chain_hint NEVER changes the
   action — a PR stays PR; never invent a new action code.
@@ -29412,6 +29416,39 @@ def _apply_route_chains(conn, route_id):
         stops.append({"id": d["id"], "action": d["action"], "address": d["address"],
                       "container_size": d["container_size"], "note": d.get("notes") or "",
                       "chain_hint": hint, "manual_gives_to": manual, "manual_delivery": manual_dlv})
+    # 2026-10-13: Auto-chain consecutive Pickup-and-Return stops.
+    # The driver's natural workflow: pick up bin at stop 1 → dump → take empty
+    # to stop 2 → swap (drop empty, pick up full) → dump → return empty to stop 1.
+    # The first bin ends at stop 2, the second bin ends at stop 1.
+    # If 2+ consecutive PR/Swap stops have no explicit chain signal, link them
+    # as a swap chain (terminal defaults to 'head' = return to first stop).
+    # Explicit hints, manual links, and note phrases take precedence (not overridden).
+    def _is_pr_action(a):
+        al = (a or "").lower()
+        return "pickup and return" in al or ("swap" in al and "pull" not in al)
+    i = 0
+    while i < len(stops):
+        if _is_pr_action(stops[i]["action"]):
+            # Find the run of consecutive PR stops
+            j = i
+            while j < len(stops) and _is_pr_action(stops[j]["action"]):
+                j += 1
+            run = stops[i:j]
+            # Only auto-chain if 2+ stops AND none have explicit/manual signals
+            if len(run) >= 2:
+                has_signal = any(
+                    s["chain_hint"] or s["manual_gives_to"] or s["manual_delivery"]
+                    or chain_resolver.strip_chain_phrases(s["note"] or "") != (s["note"] or "").strip()
+                    for s in run
+                )
+                if not has_signal:
+                    # Link each stop to the next (last stop uses default terminal='head')
+                    for k in range(len(run) - 1):
+                        run[k]["chain_hint"] = {"kind": "next"}
+                        run[k]["_auto_chained"] = True
+            i = j
+        else:
+            i += 1
     res = chain_resolver.resolve_chain(stops)
     for s in stops:
         conn.execute(
