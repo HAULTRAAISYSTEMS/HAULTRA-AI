@@ -19091,8 +19091,6 @@ def route_messages(route_id):
     ]})
 
 
-@app.route("/route/<int:route_id>/report")
-@login_required
 def _city_for_log(s):
     """City for the daily log: use stored city, else parse from address.
     2026-10-13: Many stops have empty city column; parse from address as fallback.
@@ -19118,6 +19116,8 @@ def _city_for_log(s):
     return ""
 
 
+@app.route("/route/<int:route_id>/report")
+@login_required
 def route_report(route_id):
     """Daily Route Log as a web page (2026-10-10) — the digital version of the
     paper sheet the driver used to hand back. Per-stop times, counts, landfill
