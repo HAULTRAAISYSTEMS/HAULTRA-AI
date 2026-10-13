@@ -19093,6 +19093,31 @@ def route_messages(route_id):
 
 @app.route("/route/<int:route_id>/report")
 @login_required
+def _city_for_log(s):
+    """City for the daily log: use stored city, else parse from address.
+    2026-10-13: Many stops have empty city column; parse from address as fallback.
+    "401 Naval Base Rd, Norfolk" → "Norfolk"; "114 Sawyers Creek, Camden, NC" → "Camden"."""
+    city = (s["city"] or "").strip() if "city" in s.keys() else ""
+    if city:
+        return city
+    addr = (s["address"] or "").strip()
+    if not addr:
+        return ""
+    # Address format: "street, city" or "street, city, ST"
+    parts = [p.strip() for p in addr.split(",")]
+    if len(parts) >= 3:
+        # "114 Sawyers Creek, Camden, NC" → "Camden"
+        return parts[-2]
+    elif len(parts) == 2:
+        # "401 Naval Base Rd, Norfolk" → "Norfolk"
+        # But avoid returning a state abbreviation
+        candidate = parts[-1]
+        if len(candidate) <= 3 and candidate.isupper():
+            return ""
+        return candidate
+    return ""
+
+
 def route_report(route_id):
     """Daily Route Log as a web page (2026-10-10) — the digital version of the
     paper sheet the driver used to hand back. Per-stop times, counts, landfill
@@ -19203,11 +19228,11 @@ def route_report(route_id):
         rows += (
             f"<tr><td>{typ}</td>"
             f"<td>{e(s['address'] or '')}</td>"
-            f"<td>{e(s['city'] or '')}</td>"
+            f"<td>{e(_city_for_log(s))}</td>"
             f"<td>{e(dumpster_size)}</td>"
-            f"<td>{fmt_time(s['started_at'])}</td>"
-            f"<td>{fmt_time(s['arrived_at'])}</td>"
-            f"<td>{fmt_time(s['departed_at'])}</td>"
+            f"<td>{fmt_time(route['started_at'])}</td>"
+            f"<td>{fmt_time(s['go_to_dump_at'])}</td>"
+            f"<td>{fmt_time(s['box_in_at'])}</td>"
             f"<td>{fmt_time(s['completed_at'])}</td>"
             f"<td>{e(box_in) or dash}</td>"
             f"<td>{e(box_out) or dash}</td>"
@@ -21313,6 +21338,14 @@ def stop_driver_action(stop_id):
             f"UPDATE stops SET driver_status=?, {time_col}=? WHERE id=? AND driver_status=?",
             (action, ts, stop_id, current_status)
         )
+        # 2026-10-13: Auto-start the route on first driver action.
+        # Start Time on the daily log = when the driver started the route.
+        if action == "arrived":
+            conn.execute(
+                """UPDATE routes SET status='in_progress', started_at=?
+                   WHERE id=? AND status='open'""",
+                (ts, stop["rid"])
+            )
 
     if conn.total_changes == 0:
         conn.close()
