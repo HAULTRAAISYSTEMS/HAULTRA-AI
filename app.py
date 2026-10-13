@@ -6593,10 +6593,11 @@ def _bottom_tab(href, icon_html, label, current_path, badge=""):
 
 
 def _bottom_tab_more():
-    return (f'<button class="haul-tab haul-tab-more" onclick="openMoreSheet()" type="button">'
+    # 2026-10-13: Anchor (not button) so it renders identically to other tabs
+    return (f'<a class="haul-tab" href="javascript:void(0)" onclick="openMoreSheet()">'
             f'<span class="haul-tab-icon">&#183;&#183;&#183;</span>'
             f'<span class="haul-tab-label">More</span>'
-            f'<span class="haul-tab-glow"></span></button>')
+            f'<span class="haul-tab-glow"></span></a>')
 
 
 # Boss-only: keep the nav "Requests" badge live without a full reload. Plain
@@ -7530,9 +7531,28 @@ a:hover {{ color: #FF9D5C; }}
     transition: opacity 0.25s, transform 0.25s;
 }}
 .haul-tab.active {{ color: #FF8C42; }}
+.haul-tab.active::before {{
+    content: '';
+    position: absolute;
+    inset: 6px 8px;
+    background: rgba(255, 107, 26, 0.1);
+    border-radius: 14px;
+    border: 1px solid rgba(255, 107, 26, 0.2);
+}}
 .haul-tab.active .haul-tab-icon {{
     transform: translateY(-2px);
     filter: drop-shadow(0 0 8px rgba(255, 107, 26, 0.6));
+    position: relative;
+}}
+.haul-tab.active .haul-tab-label {{
+    position: relative;
+}}
+@keyframes haul-page-in {{
+    from {{ opacity: 0; transform: translateY(8px); }}
+    to {{ opacity: 1; transform: translateY(0); }}
+}}
+body {{
+    animation: haul-page-in 0.35s ease-out;
 }}
 .haul-tab.active .haul-tab-glow {{
     opacity: 1;
