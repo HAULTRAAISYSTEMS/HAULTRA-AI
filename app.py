@@ -26836,6 +26836,59 @@ def _address_book_section_html():
     """
 
 
+def _parse_name_as_address(name):
+    """2026-10-13: Parse address-like names (e.g., '3100 Shore Dr, Virginia Beach')
+    into (street, city, state, zip). Returns None if not address-like."""
+    import re
+    if not name or not name.strip():
+        return None
+    name = name.strip()
+    # Must start with a street number and contain a comma
+    if not re.match(r'^\d+\s+\w+', name):
+        return None
+    if ',' not in name:
+        return None
+    parts = [p.strip() for p in name.split(',')]
+    if len(parts) < 2:
+        return None
+    street = parts[0]
+    # Last part might be "ST ZIP" or "ST" or "ZIP" or city
+    city = ""
+    state = ""
+    zip_code = ""
+    if len(parts) >= 3:
+        # "street, city, ST" or "street, city, ST ZIP"
+        city = parts[1]
+        last = parts[2].strip()
+        # Try "ST ZIP" or "ST" 
+        m = re.match(r'^([A-Z]{2})\s*(\d{5})?$', last)
+        if m:
+            state = m.group(1)
+            zip_code = m.group(2) or ""
+        else:
+            # Might be just city in last part
+            city = parts[1]
+    elif len(parts) == 2:
+        # "street, city" or "street, city ST" or "street, ST"
+        rest = parts[1].strip()
+        # Try to extract state/zip from end
+        m = re.match(r'^(.*?)\s+([A-Z]{2})(?:\s+(\d{5}))?$', rest)
+        if m:
+            city = m.group(1).strip()
+            state = m.group(2)
+            zip_code = m.group(3) or ""
+        else:
+            # Just city
+            # Check if it's a state abbreviation
+            if re.match(r'^[A-Z]{2}$', rest):
+                state = rest
+            else:
+                city = rest
+    if not street:
+        return None
+    return (street, city, state, zip_code)
+
+
 def _site_locations_section_html():
     """Boss editor for promoted DUMP SITES and YARDS (address-book rows with
     kind='dump'/'yard'). Unlike the customer address book, these are surfaced
@@ -26844,6 +26897,28 @@ def _site_locations_section_html():
     navigation and dump-fee reporting work. Filter chips switch between All /
     Dump / Yard client-side."""
     conn = get_db()
+    # 2026-10-13: Auto-migrate address-like names into address fields.
+    # The parser sometimes saves "3100 Shore Dr, Virginia Beach" as the name
+    # instead of parsing it. Fix the data so "needs address" goes away.
+    _to_fix = conn.execute(
+        """SELECT id, customer_name, label FROM saved_addresses
+           WHERE company_id=? AND kind IN ('dump','yard')
+           AND (TRIM(COALESCE(address,''))='' AND TRIM(COALESCE(full_address,''))='')""",
+        (cid(),)
+    ).fetchall()
+    for _row in _to_fix:
+        _nm = (_row["label"] or _row["customer_name"] or "").strip()
+        _parsed = _parse_name_as_address(_nm)
+        if _parsed:
+            _st, _ct, _state, _zp = _parsed
+            _full = ", ".join(p for p in [_st, _ct, _state, _zp] if p)
+            conn.execute(
+                """UPDATE saved_addresses SET address=?, city=?, state=?, zip=?,
+                          full_address=? WHERE id=?""",
+                (_st, _ct, _state, _zp, _full, _row["id"])
+            )
+    if _to_fix:
+        conn.commit()
     rows_db = conn.execute(
         """SELECT id, customer_name, label, address, city, state, zip, full_address, kind, times_used,
                   issues_tickets
