@@ -690,6 +690,19 @@
 </style>
 </head>
 <body>
+<svg style="display:none" aria-hidden="true">
+<defs>
+<symbol id="i-board" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3" y="4" width="7" height="16" rx="1.6"/><rect x="14" y="4" width="7" height="9" rx="1.6"/></symbol>
+<symbol id="i-box" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M12 3.3 20.2 8v8L12 20.7 3.8 16V8z"/><path d="M3.8 8 12 12.6 20.2 8M12 12.6v8.1"/></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M3.5 13 6 5h12l2.5 8v6h-17z"/><path d="M3.5 13H9l1 2.5h4l1-2.5h5.5"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="9" cy="8" r="3.2"/><path d="M2.8 20a6.4 6.4 0 0 1 12.4 0M16.5 5.2a3.2 3.2 0 0 1 0 5.9M18 20a6 6 0 0 0-2.2-4.4"/></symbol>
+</defs>
+</svg>
+
 
 <div class="topbar">
   <a class="back-link" href="/routes">&larr; Board</a>
@@ -1940,27 +1953,27 @@
 <!-- 2026-10-13: Bottom tab bar for standalone parser page -->
 <nav class="haul-tabbar" id="haul-tabbar">
   <a class="haul-tab" href="/routes">
-    <span class="haul-tab-icon">&#x25E4;</span>
+    <span class="haul-tab-icon"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-board"/></svg></span>
     <span class="haul-tab-label">Board</span>
     <span class="haul-tab-glow"></span>
   </a>
   <a class="haul-tab active" href="/parser">
-    <span class="haul-tab-icon">&#x25E5;</span>
+    <span class="haul-tab-icon"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-box"/></svg></span>
     <span class="haul-tab-label">Roll-Off</span>
     <span class="haul-tab-glow"></span>
   </a>
   <a class="haul-tab" href="/requests">
-    <span class="haul-tab-icon">&#x25E7;</span>
+    <span class="haul-tab-icon"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-inbox"/></svg></span>
     <span class="haul-tab-label">Requests</span>
     <span class="haul-tab-glow"></span>
   </a>
   <a class="haul-tab" href="/customers">
-    <span class="haul-tab-icon">&#x25E6;</span>
+    <span class="haul-tab-icon"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-users"/></svg></span>
     <span class="haul-tab-label">Customers</span>
     <span class="haul-tab-glow"></span>
   </a>
   <a class="haul-tab" href="javascript:void(0)" onclick="openMoreSheet()">
-    <span class="haul-tab-icon">&#x22EF;</span>
+    <span class="haul-tab-icon" style="font-size:22px;letter-spacing:2px;">&#183;&#183;&#183;</span>
     <span class="haul-tab-label">More</span>
     <span class="haul-tab-glow"></span>
   </a>
