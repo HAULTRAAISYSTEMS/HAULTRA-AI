@@ -6861,7 +6861,7 @@ def shell_page(title, body, extra_head=""):
         </nav>
         <!-- 2026-10-13: Pull-to-refresh with HAULTRA logo loader -->
         <div class="haul-ptr" id="haul-ptr">
-            <div class="haul-ptr-logo">{brand_mark(44)}</div>
+            <div class="haul-ptr-logo"><img src="/static/haultra-logo.jpg" alt="HAULTRA" /></div>
         </div>
         <!-- 2026-10-13: Bottom tab bar — HAULTRA mobile nav -->
         <nav class="haul-tabbar" id="haul-tabbar">
@@ -6896,13 +6896,18 @@ def shell_page(title, body, extra_head=""):
             document.body.style.overflow = '';
         }}
         // 2026-10-13: Pull-to-refresh with HAULTRA logo
+        // 2026-10-13: Disabled when More sheet is open (no gesture conflict)
         (function() {{
             var ptr = document.getElementById('haul-ptr');
             if (!ptr) return;
             var startY = 0, pulling = false, threshold = 80;
+            function sheetOpen() {{
+                var s = document.getElementById('haul-more-sheet');
+                return s && s.classList.contains('open');
+            }}
             document.addEventListener('touchstart', function(e) {{
-                // Only when scrolled to top
-                if (window.scrollY > 0) return;
+                // Only when scrolled to top, and More sheet is closed
+                if (window.scrollY > 0 || sheetOpen()) return;
                 startY = e.touches[0].clientY;
                 pulling = true;
             }}, {{passive: true}});
@@ -7441,15 +7446,18 @@ a:hover {{ color: #FF9D5C; }}
     transform: translateY(0);
 }}
 .haul-ptr-logo {{
-    width: 52px;
-    height: 52px;
-    border-radius: 50%;
-    background: rgba(10, 10, 12, 0.9);
-    border: 1px solid rgba(255, 107, 26, 0.3);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5), 0 0 20px rgba(255, 107, 26, 0.15);
+    width: 56px;
+    height: 56px;
+    border-radius: 16px;
+    overflow: hidden;
+    border: 1px solid rgba(255, 107, 26, 0.4);
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5), 0 0 24px rgba(255, 107, 26, 0.25);
+}}
+.haul-ptr-logo img {{
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
 }}
 .haul-ptr.loading .haul-ptr-logo {{
     animation: haul-logo-spin 1s linear infinite;
