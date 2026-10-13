@@ -19235,7 +19235,6 @@ def route_report(route_id):
     # Box Out = bin picked up at THIS stop (from this stop's ticket).
     # Box In = bin dropped at THIS stop (from the chain giver's ticket).
     _can_by_stop = {}
-    _gives_to = {}  # stop_id -> stop_id it gives its empty to
     _takes_from = {}  # stop_id -> stop_id it takes empty from
     for _s in stops:
         _dt = conn.execute(
@@ -19244,8 +19243,6 @@ def route_report(route_id):
         if _dt and _dt["can_number"]:
             _can_by_stop[_s["id"]] = _dt["can_number"]
         _sk = _s.keys()
-        if "chain_gives_to_stop_id" in _sk and _s["chain_gives_to_stop_id"]:
-            _gives_to[_s["id"]] = _s["chain_gives_to_stop_id"]
         if "chain_takes_from_stop_id" in _sk and _s["chain_takes_from_stop_id"]:
             _takes_from[_s["id"]] = _s["chain_takes_from_stop_id"]
         # Terminal head return: tail gives to head
@@ -19257,7 +19254,6 @@ def route_report(route_id):
                     _hk = _h.keys()
                     if ("chain_group_id" in _hk and _h["chain_group_id"] == _gid
                             and not (_h["chain_takes_from_stop_id"] if "chain_takes_from_stop_id" in _hk else None)):
-                        _gives_to[_s["id"]] = _h["id"]
                         _takes_from[_h["id"]] = _s["id"]
                         break
     for i, s in enumerate(stops, start=1):
@@ -19306,10 +19302,6 @@ def route_report(route_id):
                     # Not a chain swap (or giver has no ticket yet): same can
                     # returned (normal pickup-and-return)
                     box_in = dt["can_number"]
-            elif s["id"] in _can_by_stop:
-                box_out = _can_by_stop[s["id"]]
-                _giver_id = _takes_from.get(s["id"])
-                box_in = _can_by_stop.get(_giver_id, box_out) if _giver_id else box_out
             if dt["dump_site"]:
                 dump_site = dt["dump_site"]
             if dt["ticket_number"]:
@@ -21900,7 +21892,6 @@ def dump_ticket(stop_id):
         arrival_time   = request.form.get("arrival_time", "").strip()
         departure_time = request.form.get("departure_time", "").strip()
         can_number     = request.form.get("can_number", "").strip()
-        skip_ticket    = request.form.get("skip_ticket", "0") == "1"
         scale_in       = _sf("scale_in_weight")
         scale_out      = _sf("scale_out_weight")
         net_tons       = _sf("net_tons")
