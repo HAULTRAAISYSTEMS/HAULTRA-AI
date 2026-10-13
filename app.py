@@ -7476,8 +7476,7 @@ a:hover {{ color: #FF9D5C; }}
 @keyframes haul-logo-pulse {{
     0%, 100% {{ transform: scale(1); }}
     50% {{ transform: scale(1.1); }}
-
-/* 2026-10-13: PTR keyframes removed */
+}}
 
 .haul-tabbar::before {{
     content: '';
