@@ -6884,9 +6884,51 @@ def shell_page(title, body, extra_head=""):
             document.body.style.overflow = 'hidden';
         }}
         function closeMoreSheet() {{
-            document.getElementById('haul-more-sheet').classList.remove('open');
+            var sheet = document.getElementById('haul-more-sheet');
+            var panel = sheet.querySelector('.haul-more-panel');
+            panel.style.transform = '';
+            panel.style.transition = '';
+            sheet.classList.remove('open');
             document.body.style.overflow = '';
         }}
+        // 2026-10-13: Swipe down to dismiss — native sheet feel
+        (function() {{
+            var sheet = document.getElementById('haul-more-sheet');
+            if (!sheet) return;
+            var panel = sheet.querySelector('.haul-more-panel');
+            var startY = 0, currentY = 0, dragging = false;
+            // Start drag from the handle area or panel top
+            panel.addEventListener('touchstart', function(e) {{
+                // Only start if panel is scrolled to top (don't hijack scroll)
+                if (panel.scrollTop > 0) return;
+                startY = e.touches[0].clientY;
+                dragging = true;
+                panel.style.transition = 'none';
+            }}, {{passive: true}});
+            panel.addEventListener('touchmove', function(e) {{
+                if (!dragging) return;
+                currentY = e.touches[0].clientY;
+                var dy = currentY - startY;
+                if (dy > 0) {{
+                    panel.style.transform = 'translateY(' + dy + 'px)';
+                }}
+            }}, {{passive: true}});
+            panel.addEventListener('touchend', function() {{
+                if (!dragging) return;
+                dragging = false;
+                var dy = currentY - startY;
+                panel.style.transition = 'transform 0.3s cubic-bezier(0.32, 0.72, 0, 1)';
+                if (dy > 100) {{
+                    // Swiped far enough — dismiss
+                    panel.style.transform = 'translateY(100%)';
+                    setTimeout(closeMoreSheet, 250);
+                }} else {{
+                    // Snap back
+                    panel.style.transform = 'translateY(0)';
+                }}
+                startY = 0; currentY = 0;
+            }});
+        }})();
         </script>
         """
         # Live pending-requests badge poll (every 45s), boss only. Mirrors the
@@ -7447,9 +7489,17 @@ a:hover {{ color: #FF9D5C; }}
 .haul-more-handle {{
     width: 40px;
     height: 4px;
-    background: rgba(255, 255, 255, 0.2);
+    background: rgba(255, 255, 255, 0.25);
     border-radius: 2px;
     margin: 12px auto 8px;
+    cursor: grab;
+}}
+.haul-more-handle:active {{
+    cursor: grabbing;
+    background: rgba(255, 140, 66, 0.6);
+}}
+.haul-more-panel {{
+    touch-action: pan-y;
 }}
 .haul-more-user {{
     text-align: center;
