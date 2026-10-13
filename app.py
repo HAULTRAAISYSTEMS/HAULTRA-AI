@@ -6860,9 +6860,7 @@ def shell_page(title, body, extra_head=""):
             </div>
         </nav>
         <!-- 2026-10-13: Pull-to-refresh with HAULTRA logo loader -->
-        <div class="haul-ptr" id="haul-ptr">
-            <div class="haul-ptr-logo"><img src="/static/haultra-logo.jpg" alt="HAULTRA" /></div>
-        </div>
+        <!-- 2026-10-13: pull-to-refresh removed per user request -->
         <!-- 2026-10-13: Bottom tab bar — HAULTRA mobile nav -->
         <nav class="haul-tabbar" id="haul-tabbar">
             {bottom_tabs}
@@ -6895,53 +6893,8 @@ def shell_page(title, body, extra_head=""):
             sheet.classList.remove('open');
             document.body.style.overflow = '';
         }}
-        // 2026-10-13: Pull-to-refresh with HAULTRA logo
-        // 2026-10-13: Disabled when More sheet is open (no gesture conflict)
-        (function() {{
-            var ptr = document.getElementById('haul-ptr');
-            if (!ptr) return;
-            var startY = 0, pulling = false, threshold = 80;
-            function sheetOpen() {{
-                var s = document.getElementById('haul-more-sheet');
-                return s && s.classList.contains('open');
-            }}
-            document.addEventListener('touchstart', function(e) {{
-                // Only when scrolled to top, and More sheet is closed
-                if (window.scrollY > 0 || sheetOpen()) return;
-                startY = e.touches[0].clientY;
-                pulling = true;
-            }}, {{passive: true}});
-            document.addEventListener('touchmove', function(e) {{
-                if (!pulling) return;
-                var dy = e.touches[0].clientY - startY;
-                if (dy > 0 && window.scrollY <= 0) {{
-                    // Show the logo, scale with pull distance
-                    var progress = Math.min(dy / threshold, 1);
-                    ptr.classList.add('visible', 'pulling');
-                    ptr.style.transform = 'translateY(' + (dy * 0.4) + 'px)';
-                    ptr.style.opacity = progress;
-                }}
-            }}, {{passive: true}});
-            document.addEventListener('touchend', function(e) {{
-                if (!pulling) return;
-                pulling = false;
-                var dy = (e.changedTouches[0].clientY - startY);
-                if (dy > threshold && window.scrollY <= 0) {{
-                    // Trigger refresh — logo spins
-                    ptr.classList.remove('pulling');
-                    ptr.classList.add('loading');
-                    ptr.style.transform = 'translateY(0)';
-                    ptr.style.opacity = '1';
-                    setTimeout(function() {{ window.location.reload(); }}, 600);
-                }} else {{
-                    // Snap back
-                    ptr.classList.remove('visible', 'pulling');
-                    ptr.style.transform = '';
-                    ptr.style.opacity = '';
-                }}
-                startY = 0;
-            }});
-        }})();
+                // 2026-10-13: PTR JS removed
+
         // 2026-10-13: Swipe down to dismiss — native sheet feel
         (function() {{
             var sheet = document.getElementById('haul-more-sheet');
@@ -7426,56 +7379,9 @@ a:hover {{ color: #FF9D5C; }}
     box-shadow: 0 -8px 32px rgba(255, 107, 26, 0.08), 0 -2px 8px rgba(0, 0, 0, 0.5);
     padding-bottom: env(safe-area-inset-bottom, 0px);
 }}
-/* ── 2026-10-13: Pull-to-refresh with HAULTRA logo ── */
-.haul-ptr {{
-    position: fixed;
-    top: env(safe-area-inset-top, 0px);
-    left: 0;
-    right: 0;
-    z-index: 350;
-    display: flex;
-    justify-content: center;
-    padding-top: 12px;
-    pointer-events: none;
-    opacity: 0;
-    transform: translateY(-20px);
-    transition: opacity 0.2s, transform 0.2s;
-}}
-.haul-ptr.visible {{
-    opacity: 1;
-    transform: translateY(0);
-}}
-.haul-ptr-logo {{
-    width: 56px;
-    height: 56px;
-    border-radius: 16px;
-    overflow: hidden;
-    border: 1px solid rgba(255, 107, 26, 0.4);
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5), 0 0 24px rgba(255, 107, 26, 0.25);
-}}
-.haul-ptr-logo img {{
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    display: block;
-}}
-.haul-ptr.loading .haul-ptr-logo {{
-    animation: haul-logo-spin 1s linear infinite;
-}}
-.haul-ptr-logo svg {{
-    filter: drop-shadow(0 0 6px rgba(255, 107, 26, 0.5));
-}}
-@keyframes haul-logo-spin {{
-    from {{ transform: rotate(0deg); }}
-    to {{ transform: rotate(360deg); }}
-}}
-.haul-ptr.pulling .haul-ptr-logo {{
-    animation: haul-logo-pulse 1s ease-in-out infinite;
-}}
-@keyframes haul-logo-pulse {{
-    0%, 100% {{ transform: scale(1); }}
-    50% {{ transform: scale(1.1); }}
-}}
+/* 2026-10-13: PTR CSS removed */
+
+/* 2026-10-13: PTR keyframes removed */
 
 .haul-tabbar::before {{
     content: '';
@@ -8526,6 +8432,8 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     border-radius: var(--radius-lg);
     padding: 24px 22px;
     margin-bottom: 14px;
+    /* 2026-10-13: right padding clears the absolute un-arrive button */
+    padding-right: 58px;
 }}
 .cab-action-row {{ display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }}
 .cab-action-badge {{
