@@ -7470,32 +7470,65 @@ a:hover {{ color: #FF9D5C; }}
     opacity: 1;
     transform: translateY(0);
 }}
+/* 2026-10-13: Creative logo loader — no black box, blend removes bg */
 .haul-ptr-logo {{
-    width: 56px;
-    height: 56px;
-    border-radius: 16px;
-    overflow: hidden;
-    border: 1px solid rgba(255, 107, 26, 0.4);
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5), 0 0 24px rgba(255, 107, 26, 0.25);
+    width: 64px;
+    height: 64px;
+    border-radius: 50%;
+    overflow: visible;
+    border: none;
+    background: transparent;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}}
+.haul-ptr-logo::before {{
+    content: '';
+    position: absolute;
+    inset: -6px;
+    border-radius: 50%;
+    border: 2px solid transparent;
+    border-top-color: #FF6B1A;
+    border-right-color: rgba(255, 107, 26, 0.3);
+    animation: haul-ring-spin 1.2s linear infinite;
+    opacity: 0;
+    transition: opacity 0.3s;
+}}
+.haul-ptr.loading .haul-ptr-logo::before,
+.haul-ptr.pulling .haul-ptr-logo::before {{
+    opacity: 1;
 }}
 .haul-ptr-logo img {{
     width: 100%;
     height: 100%;
-    object-fit: cover;
+    object-fit: contain;
     display: block;
+    /* Blend mode makes the black JPG background transparent */
+    mix-blend-mode: screen;
+    filter: drop-shadow(0 0 12px rgba(255, 107, 26, 0.6));
+    border-radius: 50%;
 }}
-.haul-ptr.loading .haul-ptr-logo {{
-    animation: haul-logo-spin 1s linear infinite;
+.haul-ptr.loading .haul-ptr-logo img {{
+    animation: haul-logo-glow 1.5s ease-in-out infinite;
 }}
 .haul-ptr-logo svg {{
     filter: drop-shadow(0 0 6px rgba(255, 107, 26, 0.5));
 }}
-@keyframes haul-logo-spin {{
+@keyframes haul-ring-spin {{
     from {{ transform: rotate(0deg); }}
     to {{ transform: rotate(360deg); }}
 }}
-.haul-ptr.pulling .haul-ptr-logo {{
-    animation: haul-logo-pulse 1s ease-in-out infinite;
+@keyframes haul-logo-glow {{
+    0%, 100% {{ filter: drop-shadow(0 0 8px rgba(255, 107, 26, 0.4)); transform: scale(1); }}
+    50% {{ filter: drop-shadow(0 0 20px rgba(255, 107, 26, 0.8)); transform: scale(1.05); }}
+}}
+.haul-ptr.pulling .haul-ptr-logo img {{
+    animation: haul-logo-breathe 1s ease-in-out infinite;
+}}
+@keyframes haul-logo-breathe {{
+    0%, 100% {{ transform: scale(1); }}
+    50% {{ transform: scale(1.08); }}
 }}
 @keyframes haul-logo-pulse {{
     0%, 100% {{ transform: scale(1); }}
@@ -19381,9 +19414,13 @@ def route_report(route_id):
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Daily Route Log — {e(route["route_name"])}</title>
 <style>
-body{{font-family:system-ui,sans-serif;margin:0;padding:16px;background:#fff;color:#111;}}
+/* 2026-10-13: Safe-area padding so title doesn't overlap iPhone status bar */
+body{{font-family:system-ui,sans-serif;margin:0;padding:16px;background:#fff;color:#111;
+  padding-top:calc(16px + env(safe-area-inset-top,0px));
+  padding-left:calc(16px + env(safe-area-inset-left,0px));
+  padding-right:calc(16px + env(safe-area-inset-right,0px));}}
 .wrap{{max-width:1000px;margin:0 auto;}}
-h1{{font-size:1.2rem;margin:0;}} .sub{{color:#555;margin:4px 0 12px;}}
+h1{{font-size:1.2rem;margin:0;padding-top:8px;}} .sub{{color:#555;margin:4px 0 12px;}}
 table{{width:100%;border-collapse:collapse;font-size:.82rem;}}
 th,td{{border:1px solid #999;padding:6px 8px;text-align:left;}}
 th{{background:#eee;}}
