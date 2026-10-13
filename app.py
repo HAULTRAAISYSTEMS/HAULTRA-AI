@@ -9832,12 +9832,9 @@ def login():
     body = f"""
     <div class="auth-wrap">
       <div class="auth-inner">
-        <div class="auth-brand">
-            {brand_mark(64, "auth-mark")}
-            <div>
-                <div class="auth-word">HAULTRA</div>
-                <div class="auth-tagline">AI Dispatch Systems</div>
-            </div>
+        <div class="auth-brand" style="justify-content:center;">
+            <img src="/static/haultra-logo-full.jpg" alt="HAULTRA AI Systems"
+                 style="width:200px;height:auto;mix-blend-mode:screen;filter:drop-shadow(0 0 24px rgba(255,107,26,0.4));">
         </div>
         <div class="card auth-card">
                 <form method="POST">
