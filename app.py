@@ -15325,8 +15325,8 @@ def _cab_preflight_body(route, stops, total_count, csrf, clocked_in=True):
     glove-sized START ROUTE button and a reserved slot above it for the pre-trip
     / container-securement checklist to be gated here later. Safe with 0 stops
     (the stat tiles show zeroes and the first-stop preview says so).
-    2026-10-14: clocked_in=False turns the button into CLOCK IN & START ROUTE —
-    one tap clocks the driver in and starts the route."""
+    2026-10-14: clocked_in=False renders a CLOCK IN button first — the driver
+    clocks in at the truck (before fuel-up / pre-trip), then START ROUTE."""
     # Stat tiles: stop count, total yards (sum of the leading number in each
     # container_size like "20yd"), and how many stops include a dump leg.
     total_yards = 0
@@ -15357,9 +15357,25 @@ def _cab_preflight_body(route, stops, total_count, csrf, clocked_in=True):
 
     start_action = url_for('mark_route_in_progress', route_id=route["id"])
     back_href = url_for('driver_dashboard')
-    # 2026-10-14: not clocked in → the start button clocks in first.
-    _start_label = "START ROUTE" if clocked_in else "CLOCK IN &amp; START ROUTE"
-    _clock_in_field = "" if clocked_in else '<input type="hidden" name="clock_in" value="1">'
+    # 2026-10-14: clock-in is a separate first tap (fuel-up / pre-trip happens
+    # before the route starts, and that time belongs on the clock). After
+    # clocking in the card re-renders with START ROUTE.
+    if clocked_in:
+        _start_form = f"""
+    <form method="POST" action="{start_action}">
+      <input type="hidden" name="_csrf_token" value="{csrf}">
+      <button class="pf-start-btn" type="submit">START ROUTE</button>
+    </form>"""
+    else:
+        _clock_in_action = url_for('driver_clock_in_now_ep')
+        _cab_url = url_for('driver_route_detail', route_id=route["id"])
+        _start_form = f"""
+    <form method="POST" action="{_clock_in_action}">
+      <input type="hidden" name="_csrf_token" value="{csrf}">
+      <input type="hidden" name="next" value="{e(_cab_url)}">
+      <button class="pf-start-btn" type="submit">&#9200; CLOCK IN</button>
+    </form>
+    <p class="muted small" style="margin-top:10px;text-align:center;">Clock in when you get to the truck — then start your route.</p>"""
 
     return f"""
 <style>
@@ -15404,11 +15420,7 @@ def _cab_preflight_body(route, stops, total_count, csrf, clocked_in=True):
 
     {first_html}
 
-    <form method="POST" action="{start_action}">
-      <input type="hidden" name="_csrf_token" value="{csrf}">
-      {_clock_in_field}
-      <button class="pf-start-btn" type="submit">{_start_label}</button>
-    </form>
+    {_start_form}
   </div>
 </div>
 """
@@ -20936,13 +20948,6 @@ def mark_route_in_progress(route_id):
         UPDATE routes SET status='in_progress', started_at=?
         WHERE id=? AND company_id=? AND status='open'
     """, (now_ts(), route_id, cid()))
-
-    # 2026-10-14: CLOCK IN & START ROUTE — the pre-flight card folds clock-in
-    # into the start tap when the driver isn't clocked in yet. A manual entry
-    # takes priority over any auto-derived start time downstream.
-    if session.get("role") == "driver" and (request.form.get("clock_in") or "").strip() == "1":
-        _driver_clock_in_now(conn, cid(), session["user_id"],
-                             note="clock_in via START ROUTE")
 
     conn.commit()
     conn.close()
@@ -30321,6 +30326,32 @@ def driver_clock_correct():
         flash(err or "Could not update.", "error")
     conn.close()
     return redirect(url_for("driver_clock"))
+
+
+@app.route("/driver/clock/in", methods=["POST"])
+@driver_required
+def driver_clock_in_now_ep():
+    """Clock in from the cab view pre-flight card — the driver taps this when
+    they get to the truck, before fuel-up / pre-trip, so that time is on the
+    record. Redirects to `next` (the pre-flight card re-renders as START
+    ROUTE once clocked in)."""
+    driver_id = session["user_id"]
+    company_id = cid()
+    conn = get_db()
+    now_ts_str, today_local = _driver_clock_now(company_id)
+    next_url = (request.form.get("next") or "").strip() or request.referrer or url_for("driver_dashboard")
+    if not next_url.startswith("/"):
+        next_url = url_for("driver_dashboard")
+    _driver_clock_in_now(conn, company_id, driver_id, note="clock_in via pre-flight")
+    # Clocking in auto-clears today's "running late" check-in, mirroring the
+    # clock page (the row stays for the record; the amber chips clear).
+    conn.execute(
+        "UPDATE late_checkins SET cleared_at=? WHERE company_id=? AND driver_id=? AND work_date=? AND cleared_at IS NULL",
+        (now_ts_str, company_id, driver_id, today_local))
+    conn.commit()
+    conn.close()
+    flash("Clocked in.", "success")
+    return redirect(next_url)
 
 
 @app.route("/driver/clock/out", methods=["POST"])
