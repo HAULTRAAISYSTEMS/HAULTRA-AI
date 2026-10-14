@@ -213,7 +213,7 @@ _ERROR_PAGE_TEMPLATE = """
   p {{ color: #A6A69E; font-size: 14px; line-height: 1.6; margin-bottom: 22px; }}
   a {{
     display: inline-block; padding: 10px 22px; border-radius: 9px;
-    background: linear-gradient(135deg, #FF8A42 0%, #FF6B1A 100%);
+    background: linear-gradient(135deg, #CE6224 0%, #A84C14 100%);
     color: #1A1000; text-decoration: none; font-weight: 700; font-size: 13px;
   }}
 </style></head><body><div class="box">
@@ -7354,7 +7354,7 @@ a:hover {{ color: #FF9D5C; }}
 .auth-card button[type="submit"] {{
     position: relative;
     overflow: hidden;
-    background: linear-gradient(135deg, #FF6B1A 0%, #FF8C42 100%);
+    background: linear-gradient(135deg, #CE6224 0%, #A84C14 100%);
     border: none;
     font-weight: 800;
     letter-spacing: 1px;
@@ -8218,19 +8218,29 @@ button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact
     letter-spacing: .15px;
     text-decoration: none;
     transition: filter .15s, transform .1s, box-shadow .15s;
-    /* default = safety orange (primary/commit) */
-    color: #1A1000;
-    background: linear-gradient(135deg, #FF8A42 0%, #FF6B1A 100%);
-    box-shadow: 0 0 18px rgba(255,107,26,0.22);
+    /* default = ember orange (primary/commit) — deep, not neon */
+    color: #FFE9D6;
+    background: linear-gradient(135deg, #CE6224 0%, #A84C14 100%);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.14), 0 0 10px rgba(206,98,36,0.16);
+}}
+.btn:active {{
+    transform: scale(0.98);
+    filter: brightness(0.96);
 }}
 
-.btn:hover,
+.btn:hover {{
+    filter: brightness(1.06);
+    transform: translateY(-1px);
+    text-decoration: none;
+    color: #FFE9D6;
+    box-shadow: 0 0 16px rgba(206,98,36,0.22);
+}}
 button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-topbar-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip):hover {{
     filter: brightness(1.1);
     transform: translateY(-1px);
     text-decoration: none;
     color: #1A1000;
-    box-shadow: 0 0 24px rgba(255,107,26,0.34);
+    box-shadow: 0 0 16px rgba(206,98,36,0.22);
 }}
 
 /* secondary — dark glass */
@@ -8242,16 +8252,16 @@ button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact
 }}
 .btn.secondary:hover {{ color: #F0F0E8; filter: none; border-color: rgba(255,107,26,0.35); }}
 
-/* gold — priority actions */
+/* gold — priority actions (ember, not neon) */
 .btn.gold, .btn.orange {{
-    background: linear-gradient(135deg, #FF8A42 0%, #FF6B1A 100%);
-    color: #1A1000;
-    box-shadow: 0 0 18px rgba(255,107,26,0.24);
+    background: linear-gradient(135deg, #CE6224 0%, #A84C14 100%);
+    color: #FFE9D6;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.14), 0 0 10px rgba(206,98,36,0.16);
 }}
 .btn.gold:hover, .btn.orange:hover {{
-    filter: brightness(1.08);
-    box-shadow: 0 0 28px rgba(255,107,26,0.38);
-    color: #1A1000;
+    filter: brightness(1.06);
+    box-shadow: 0 0 18px rgba(206,98,36,0.28);
+    color: #FFE9D6;
 }}
 
 /* green */
@@ -8262,13 +8272,14 @@ button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact
 }}
 .btn.green:hover {{ filter: brightness(1.08); color: #06170D; }}
 
-/* red / danger */
+/* red / danger — quiet ghost, never the loudest thing on screen */
 .btn.red {{
-    background: linear-gradient(135deg, #FF5252 0%, #CC3333 100%);
-    color: #1A0000;
+    background: rgba(26,26,26,0.90);
+    border: 1px solid rgba(255,82,82,0.38);
+    color: #FF8A80;
     box-shadow: none;
 }}
-.btn.red:hover {{ filter: brightness(1.1); color: #1A0000; }}
+.btn.red:hover {{ filter: none; border-color: rgba(255,82,82,0.62); color: #FFA49E; }}
 
 /* ── Forms ──────────────────────────────────────────────────*/
 form.inline {{ display: inline; }}
@@ -9021,8 +9032,9 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     padding: 9px 18px; border-radius: 9px; text-decoration: none;
 }}
 .route-tab.active {{
-    background: linear-gradient(135deg, #FF8A42 0%, #FF6B1A 100%);
-    color: #1A1000; border-color: transparent;
+    background: linear-gradient(135deg, #CE6224 0%, #A84C14 100%);
+    color: #FFE9D6; border-color: transparent;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.14), 0 0 12px rgba(206,98,36,0.20);
 }}
 
 .board-legend {{ display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }}
@@ -19686,8 +19698,7 @@ def view_route(route_id):
         # with the /api/parse-route-text gate. Daily Log / Optimize / Delete stay
         # available to any management boss.
         _paste_route_btn = (
-            '<button class="btn" type="button" onclick="_haulsTogglePaste()" '
-            'style="background:linear-gradient(135deg,#FF8A42,#FF6B1A);border:1px solid rgba(255,107,26,.3);">'
+            '<button class="btn secondary" type="button" onclick="_haulsTogglePaste()">'
             '&#x1F4CB; Paste Route</button>'
             if has_role("dispatcher") else ''
         )
@@ -25852,7 +25863,7 @@ def delete_account_request():
                 and understand this cannot be undone.
             </label>
             <div style="margin-top:14px;">
-                <button type="submit" class="btn orange" style="width:100%;font-size:16px;padding:14px;">
+                <button type="submit" class="btn red" style="width:100%;font-size:16px;padding:14px;">
                     Submit Deletion Request
                 </button>
             </div>
