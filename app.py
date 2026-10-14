@@ -2401,6 +2401,83 @@ def _valid_hhmm(raw):
     return None
 
 
+def _driver_clock_entry(conn, company_id, driver_id, date_str):
+    """One driver's clock row for a date, or None."""
+    return conn.execute(
+        "SELECT * FROM driver_clock_entries WHERE company_id=? AND driver_id=? AND date=?",
+        (company_id, driver_id, date_str)).fetchone()
+
+
+def _driver_open_clock_entries(conn, company_id, driver_id, before_date):
+    """Clocked in but never clocked out, before a given date — the 'forgot to
+    clock out' backlog, newest first."""
+    return conn.execute(
+        "SELECT * FROM driver_clock_entries "
+        "WHERE company_id=? AND driver_id=? AND date < ? "
+        "AND clock_in_at IS NOT NULL AND clock_out_at IS NULL "
+        "ORDER BY date DESC",
+        (company_id, driver_id, before_date)).fetchall()
+
+
+def _driver_clock_now(company_id):
+    """(timestamp 'YYYY-MM-DD HH:MM:SS', date 'YYYY-MM-DD') in the company's
+    local timezone — what a clock tap means."""
+    conn = get_db()
+    try:
+        co = conn.execute("SELECT timezone FROM companies WHERE id=?", (company_id,)).fetchone()
+        tz_name = ((co["timezone"] if co else None) or "America/New_York").strip()
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo(tz_name))
+    except Exception:
+        now = datetime.now(_EASTERN) if _EASTERN else datetime.now()
+    finally:
+        conn.close()
+    return now.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d")
+
+
+def _driver_clock_in_now(conn, company_id, driver_id, note=""):
+    """Record a clock-in at this instant. Idempotent: if already clocked in
+    today, returns the existing entry unchanged."""
+    ts, today = _driver_clock_now(company_id)
+    row = _driver_clock_entry(conn, company_id, driver_id, today)
+    if row and row["clock_in_at"]:
+        return row
+    notes = (((row["notes"] if row else "") or "") + "\n[%s] %s" % (ts, note or "clock_in")).strip()
+    if row:
+        conn.execute(
+            "UPDATE driver_clock_entries SET clock_in_at=?, notes=? WHERE id=?",
+            (ts, notes, row["id"]))
+    else:
+        conn.execute(
+            "INSERT INTO driver_clock_entries "
+            "(company_id, driver_id, date, clock_in_at, notes, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (company_id, driver_id, today, ts, notes, ts))
+    conn.commit()
+    return _driver_clock_entry(conn, company_id, driver_id, today)
+
+
+def _driver_clock_out_at(conn, company_id, driver_id, date_str, ts, note=""):
+    """Record a clock-out at an exact 'YYYY-MM-DD HH:MM:SS' timestamp.
+    Returns (ok, error) — rejects a clock-out before the clock-in."""
+    row = _driver_clock_entry(conn, company_id, driver_id, date_str)
+    if row and row["clock_in_at"] and ts[:19] < row["clock_in_at"][:19]:
+        return False, "Clock-out can't be before clock-in."
+    notes = (((row["notes"] if row else "") or "") + "\n[%s] %s" % (ts, note or "clock_out")).strip()
+    if row:
+        conn.execute(
+            "UPDATE driver_clock_entries SET clock_out_at=?, notes=? WHERE id=?",
+            (ts, notes, row["id"]))
+    else:
+        conn.execute(
+            "INSERT INTO driver_clock_entries "
+            "(company_id, driver_id, date, clock_out_at, notes, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (company_id, driver_id, date_str, ts, notes, ts))
+    conn.commit()
+    return True, None
+
+
 def _apply_clock_correction(conn, company_id, driver_id, date_str, ci_hhmm,
                             co_hhmm, actor_id, actor_desc):
     """Upsert the driver_clock_entries row for (company, driver, date), setting
@@ -10385,6 +10462,14 @@ def driver_dashboard():
     _co_row = conn.execute("SELECT * FROM companies WHERE id=?", (session["company_id"],)).fetchone()
     co_settings = {k: _co_row[k] for k in _co_row.keys()} if _co_row else {}
     pay_period_start, pay_period_end = get_pay_period_bounds(co_settings)
+
+    # 2026-10-14: clock status for the My Day header — today's entry plus any
+    # forgotten clock-outs from earlier days.
+    _clk_now, _clk_today = _driver_clock_now(session["company_id"])
+    _clk_today_entry = _driver_clock_entry(conn, session["company_id"], session["user_id"], _clk_today)
+    _clk_on = bool(_clk_today_entry and _clk_today_entry["clock_in_at"] and not _clk_today_entry["clock_out_at"])
+    _clk_in_at = (_clk_today_entry["clock_in_at"] or "")[11:16] if _clk_today_entry else ""
+    _forgot = _driver_open_clock_entries(conn, session["company_id"], session["user_id"], _clk_today)
     conn.close()
 
     display_routes = [r for r in routes if pay_period_start <= r["route_date"] <= pay_period_end]
@@ -10418,11 +10503,50 @@ def driver_dashboard():
         if r['status'] in ('open', 'in_progress') and not r['cancelled_at']
     ])
 
+    # 2026-10-14: clock cards — on-the-clock pill + forgotten clock-out catch-up.
+    _csrf_tok = get_csrf_token()
+    _clock_cards = ""
+    if _clk_on:
+        _clock_cards += f"""
+    <div class="card" style="border-color:rgba(61,220,132,0.35);background:rgba(61,220,132,0.07);">
+        <div style="display:flex;align-items:center;gap:10px;">
+            <span style="width:12px;height:12px;border-radius:50%;background:#3DDC84;
+                  box-shadow:0 0 10px rgba(61,220,132,0.8);flex:none;"></span>
+            <div style="font-weight:800;color:#3DDC84;">ON THE CLOCK{" since " + _clk_in_at if _clk_in_at else ""}</div>
+        </div>
+    </div>
+        """
+    for _f in _forgot:
+        _fdate = _f["date"] or ""
+        try:
+            _flbl = datetime.strptime(_fdate, "%Y-%m-%d").strftime("%a, %b %-d")
+        except Exception:
+            _flbl = _fdate
+        _fin = (_f["clock_in_at"] or "")[11:16]
+        _clock_cards += f"""
+    <div class="card" style="border-color:rgba(255,82,82,0.4);background:rgba(255,82,82,0.06);">
+        <div style="font-weight:800;color:#FF6B6B;margin-bottom:6px;">&#9888; You didn't clock out {_flbl}</div>
+        <p class="muted small" style="margin:0 0 10px;">Clocked in{" at " + _fin if _fin else ""} — what time did you finish?</p>
+        <form method="POST" action="{url_for('driver_clock_out_now')}" style="display:flex;gap:8px;align-items:center;">
+            <input type="hidden" name="_csrf_token" value="{_csrf_tok}">
+            <input type="hidden" name="date" value="{e(_fdate)}">
+            <input type="hidden" name="next" value="{e(request.path)}">
+            <input type="time" name="time" required
+                   style="flex:1;padding:10px 12px;background:rgba(255,255,255,0.05);
+                          border:1px solid rgba(255,107,26,0.25);border-radius:8px;color:var(--text);
+                          font-size:16px;min-height:48px;">
+            <button type="submit" class="btn orange" style="min-height:48px;">Save</button>
+        </form>
+    </div>
+        """
+
     body = f"""
     <div class="hero">
         <h1>Driver Dashboard</h1>
         <p>See your assigned routes, open them fast, and complete stops in the field.</p>
     </div>
+
+    {_clock_cards}
 
     <div class="card">
         <h2 style="margin-bottom:4px;">This Pay Week</h2>
@@ -15195,12 +15319,14 @@ def _breakdown_driver_ui_html(route_id, container_prefill, csrf):
     return modal
 
 
-def _cab_preflight_body(route, stops, total_count, csrf):
+def _cab_preflight_body(route, stops, total_count, csrf, clocked_in=True):
     """Full-screen Cab View pre-flight card shown before a route is started.
     Summary only — no stop list, no map, no scrolling required — with big
     glove-sized START ROUTE button and a reserved slot above it for the pre-trip
     / container-securement checklist to be gated here later. Safe with 0 stops
-    (the stat tiles show zeroes and the first-stop preview says so)."""
+    (the stat tiles show zeroes and the first-stop preview says so).
+    2026-10-14: clocked_in=False turns the button into CLOCK IN & START ROUTE —
+    one tap clocks the driver in and starts the route."""
     # Stat tiles: stop count, total yards (sum of the leading number in each
     # container_size like "20yd"), and how many stops include a dump leg.
     total_yards = 0
@@ -15231,6 +15357,9 @@ def _cab_preflight_body(route, stops, total_count, csrf):
 
     start_action = url_for('mark_route_in_progress', route_id=route["id"])
     back_href = url_for('driver_dashboard')
+    # 2026-10-14: not clocked in → the start button clocks in first.
+    _start_label = "START ROUTE" if clocked_in else "CLOCK IN &amp; START ROUTE"
+    _clock_in_field = "" if clocked_in else '<input type="hidden" name="clock_in" value="1">'
 
     return f"""
 <style>
@@ -15277,7 +15406,8 @@ def _cab_preflight_body(route, stops, total_count, csrf):
 
     <form method="POST" action="{start_action}">
       <input type="hidden" name="_csrf_token" value="{csrf}">
-      <button class="pf-start-btn" type="submit">START ROUTE</button>
+      {_clock_in_field}
+      <button class="pf-start-btn" type="submit">{_start_label}</button>
     </form>
   </div>
 </div>
@@ -16256,10 +16386,21 @@ def driver_route_detail(route_id):
     # Render ONLY a full-screen pre-flight card: no stop list, no map,
     # no scrolling. The driver reviews the route summary and taps START
     # ROUTE (which POSTs to mark_route_in_progress) to begin.
+    # 2026-10-14: if not clocked in, the button becomes CLOCK IN & START
+    # ROUTE — one tap clocks in and starts the route.
     # ══════════════════════════════════════════════════════════
     if route["status"] == "open":
+        # Main conn is closed above; short-lived lookup like the yard block.
+        _pf_conn = get_db()
+        try:
+            _pf_now, _pf_today = _driver_clock_now(cid())
+            _pf_entry = _driver_clock_entry(_pf_conn, cid(), session["user_id"], _pf_today)
+            _pf_clocked_in = bool(_pf_entry and _pf_entry["clock_in_at"])
+        finally:
+            _pf_conn.close()
         return render_template_string(
-            shell_page("Cab View", _cab_preflight_body(route, stops, total_count, _csrf))
+            shell_page("Cab View", _cab_preflight_body(
+                route, stops, total_count, _csrf, clocked_in=_pf_clocked_in))
         )
 
     route_action_buttons = ""
@@ -16398,6 +16539,29 @@ def driver_route_detail(route_id):
     """
 
     if not current_stop:
+        # 2026-10-14: clock-out on the all-done screen — the route is done but
+        # the yard drive is still paid time, so clock-out is a separate tap.
+        # Shown only when clocked in today and not yet out.
+        _co_conn = get_db()
+        try:
+            _co_now, _co_today = _driver_clock_now(cid())
+            _co_entry = _driver_clock_entry(_co_conn, cid(), session["user_id"], _co_today)
+            _co_show = bool(_co_entry and _co_entry["clock_in_at"] and not _co_entry["clock_out_at"])
+            _co_in_at = (_co_entry["clock_in_at"] or "")[11:16] if _co_entry else ""
+        finally:
+            _co_conn.close()
+        _clock_out_html = ""
+        if _co_show:
+            _clock_out_html = f"""
+            <form method="POST" action="{url_for('driver_clock_out_now')}" style="width:100%;margin-top:6px;">
+                <input type="hidden" name="_csrf_token" value="{_csrf}">
+                <input type="hidden" name="next" value="{e(request.path)}">
+                <button type="submit" class="pf-start-btn" style="background:var(--green,#2E9E5B);color:#fff;">
+                    &#9200; CLOCK OUT{" — on since " + _co_in_at if _co_in_at else ""}
+                </button>
+            </form>
+            <p class="muted small" style="margin-top:8px;">Back at the yard? Clock out to end your day.</p>
+            """
         body = f"""
 <div class="cab-wrap">
     <div class="cab-header">
@@ -16429,6 +16593,7 @@ def driver_route_detail(route_id):
             {_yard_nav_html}
             <a class="btn secondary" href="{url_for('driver_dashboard')}">&#8592; Back to My Routes</a>
         </div>
+        {_clock_out_html}
     </div>
 </div>
 <script>
@@ -20771,6 +20936,13 @@ def mark_route_in_progress(route_id):
         UPDATE routes SET status='in_progress', started_at=?
         WHERE id=? AND company_id=? AND status='open'
     """, (now_ts(), route_id, cid()))
+
+    # 2026-10-14: CLOCK IN & START ROUTE — the pre-flight card folds clock-in
+    # into the start tap when the driver isn't clocked in yet. A manual entry
+    # takes priority over any auto-derived start time downstream.
+    if session.get("role") == "driver" and (request.form.get("clock_in") or "").strip() == "1":
+        _driver_clock_in_now(conn, cid(), session["user_id"],
+                             note="clock_in via START ROUTE")
 
     conn.commit()
     conn.close()
@@ -29857,6 +30029,18 @@ def driver_clock():
         + '</div>'
     ) if _me_row else ""
 
+    # 2026-10-14: warn before clocking out with stops still open — the yard
+    # drive is paid time, but an unfinished route usually means "not done yet".
+    _open_stops = conn.execute("""
+        SELECT COUNT(*) n FROM stops s JOIN routes r ON r.id = s.route_id
+        WHERE r.assigned_to=? AND r.company_id=? AND r.status='in_progress'
+          AND s.status != 'completed' AND s.cancelled_at IS NULL
+    """, (driver_id, cid())).fetchone()["n"] or 0
+    _co_warn = (
+        "return confirm('You still have %d open stop%s \\u2014 clock out anyway?');"
+        % (_open_stops, "" if _open_stops == 1 else "s")
+    ) if _open_stops else ""
+
     conn.close()
 
     _entry = {k: entry[k] for k in entry.keys()} if entry else {}
@@ -29926,9 +30110,10 @@ def driver_clock():
             '<input type="hidden" name="clock_action" value="' + action_val + '">'
         )
 
-    def _btn_form(action_val, btn_html, mb="12px"):
+    def _btn_form(action_val, btn_html, mb="12px", onsubmit=""):
         return (
-            '<form method="POST" style="margin-bottom:' + mb + ';">'
+            '<form method="POST" style="margin-bottom:' + mb + ';"'
+            + (' onsubmit="' + onsubmit + '"' if onsubmit else '') + '>'
             + _hid(action_val) + btn_html + '</form>'
         )
 
@@ -29959,7 +30144,8 @@ def driver_clock():
             parts.append(_btn_form(
                 "clock_out",
                 '<button type="submit" style="' + S_GREEN + '">&#9632;&nbsp;Clock Out</button>',
-                mb="0"
+                mb="0",
+                onsubmit=_co_warn
             ))
 
     elif has_ci and not has_co:
@@ -29967,7 +30153,8 @@ def driver_clock():
         if can_edit_end:
             parts.append(_btn_form(
                 "clock_out",
-                '<button type="submit" style="' + S_RED + '">&#9632;&nbsp;Clock Out</button>'
+                '<button type="submit" style="' + S_RED + '">&#9632;&nbsp;Clock Out</button>',
+                onsubmit=_co_warn
             ))
         if can_edit_start:
             parts.append(DIVIDER)
@@ -30134,6 +30321,47 @@ def driver_clock_correct():
         flash(err or "Could not update.", "error")
     conn.close()
     return redirect(url_for("driver_clock"))
+
+
+@app.route("/driver/clock/out", methods=["POST"])
+@driver_required
+def driver_clock_out_now():
+    """Clock out from anywhere — the cab view's all-done screen, My Day, or a
+    next-day 'forgot to clock out' backfill. Form fields: date=YYYY-MM-DD
+    (default: today, company-local), time=HH:MM (default: now — only allowed
+    for today), next=redirect URL (default: referrer). An explicit driver tap
+    is a manual entry, which the hours resolution already treats as the source
+    of truth over any auto-derived time."""
+    driver_id = session["user_id"]
+    company_id = cid()
+    conn = get_db()
+    now_ts_str, today_local = _driver_clock_now(company_id)
+    date_str = (request.form.get("date") or "").strip() or today_local
+    time_str = (request.form.get("time") or "").strip()
+    next_url = (request.form.get("next") or "").strip() or request.referrer or url_for("driver_dashboard")
+    # Same-origin only — never redirect to an absolute/external URL.
+    if not next_url.startswith("/"):
+        next_url = url_for("driver_dashboard")
+    if not time_str:
+        if date_str == today_local:
+            # "Right now" keeps full-second precision — a minute-truncated
+            # "now" could land before a same-minute clock-in.
+            ok, err = _driver_clock_out_at(
+                conn, company_id, driver_id, date_str, now_ts_str, "driver")
+        else:
+            conn.close()
+            flash("Pick the time you finished.", "error")
+            return redirect(next_url)
+    else:
+        ok, err = _apply_clock_correction(
+            conn, company_id, driver_id, date_str, "", time_str, driver_id, "driver")
+    if ok:
+        conn.commit()
+        flash("Clocked out.", "success")
+    else:
+        flash(err or "Could not clock out.", "error")
+    conn.close()
+    return redirect(next_url)
 
 
 # =========================================================
