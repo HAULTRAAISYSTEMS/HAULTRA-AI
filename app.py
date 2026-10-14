@@ -11248,6 +11248,13 @@ def boss_notifications_page():
         icon_name, _dsev, label = ALERT_KINDS.get(r["kind"], ("bell", "info", r["kind"]))
         col, bg, bd = _sev_style.get(r["severity"], _sev_style["info"])
         done = bool(r["resolved_at"])
+        # 2026-10-14: opening a driver-message alert marks it handled in the
+        # same tap (alert_open) and deep-links into the thread.
+        _open_href = (
+            url_for("alert_open", alert_id=r["id"])
+            if (r["kind"] == "DRIVER_MESSAGE" and not done)
+            else r["link"]
+        )
         cards += f"""
         <div class="alert-card{' is-done' if done else ''}"
              style="border-left-color:{col};background:{'transparent' if done else bg};border-color:{bd};">
@@ -11258,7 +11265,7 @@ def boss_notifications_page():
             <div class="alert-title">{e(r['title'])}</div>
             {f'<div class="alert-body">{e(r["body"])}</div>' if r["body"] else ''}
             <div class="alert-actions">
-                {f'<a class="alert-link" href="{r["link"]}">Open{icon("board")}</a>' if r["link"] else ''}
+                {f'<a class="alert-link" href="{_open_href}">Open{icon("board")}</a>' if _open_href else ''}
                 {'<span class="alert-done-tag">Handled</span>' if done else
                  f'''<form method="POST" action="{url_for('alert_resolve', alert_id=r['id'])}" style="margin:0;">
                      <button type="submit" class="alert-resolve">{icon('check')}Mark handled</button></form>'''}
@@ -11427,6 +11434,33 @@ def alert_resolve(alert_id):
     conn.commit()
     conn.close()
     return redirect(request.referrer or url_for("boss_notifications_page"))
+
+
+@app.route("/alert/<int:alert_id>/open")
+@boss_required
+def alert_open(alert_id):
+    """One tap: mark the alert handled AND follow its link. Driver-message
+    alerts deep-link straight into the merged driver thread
+    (/messages?thread=dm:<id>), so opening the message clears it from
+    "Needs you" — no separate "Mark handled" tap."""
+    conn = get_db()
+    a = conn.execute(
+        "SELECT id, kind, link, actor_user_id FROM alerts WHERE id=? AND company_id=?",
+        (alert_id, cid()),
+    ).fetchone()
+    if not a:
+        conn.close()
+        return redirect(url_for("boss_notifications_page"))
+    conn.execute(
+        "UPDATE alerts SET resolved_at=?, resolved_by=? WHERE id=? AND resolved_at IS NULL",
+        (now_ts(), session["user_id"], alert_id),
+    )
+    conn.commit()
+    conn.close()
+    # Only the driver's side raises message alerts, so the actor IS the driver.
+    if a["kind"] == "DRIVER_MESSAGE" and a["actor_user_id"]:
+        return redirect(url_for("messages_page") + "?thread=dm:%d" % a["actor_user_id"])
+    return redirect(a["link"] or url_for("boss_notifications_page"))
 
 
 @app.route("/api/alerts/count")
@@ -19856,6 +19890,17 @@ def messages_page():
                     var threads = d.threads || [];
                     list.innerHTML = threads.map(rowHtml).join('')
                         || '<div class="msg-inbox-empty">No conversations yet.</div>';
+                    // 2026-10-14: deep-link (?thread=dm:<id>) — e.g. from an
+                    // alert's Open button — opens the thread straight away.
+                    var want = null;
+                    try { want = new URLSearchParams(location.search).get('thread'); } catch (e) {}
+                    if (want && typeof window.openMessageThread === 'function') {
+                        var hit = null;
+                        for (var i = 0; i < threads.length; i++) {
+                            if (threads[i].key === want) { hit = threads[i]; break; }
+                        }
+                        if (hit) window.openMessageThread(hit.key, hit.title);
+                    }
                 })
                 .catch(function() {
                     document.getElementById('msg-inbox-loading').textContent = 'Could not load messages \u2014 check your connection.';
