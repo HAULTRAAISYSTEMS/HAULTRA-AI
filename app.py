@@ -17185,7 +17185,7 @@ def driver_route_detail(route_id):
             "current": _st["id"] == stop_id,
         })
 
-    if _route_map_points:
+    if False:  # 2026-10-14: route map removed per user request (CARTO API key issue)
         cab_map_head = (
             '<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" '
             'integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />'
