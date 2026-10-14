@@ -7496,6 +7496,26 @@ a:hover {{ color: #FF9D5C; }}
     justify-content: flex-end;
     row-gap: 6px;
 }}
+/* ── 2026-10-13: Lane utility strip — quiet text actions, not pills ── */
+.lane-util {{
+    display: flex;
+    align-items: center;
+    margin-top: 7px;
+}}
+.lane-util-link {{
+    background: none;
+    border: none;
+    padding: 9px 11px;
+    color: #FF8C42;
+    font-size: 13.5px;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+    text-decoration: none;
+    white-space: nowrap;
+}}
+.lane-util-link:hover {{ color: #FFA76B; text-decoration: underline; }}
+.lane-util-sep {{ color: #3d3d38; font-size: 13px; user-select: none; }}
 .lane-icon-btn {{
     width: 34px;
     height: 34px;
@@ -8210,7 +8230,7 @@ body {{
    BUTTONS
    ══════════════════════════════════════════════════════════*/
 .btn,
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.lane-word-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-topbar-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip) {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.lane-word-btn):not(.lane-util-link):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-topbar-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip) {{
     display: inline-block;
     border: none;
     cursor: pointer;
@@ -8238,7 +8258,7 @@ button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact
     color: #FFE9D6;
     box-shadow: 0 0 16px rgba(206,98,36,0.22);
 }}
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.lane-word-btn):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-topbar-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip):hover {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.lane-word-btn):not(.lane-util-link):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-topbar-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip):hover {{
     filter: brightness(1.1);
     transform: translateY(-1px);
     text-decoration: none;
@@ -14159,6 +14179,7 @@ def _build_route_board_html(user):
             'font-weight:800;letter-spacing:.5px;background:rgba(66,135,245,.16);color:#8FB8FF;'
             'border:1px solid rgba(66,135,245,.5);">&#128666; GARBAGE</span>'
         ) if _is_garbage_lane else ""
+        lane_util_html = ""
         _report_html = ""
         if _is_garbage_lane and user["role"] == "boss" and len(lane["route_ids_seen"]) == 1:
             _rid = next(iter(lane["route_ids_seen"]))
@@ -14184,22 +14205,27 @@ def _build_route_board_html(user):
             add_stops_html = ""  # No longer a pill in lane-actions
             _lane_unread = unread_by_route.get(_lane_route_id, 0)
             _lane_msg_badge = f'<span class="lane-msg-badge">{_lane_unread}</span>' if _lane_unread else ""
-            # 2026-10-13: Message & Daily Log as word buttons (user preference)
-            message_html = (
-                f'<button type="button" class="lane-word-btn" '
+            # 2026-10-13 (rev): lane actions as a quiet utility strip, not pills.
+            # Message / Daily Log / Optimize live here now (detail-page copies removed).
+            message_html = ""
+            _util_items = [
+                f'<button type="button" class="lane-util-link" '
                 f'onclick="openMessageThread({_lane_route_id}, {e(json.dumps(display_name))})">'
-                f'Message{_lane_msg_badge}</button>'
-                f'<a class="lane-word-btn" href="/route/{_lane_route_id}/report" '
-                f'style="text-decoration:none;">Daily Log</a>'
-            )
-            # 2026-10-13: Smart Optimize on the board — one tap per route, stays on the board
+                f'Message{_lane_msg_badge}</button>',
+                f'<a class="lane-util-link" href="/route/{_lane_route_id}/report">Daily Log</a>',
+            ]
             if len(stops) >= 2:
-                message_html += (
+                _util_items.append(
                     f'<form class="inline" method="POST" '
                     f'action="{url_for("optimize_route", route_id=_lane_route_id)}?next=board" '
-                    f'onsubmit="showOptimizeOverlay(event, {len(stops)})">'
-                    f'<button type="submit" class="lane-word-btn">&#9883; Optimize</button></form>'
+                    f'onsubmit="showOptimizeOverlay(event, {len(stops)})" style="display:inline;">'
+                    f'<button type="submit" class="lane-util-link">&#9883; Optimize</button></form>'
                 )
+            lane_util_html = (
+                '<div class="lane-util">' +
+                '<span class="lane-util-sep">&middot;</span>'.join(_util_items) +
+                '</div>'
+            )
             # Truck parked at a vendor (Go NOW) → offer a manual hold release.
             if any(dict(x).get("held_at") and x["stop_status"] != "completed" for x in stops):
                 message_html += (
@@ -14375,6 +14401,7 @@ def _build_route_board_html(user):
                     <span class="lane-header-actions">{message_html}{_report_html}</span>
                 </div>
                 <div class="lane-sub">{e(route_label)}{_garbage_badge}<br>{e(progress_label)}</div>
+                {lane_util_html}
             </div>
             <div class="lane-track">{cards_html}{add_stops_tile}</div>
         </div>"""
@@ -19757,8 +19784,9 @@ def view_route(route_id):
     if session.get("role") == "boss":
         # Paste Route is dispatch tooling (parses text → builds stops), so it's
         # dispatcher/owner only — not a customer-manager-only boss — consistent
-        # with the /api/parse-route-text gate. Daily Log / Optimize / Delete stay
-        # available to any management boss.
+        # with the /api/parse-route-text gate.
+        # 2026-10-13: Daily Log + Smart Optimize live on the board lane now —
+        # removed here as duplicates.
         _paste_route_btn = (
             '<button class="btn secondary" type="button" onclick="_haulsTogglePaste()">'
             '&#x1F4CB; Paste Route</button>'
@@ -19766,12 +19794,6 @@ def view_route(route_id):
         )
         route_action_buttons += f"""
     {_paste_route_btn}
-    <a class="btn secondary" href="{url_for('route_daily_log', route_id=route_id)}">{icon('clipboard')} Daily Log</a>
-    <form class="inline" method="POST" action="{url_for('optimize_route', route_id=route_id)}"
-          id="optimize-form"
-          onsubmit="showOptimizeOverlay(event, {len(stops)})">
-        <button class="btn orange" type="submit" id="optimize-btn">&#9883; Smart Optimize</button>
-    </form>
     <form class="inline" method="POST"
       action="{url_for('delete_route', route_id=route_id)}"
       onsubmit="return confirm('Delete this entire route? This erases the stops and their photos. To take the work off the board but keep the record, use Cancel Route instead.')">
@@ -20277,8 +20299,6 @@ def view_route(route_id):
     {add_stop_block}
     {reorder_script}
     {move_script}
-
-    {_OPTIMIZE_OVERLAY_HTML}
 
     """
 
