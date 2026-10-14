@@ -2327,12 +2327,12 @@ def resolve_driver_day_punches(conn, driver_id, date_str, company_settings):
         start_ts = manual_ci                         # manual always wins
     elif start_rule == "first_action":
         row = conn.execute(
-            """SELECT MIN(COALESCE(arrived_at, completed_at)) AS t
+            """SELECT MIN(COALESCE(s.arrived_at, s.completed_at)) AS t
                FROM stops s
                JOIN routes r ON s.route_id = r.id
                WHERE r.assigned_to = ?
-                 AND COALESCE(arrived_at, completed_at) >= ?
-                 AND COALESCE(arrived_at, completed_at) < date(?, '+1 day')
+                 AND COALESCE(s.arrived_at, s.completed_at) >= ?
+                 AND COALESCE(s.arrived_at, s.completed_at) < date(?, '+1 day')
                  AND s.status = 'completed'""",
             (driver_id, date_str, date_str)
         ).fetchone()
@@ -2345,7 +2345,7 @@ def resolve_driver_day_punches(conn, driver_id, date_str, company_settings):
         end_ts = manual_co                           # manual always wins
     elif end_rule == "last_action":
         row = conn.execute(
-            """SELECT MAX(completed_at) AS t
+            """SELECT MAX(s.completed_at) AS t
                FROM stops s
                JOIN routes r ON s.route_id = r.id
                WHERE r.assigned_to = ?
@@ -10597,10 +10597,17 @@ def dashboard():
         _co_row = conn.execute("SELECT * FROM companies WHERE id=?", (company_id,)).fetchone()
         _co_s = {k: _co_row[k] for k in _co_row.keys()} if _co_row else {}
         _pp_start, _pp_end = get_pay_period_bounds(_co_s)
+        # Week hours — same summary the Clock page and Team Hours use, so the
+        # dashboard can never disagree with payroll.
+        _now_local = _company_local_now(_co_s)
+        _monday = company_week_start_for(_co_s, _now_local)
+        _week_summary = get_driver_week_summary(conn, user["id"], _monday, _co_s, _now_local)
+        _week_hours = _week_summary["total"]
         _forgot_all = _driver_open_clock_entries(conn, company_id, user["id"], _clk_today)
         _forgot = [f for f in _forgot_all
                    if _pp_start <= (f["date"] or "") <= _pp_end]
-        _forgot_older = len(_forgot_all) - len(_forgot)
+        # 2026-10-14 ~8:05 AM: older backlog is boss-side only now (Team Hours
+        # still flags it) — no nag line on the driver's dashboard at all.
         _csrf_tok = get_csrf_token()
 
         # Clock strip
@@ -10640,13 +10647,6 @@ def dashboard():
                 <input type="time" name="time" required>
                 <button type="submit" class="btn orange">Save</button>
             </form>
-        </div>"""
-        if _forgot_older:
-            _pl = "" if _forgot_older == 1 else "s"
-            _vb = "needs" if _forgot_older == 1 else "need"
-            _forgot_html += f"""
-        <div class="drv-older">
-            <a href="{url_for('driver_clock')}">{_forgot_older} older day{_pl} still {_vb} a clock-out — fix in Clock In/Out &#8250;</a>
         </div>"""
 
         # Route lanes — active first, then by date
@@ -10752,14 +10752,17 @@ def dashboard():
         border:1px solid rgba(255,107,26,.25); border-radius:8px; color:var(--text);
         font-size:16px; min-height:48px; }}
       .drv-forgot button {{ min-height:48px; }}
-      .drv-older {{ text-align:center; margin:2px 0 12px; }}
-      .drv-older a {{ color:var(--text-dim); font-size:13px; font-weight:600; }}
       .drv-stats {{ display:flex; gap:10px; margin-bottom:16px; }}
       .drv-stat {{ flex:1; background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.07);
         border-radius:12px; padding:12px 8px; text-align:center; }}
       .drv-stat .n {{ font-size:1.6rem; font-weight:800; line-height:1; }}
       .drv-stat .l {{ margin-top:6px; font-size:.68rem; letter-spacing:.4px; text-transform:uppercase;
         color:var(--text-muted); }}
+      .drv-stat.drv-hours {{ border-color:rgba(61,220,132,.4);
+        background:linear-gradient(160deg,rgba(61,220,132,.14),rgba(61,220,132,.04));
+        box-shadow:0 0 18px rgba(61,220,132,.12); }}
+      .drv-stat.drv-hours .n {{ color:#3DDC84; text-shadow:0 0 14px rgba(61,220,132,.55); }}
+      .drv-stat.drv-hours .l {{ color:#3DDC84; opacity:.85; }}
       .drv-board-lbl {{ font-size:11px; font-weight:700; letter-spacing:1.2px; text-transform:uppercase;
         color:#55554C; margin:0 0 12px; }}
       .drv-lane {{ display:block; background:var(--card-bg,#171717);
@@ -10808,6 +10811,7 @@ def dashboard():
         <div class="drv-stat"><div class="n" style="color:#FF8C42;">{_active_n}</div><div class="l">Active</div></div>
         <div class="drv-stat"><div class="n">{_rc_total}</div><div class="l">Routes</div></div>
         <div class="drv-stat"><div class="n">{_stop_total}</div><div class="l">Stops</div></div>
+        <div class="drv-stat drv-hours"><div class="n">{_week_hours:.1f}</div><div class="l">Hours</div></div>
     </div>
     <h2 class="drv-board-lbl">Route Board</h2>
     {_lanes}
