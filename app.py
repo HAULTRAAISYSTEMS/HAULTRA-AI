@@ -2733,8 +2733,13 @@ def render_week_hours_card(summary, nav_base_url, w, extra_qs="", heading="This 
             co = _fmt_12h(day["end"]) if day["end"] else "now"
             detail = '%s &ndash; %s' % (e(ci), e(co))
             if day["live"]:
-                hrs_cell = ('<span data-live-hours style="color:var(--green);font-weight:800;">'
-                            '%.1f</span>' % day["hours"])
+                # 2026-10-14: live hours are computed CLIENT-SIDE from the
+                # phone's clock (data-clock-in), not the server's "now".
+                # The phone's timezone is always right; the server's may not
+                # be (see tzdata saga). Server value is the no-JS fallback.
+                _ci_iso = (day["start"][:19].replace(" ", "T") if day["start"] else "")
+                hrs_cell = ('<span data-live-hours data-clock-in="%s" style="color:var(--green);font-weight:800;">'
+                            '%.1f</span>' % (e(_ci_iso), day["hours"]))
                 detail += ' <span style="color:var(--green);font-weight:700;">&#9679; live</span>'
             else:
                 hrs_cell = '<span style="font-weight:800;">%.1f</span>' % day["hours"]
@@ -2766,7 +2771,12 @@ def render_week_hours_card(summary, nav_base_url, w, extra_qs="", heading="This 
             '</div>' % (summary["missing_days"], "" if summary["missing_days"] == 1 else "s")
         )
 
-    total_attr = ' data-live-total="%.4f"' % summary["total"] if summary["has_live"] else ""
+    # 2026-10-14: the live total's base EXCLUDES the server-computed live hours
+    # (which may be timezone-wrong); the client recomputes live from the
+    # phone's clock and adds it back. data-live-total is the no-JS fallback.
+    _live_base = summary["total"] - (summary["live_hours"] if summary["has_live"] else 0.0)
+    total_attr = (' data-live-total="%.4f" data-live-base="%.4f"'
+                  % (summary["total"], _live_base)) if summary["has_live"] else ""
 
     return (
         '<div class="card" style="max-width:460px;margin:0 auto 16px;">'
@@ -2797,17 +2807,48 @@ def render_week_hours_card(summary, nav_base_url, w, extra_qs="", heading="This 
 _WEEK_LIVE_TICK_JS = """
 <script>
 (function(){
+  // 2026-10-14: live hours are computed from the PHONE's clock, not the
+  // server's. The server embeds the clock-in time (company-local wall time,
+  // e.g. "2026-10-14T06:30:00"); the phone interprets it in its own local
+  // timezone — which matches, because the driver is where the company is.
+  // This is immune to server timezone misconfiguration.
   var liveEl  = document.querySelector('[data-live-hours]');
   var totalEl = document.querySelector('[data-live-total]');
   if(!liveEl && !totalEl) return;
-  var baseLive  = liveEl  ? parseFloat(liveEl.textContent) || 0 : 0;
-  var baseTotal = totalEl ? parseFloat(totalEl.getAttribute('data-live-total')) || 0 : 0;
-  var t0 = Date.now();
-  function tick(){
-    var add = (Date.now() - t0) / 3600000;  // ms → hours since load
-    if(liveEl)  liveEl.textContent  = (baseLive  + add).toFixed(1);
-    if(totalEl) totalEl.textContent = (baseTotal + add).toFixed(1);
+  var clockInMs = 0;
+  if (liveEl) {
+    var ci = liveEl.getAttribute('data-clock-in');
+    if (ci) {
+      var t = new Date(ci).getTime();
+      if (!isNaN(t)) clockInMs = t;
+    }
   }
+  // Base total excludes the server's live portion; we add back the
+  // phone-computed live hours. Falls back to the server total if no clock-in.
+  var baseTotal = totalEl ? parseFloat(totalEl.getAttribute('data-live-base')) : NaN;
+  if (isNaN(baseTotal)) baseTotal = totalEl ? parseFloat(totalEl.getAttribute('data-live-total')) || 0 : 0;
+  function liveHours(){
+    if (!clockInMs) return null;
+    return Math.max(0, (Date.now() - clockInMs) / 3600000);
+  }
+  function tick(){
+    var lh = liveHours();
+    if (lh === null) {
+      // No clock-in data — fall back to incrementing the server value.
+      var t0 = tick._t0 || (tick._t0 = Date.now());
+      var add = (Date.now() - t0) / 3600000;
+      if (liveEl) {
+        var b = parseFloat(liveEl.getAttribute('data-live-fallback')) || 0;
+        if (!liveEl.getAttribute('data-live-fallback')) liveEl.setAttribute('data-live-fallback', liveEl.textContent);
+        liveEl.textContent = (parseFloat(liveEl.getAttribute('data-live-fallback')) + add).toFixed(1);
+      }
+      if (totalEl) totalEl.textContent = (parseFloat(totalEl.getAttribute('data-live-total')) + add).toFixed(1);
+      return;
+    }
+    if (liveEl)  liveEl.textContent  = lh.toFixed(1);
+    if (totalEl) totalEl.textContent = (baseTotal + lh).toFixed(1);
+  }
+  tick();
   setInterval(tick, 1000);
 })();
 </script>
@@ -10618,6 +10659,20 @@ def dashboard():
         _monday = company_week_start_for(_co_s, _now_local)
         _week_summary = get_driver_week_summary(conn, user["id"], _monday, _co_s, _now_local)
         _week_hours = _week_summary["total"]
+        # 2026-10-14: dashboard live hours also compute client-side from the
+        # phone's clock (see _WEEK_LIVE_TICK_JS). Embed clock-in + base total.
+        _dash_live_ci = ""
+        _dash_live_base = _week_hours
+        if _week_summary["has_live"]:
+            _dash_live_base = _week_hours - _week_summary["live_hours"]
+            for _d in _week_summary["days"]:
+                if _d.get("live") and _d.get("start"):
+                    _dash_live_ci = _d["start"][:19].replace(" ", "T")
+                    break
+        _dash_hours_attrs = ""
+        if _dash_live_ci:
+            _dash_hours_attrs = (' data-live-hours data-clock-in="%s" data-live-base="%.4f"'
+                                 % (e(_dash_live_ci), _dash_live_base))
         _forgot_all = _driver_open_clock_entries(conn, company_id, user["id"], _clk_today)
         _forgot = [f for f in _forgot_all
                    if _pp_start <= (f["date"] or "") <= _pp_end]
@@ -10837,11 +10892,28 @@ def dashboard():
         <div class="drv-stat"><div class="n" style="color:#FF8C42;">{_active_n}</div><div class="l">Active</div></div>
         <div class="drv-stat"><div class="n">{_rc_total}</div><div class="l">Routes</div></div>
         <div class="drv-stat"><div class="n">{_stop_total}</div><div class="l">Stops</div></div>
-        <div class="drv-stat drv-hours"><div class="n">{_week_hours:.1f}</div><div class="l">Hours</div></div>
+        <div class="drv-stat drv-hours"><div class="n"{_dash_hours_attrs}>{_week_hours:.1f}</div><div class="l">Hours</div></div>
     </div>
     <h2 class="drv-board-lbl">Route Board</h2>
     {_lanes}
     <div class="drv-more"><a href="{url_for('driver_dashboard')}">Full route history &#8250;</a></div>
+    <script>
+    // 2026-10-14: dashboard hours tick from the phone's clock (same logic as
+    // _WEEK_LIVE_TICK_JS) — immune to server timezone issues.
+    (function(){{
+        var el = document.querySelector('.drv-hours .n[data-live-hours]');
+        if (!el) return;
+        var ci = el.getAttribute('data-clock-in');
+        var t = ci ? new Date(ci).getTime() : NaN;
+        if (isNaN(t)) return;
+        var base = parseFloat(el.getAttribute('data-live-base')) || 0;
+        function tick(){{
+            el.textContent = (base + Math.max(0, (Date.now() - t) / 3600000)).toFixed(1);
+        }}
+        tick();
+        setInterval(tick, 1000);
+    }})();
+    </script>
     """
         return render_template_string(shell_page("Driver Dashboard", body))
 
