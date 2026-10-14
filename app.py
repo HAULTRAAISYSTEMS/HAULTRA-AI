@@ -17406,7 +17406,7 @@ def driver_route_detail(route_id):
         if (inited) {{ setTimeout(function() {{ map.invalidateSize(); }}, 60); return; }}
         if (typeof L === 'undefined') return;   // Leaflet not loaded yet
         map = L.map('cab-route-map', {{ scrollWheelZoom: true }}).setView([36.85, -76.28], 11);
-        L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {{
+        L.tileLayer('https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
             attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
             maxZoom: 19,
         }}).addTo(map);
@@ -27448,7 +27448,7 @@ def bin_tracker():
             // OpenStreetMap standard tiles: labelled street basemap, no API key
             // needed — full street names stay readable at neighbourhood zoom
             // so the boss can eyeball location.
-            L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {{
+            L.tileLayer('https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
                 attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
                 maxZoom: 19,
             }}).addTo(map);
