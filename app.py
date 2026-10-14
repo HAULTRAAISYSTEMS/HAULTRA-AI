@@ -14185,7 +14185,7 @@ def _build_route_board_html(user):
             _rid = next(iter(lane["route_ids_seen"]))
             _report_html = (
                 f'<a class="lane-message-btn" style="text-decoration:none;" '
-                f'href="{url_for("route_report", route_id=_rid)}">&#128203; Report</a>'
+                f'href="{url_for("route_daily_log", route_id=_rid)}">&#128203; Report</a>'
             )
 
         add_stops_html = ""
@@ -14212,7 +14212,7 @@ def _build_route_board_html(user):
                 f'<button type="button" class="lane-util-link" '
                 f'onclick="openMessageThread({_lane_route_id}, {e(json.dumps(display_name))})">'
                 f'Message{_lane_msg_badge}</button>',
-                f'<a class="lane-util-link" href="/route/{_lane_route_id}/report">Daily Log</a>',
+                f'<a class="lane-util-link" href="/route/{_lane_route_id}/daily-log">Daily Log</a>',
             ]
             if len(stops) >= 2:
                 _util_items.append(
@@ -19382,6 +19382,91 @@ def _city_for_log(s):
     return ""
 
 
+def _log_fmt_time(ts):
+    """12-hour clock for the daily log, e.g. '6:54 am'. One format everywhere."""
+    if not ts:
+        return ""
+    try:
+        import datetime as _dt
+        d = _dt.datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S")
+        return d.strftime("%-I:%M %p").lower()
+    except Exception:
+        return ts[11:16] if len(ts) > 16 else ts
+
+
+def _log_work_order(action):
+    """Paper work-order shorthand."""
+    return {"Toter": "toter", "Hand Pickup": "HPU", "Landfill": "LAND"}.get(action or "", action or "")
+
+
+def _log_chain_maps(stop_rows):
+    """can_number by stop + takes-from map for chain-swap Box In/Out.
+    Box Out = bin picked up at THIS stop; Box In = bin dropped here."""
+    can_by_stop = {}
+    takes_from = {}
+    for _s in stop_rows:
+        _d = dict(_s)
+        if _d.get("can_number"):
+            can_by_stop[_d["id"]] = _d["can_number"]
+        _sk = _s.keys()
+        if "chain_takes_from_stop_id" in _sk and _s["chain_takes_from_stop_id"]:
+            takes_from[_s["id"]] = _s["chain_takes_from_stop_id"]
+        if "chain_terminal" in _sk and (_s["chain_terminal"] or "") == "head":
+            _gid = _s["chain_group_id"] if "chain_group_id" in _sk else None
+            if _gid:
+                for _h in stop_rows:
+                    _hk = _h.keys()
+                    if ("chain_group_id" in _hk and _h["chain_group_id"] == _gid
+                            and not (_h["chain_takes_from_stop_id"] if "chain_takes_from_stop_id" in _hk else None)):
+                        takes_from[_h["id"]] = _s["id"]
+                        break
+    return can_by_stop, takes_from
+
+
+def _log_box_numbers(stop_id, can_number, can_by_stop, takes_from):
+    box_in = box_out = ""
+    if can_number:
+        box_out = can_number
+        _giver = takes_from.get(stop_id)
+        box_in = can_by_stop.get(_giver) if _giver else can_number
+        if not box_in:
+            box_in = can_number
+    return box_in, box_out
+
+
+def _log_weight(net_tons, material, fallback_tons):
+    """Returns (display, tons_float)."""
+    if net_tons:
+        t = float(net_tons)
+        return ("%.2f" % t, t)
+    if material:
+        return (material, 0.0)
+    if fallback_tons:
+        t = float(fallback_tons)
+        return ("%.2f" % t, t)
+    return ("", 0.0)
+
+
+def _log_ticket_cell(ticket_no, ticket_photo, ticket_id, notes, material, has_ticket):
+    """Dark-theme ticket cell with photo link (unified)."""
+    if ticket_no:
+        if ticket_photo and ticket_id:
+            cell = (f'<a href="/ticket-photo/{ticket_id}" target="_blank" style="color:#7FB8FF;">'
+                    f'Tkt#{e(ticket_no)} \U0001F4F7</a>')
+        elif ticket_photo:
+            cell = (f'<a href="/{e(ticket_photo)}" target="_blank" style="color:#7FB8FF;">'
+                    f'Tkt#{e(ticket_no)} \U0001F4F7</a>')
+        else:
+            cell = f"Tkt#{e(ticket_no)}"
+    elif has_ticket:
+        cell = e(material or "No tkt")
+    else:
+        cell = '<span style="color:#777;">\u2014</span>'
+    if notes:
+        cell += f"<br><small>{e(notes)}</small>"
+    return cell
+
+
 @app.route("/ticket-photo/<int:ticket_id>")
 @login_required
 def ticket_photo_view(ticket_id):
@@ -19429,219 +19514,8 @@ Route: {t["route_name"] or ""} &middot; {t["route_date"] or ""}
 @app.route("/route/<int:route_id>/report")
 @login_required
 def route_report(route_id):
-    """Daily Route Log as a web page (2026-10-10) — the digital version of the
-    paper sheet the driver used to hand back. Per-stop times, counts, landfill
-    legs, and totals. Print-friendly."""
-    conn = get_db()
-    route = conn.execute(
-        """SELECT r.*, u.full_name AS driver_name, u.username AS driver_username,
-                  t.name AS truck_name
-           FROM routes r LEFT JOIN users u ON r.assigned_to = u.id
-           LEFT JOIN trucks t ON t.id = (
-               SELECT truck_id FROM inspections
-               WHERE driver_id = r.assigned_to AND company_id = r.company_id
-               ORDER BY id DESC LIMIT 1)
-           WHERE r.id=? AND r.company_id=?""",
-        (route_id, cid())).fetchone()
-    if not route:
-        conn.close()
-        abort(404)
-    stops = conn.execute(
-        "SELECT * FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
-        (route_id,)).fetchall()
-    # conn closed after loop (dump_tickets queried per stop)
-
-    def fmt_time(ts):
-        if not ts:
-            return ""
-        try:
-            # stored as "YYYY-MM-DD HH:MM:SS" — show h:MM AM/PM
-            import datetime as _dt
-            d = _dt.datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S")
-            return d.strftime("%-I:%M %p").lower()
-        except Exception:
-            return ts[11:16] if len(ts) > 16 else ts
-
-    rows = ""
-    total_cans = total_bags = 0
-    total_tons = 0.0
-    ticket_photos = []  # 2026-10-12: gallery of ticket photos
-    dash = '<span style="color:#999;">—</span>'
-    # 2026-10-13: Build can_number map for chain swap Box In/Out.
-    # Box Out = bin picked up at THIS stop (from this stop's ticket).
-    # Box In = bin dropped at THIS stop (from the chain giver's ticket).
-    _can_by_stop = {}
-    _takes_from = {}  # stop_id -> stop_id it takes empty from
-    for _s in stops:
-        _dt = conn.execute(
-            "SELECT can_number FROM dump_tickets WHERE stop_id=?", (_s["id"],)
-        ).fetchone()
-        if _dt and _dt["can_number"]:
-            _can_by_stop[_s["id"]] = _dt["can_number"]
-        _sk = _s.keys()
-        if "chain_takes_from_stop_id" in _sk and _s["chain_takes_from_stop_id"]:
-            _takes_from[_s["id"]] = _s["chain_takes_from_stop_id"]
-        # Terminal head return: tail gives to head
-        if "chain_terminal" in _sk and (_s["chain_terminal"] or "") == "head":
-            # Find head of this chain (takes from nobody)
-            _gid = _s["chain_group_id"] if "chain_group_id" in _sk else None
-            if _gid:
-                for _h in stops:
-                    _hk = _h.keys()
-                    if ("chain_group_id" in _hk and _h["chain_group_id"] == _gid
-                            and not (_h["chain_takes_from_stop_id"] if "chain_takes_from_stop_id" in _hk else None)):
-                        _takes_from[_h["id"]] = _s["id"]
-                        break
-    for i, s in enumerate(stops, start=1):
-        action = s["action"] or ""
-        typ = {"Toter": "toter", "Hand Pickup": "HPU", "Landfill": "LAND"}.get(action, action)
-        cnt = s["service_count"] or 0
-        if action == "Toter":
-            total_cans += cnt
-        elif action == "Hand Pickup":
-            total_bags += cnt
-        # 2026-10-12: Match paper Daily Route Log columns + ticket data
-        # Paper: Work Order | Address | City | Dumpster Size | Start | Landfill Arrive |
-        #        Landfill Depart | Finish | Box In | Box Out | Weight (tons) | Dump Site
-        dt = conn.execute(
-            """SELECT id, net_tons, material, ticket_number, can_number, dump_site,
-                      scale_in_weight, scale_out_weight, fee_usd, photo_path
-               FROM dump_tickets WHERE stop_id=?""",
-            (s["id"],)).fetchone()
-        tons = 0.0
-        box_in = box_out = ""
-        dump_site = ""
-        ticket_no = ""
-        ticket_photo = ""
-        ticket_id = None
-        weight_display = ""
-        if dt:
-            if dt["net_tons"]:
-                tons = float(dt["net_tons"])
-                total_tons += tons
-                weight_display = "%.2f" % tons
-            elif dt["material"]:
-                # e.g. "conc" written in weight column on paper
-                weight_display = dt["material"]
-            # 2026-10-13: Box Out = bin picked up HERE (this stop's ticket).
-            # Box In = bin dropped HERE (from chain giver's ticket).
-            # Swap example: Stop 1 picks up 3128, Stop 2 picks up 3116.
-            #   Stop 1: Box Out=3128 (picked up), Box In=3116 (returned from Stop 2)
-            #   Stop 2: Box Out=3116 (picked up), Box In=3128 (dropped from Stop 1)
-            if dt and dt["can_number"]:
-                box_out = dt["can_number"]
-                # Box In: who gives an empty to this stop?
-                _giver_id = _takes_from.get(s["id"])
-                if _giver_id and _giver_id in _can_by_stop:
-                    box_in = _can_by_stop[_giver_id]
-                else:
-                    # Not a chain swap (or giver has no ticket yet): same can
-                    # returned (normal pickup-and-return)
-                    box_in = dt["can_number"]
-            if dt["dump_site"]:
-                dump_site = dt["dump_site"]
-            if dt["ticket_number"]:
-                ticket_no = dt["ticket_number"]
-            ticket_id = dt["id"]
-            if dt["photo_path"]:
-                ticket_photo = dt["photo_path"]
-        elif s["weight_tons"]:
-            tons = float(s["weight_tons"])
-            total_tons += tons
-            weight_display = "%.2f" % tons
-        # Dumpster size from stop
-        dumpster_size = s["container_size"] or ""
-        # Ticket column: ticket number (tappable if photo exists), plus any notes
-        # 2026-10-12: Build as HTML, do NOT escape the link
-        ticket_cell = ""
-        if ticket_no:
-            if ticket_photo and ticket_id:
-                ticket_cell = f'<a href="/ticket-photo/{ticket_id}" target="_blank" style="color:#0066cc;">Tkt#{e(ticket_no)} \U0001F4F7</a>'
-            elif ticket_photo:
-                ticket_cell = f'<a href="/{e(ticket_photo)}" target="_blank" style="color:#0066cc;">Tkt#{e(ticket_no)} \U0001F4F7</a>'
-            else:
-                ticket_cell = f"Tkt#{e(ticket_no)}"
-        elif dt:
-            # Has ticket record but no ticket number (e.g. skipped) - show material or "No tkt"
-            ticket_cell = e(dt["material"] or "No tkt")
-        else:
-            ticket_cell = '<span style="color:#999;">—</span>'
-        # Append stop notes if any
-        if s["notes"]:
-            ticket_cell += f"<br><small>{e(s['notes'])}</small>"
-        # Collect for photo gallery
-        if ticket_photo:
-            ticket_photos.append({
-                'stop': f"{s['address'] or ''}",
-                'ticket': ticket_no,
-                'photo': ticket_photo,
-                'ticket_id': ticket_id,
-            })
-        rows += (
-            f"<tr><td>{typ}</td>"
-            f"<td>{e(s['address'] or '')}</td>"
-            f"<td>{e(_city_for_log(s))}</td>"
-            f"<td>{e(dumpster_size)}</td>"
-            f"<td>{fmt_time(route['started_at'])}</td>"
-            f"<td>{fmt_time(s['go_to_dump_at'])}</td>"
-            f"<td>{fmt_time(s['box_in_at'])}</td>"
-            f"<td>{fmt_time(s['completed_at'])}</td>"
-            f"<td>{e(box_in) or dash}</td>"
-            f"<td>{e(box_out) or dash}</td>"
-            f"<td>{e(weight_display) or dash}</td>"
-            f"<td>{e(dump_site) or dash}</td>"
-            f"<td>{ticket_cell}</td></tr>"
-        )
-
-    driver = route["driver_name"] or route["driver_username"] or "—"
-    conn.close()
-    # 2026-10-12: Ticket photo gallery (hidden when printing)
-    gallery = ""
-    if ticket_photos:
-        thumbs = ""
-        for p in ticket_photos:
-            _thumb_href = f"/ticket-photo/{p['ticket_id']}" if p.get('ticket_id') else f"/{e(p['photo'])}"
-            thumbs += (
-                f'<a href="{_thumb_href}" target="_blank" style="text-decoration:none;color:#111;">'
-                f'<div style="display:inline-block;margin:8px;text-align:center;">'
-                f'<img src="/{e(p["photo"])}" style="width:120px;height:120px;object-fit:cover;border-radius:8px;border:1px solid #999;">'
-                f'<div style="font-size:11px;margin-top:4px;">{e(p["ticket"] or "Ticket")}<br>{e(p["stop"][:25])}</div>'
-                f'</div></a>'
-            )
-        gallery = (
-            f'<div class="no-print" style="margin-top:20px;">'
-            f'<h3 style="font-size:1rem;">Ticket Photos ({len(ticket_photos)})</h3>'
-            f'<div>{thumbs}</div></div>'
-        )
-    return f"""<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Daily Route Log — {e(route["route_name"])}</title>
-<style>
-/* 2026-10-13: Safe-area padding so title doesn't overlap iPhone status bar */
-body{{font-family:system-ui,sans-serif;margin:0;padding:16px;background:#fff;color:#111;
-  padding-top:calc(16px + env(safe-area-inset-top,0px));
-  padding-left:calc(16px + env(safe-area-inset-left,0px));
-  padding-right:calc(16px + env(safe-area-inset-right,0px));}}
-.wrap{{max-width:1000px;margin:0 auto;}}
-h1{{font-size:1.2rem;margin:0;padding-top:8px;}} .sub{{color:#555;margin:4px 0 12px;}}
-table{{width:100%;border-collapse:collapse;font-size:.82rem;}}
-th,td{{border:1px solid #999;padding:6px 8px;text-align:left;}}
-th{{background:#eee;}}
-.tot{{font-weight:800;margin-top:12px;}}
-button{{margin:12px 8px 0 0;padding:10px 18px;font-size:15px;cursor:pointer;}}
-@media print{{ button{{display:none;}} body{{padding:0;}} .no-print{{display:none;}} }}
-</style></head><body><div class="wrap">
-<h1>Daily Route Log — {e(route["route_name"])}</h1>
-<div class="sub">Driver: {e(driver)} &nbsp;·&nbsp; Date: {e(route["route_date"])} &nbsp;·&nbsp;
-Truck: {e(route["truck_name"] or "—")} &nbsp;·&nbsp; Type: {e(route["route_type"] or "rolloff")}</div>
-<table><tr><th>Work Order</th><th>Customer Site Address</th><th>City</th><th>Dumpster Size</th><th>Start Time</th>
-<th>Landfill Arrival Time</th><th>Landfill Depart Time</th><th>Finish Time</th><th>Box In</th><th>Box Out</th><th>Weight of Load (tons)</th><th>Dump Site</th><th>Ticket</th></tr>
-{rows}</table>
-<div class="tot">Totals — {"" if (route["route_type"] or "rolloff").lower() == "rolloff" else f"cans: {total_cans} &nbsp;·&nbsp; bags: {total_bags} &nbsp;·&nbsp; "}tons: {total_tons:.2f}</div>
-{gallery}
-<button onclick="window.print()">Print</button>
-<button onclick="history.back()">Back</button>
-</div></body></html>"""
+    """Retired 2026-10-13 — the printable report is unified into the daily log."""
+    return redirect(url_for("route_daily_log", route_id=route_id))
 
 
 # Shared Smart-Optimize loading overlay (route detail + route board).
@@ -22835,11 +22709,20 @@ def dump_ticket(stop_id):
 # =========================================================
 @app.route("/route/<int:route_id>/daily-log")
 @boss_required
+@app.route("/route/<int:route_id>/daily-log")
+@boss_required
 def route_daily_log(route_id):
+    """THE daily log (2026-10-13 unified) — one canonical column set for screen
+    and print, matching the paper log. /report redirects here."""
     conn = get_db()
     route = conn.execute(
-        """SELECT r.*, u.username AS driver_name, u.full_name AS driver_full
+        """SELECT r.*, u.username AS driver_name, u.full_name AS driver_full,
+                  t.name AS truck_name
            FROM routes r LEFT JOIN users u ON r.assigned_to=u.id
+           LEFT JOIN trucks t ON t.id = (
+               SELECT truck_id FROM inspections
+               WHERE driver_id = r.assigned_to AND company_id = r.company_id
+               ORDER BY id DESC LIMIT 1)
            WHERE r.id=? AND r.company_id=?""",
         (route_id, cid())
     ).fetchone()
@@ -22849,59 +22732,110 @@ def route_daily_log(route_id):
 
     stops = conn.execute(
         """SELECT s.*,
-                  dt.dump_site, dt.arrival_time AS dump_arrival, dt.departure_time AS dump_departure,
-                  dt.can_number, dt.scale_in_weight, dt.scale_out_weight, dt.net_tons,
-                  dt.ticket_number AS dump_ticket_number, dt.notes AS dump_notes
+                  dt.id AS dump_ticket_id, dt.dump_site,
+                  dt.arrival_time AS dump_arrival, dt.departure_time AS dump_departure,
+                  dt.can_number, dt.net_tons, dt.material,
+                  dt.ticket_number AS dump_ticket_number, dt.photo_path AS dump_photo_path
            FROM stops s
            LEFT JOIN dump_tickets dt ON dt.stop_id = s.id
            WHERE s.route_id=?
-           ORDER BY s.stop_order ASC""",
+           ORDER BY s.stop_order ASC, s.id ASC""",
         (route_id,)
     ).fetchall()
     conn.close()
 
-    def _t(ts):
-        if not ts:
-            return ""
-        return ts[11:16] if len(ts) >= 16 else ts
+    # One row per stop (a stop can carry several tickets; the paper shows one line)
+    seen = set()
+    ustops = []
+    for _r in stops:
+        if _r["id"] not in seen:
+            seen.add(_r["id"])
+            ustops.append(_r)
+    stops = ustops
 
-    def _w(v):
-        return f"{v:.3f}" if v is not None else ""
+    can_by_stop, takes_from = _log_chain_maps(stops)
 
-    total_net  = sum((s["net_tons"] or 0) for s in stops)
-    done_count = sum(1 for s in stops if s["status"] == "completed")
-    total_count = len(stops)
-
+    dash = '<span style="color:#777;">\u2014</span>'
     rows = ""
+    total_tons = 0.0
+    total_cans = total_bags = 0
+    done_count = 0
+    ticket_photos = []
     for _pos, s in enumerate(stops, start=1):
-        _sd = dict(s)
+        if s["status"] == "completed":
+            done_count += 1
+        action = s["action"] or ""
+        cnt = s["service_count"] or 0
+        if action == "Toter":
+            total_cans += cnt
+        elif action == "Hand Pickup":
+            total_bags += cnt
+        has_ticket = s["dump_ticket_id"] is not None
+        box_in, box_out = _log_box_numbers(s["id"], s["can_number"], can_by_stop, takes_from)
+        weight_display, tons = _log_weight(
+            s["net_tons"],
+            s["material"] if has_ticket else None,
+            s["weight_tons"] if not has_ticket else None,
+        )
+        total_tons += tons
+        ticket_no = s["dump_ticket_number"] or ""
+        ticket_cell = _log_ticket_cell(
+            ticket_no, s["dump_photo_path"], s["dump_ticket_id"],
+            s["notes"], s["material"] if has_ticket else None, has_ticket,
+        )
+        if s["dump_photo_path"]:
+            ticket_photos.append({
+                "stop": s["address"] or "",
+                "ticket": ticket_no,
+                "photo": s["dump_photo_path"],
+                "ticket_id": s["dump_ticket_id"],
+            })
         rows += f"""
         <tr class="{'row-done' if s['status'] == 'completed' else ''}">
             <td class="col-num">#{_pos}</td>
+            <td class="col-center">{e(_log_work_order(action))}</td>
             <td>{e(s['customer_name'] or '')}</td>
-            <td class="col-addr">{e(s['address'] or '')} {e(s['city'] or '')}</td>
-            <td class="col-center">{e(s['action'] or '')}</td>
+            <td class="col-addr">{e(s['address'] or '')}</td>
+            <td>{e(_city_for_log(s))}</td>
             <td class="col-center">{e(str(s['container_size']) + ' yd') if s['container_size'] else ''}</td>
-            <td class="col-time">{_t(_sd.get('arrived_at'))}</td>
-            <td class="col-time">{_t(_sd.get('box_in_at'))}</td>
-            <td class="col-time">{_t(_sd.get('box_out_at'))}</td>
-            <td class="col-time">{_t(_sd.get('go_to_dump_at'))}</td>
+            <td class="col-time">{_log_fmt_time(route['started_at'])}</td>
+            <td class="col-time">{_log_fmt_time(s['dump_arrival'])}</td>
+            <td class="col-time">{_log_fmt_time(s['dump_departure'])}</td>
+            <td class="col-time">{_log_fmt_time(s['completed_at'])}</td>
+            <td class="col-center">{e(box_in) or dash}</td>
+            <td class="col-center">{e(box_out) or dash}</td>
+            <td class="col-num">{weight_display or dash}</td>
             <td class="col-center">{e(s['dump_site'] or '')}</td>
-            <td class="col-time">{_t(s['dump_arrival'])}</td>
-            <td class="col-time">{_t(s['dump_departure'])}</td>
-            <td class="col-center">{e(s['can_number'] or '')}</td>
-            <td class="col-num">{_w(s['scale_in_weight'])}</td>
-            <td class="col-num">{_w(s['scale_out_weight'])}</td>
-            <td class="col-num" style="font-weight:700;color:#FF9D5C;">{_w(s['net_tons'])}</td>
-            <td class="col-center">{e(s['dump_ticket_number'] or '')}</td>
-            <td class="col-center">
-                <span class="badge {e(s['status'])}" style="font-size:10px;">{e(s['status'])}</span>
-            </td>
+            <td class="col-center">{ticket_cell}</td>
         </tr>"""
+
+    _tot_extra = ""
+    if (route["route_type"] or "rolloff").lower() != "rolloff":
+        _tot_extra = f"Cans: {total_cans} &nbsp;&middot;&nbsp; Bags: {total_bags} &nbsp;|&nbsp; "
+
+    gallery = ""
+    if ticket_photos:
+        thumbs = ""
+        for tp in ticket_photos:
+            _href = f"/ticket-photo/{tp['ticket_id']}" if tp.get("ticket_id") else f"/{e(tp['photo'])}"
+            thumbs += (
+                f'<a href="{_href}" target="_blank" style="text-decoration:none;">'
+                f'<div style="display:inline-block;margin:8px;text-align:center;">'
+                f'<img src="/{e(tp["photo"])}" style="width:120px;height:120px;object-fit:cover;'
+                f'border-radius:8px;border:1px solid #444;">'
+                f'<div style="font-size:11px;margin-top:4px;color:#C9C9C0;">'
+                f'{e(tp["ticket"] or "Ticket")}<br>{e(tp["stop"][:25])}</div>'
+                f'</div></a>'
+            )
+        gallery = (
+            f'<div class="no-print" style="margin-top:20px;">'
+            f'<h3 style="font-size:1rem;">Ticket Photos ({len(ticket_photos)})</h3>'
+            f'<div>{thumbs}</div></div>'
+        )
 
     body = f"""
     <style>
-    .log-tbl {{ width:100%;border-collapse:collapse;font-size:12px;min-width:900px; }}
+    .log-tbl {{ width:100%;border-collapse:collapse;font-size:12px;min-width:1000px; }}
     .log-tbl th {{
         background:rgba(255,107,26,0.10);color:#FF9D5C;font-size:10px;font-weight:700;
         padding:8px 5px;border-bottom:1px solid rgba(255,107,26,0.22);
@@ -22911,28 +22845,35 @@ def route_daily_log(route_id):
     .log-tbl tr.row-done td {{ color:#3DDC84;opacity:.85; }}
     .log-tbl tr:hover td {{ background:rgba(255,107,26,0.04); }}
     .col-num   {{ text-align:right;font-family:var(--font-mono, monospace); }}
-    .col-time  {{ text-align:center;font-family:var(--font-mono, monospace);color:#D8D8D0; }}
+    .col-time  {{ text-align:center;font-family:var(--font-mono, monospace);color:#D8D8D0;white-space:nowrap; }}
     .col-center{{ text-align:center; }}
     .col-addr  {{ font-size:11px;font-family:var(--font-mono, monospace); }}
     .log-totals-row td {{ border-top:2px solid rgba(255,107,26,0.40);
                           font-weight:700;color:#fbbf24;font-size:13px; }}
+    @page {{ size: landscape; margin: 8mm; }}
     @media print {{
-        .sidebar,.btn,.hero p {{display:none!important;}}
-        body {{background:#fff!important;color:#000!important;}}
-        .card {{background:#fff!important;border:none!important;}}
-        .log-tbl th {{background:#eee!important;color:#000!important;}}
-        .log-tbl td {{color:#000!important;}}
-        .log-tbl tr.row-done td {{color:#007700!important;opacity:1;}}
-        .col-time {{color:#333!important;}}
+        .sidebar,.topnav,.btn,.no-print {{ display:none !important; }}
+        body {{ background:#fff !important;color:#000 !important; }}
+        .hero h1 {{ color:#000 !important; }}
+        .hero p {{ color:#333 !important; }}
+        .card {{ background:#fff !important;border:none !important;box-shadow:none !important; }}
+        .log-tbl {{ min-width:0; }}
+        .log-tbl th {{ background:#eee !important;color:#000 !important;font-size:9px;padding:5px 3px; }}
+        .log-tbl td {{ color:#000 !important;font-size:10px;padding:5px 3px;border-bottom:1px solid #ccc; }}
+        .log-tbl tr.row-done td {{ color:#007700 !important;opacity:1; }}
+        .log-tbl tr:hover td {{ background:none !important; }}
+        .col-time {{ color:#333 !important; }}
+        .log-totals-row td {{ color:#000 !important;border-top:2px solid #000; }}
     }}
     </style>
 
     <div class="hero">
         <h1>&#x1F4CB; Daily Route Log</h1>
         <p>{e(route['route_name'])} &nbsp;&#124;&nbsp; {e(route['route_date'])}
-           &nbsp;&#124;&nbsp; Driver: {e(route['driver_full'] or route['driver_name'] or 'Unassigned')}</p>
-        <p>Progress: {done_count}/{total_count} stops &nbsp;&#124;&nbsp;
-           Total Net Tons: <strong style="color:#fbbf24;">{total_net:.3f}</strong></p>
+           &nbsp;&#124;&nbsp; Driver: {e(route['driver_full'] or route['driver_name'] or 'Unassigned')}
+           &nbsp;&#124;&nbsp; Truck: {e(route['truck_name'] or '')}</p>
+        <p>Progress: {done_count}/{len(stops)} stops &nbsp;&#124;&nbsp;
+           {_tot_extra}Total Net Tons: <strong style="color:#fbbf24;">{total_tons:.2f}</strong></p>
         <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;">
             <a class="btn secondary" href="{url_for('view_route', route_id=route_id)}">&#8592; Route View</a>
             <button class="btn" onclick="window.print()">&#128424; Print</button>
@@ -22945,40 +22886,38 @@ def route_daily_log(route_id):
             <thead>
                 <tr>
                     <th>#</th>
+                    <th>Work Order</th>
                     <th style="text-align:left;">Customer</th>
                     <th style="text-align:left;">Address</th>
-                    <th>Action</th>
+                    <th>City</th>
                     <th>Size</th>
-                    <th>Arrived</th>
-                    <th>Box&nbsp;In</th>
-                    <th>Box&nbsp;Out</th>
-                    <th>To&nbsp;Dump</th>
+                    <th>Start</th>
+                    <th>Landfill Arrive</th>
+                    <th>Landfill Depart</th>
+                    <th>Finish</th>
+                    <th>Box In</th>
+                    <th>Box Out</th>
+                    <th>Tons</th>
                     <th>Dump Site</th>
-                    <th>Dump&nbsp;In</th>
-                    <th>Dump&nbsp;Out</th>
-                    <th>Can&nbsp;#</th>
-                    <th>Scale&nbsp;In</th>
-                    <th>Scale&nbsp;Out</th>
-                    <th>Net Tons</th>
-                    <th>Ticket&nbsp;#</th>
-                    <th>Status</th>
+                    <th>Ticket</th>
                 </tr>
             </thead>
             <tbody>
                 {rows}
                 <tr class="log-totals-row">
-                    <td colspan="15" style="text-align:right;padding-right:8px;">TOTAL NET TONS</td>
-                    <td class="col-num">{total_net:.3f}</td>
+                    <td colspan="12" style="text-align:right;padding-right:8px;">TOTAL TONS</td>
+                    <td class="col-num">{total_tons:.2f}</td>
                     <td colspan="2"></td>
                 </tr>
             </tbody>
         </table>
     </div>
+    {gallery}
     """
     return render_template_string(shell_page("Daily Route Log", body))
 
 
-# =========================================================
+
 # REORDER STOPS
 # =========================================================
 @app.route("/route/<int:route_id>/reorder", methods=["POST"])
