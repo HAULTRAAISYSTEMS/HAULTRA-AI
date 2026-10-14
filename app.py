@@ -13777,7 +13777,7 @@ def _message_thread_js():
         queueFor(currentThreadKey).forEach(function(it) {
             var meta, extra = '';
             if (it.state === 'failed') {
-                meta = 'Failed';
+                meta = 'Failed' + (it.failStatus ? ' · ' + it.failStatus : '');
                 extra = '<button type="button" class="msg-retry-btn" data-cid="' + it.cid + '">Retry</button>';
             } else { meta = (it.state === 'queued') ? 'Queued — will send' : 'Sending…'; }
             html += bubbleHtml(meta, it.body, 'msg-me msg-pending msg-' + it.state);
@@ -13854,12 +13854,30 @@ def _message_thread_js():
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF },
             credentials: 'same-origin',
             body: JSON.stringify({ body: item.body, client_id: item.cid }),
-        }).then(function(r) { return r.json().then(function(j) { return { ok: r.ok, j: j }; }); });
+        }).then(function(r) {
+            var status = r.status;
+            return r.json().then(
+                function(j) { return { ok: r.ok, status: status, j: j }; },
+                // Non-JSON error page (403/500 HTML) — still surface the status.
+                function() { return { ok: false, status: status, j: null }; }
+            );
+        }).catch(function() {
+            return { ok: false, status: 0, j: null };
+        });
     }
 
     function setState(cid, state) {
         var q = loadQueue();
         for (var i = 0; i < q.length; i++) { if (q[i].cid === cid) { q[i].state = state; } }
+        saveQueue(q); renderThread();
+    }
+    // Failed sends remember the HTTP status so the bubble can say WHY
+    // (0 = network, 403 = CSRF/session, 404 = route, 500 = server error).
+    function setFailed(cid, status) {
+        var q = loadQueue();
+        for (var i = 0; i < q.length; i++) {
+            if (q[i].cid === cid) { q[i].state = 'failed'; q[i].failStatus = status || 0; }
+        }
         saveQueue(q); renderThread();
     }
     function removeItem(cid) { saveQueue(loadQueue().filter(function(i) { return i.cid !== cid; })); }
@@ -13882,9 +13900,9 @@ def _message_thread_js():
                     removeItem(item.cid);
                     if (item.routeId === currentThreadKey) fetchThread(item.routeId);
                     else renderThread();
-                } else { setState(item.cid, 'failed'); }
+                } else { setFailed(item.cid, res.status); }
                 next();
-            }).catch(function() { setState(item.cid, navigator.onLine ? 'failed' : 'queued'); flushing = false; });
+            }).catch(function() { setFailed(item.cid, 0); flushing = false; });
         }
         next();
     }
@@ -13899,8 +13917,8 @@ def _message_thread_js():
                 if (res.ok && res.j && res.j.success) {
                     removeItem(item.cid);
                     fetchThread(routeId);
-                } else { setState(item.cid, 'failed'); }
-            }).catch(function() { setState(item.cid, navigator.onLine ? 'failed' : 'queued'); });
+                } else { setFailed(item.cid, res.status); }
+            }).catch(function() { setFailed(item.cid, 0); });
         }
     }
 
