@@ -6938,14 +6938,14 @@ def shell_page(title, body, extra_head=""):
             # Driver nav is deliberately work-DOING only — no parser / dispatch
             # tooling (that creates or assigns work) is reachable from here.
             primary_items = (
-                nav_link(url_for("dashboard"), 'My Day', path)
+                nav_link(url_for("dashboard"), 'Dashboard', path)
                 + nav_link(cab_href, 'Cab View', path)
                 + nav_link(url_for("messages_page"), icon('msg') + 'Messages', path)
                 + nav_link(url_for("inspection_new"), icon('clipboard') + 'Inspection', path)
             )
             # 2026-10-13: Driver bottom tabs
             bottom_tabs = (
-                _bottom_tab(url_for("dashboard"), icon('calendar'), 'My Day', path)
+                _bottom_tab(url_for("dashboard"), icon('calendar'), 'Dashboard', path)
                 + _bottom_tab(cab_href, icon('truck'), 'Cab View', path)
                 + _bottom_tab(url_for("messages_page"), icon('msg'), 'Messages', path,
                               badge=_msg_nav_badge(_msg_unread))
@@ -10463,19 +10463,8 @@ def driver_dashboard():
     co_settings = {k: _co_row[k] for k in _co_row.keys()} if _co_row else {}
     pay_period_start, pay_period_end = get_pay_period_bounds(co_settings)
 
-    # 2026-10-14: clock status for the My Day header — today's entry plus any
-    # forgotten clock-outs from earlier days. 2026-10-14 ~7:45 AM: only nag
-    # about the current pay week — older ones are stale (payroll's done) and
-    # just clutter the dashboard; they're still fixable in Clock In/Out and
-    # still flagged on the boss's Team Hours.
-    _clk_now, _clk_today = _driver_clock_now(session["company_id"])
-    _clk_today_entry = _driver_clock_entry(conn, session["company_id"], session["user_id"], _clk_today)
-    _clk_on = bool(_clk_today_entry and _clk_today_entry["clock_in_at"] and not _clk_today_entry["clock_out_at"])
-    _clk_in_at = (_clk_today_entry["clock_in_at"] or "")[11:16] if _clk_today_entry else ""
-    _forgot_all = _driver_open_clock_entries(conn, session["company_id"], session["user_id"], _clk_today)
-    _forgot = [f for f in _forgot_all
-               if pay_period_start <= (f["date"] or "") <= pay_period_end]
-    _forgot_older = len(_forgot_all) - len(_forgot)
+    # 2026-10-14: clock lives on the Driver Dashboard tab now; this page is
+    # the pay-week route history.
     conn.close()
 
     display_routes = [r for r in routes if pay_period_start <= r["route_date"] <= pay_period_end]
@@ -10509,60 +10498,11 @@ def driver_dashboard():
         if r['status'] in ('open', 'in_progress') and not r['cancelled_at']
     ])
 
-    # 2026-10-14: clock cards — on-the-clock pill + forgotten clock-out catch-up.
-    _csrf_tok = get_csrf_token()
-    _clock_cards = ""
-    if _clk_on:
-        _clock_cards += f"""
-    <div class="card" style="border-color:rgba(61,220,132,0.35);background:rgba(61,220,132,0.07);">
-        <div style="display:flex;align-items:center;gap:10px;">
-            <span style="width:12px;height:12px;border-radius:50%;background:#3DDC84;
-                  box-shadow:0 0 10px rgba(61,220,132,0.8);flex:none;"></span>
-            <div style="font-weight:800;color:#3DDC84;">ON THE CLOCK{" since " + _clk_in_at if _clk_in_at else ""}</div>
-        </div>
-    </div>
-        """
-    for _f in _forgot:
-        _fdate = _f["date"] or ""
-        try:
-            _flbl = datetime.strptime(_fdate, "%Y-%m-%d").strftime("%a, %b %-d")
-        except Exception:
-            _flbl = _fdate
-        _fin = (_f["clock_in_at"] or "")[11:16]
-        _clock_cards += f"""
-    <div class="card" style="border-color:rgba(255,82,82,0.4);background:rgba(255,82,82,0.06);">
-        <div style="font-weight:800;color:#FF6B6B;margin-bottom:6px;">&#9888; You didn't clock out {_flbl}</div>
-        <p class="muted small" style="margin:0 0 10px;">Clocked in{" at " + _fin if _fin else ""} — what time did you finish?</p>
-        <form method="POST" action="{url_for('driver_clock_out_now')}" style="display:flex;gap:8px;align-items:center;">
-            <input type="hidden" name="_csrf_token" value="{_csrf_tok}">
-            <input type="hidden" name="date" value="{e(_fdate)}">
-            <input type="hidden" name="next" value="{e(request.path)}">
-            <input type="time" name="time" required
-                   style="flex:1;padding:10px 12px;background:rgba(255,255,255,0.05);
-                          border:1px solid rgba(255,107,26,0.25);border-radius:8px;color:var(--text);
-                          font-size:16px;min-height:48px;">
-            <button type="submit" class="btn orange" style="min-height:48px;">Save</button>
-        </form>
-    </div>
-        """
-    if _forgot_older:
-        _plural = "" if _forgot_older == 1 else "s"
-        _verb = "needs" if _forgot_older == 1 else "need"
-        _clock_cards += f"""
-    <div style="text-align:center;margin:2px 0 12px;">
-        <a href="{url_for('driver_clock')}" style="color:var(--text-dim);font-size:13px;font-weight:600;">
-            {_forgot_older} older day{_plural} still {_verb} a clock-out — fix in Clock In/Out &#8250;
-        </a>
-    </div>
-        """
-
     body = f"""
     <div class="hero">
-        <h1>Driver Dashboard</h1>
-        <p>See your assigned routes, open them fast, and complete stops in the field.</p>
+        <h1>My Routes</h1>
+        <p>This pay week &mdash; every route assigned to you.</p>
     </div>
-
-    {_clock_cards}
 
     <div class="card">
         <h2 style="margin-bottom:4px;">This Pay Week</h2>
@@ -10644,60 +10584,236 @@ def dashboard():
     today = today_str()
 
     if user["role"] != "boss":
-        # ── Driver: simple personal view (Cab View covers the working driver UX) ──
-        routes = conn.execute("""
-            SELECT r.*, u.username AS assigned_username
+        # ══════════════════════════════════════════════════════════
+        # DRIVER DASHBOARD — the driver's route board. Lanes for each of
+        # their routes with the stops visible right on the board (view-only;
+        # no dispatch controls), plus a clock strip. Tap a lane → cab view.
+        # ══════════════════════════════════════════════════════════
+        _clk_now, _clk_today = _driver_clock_now(company_id)
+        _clk_entry = _driver_clock_entry(conn, company_id, user["id"], _clk_today)
+        _clk_on = bool(_clk_entry and _clk_entry["clock_in_at"]
+                       and not _clk_entry["clock_out_at"])
+        _clk_in_at = (_clk_entry["clock_in_at"] or "")[11:16] if _clk_entry else ""
+        _co_row = conn.execute("SELECT * FROM companies WHERE id=?", (company_id,)).fetchone()
+        _co_s = {k: _co_row[k] for k in _co_row.keys()} if _co_row else {}
+        _pp_start, _pp_end = get_pay_period_bounds(_co_s)
+        _forgot_all = _driver_open_clock_entries(conn, company_id, user["id"], _clk_today)
+        _forgot = [f for f in _forgot_all
+                   if _pp_start <= (f["date"] or "") <= _pp_end]
+        _forgot_older = len(_forgot_all) - len(_forgot)
+        _csrf_tok = get_csrf_token()
+
+        # Clock strip
+        if _clk_on:
+            _clock_strip = f"""
+        <div class="drv-clock on">
+            <span class="drv-clock-dot"></span>
+            <span>ON THE CLOCK since {_clk_in_at}</span>
+            <a href="{url_for('driver_clock')}">Clock In/Out</a>
+        </div>"""
+        else:
+            _clock_strip = f"""
+        <form method="POST" action="{url_for('driver_clock_in_now_ep')}" class="drv-clock off">
+            <input type="hidden" name="_csrf_token" value="{_csrf_tok}">
+            <input type="hidden" name="next" value="{e(request.path)}">
+            <span>Not clocked in</span>
+            <button type="submit">&#9200; CLOCK IN</button>
+        </form>"""
+
+        # Forgot prompts (pay week only)
+        _forgot_html = ""
+        for _f in _forgot:
+            _fdate = _f["date"] or ""
+            try:
+                _flbl = datetime.strptime(_fdate, "%Y-%m-%d").strftime("%a, %b %-d")
+            except Exception:
+                _flbl = _fdate
+            _fin = (_f["clock_in_at"] or "")[11:16]
+            _forgot_html += f"""
+        <div class="drv-forgot">
+            <div class="drv-forgot-title">&#9888; You didn't clock out {_flbl}</div>
+            <p>Clocked in{" at " + _fin if _fin else ""} — what time did you finish?</p>
+            <form method="POST" action="{url_for('driver_clock_out_now')}">
+                <input type="hidden" name="_csrf_token" value="{_csrf_tok}">
+                <input type="hidden" name="date" value="{e(_fdate)}">
+                <input type="hidden" name="next" value="{e(request.path)}">
+                <input type="time" name="time" required>
+                <button type="submit" class="btn orange">Save</button>
+            </form>
+        </div>"""
+        if _forgot_older:
+            _pl = "" if _forgot_older == 1 else "s"
+            _vb = "needs" if _forgot_older == 1 else "need"
+            _forgot_html += f"""
+        <div class="drv-older">
+            <a href="{url_for('driver_clock')}">{_forgot_older} older day{_pl} still {_vb} a clock-out — fix in Clock In/Out &#8250;</a>
+        </div>"""
+
+        # Route lanes — active first, then by date
+        _routes = conn.execute("""
+            SELECT r.*,
+                (SELECT COUNT(*) FROM stops s
+                 WHERE s.route_id=r.id AND s.cancelled_at IS NULL) AS total_stops,
+                (SELECT COUNT(*) FROM stops s
+                 WHERE s.route_id=r.id AND s.status='completed'
+                   AND s.cancelled_at IS NULL) AS done_stops
             FROM routes r
-            LEFT JOIN users u ON r.assigned_to = u.id
-            WHERE r.assigned_to = ? AND r.company_id = ?
-            ORDER BY r.route_date DESC, r.id DESC LIMIT 8
+            WHERE r.assigned_to=? AND r.company_id=?
+            ORDER BY CASE r.status WHEN 'in_progress' THEN 0
+                                   WHEN 'open' THEN 1 ELSE 2 END,
+                     r.route_date DESC, r.id DESC
+            LIMIT 8
         """, (user["id"], company_id)).fetchall()
-        _rc = conn.execute("""
-            SELECT COUNT(*) AS total, SUM(status='open') AS open,
-                   SUM(status='in_progress') AS progress, SUM(status='completed') AS completed
-            FROM routes WHERE assigned_to=? AND company_id=?
-        """, (user["id"], company_id)).fetchone()
-        route_total, open_routes, progress_routes, completed_routes = (
-            _rc["total"], _rc["open"] or 0, _rc["progress"] or 0, _rc["completed"] or 0
-        )
-        stop_total = conn.execute(
-            "SELECT COUNT(*) n FROM stops s JOIN routes r ON s.route_id=r.id WHERE r.assigned_to=? AND r.company_id=?",
-            (user["id"], company_id)
-        ).fetchone()["n"]
+
+        _lanes = ""
+        _active_n = 0
+        _rc_total = 0
+        _stop_total = 0
+        for _r in _routes:
+            _rc_total += 1
+            if _r["status"] in ("open", "in_progress"):
+                _active_n += 1
+            _stops = conn.execute("""
+                SELECT stop_order, action, customer_name, address, city, status
+                FROM stops WHERE route_id=? AND cancelled_at IS NULL
+                ORDER BY stop_order, id
+            """, (_r["id"],)).fetchall()
+            _total = _r["total_stops"] or 0
+            _done = _r["done_stops"] or 0
+            _stop_total += _total
+            _pct = int(100 * _done / _total) if _total else 0
+            _status_cls = {"open": "open", "in_progress": "progress",
+                           "completed": "done"}.get(_r["status"], "")
+            _status_lbl = {"open": "NOT STARTED", "in_progress": "IN PROGRESS",
+                           "completed": "DONE"}.get(_r["status"],
+                                                   (_r["status"] or "").upper())
+            # Stop rows — first incomplete stop is "current"
+            _stop_rows = ""
+            _cur_marked = False
+            for _s in _stops:
+                _s_done = _s["status"] == "completed"
+                if _s_done:
+                    _dot = '<span class="drv-dot done">&#10003;</span>'
+                elif not _cur_marked:
+                    _dot = '<span class="drv-dot cur">&#9654;</span>'
+                    _cur_marked = True
+                else:
+                    _dot = '<span class="drv-dot todo"></span>'
+                _who = (_s["customer_name"] or _s["address"] or "Stop").strip()
+                _where = (_s["address"] or "").strip()
+                _sub = (" — " + _where) if _where and _where != _who else ""
+                _act = (_s["action"] or "").strip().upper()
+                _stop_rows += (
+                    f'<div class="drv-stop">{_dot}'
+                    + (f'<span class="drv-act">{e(_act)}</span>' if _act else "")
+                    + f'<span class="drv-stop-name">{e(_who)}{e(_sub)}</span></div>'
+                )
+            if not _stop_rows:
+                _stop_rows = '<div class="drv-stop"><span class="drv-stop-name muted">No stops yet.</span></div>'
+            _cab = url_for("driver_route_detail", route_id=_r["id"])
+            _lanes += f"""
+        <a class="drv-lane" href="{_cab}">
+            <div class="drv-lane-head">
+                <div>
+                    <div class="drv-lane-name">{e(_r["route_name"])}</div>
+                    <div class="drv-lane-date">{e(_r["route_date"])}</div>
+                </div>
+                <span class="drv-status {_status_cls}">{_status_lbl}</span>
+            </div>
+            <div class="drv-progress"><div style="width:{_pct}%;"></div></div>
+            <div class="drv-progress-lbl">{_done} of {_total} stops</div>
+            <div class="drv-stops">{_stop_rows}</div>
+            <div class="drv-lane-foot">Open in Cab View &#8250;</div>
+        </a>"""
+        if not _lanes:
+            _lanes = '<div class="drv-empty">No routes assigned yet.</div>'
         conn.close()
 
-        route_rows = ""
-        for r in routes:
-            route_rows += f"""
-<tr>
-    <td>{e(r['route_date'])}</td>
-    <td><a href="{url_for('driver_route_detail', route_id=r['id'])}">{e(r['route_name'])}</a></td>
-    <td><span class="badge {e(r['status'])}">{e(r['status'])}</span></td>
-</tr>
-"""
         body = f"""
+    <style>
+      .drv-clock {{ display:flex; align-items:center; gap:10px; border-radius:14px;
+        padding:14px 16px; margin-bottom:14px; font-weight:700; }}
+      .drv-clock.on {{ border:1px solid rgba(61,220,132,.35); background:rgba(61,220,132,.07);
+        color:#3DDC84; }}
+      .drv-clock-dot {{ width:12px; height:12px; border-radius:50%; background:#3DDC84;
+        box-shadow:0 0 10px rgba(61,220,132,.8); flex:none; }}
+      .drv-clock a {{ margin-left:auto; color:#3DDC84; font-size:13px; }}
+      .drv-clock.off {{ border:1px solid rgba(255,107,26,.35); background:rgba(255,107,26,.07);
+        color:#FF9D5C; }}
+      .drv-clock.off button {{ margin-left:auto; background:var(--orange,#FF6B1A); color:#111;
+        border:none; border-radius:10px; font-weight:800; padding:10px 18px; cursor:pointer;
+        min-height:48px; }}
+      .drv-forgot {{ border:1px solid rgba(255,82,82,.4); background:rgba(255,82,82,.06);
+        border-radius:14px; padding:14px 16px; margin-bottom:12px; }}
+      .drv-forgot-title {{ font-weight:800; color:#FF6B6B; margin-bottom:6px; }}
+      .drv-forgot p {{ color:var(--text-dim); font-size:13px; margin:0 0 10px; }}
+      .drv-forgot form {{ display:flex; gap:8px; }}
+      .drv-forgot input[type=time] {{ flex:1; padding:10px 12px; background:rgba(255,255,255,.05);
+        border:1px solid rgba(255,107,26,.25); border-radius:8px; color:var(--text);
+        font-size:16px; min-height:48px; }}
+      .drv-forgot button {{ min-height:48px; }}
+      .drv-older {{ text-align:center; margin:2px 0 12px; }}
+      .drv-older a {{ color:var(--text-dim); font-size:13px; font-weight:600; }}
+      .drv-stats {{ display:flex; gap:10px; margin-bottom:16px; }}
+      .drv-stat {{ flex:1; background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.07);
+        border-radius:12px; padding:12px 8px; text-align:center; }}
+      .drv-stat .n {{ font-size:1.6rem; font-weight:800; line-height:1; }}
+      .drv-stat .l {{ margin-top:6px; font-size:.68rem; letter-spacing:.4px; text-transform:uppercase;
+        color:var(--text-muted); }}
+      .drv-board-lbl {{ font-size:11px; font-weight:700; letter-spacing:1.2px; text-transform:uppercase;
+        color:#55554C; margin:0 0 12px; }}
+      .drv-lane {{ display:block; background:var(--card-bg,#171717);
+        border:1px solid rgba(255,255,255,.08); border-radius:16px; padding:16px;
+        margin-bottom:14px; text-decoration:none; color:var(--text); }}
+      .drv-lane:active {{ filter:brightness(1.15); }}
+      .drv-lane-head {{ display:flex; align-items:flex-start; justify-content:space-between;
+        gap:10px; margin-bottom:10px; }}
+      .drv-lane-name {{ font-size:1.15rem; font-weight:800; word-break:break-word; }}
+      .drv-lane-date {{ color:var(--text-muted); font-size:.85rem; margin-top:2px; }}
+      .drv-status {{ flex:none; font-size:.68rem; font-weight:800; letter-spacing:.6px;
+        padding:6px 10px; border-radius:999px; }}
+      .drv-status.open {{ background:rgba(255,255,255,.08); color:var(--text-dim); }}
+      .drv-status.progress {{ background:rgba(255,107,26,.16); color:#FF8C42; }}
+      .drv-status.done {{ background:rgba(61,220,132,.14); color:#3DDC84; }}
+      .drv-progress {{ height:8px; border-radius:4px; background:rgba(255,255,255,.08);
+        overflow:hidden; }}
+      .drv-progress div {{ height:100%; border-radius:4px;
+        background:linear-gradient(90deg,#FF6B1A,#FF9D5C); }}
+      .drv-progress-lbl {{ font-size:.75rem; color:var(--text-muted); margin:6px 0 10px; }}
+      .drv-stop {{ display:flex; align-items:center; gap:8px; padding:7px 0;
+        border-top:1px solid rgba(255,255,255,.05); font-size:.9rem; }}
+      .drv-dot {{ flex:none; width:22px; height:22px; border-radius:50%;
+        display:inline-flex; align-items:center; justify-content:center; font-size:.7rem; }}
+      .drv-dot.done {{ background:rgba(61,220,132,.18); color:#3DDC84; }}
+      .drv-dot.cur {{ background:rgba(255,107,26,.2); color:#FF8C42; }}
+      .drv-dot.todo {{ border:2px solid rgba(255,255,255,.18); }}
+      .drv-act {{ flex:none; font-size:.66rem; font-weight:800; letter-spacing:.4px;
+        color:#FF8C42; background:rgba(255,107,26,.12); padding:4px 8px; border-radius:6px; }}
+      .drv-stop-name {{ color:var(--text); overflow:hidden; text-overflow:ellipsis;
+        white-space:nowrap; }}
+      .drv-stop-name.muted {{ color:var(--text-muted); }}
+      .drv-lane-foot {{ margin-top:10px; text-align:right; color:#FF8C42; font-weight:700;
+        font-size:.85rem; }}
+      .drv-empty {{ text-align:center; color:var(--text-muted); padding:30px 0; }}
+      .drv-more {{ text-align:center; margin-top:4px; }}
+      .drv-more a {{ color:var(--text-dim); font-size:13px; font-weight:600; }}
+    </style>
     <div class="hero">
-        <h1>My Day</h1>
-        <p>{e(today)} &mdash; your assigned routes and stops.</p>
+        <h1>Driver Dashboard</h1>
+        <p>{e(today)} &mdash; your board, your routes, your stops.</p>
     </div>
-    <div class="grid" style="margin-bottom:20px;">
-        <div class="stat"><div class="label">Total Routes</div><div class="num">{route_total}</div></div>
-        <div class="stat"><div class="label">Open</div><div class="num">{open_routes}</div></div>
-        <div class="stat"><div class="label">In Progress</div><div class="num" style="color:#FF6B1A;">{progress_routes}</div></div>
-        <div class="stat"><div class="label">Completed</div><div class="num" style="color:#3DDC84;">{completed_routes}</div></div>
-        <div class="stat"><div class="label">Total Stops</div><div class="num">{stop_total}</div></div>
+    {_clock_strip}
+    {_forgot_html}
+    <div class="drv-stats">
+        <div class="drv-stat"><div class="n" style="color:#FF8C42;">{_active_n}</div><div class="l">Active</div></div>
+        <div class="drv-stat"><div class="n">{_rc_total}</div><div class="l">Routes</div></div>
+        <div class="drv-stat"><div class="n">{_stop_total}</div><div class="l">Stops</div></div>
     </div>
-    <div class="card">
-        <h2 style="margin:0 0 14px;font-size:11px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:#55554C;">My Routes</h2>
-        <div class="table-wrap">
-            <table>
-                <thead><tr><th>Date</th><th>Route</th><th>Status</th></tr></thead>
-                <tbody>{route_rows if route_rows else '<tr><td colspan="3" style="color:#55554C;padding:20px 12px;">No routes yet.</td></tr>'}</tbody>
-            </table>
-        </div>
-    </div>
+    <h2 class="drv-board-lbl">Route Board</h2>
+    {_lanes}
+    <div class="drv-more"><a href="{url_for('driver_dashboard')}">Full route history &#8250;</a></div>
     """
-        return render_template_string(shell_page("My Day", body))
+        return render_template_string(shell_page("Driver Dashboard", body))
 
     # ══════════════════════════════════════════════════════════
     # OWNER DASHBOARD (boss) — real data, "—" for anything we don't track
