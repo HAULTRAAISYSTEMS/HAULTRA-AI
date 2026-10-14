@@ -6963,6 +6963,7 @@ def shell_page(title, body, extra_head=""):
             if is_disp:
                 _btabs.append(_bottom_tab(url_for("routes_page"), icon('board'), 'Board', path))
                 _btabs.append(_bottom_tab('/parser', icon('box'), 'Roll-Off', path))
+                _btabs.append(_bottom_tab('/garbage-dispatch', icon('truck'), 'Garbage', path))
             if is_cm:
                 _btabs.append(_bottom_tab(url_for("requests_page"), icon('inbox'), 'Requests', path,
                                           badge=_nav_badge('req-nav-badge', _pending_reqs)))
