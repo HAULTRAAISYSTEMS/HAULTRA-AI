@@ -3608,6 +3608,24 @@ def init_db():
     )
     """)
 
+    # --- Direct boss<->driver messages: the "contact the driver for anything"
+    # channel. Unlike messages (which are glued to a route), these belong to a
+    # driver, so either side can reach the other without a route context. ---
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS direct_messages (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id     INTEGER NOT NULL,
+        driver_user_id INTEGER NOT NULL,
+        sender_user_id INTEGER NOT NULL,
+        body           TEXT NOT NULL,
+        created_at     TEXT NOT NULL,
+        read_at        TEXT,
+        client_id      TEXT,
+        FOREIGN KEY (driver_user_id) REFERENCES users(id),
+        FOREIGN KEY (sender_user_id) REFERENCES users(id)
+    )
+    """)
+
     # --- Password reset tokens: single-use, 1-hour expiry, only the hash is stored ---
     cur.execute("""
     CREATE TABLE IF NOT EXISTS password_reset_tokens (
@@ -6592,6 +6610,47 @@ def _bottom_tab(href, icon_html, label, current_path, badge=""):
             f'<span class="haul-tab-glow"></span></a>')
 
 
+def _msg_nav_badge(n):
+    """Unread-messages badge (id="msg-nav-badge") for the driver tab and the
+    boss envelope. Inline display:none at zero — see _nav_badge's note."""
+    return (
+        '<span id="msg-nav-badge" style="display:%s;min-width:16px;padding:1px 6px;'
+        'margin-left:6px;border-radius:999px;background:var(--cyan);color:#121212;'
+        'font-size:10px;font-weight:800;line-height:16px;text-align:center;'
+        'vertical-align:middle;"%s>%s</span>'
+        % ("inline-block" if n else "none", "" if n else " hidden", n or "")
+    )
+
+
+# 2026-10-14: Keeps #msg-nav-badge fresh on every page — polls the unread count
+# every 30s and on tab refocus. Exposes window.refreshMsgBadge() so the inbox
+# can clear the badge the moment a thread is read.
+_MSG_BADGE_POLL_JS = """
+<script>
+(function() {
+    function setBadge(n) {
+        var b = document.getElementById('msg-nav-badge');
+        if (!b) return;
+        b.style.display = n ? 'inline-block' : 'none';
+        if (n) b.removeAttribute('hidden');
+        b.textContent = n > 99 ? '99+' : (n || '');
+    }
+    window.refreshMsgBadge = function() {
+        fetch('/api/messages/unread-count', { credentials: 'same-origin' })
+            .then(function(r) { return r.json(); })
+            .then(function(d) { setBadge(d.count || 0); })
+            .catch(function() {});
+    };
+    window.refreshMsgBadge();
+    setInterval(window.refreshMsgBadge, 30000);
+    document.addEventListener('visibilitychange', function() {
+        if (!document.hidden) window.refreshMsgBadge();
+    });
+})();
+</script>
+"""
+
+
 def _bottom_tab_more():
     # 2026-10-13: Anchor (not button) so it renders identically to other tabs
     return (f'<a class="haul-tab" href="javascript:void(0)" onclick="openMoreSheet()">'
@@ -6728,6 +6787,18 @@ def shell_page(title, body, extra_head=""):
             # driver channel — not just the customer-portal notices the old
             # Alerts page could see.
             _alert_open = alert_open_count(_rc, user["company_id"])
+            # 2026-10-14: unread across route threads + direct channels — seeds
+            # the boss message envelope badge.
+            try:
+                _msg_unread_boss = _rc.execute("""
+                    SELECT (SELECT COUNT(*) FROM messages m JOIN routes r ON r.id=m.route_id
+                             WHERE r.company_id=? AND m.sender_user_id != ? AND m.read_at IS NULL)
+                         + (SELECT COUNT(*) FROM direct_messages
+                             WHERE company_id=? AND sender_user_id != ? AND read_at IS NULL)
+                """, (session.get("company_id"), user["id"],
+                      session.get("company_id"), user["id"])).fetchone()[0] or 0
+            except Exception:
+                _msg_unread_boss = 0
 
             _parts = []
             if is_disp:
@@ -6763,13 +6834,24 @@ def shell_page(title, body, extra_head=""):
                                           badge=_nav_badge('req-nav-badge', _pending_reqs)))
                 _btabs.append(_bottom_tab(url_for("customers_page"), icon('users'), 'Customers', path))
             _btabs.append(_bottom_tab_more())
-            bottom_tabs = "".join(_btabs)
+            bottom_tabs = "".join(_btabs) + _MSG_BADGE_POLL_JS
             # NOTE: unassigned_work + customers_page routes are defined in the
             # same module (sections 3 & 4); url_for resolves them at request
             # time, so ordering within the file doesn't matter.
         else:
             _cab_conn = get_db()
             _active_route_id = driver_active_route_id(_cab_conn, user["id"])
+            # 2026-10-14: unread messages across route threads + the direct
+            # boss channel — seeds the Messages tab badge.
+            try:
+                _msg_unread = _cab_conn.execute("""
+                    SELECT (SELECT COUNT(*) FROM messages m JOIN routes r ON r.id=m.route_id
+                             WHERE r.company_id=? AND r.assigned_to=? AND m.sender_user_id != ? AND m.read_at IS NULL)
+                         + (SELECT COUNT(*) FROM direct_messages
+                             WHERE driver_user_id=? AND sender_user_id != ? AND read_at IS NULL)
+                """, (user["company_id"], user["id"], user["id"], user["id"], user["id"])).fetchone()[0] or 0
+            except Exception:
+                _msg_unread = 0
             _cab_conn.close()
             cab_href = (url_for('driver_route_detail', route_id=_active_route_id)
                         if _active_route_id else url_for('driver_dashboard'))
@@ -6778,15 +6860,18 @@ def shell_page(title, body, extra_head=""):
             primary_items = (
                 nav_link(url_for("dashboard"), 'My Day', path)
                 + nav_link(cab_href, 'Cab View', path)
+                + nav_link(url_for("messages_page"), icon('msg') + 'Messages', path)
                 + nav_link(url_for("inspection_new"), icon('clipboard') + 'Inspection', path)
             )
             # 2026-10-13: Driver bottom tabs
             bottom_tabs = (
                 _bottom_tab(url_for("dashboard"), icon('calendar'), 'My Day', path)
                 + _bottom_tab(cab_href, icon('truck'), 'Cab View', path)
+                + _bottom_tab(url_for("messages_page"), icon('msg'), 'Messages', path,
+                              badge=_msg_nav_badge(_msg_unread))
                 + _bottom_tab(url_for("inspection_new"), icon('clipboard'), 'Inspect', path)
                 + _bottom_tab_more()
-            )
+            ) + _MSG_BADGE_POLL_JS
 
         # ── Overflow "More" items (role-aware) ───────────────────────────
         # Boss "More" is deliberately limited to these three — Driver Hours now
@@ -6829,6 +6914,15 @@ def shell_page(title, body, extra_head=""):
             if session.get("is_superadmin") else ""
 
         co_pill = (f'<span class="company-pill">{e(_co_name)}</span>') if _co_name else ""
+        # 2026-10-14: boss message envelope — inbox for direct + route threads.
+        _msg_env = ""
+        if user["role"] == "boss":
+            _msg_env = (
+                f'<a href="{url_for("messages_page")}" aria-label="Messages" title="Messages" '
+                f'style="position:relative;display:inline-flex;align-items:center;color:inherit;'
+                f'text-decoration:none;padding:8px 6px;">'
+                f'{icon("msg")}{_msg_nav_badge(_msg_unread_boss)}</a>'
+            )
 
         sidebar = f"""
         <nav class="topnav">
@@ -6839,7 +6933,7 @@ def shell_page(title, body, extra_head=""):
                 </div>
                 <!-- 2026-10-13: Utility bar — company only (pull-to-refresh replaces reload btn) -->
                 <div class="topnav-utility">
-                    {co_pill}
+                    {co_pill}{_msg_env}
                 </div>
                 <div class="topnav-right">
                     <details class="topnav-more">
@@ -13618,10 +13712,19 @@ def _message_thread_js():
     return """
 (function() {
     var CSRF = (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
-    var currentThreadRouteId = null;
+    var currentThreadKey = null;
     var currentThreadTitle = '';
 
     function el(id) { return document.getElementById(id); }
+
+    // Thread keys: legacy numeric route ids ("45"), "route:45", or "dm:7" for
+    // the direct boss<->driver channel. One modal serves all three.
+    function threadUrl(key) {
+        var s = String(key == null ? '' : key);
+        if (s.indexOf('dm:') === 0) return '/dm/' + s.slice(3) + '/messages';
+        if (s.indexOf('route:') === 0) return '/route/' + s.slice(6) + '/messages';
+        return '/route/' + s + '/messages';
+    }
 
     function escapeHtml(s) {
         var d = document.createElement('div');
@@ -13671,7 +13774,7 @@ def _message_thread_js():
                 { path: m.sender_avatar, initial: m.sender_initial, color: m.sender_color });
         }).join('');
         // Optimistic / queued / failed bubbles for THIS thread, always mine.
-        queueFor(currentThreadRouteId).forEach(function(it) {
+        queueFor(currentThreadKey).forEach(function(it) {
             var meta, extra = '';
             if (it.state === 'failed') {
                 meta = 'Failed';
@@ -13691,8 +13794,8 @@ def _message_thread_js():
         list.scrollTop = list.scrollHeight;
     }
 
-    function fetchThread(routeId, cb) {
-        fetch('/route/' + routeId + '/messages', { credentials: 'same-origin' })
+    function fetchThread(key, cb) {
+        fetch(threadUrl(key), { credentials: 'same-origin' })
             .then(function(r) { return r.json(); })
             .then(function(data) {
                 serverMessages = data.messages || [];
@@ -13707,8 +13810,9 @@ def _message_thread_js():
             });
     }
 
-    window.openMessageThread = function(routeId, title) {
-        currentThreadRouteId = routeId;
+    // key: legacy numeric route id, "route:<id>", or "dm:<driver_id>".
+    window.openMessageThread = function(key, title) {
+        currentThreadKey = key;
         currentThreadTitle = title || 'Messages';
         lastRenderedMax = 0;
         serverMessages = [];
@@ -13722,7 +13826,7 @@ def _message_thread_js():
     // Called by the Cab View SSE stream when a new message lands while the
     // thread is open, so it updates live without a manual re-open.
     window.refreshOpenThread = function() {
-        if (currentThreadRouteId != null) fetchThread(currentThreadRouteId);
+        if (currentThreadKey != null) fetchThread(currentThreadKey);
     };
 
     // Boss releases the stops parked behind a Go NOW vendor visit.
@@ -13745,7 +13849,7 @@ def _message_thread_js():
     // Send with an idempotent client_id: the row is inserted once no matter how
     // many times it's retried or flushed, so nothing double-sends.
     function attemptSend(item) {
-        return fetch('/route/' + item.routeId + '/messages', {
+        return fetch(threadUrl(item.routeId), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF },
             credentials: 'same-origin',
@@ -13776,7 +13880,7 @@ def _message_thread_js():
             attemptSend(item).then(function(res) {
                 if (res.ok && res.j && res.j.success) {
                     removeItem(item.cid);
-                    if (item.routeId === currentThreadRouteId) fetchThread(item.routeId);
+                    if (item.routeId === currentThreadKey) fetchThread(item.routeId);
                     else renderThread();
                 } else { setState(item.cid, 'failed'); }
                 next();
@@ -13810,8 +13914,8 @@ def _message_thread_js():
     }
 
     function postMessage(body) {
-        if (!currentThreadRouteId || !body) return;
-        enqueueAndSend(currentThreadRouteId, body);
+        if (!currentThreadKey || !body) return;
+        enqueueAndSend(currentThreadKey, body);
     }
 
     window.sendQuickMessage = function(text) { postMessage(text); };
@@ -19357,6 +19461,301 @@ def route_messages(route_id):
     ]})
 
 
+@app.route("/dm/<int:driver_id>/messages", methods=["GET", "POST"])
+@login_required
+def direct_messages_api(driver_id):
+    """Direct boss<->driver thread (no route). Same per-viewer unread semantics
+    as route_messages: unread = not sent by me AND read_at IS NULL. Drivers can
+    only touch their own thread; bosses can touch any driver in their company."""
+    conn = get_db()
+    me = session["user_id"]
+    role = session.get("role")
+    driver = conn.execute(
+        "SELECT id, username, full_name FROM users WHERE id=? AND role='driver'",
+        (driver_id,),
+    ).fetchone()
+    if not driver:
+        conn.close()
+        return jsonify({"error": "Driver not found."}), 404
+    if role == "boss":
+        same_co = conn.execute(
+            "SELECT 1 FROM users WHERE id=? AND company_id=?",
+            (driver_id, cid()),
+        ).fetchone()
+        if not same_co:
+            conn.close()
+            return jsonify({"error": "Access denied."}), 403
+    elif driver_id != me:
+        conn.close()
+        return jsonify({"error": "Access denied."}), 403
+
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        body = (data.get("body") or "").strip()[:500]
+        if not body:
+            conn.close()
+            return jsonify({"error": "Message can't be empty."}), 400
+        client_id = (str(data.get("client_id") or "").strip() or None)
+        if client_id:
+            dup = conn.execute(
+                "SELECT id FROM direct_messages WHERE driver_user_id=? AND sender_user_id=? AND client_id=?",
+                (driver_id, me, client_id),
+            ).fetchone()
+            if dup:
+                conn.close()
+                return jsonify({"success": True, "id": dup["id"], "duplicate": True})
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO direct_messages (company_id, driver_user_id, sender_user_id, body, created_at, client_id)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (cid(), driver_id, me, body, now_ts(), client_id),
+        )
+        msg_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True, "id": msg_id})
+
+    # GET — mark the other party's messages read, then return the full thread.
+    conn.execute(
+        "UPDATE direct_messages SET read_at=? WHERE driver_user_id=? AND sender_user_id != ? AND read_at IS NULL",
+        (now_ts(), driver_id, me),
+    )
+    conn.commit()
+    rows = conn.execute("""
+        SELECT m.id, m.sender_user_id, u.username AS sender_username, u.role AS sender_role,
+               u.full_name AS sender_full_name, u.avatar_path AS sender_avatar,
+               m.body, m.created_at
+        FROM direct_messages m JOIN users u ON u.id = m.sender_user_id
+        WHERE m.driver_user_id=?
+        ORDER BY m.id ASC
+    """, (driver_id,)).fetchall()
+    conn.close()
+    return jsonify({"messages": [
+        {
+            "id": r["id"], "sender_username": r["sender_username"], "sender_role": r["sender_role"],
+            "body": r["body"], "created_at": r["created_at"],
+            "is_me": r["sender_user_id"] == me,
+            "sender_avatar": ("/" + r["sender_avatar"]) if (r["sender_avatar"] or "").strip() else None,
+            "sender_initial": _avatar_initials(r["sender_full_name"], r["sender_username"]),
+            "sender_color": _avatar_color(r["sender_user_id"]),
+        }
+        for r in rows
+    ]})
+
+
+@app.route("/api/messages/threads")
+@login_required
+def message_threads_api():
+    """Inbox data: direct boss<->driver thread(s) + per-route threads, each with
+    last-message preview, timestamp, and per-viewer unread count."""
+    conn = get_db()
+    me = session["user_id"]
+    role = session.get("role")
+    company = cid()
+
+    def _fmt_ts(ts):
+        if not ts:
+            return ""
+        try:
+            dt = datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S")
+            return dt.strftime("%b %-d, %-I:%M %p")
+        except Exception:
+            return ts[:16]
+
+    def _route_title(r):
+        name = (r["route_name"] or "Route").strip()
+        try:
+            d = datetime.strptime((r["route_date"] or "")[:10], "%Y-%m-%d").strftime("%b %-d")
+        except Exception:
+            d = (r["route_date"] or "")[:10]
+        base = ("%s · %s" % (name, d)).strip(" ·")
+        if role == "boss" and r["driver_name"]:
+            base = "%s — %s" % (r["driver_name"], base)
+        return base
+
+    routes, direct = [], []
+    if role == "driver":
+        for r in conn.execute("""
+            SELECT r.id, r.route_name, r.route_date,
+                   (SELECT m2.body FROM messages m2 WHERE m2.route_id=r.id ORDER BY m2.id DESC LIMIT 1) AS last_body,
+                   MAX(m.created_at) AS last_at,
+                   SUM(CASE WHEN m.sender_user_id != ? AND m.read_at IS NULL THEN 1 ELSE 0 END) AS unread
+            FROM messages m JOIN routes r ON r.id = m.route_id
+            WHERE r.company_id=? AND r.assigned_to=?
+            GROUP BY r.id ORDER BY last_at DESC LIMIT 50
+        """, (me, company, me)).fetchall():
+            routes.append({
+                "kind": "route", "key": "route:%d" % r["id"], "route_id": r["id"],
+                "title": _route_title(r), "url": "/route/%d/messages" % r["id"],
+                "last_body": r["last_body"], "last_at": _fmt_ts(r["last_at"]),
+                "unread": r["unread"] or 0,
+            })
+        d = conn.execute("""
+            SELECT (SELECT d2.body FROM direct_messages d2 WHERE d2.driver_user_id=? ORDER BY d2.id DESC LIMIT 1) AS last_body,
+                   MAX(created_at) AS last_at,
+                   SUM(CASE WHEN sender_user_id != ? AND read_at IS NULL THEN 1 ELSE 0 END) AS unread
+            FROM direct_messages WHERE driver_user_id=?
+        """, (me, me, me)).fetchone()
+        direct.append({
+            "kind": "direct", "key": "direct:%d" % me, "driver_id": me,
+            "title": "Boss", "url": "/dm/%d/messages" % me,
+            "last_body": d["last_body"], "last_at": _fmt_ts(d["last_at"]),
+            "unread": d["unread"] or 0,
+        })
+    else:
+        for r in conn.execute("""
+            SELECT r.id, r.route_name, r.route_date, u.username AS driver_name,
+                   (SELECT m2.body FROM messages m2 WHERE m2.route_id=r.id ORDER BY m2.id DESC LIMIT 1) AS last_body,
+                   MAX(m.created_at) AS last_at,
+                   SUM(CASE WHEN m.sender_user_id != ? AND m.read_at IS NULL THEN 1 ELSE 0 END) AS unread
+            FROM messages m JOIN routes r ON r.id = m.route_id
+                 LEFT JOIN users u ON u.id = r.assigned_to
+            WHERE r.company_id=?
+            GROUP BY r.id ORDER BY last_at DESC LIMIT 30
+        """, (me, company)).fetchall():
+            routes.append({
+                "kind": "route", "key": "route:%d" % r["id"], "route_id": r["id"],
+                "title": _route_title(r), "url": "/route/%d/messages" % r["id"],
+                "last_body": r["last_body"], "last_at": _fmt_ts(r["last_at"]),
+                "unread": r["unread"] or 0,
+            })
+        for u in conn.execute("""
+            SELECT u.id, u.username, u.full_name,
+                   (SELECT d2.body FROM direct_messages d2 WHERE d2.driver_user_id=u.id ORDER BY d2.id DESC LIMIT 1) AS last_body,
+                   (SELECT MAX(d2.created_at) FROM direct_messages d2 WHERE d2.driver_user_id=u.id) AS last_at,
+                   (SELECT COUNT(*) FROM direct_messages d2 WHERE d2.driver_user_id=u.id AND d2.sender_user_id != ? AND d2.read_at IS NULL) AS unread
+            FROM users u WHERE u.company_id=? AND u.role='driver' AND COALESCE(u.is_active,1)=1
+            ORDER BY last_at DESC
+        """, (me, company)).fetchall():
+            direct.append({
+                "kind": "direct", "key": "direct:%d" % u["id"], "driver_id": u["id"],
+                "title": (u["full_name"] or u["username"]).strip(),
+                "url": "/dm/%d/messages" % u["id"],
+                "last_body": u["last_body"], "last_at": _fmt_ts(u["last_at"]),
+                "unread": u["unread"] or 0,
+            })
+    conn.close()
+    return jsonify({"direct": direct, "routes": routes})
+
+
+@app.route("/api/messages/unread-count")
+@login_required
+def message_unread_count():
+    """Total unread across route threads + direct thread(s) — drives the nav badge."""
+    conn = get_db()
+    me = session["user_id"]
+    role = session.get("role")
+    company = cid()
+    if role == "driver":
+        n = conn.execute("""
+            SELECT (SELECT COUNT(*) FROM messages m JOIN routes r ON r.id=m.route_id
+                     WHERE r.company_id=? AND r.assigned_to=? AND m.sender_user_id != ? AND m.read_at IS NULL)
+                 + (SELECT COUNT(*) FROM direct_messages
+                     WHERE driver_user_id=? AND sender_user_id != ? AND read_at IS NULL)
+        """, (company, me, me, me, me)).fetchone()[0]
+    else:
+        n = conn.execute("""
+            SELECT (SELECT COUNT(*) FROM messages m JOIN routes r ON r.id=m.route_id
+                     WHERE r.company_id=? AND m.sender_user_id != ? AND m.read_at IS NULL)
+                 + (SELECT COUNT(*) FROM direct_messages
+                     WHERE company_id=? AND sender_user_id != ? AND read_at IS NULL)
+        """, (company, me, company, me)).fetchone()[0]
+    conn.close()
+    return jsonify({"count": n or 0})
+
+
+@app.route("/messages")
+@login_required
+def messages_page():
+    """The inbox: direct boss<->driver thread(s) up top, per-route threads below.
+    Tapping a row opens the existing thread modal (route or direct)."""
+    body = """
+    <style>
+    .msg-inbox{max-width:640px;margin:0 auto;padding:16px 14px 90px;}
+    .msg-inbox h1{font-size:22px;margin:4px 2px 14px;}
+    .msg-sec-label{font-size:11px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;
+        color:var(--text-dim,#8b8b8b);margin:18px 2px 8px;}
+    .msg-thread-row{display:flex;align-items:center;gap:10px;width:100%;text-align:left;
+        background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);
+        border-radius:14px;padding:12px 14px;margin-bottom:8px;cursor:pointer;color:inherit;font:inherit;}
+    .msg-thread-row:active{transform:scale(.99);}
+    .msg-thread-main{flex:1;min-width:0;}
+    .msg-thread-title{font-weight:700;font-size:15px;display:flex;align-items:center;gap:8px;}
+    .msg-thread-preview{display:block;font-size:13px;color:var(--text-dim,#8b8b8b);
+        white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;}
+    .msg-thread-time{font-size:11px;color:var(--text-dim,#8b8b8b);flex:none;}
+    .msg-unread-pill{min-width:20px;height:20px;padding:0 6px;border-radius:999px;
+        background:var(--cyan);color:#121212;font-size:11px;font-weight:800;
+        display:inline-flex;align-items:center;justify-content:center;}
+    .msg-inbox-empty{text-align:center;color:var(--text-dim,#8b8b8b);padding:40px 20px;font-size:14px;}
+    </style>
+    <div class="msg-inbox">
+        <h1>Messages</h1>
+        <div id="msg-direct-wrap">
+            <div class="msg-sec-label">Direct</div>
+            <div id="msg-direct-list"></div>
+        </div>
+        <div id="msg-routes-wrap">
+            <div class="msg-sec-label">Routes</div>
+            <div id="msg-routes-list"></div>
+        </div>
+        <div id="msg-inbox-loading" class="msg-inbox-empty">Loading…</div>
+    </div>
+    """ + _message_thread_modal_html(show_quick_taps=False) + """
+    <script>{thread_js}</script>
+    <script>
+    (function() {
+        function esc(s) {
+            var d = document.createElement('div');
+            d.textContent = s == null ? '' : String(s);
+            return d.innerHTML;
+        }
+        function rowHtml(t) {
+            var pill = t.unread ? ' <span class="msg-unread-pill">' + t.unread + '</span>' : '';
+            return '<button type="button" class="msg-thread-row" data-key="' + esc(t.key) + '"'
+                 + ' data-title="' + esc(t.title).replace(/"/g, '&quot;') + '">'
+                 + '<span class="msg-thread-main"><span class="msg-thread-title">' + esc(t.title) + pill + '</span>'
+                 + '<span class="msg-thread-preview">' + esc(t.last_body || 'No messages yet \u2014 say hello.') + '</span></span>'
+                 + '<span class="msg-thread-time">' + esc(t.last_at || '') + '</span></button>';
+        }
+        function loadThreads() {
+            fetch('/api/messages/threads', { credentials: 'same-origin' })
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    var dl = document.getElementById('msg-direct-list');
+                    var rl = document.getElementById('msg-routes-list');
+                    document.getElementById('msg-inbox-loading').style.display = 'none';
+                    dl.innerHTML = (d.direct || []).map(rowHtml).join('')
+                        || '<div class="msg-inbox-empty">No direct messages.</div>';
+                    document.getElementById('msg-direct-wrap').style.display = (d.direct && d.direct.length) ? '' : 'none';
+                    rl.innerHTML = (d.routes || []).map(rowHtml).join('')
+                        || '<div class="msg-inbox-empty">No route messages yet.</div>';
+                    document.getElementById('msg-routes-wrap').style.display = (d.routes && d.routes.length) ? '' : 'none';
+                })
+                .catch(function() {
+                    document.getElementById('msg-inbox-loading').textContent = 'Could not load messages \u2014 check your connection.';
+                });
+        }
+        document.addEventListener('click', function(ev) {
+            var b = ev.target.closest('.msg-thread-row');
+            if (!b || typeof window.openMessageThread !== 'function') return;
+            window.openMessageThread(b.dataset.key, b.dataset.title);
+        });
+        // Opening a thread marks it read server-side - refresh the list (and the
+        // nav badge) when the modal closes so pills clear immediately.
+        var _close = window.closeMessageThread;
+        window.closeMessageThread = function() {
+            if (_close) _close();
+            loadThreads();
+            if (typeof window.refreshMsgBadge === 'function') window.refreshMsgBadge();
+        };
+        loadThreads();
+    })();
+    </script>
+    """.replace("{thread_js}", _message_thread_js())
+    return render_template_string(shell_page("Messages", body))
+
+
 def _city_for_log(s):
     """City for the daily log: use stored city, else parse from address.
     2026-10-13: Many stops have empty city column; parse from address as fallback.
@@ -22707,8 +23106,6 @@ def dump_ticket(stop_id):
 # =========================================================
 # DAILY ROUTE LOG  (boss printable route sheet)
 # =========================================================
-@app.route("/route/<int:route_id>/daily-log")
-@boss_required
 @app.route("/route/<int:route_id>/daily-log")
 @boss_required
 def route_daily_log(route_id):
