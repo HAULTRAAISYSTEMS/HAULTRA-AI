@@ -10687,6 +10687,11 @@ def dashboard():
             _status_lbl = {"open": "NOT STARTED", "in_progress": "IN PROGRESS",
                            "completed": "DONE"}.get(_r["status"],
                                                    (_r["status"] or "").upper())
+            # Garbage lanes get their own tag so the driver can tell them
+            # apart from roll-off at a glance — same board, one product.
+            _type_tag = ""
+            if (_r["route_type"] or "rolloff") == "garbage":
+                _type_tag = '<span class="drv-type garbage">GARBAGE</span>'
             # Stop rows — first incomplete stop is "current"
             _stop_rows = ""
             _cur_marked = False
@@ -10718,7 +10723,9 @@ def dashboard():
                     <div class="drv-lane-name">{e(_r["route_name"])}</div>
                     <div class="drv-lane-date">{e(_r["route_date"])}</div>
                 </div>
-                <span class="drv-status {_status_cls}">{_status_lbl}</span>
+                <div class="drv-pills">
+                    {_type_tag}<span class="drv-status {_status_cls}">{_status_lbl}</span>
+                </div>
             </div>
             <div class="drv-progress"><div style="width:{_pct}%;"></div></div>
             <div class="drv-progress-lbl">{_done} of {_total} stops</div>
@@ -10778,6 +10785,10 @@ def dashboard():
       .drv-status.open {{ background:rgba(255,255,255,.08); color:var(--text-dim); }}
       .drv-status.progress {{ background:rgba(255,107,26,.16); color:#FF8C42; }}
       .drv-status.done {{ background:rgba(61,220,132,.14); color:#3DDC84; }}
+      .drv-pills {{ flex:none; display:flex; gap:6px; align-items:center; }}
+      .drv-type {{ font-size:.68rem; font-weight:800; letter-spacing:.6px;
+        padding:6px 10px; border-radius:999px; }}
+      .drv-type.garbage {{ background:rgba(77,171,245,.16); color:#4DABF5; }}
       .drv-progress {{ height:8px; border-radius:4px; background:rgba(255,255,255,.08);
         overflow:hidden; }}
       .drv-progress div {{ height:100%; border-radius:4px;
