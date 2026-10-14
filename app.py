@@ -10168,7 +10168,9 @@ def login():
             flash("Logged in.", "success")
 
             if user["role"] == "driver":
-                return redirect(url_for("driver_dashboard"))
+                # 2026-10-14 ~9:20 AM: drivers land on the new Driver Dashboard
+                # (clock + lanes), not the My Routes history page.
+                return redirect(url_for("dashboard"))
 
             # Land management users on the view their roles grant:
             # customer_manager -> Requests, dispatcher/owner -> Route Board.
