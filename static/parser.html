@@ -106,7 +106,7 @@
     position: fixed; left: 50%; bottom: 108px; transform: translateX(-50%);
     background: var(--bg-2); border: 1px solid var(--green); color: var(--green);
     padding: 12px 20px; border-radius: var(--radius-sm); font-weight: 600; font-size: 0.9rem;
-    z-index: 200; box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    z-index: 502; box-shadow: 0 8px 24px rgba(0,0,0,0.5);
     opacity: 0; pointer-events: none; transition: opacity 0.25s ease;
   }
   .toast.show { opacity: 1; }
@@ -491,13 +491,13 @@
 
   /* ── Confirm / Edit Stop bottom sheet ─────────────────────────── */
   .sheet-backdrop {
-    position: fixed; inset: 0; z-index: 200;
+    position: fixed; inset: 0; z-index: 500;
     background: rgba(0,0,0,0.55);
     display: none;
   }
   .sheet-backdrop.open { display: block; }
   .sheet {
-    position: fixed; left: 0; right: 0; bottom: 0; z-index: 201;
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 501;
     background: var(--bg-1);
     border-top-left-radius: var(--radius); border-top-right-radius: var(--radius);
     border-top: 1px solid rgba(255,255,255,0.08);
