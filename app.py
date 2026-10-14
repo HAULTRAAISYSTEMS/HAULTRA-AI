@@ -9055,6 +9055,11 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .msg-bubble {{ max-width: 78%; padding: 9px 14px; border-radius: 18px; font-size: 15px; line-height: 1.35; }}
 .msg-bubble-meta {{ font-size: 10px; font-weight: 600; letter-spacing: .2px; opacity: .55; margin-bottom: 3px; }}
 .msg-me .msg-bubble-meta {{ display: none; }}
+/* Route tag: which route a message was filed under (one thread per driver). */
+.msg-route-tag {{
+    font-size: 9px; font-weight: 800; letter-spacing: .6px; text-transform: uppercase;
+    opacity: .55; margin-bottom: 3px;
+}}
 .msg-them {{ align-self: flex-start; background: #2E2E30; color: #F5F5F2; border-bottom-left-radius: 5px; }}
 .msg-me {{ align-self: flex-end; background: #DD5F16; color: #FFFFFF; border-bottom-right-radius: 5px; }}
 /* Optimistic / offline outbox bubbles: sending (dim), queued (dim), failed (red). */
@@ -13537,7 +13542,8 @@ _MESSAGE_QUICK_TAPS = [
 
 def _message_thread_modal_html(show_quick_taps=False):
     """Shared thread modal, injected once per page (Cab View or Route Board).
-    JS opens it for a specific route_id via openMessageThread(routeId, title)."""
+    JS opens it via openMessageThread(key, title, tagRouteId) where key is
+    "dm:<driver_id>" — one merged thread per driver."""
     quick_taps_html = ""
     if show_quick_taps:
         buttons = "".join(
@@ -13717,6 +13723,9 @@ def _message_thread_js():
     var CSRF = (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
     var currentThreadKey = null;
     var currentThreadTitle = '';
+    // Optional route tag: when the thread is opened from a lane or cab view,
+    // new messages are filed under that route (shown as a small tag).
+    var currentTagRouteId = null;
 
     function el(id) { return document.getElementById(id); }
 
@@ -13759,10 +13768,11 @@ def _message_thread_js():
              + ';color:#12100c;font-weight:800;font-size:10px;">'
              + escapeHtml(av.initial || '?') + '</span>';
     }
-    function bubbleHtml(sender, body, cls, extra, avatar) {
+    function bubbleHtml(sender, body, cls, extra, avatar, routeTag) {
         return '<div class="msg-bubble ' + cls + '">' +
             '<div class="msg-bubble-meta" style="display:flex;align-items:center;">'
               + avatarMarkup(avatar) + escapeHtml(sender) + '</div>' +
+            (routeTag ? '<div class="msg-route-tag">' + escapeHtml(routeTag) + '</div>' : '') +
             '<div class="msg-bubble-body">' + escapeHtml(body) + '</div>' +
             (extra || '') + '</div>';
     }
@@ -13774,7 +13784,8 @@ def _message_thread_js():
             var isNew = m.id > lastRenderedMax;
             var cls = (m.is_me ? 'msg-me' : 'msg-them') + (isNew && lastRenderedMax ? ' rt-new' : '');
             return bubbleHtml(m.sender_username, m.body, cls, '',
-                { path: m.sender_avatar, initial: m.sender_initial, color: m.sender_color });
+                { path: m.sender_avatar, initial: m.sender_initial, color: m.sender_color },
+                m.route_label);
         }).join('');
         // Optimistic / queued / failed bubbles for THIS thread, always mine.
         queueFor(currentThreadKey).forEach(function(it) {
@@ -13813,9 +13824,11 @@ def _message_thread_js():
             });
     }
 
-    // key: legacy numeric route id, "route:<id>", or "dm:<driver_id>".
-    window.openMessageThread = function(key, title) {
+    // key: "dm:<driver_id>" (the one thread per driver). tagRouteId optionally
+    // files new messages under a route so they render with a route tag.
+    window.openMessageThread = function(key, title, tagRouteId) {
         currentThreadKey = key;
+        currentTagRouteId = tagRouteId || null;
         currentThreadTitle = title || 'Messages';
         lastRenderedMax = 0;
         serverMessages = [];
@@ -13856,7 +13869,7 @@ def _message_thread_js():
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF },
             credentials: 'same-origin',
-            body: JSON.stringify({ body: item.body, client_id: item.cid }),
+            body: JSON.stringify({ body: item.body, client_id: item.cid, route_id: item.tagRouteId || null }),
         }).then(function(r) {
             var status = r.status;
             return r.json().then(
@@ -13910,8 +13923,8 @@ def _message_thread_js():
         next();
     }
 
-    function enqueueAndSend(routeId, body) {
-        var item = { cid: genId(), routeId: routeId, body: body,
+    function enqueueAndSend(key, body) {
+        var item = { cid: genId(), routeId: key, tagRouteId: currentTagRouteId, body: body,
                      ts: Date.now(), state: navigator.onLine ? 'sending' : 'queued' };
         var q = loadQueue(); q.push(item); saveQueue(q);
         renderThread();
@@ -14202,15 +14215,25 @@ def _build_route_board_html(user):
         if (_days_out(c["since"]) or 0) >= OVERDUE_RENTAL_DAYS
     }
 
-    unread_by_route = {
-        r["route_id"]: r["n"]
+    # 2026-10-14: one thread per driver — the lane badge is the DRIVER's total
+    # unread across their merged thread (route + direct messages).
+    unread_by_driver = {
+        r["driver_id"]: r["n"]
         for r in conn.execute("""
-            SELECT m.route_id, COUNT(*) n
+            SELECT r.assigned_to AS driver_id, COUNT(*) n
             FROM messages m JOIN routes r ON r.id = m.route_id
-            WHERE r.company_id=? AND r.route_date=? AND m.sender_user_id != ? AND m.read_at IS NULL
-            GROUP BY m.route_id
-        """, (company_id, today, user["id"])).fetchall()
+            WHERE r.company_id=? AND m.sender_user_id != ? AND m.read_at IS NULL
+              AND r.assigned_to IS NOT NULL
+            GROUP BY r.assigned_to
+        """, (company_id, user["id"])).fetchall()
     }
+    for r in conn.execute("""
+        SELECT driver_user_id AS driver_id, COUNT(*) n
+        FROM direct_messages
+        WHERE company_id=? AND sender_user_id != ? AND read_at IS NULL
+        GROUP BY driver_user_id
+    """, (company_id, user["id"])).fetchall():
+        unread_by_driver[r["driver_id"]] = unread_by_driver.get(r["driver_id"], 0) + r["n"]
 
     # Time-off / late marks per assigned driver (feat/time-off): approved-OFF
     # today and any active running-late check-in, surfaced on the lane header.
@@ -14328,17 +14351,24 @@ def _build_route_board_html(user):
                 f'<span class="lane-add-label">Add</span></a>'
             )
             add_stops_html = ""  # No longer a pill in lane-actions
-            _lane_unread = unread_by_route.get(_lane_route_id, 0)
+            _lane_driver_id = lane.get("driver_id")
+            _lane_unread = unread_by_driver.get(_lane_driver_id, 0) if _lane_driver_id else 0
             _lane_msg_badge = f'<span class="lane-msg-badge">{_lane_unread}</span>' if _lane_unread else ""
             # 2026-10-13 (rev): lane actions as a quiet utility strip, not pills.
             # Message / Daily Log / Optimize live here now (detail-page copies removed).
+            # 2026-10-14: one thread per driver — the lane opens the DRIVER's merged
+            # thread, tagged with this route. No driver, no Message button.
             message_html = ""
-            _util_items = [
-                f'<button type="button" class="lane-util-link" '
-                f'onclick="openMessageThread({_lane_route_id}, {e(json.dumps(display_name))})">'
-                f'Message{_lane_msg_badge}</button>',
+            _util_items = []
+            if _lane_driver_id:
+                _util_items.append(
+                    f'<button type="button" class="lane-util-link" '
+                    f'onclick="openMessageThread(\'dm:{_lane_driver_id}\', {e(json.dumps(display_name))}, {_lane_route_id})">'
+                    f'Message{_lane_msg_badge}</button>'
+                )
+            _util_items.append(
                 f'<a class="lane-util-link" href="/route/{_lane_route_id}/daily-log">Daily Log</a>',
-            ]
+            )
             if len(stops) >= 2:
                 _util_items.append(
                     f'<form class="inline" method="POST" '
@@ -15708,6 +15738,9 @@ def _garbage_cab_page(conn, route, stops, current_stop, current_stop_num,
     """Standalone Cab View for garbage routes (2026-10-10): fast Start -> Done
     + count flow for toter/HPU, arrive/depart + tons for landfill. No photos,
     no container tracking — seconds per stop."""
+    # 2026-10-14: one thread per driver — "Message Boss" opens the driver's
+    # merged thread, tagged with the active route.
+    _dm_key = "dm:%d" % session["user_id"]
 
     def maps_url(addr, city):
         q = ", ".join(p for p in [addr, city] if p).strip()
@@ -15787,7 +15820,7 @@ def _garbage_cab_page(conn, route, stops, current_stop, current_stop_num,
             + (f'<button type="button" class="cab-neutral" style="margin-top:10px;" '
                f'onclick="gBlocked({s["id"]})">&#128683; Can&#39;t Get In</button>' if not s["blocked_at"] else "")
             + f'<button type="button" class="cab-neutral" style="margin-top:10px;" '
-            f'onclick="openMessageThread({route_id}, \'Boss\')">Message Boss'
+            f'onclick="openMessageThread(\'{_dm_key}\', \'Boss\', {route_id})">Message Boss'
             f'<span id="msg-boss-badge" {"hidden" if not unread_messages else ""}>'
             f'{unread_messages or ""}</span></button></div>'
         )
@@ -15972,9 +16005,16 @@ def driver_route_detail(route_id):
     ).fetchone() or {"photo_proof_mode": "encouraged"})["photo_proof_mode"] or "encouraged"
 
     unread_messages = conn.execute(
-        "SELECT COUNT(*) n FROM messages WHERE route_id=? AND sender_user_id != ? AND read_at IS NULL",
-        (route_id, session["user_id"])
-    ).fetchone()["n"]
+        """SELECT (SELECT COUNT(*) FROM messages m JOIN routes r ON r.id=m.route_id
+                    WHERE r.assigned_to=? AND r.company_id=? AND m.sender_user_id != ? AND m.read_at IS NULL)
+                + (SELECT COUNT(*) FROM direct_messages
+                    WHERE driver_user_id=? AND sender_user_id != ? AND read_at IS NULL)""",
+        (session["user_id"], session["company_id"], session["user_id"],
+         session["user_id"], session["user_id"]),
+    ).fetchone()[0]
+    # 2026-10-14: one thread per driver — the cab view's "Message Boss" opens
+    # the driver's merged thread, tagged with the active route.
+    _dm_key = "dm:%d" % session["user_id"]
 
     # Latest unacknowledged urgent (vendor-dispatch) message → pinned banner.
     urgent_msg = conn.execute(
@@ -17185,7 +17225,7 @@ def driver_route_detail(route_id):
     _dis_aria = "false" if nav_has_addr else "true"
     _copy_dis = "" if nav_has_addr else " disabled"
     _msg_boss_html = (
-        f'<button type="button" class="cab-neutral" id="msg-boss-btn" onclick="openMessageThread({route_id}, \'Boss\')">'
+        f'<button type="button" class="cab-neutral" id="msg-boss-btn" onclick="openMessageThread(\'{_dm_key}\', \'Boss\', {route_id})">'
         f'{icon("msg")} Message Boss<span id="msg-boss-badge" class="lane-msg-badge" '
         f'{"hidden" if not unread_messages else ""}>{unread_messages or ""}</span></button>'
     )
@@ -19051,10 +19091,16 @@ def driver_route_status(route_id):
         "SELECT cancelled_at, cancel_reason FROM routes WHERE id=?", (route_id,)
     ).fetchone()
 
+    # 2026-10-14: one thread per driver — this feeds the cab view's Message
+    # Boss badge, so it's the driver's merged-thread unread (route + direct).
     unread_messages = conn.execute(
-        "SELECT COUNT(*) n FROM messages WHERE route_id=? AND sender_user_id != ? AND read_at IS NULL",
-        (route_id, session["user_id"])
-    ).fetchone()["n"]
+        """SELECT (SELECT COUNT(*) FROM messages m JOIN routes r ON r.id=m.route_id
+                    WHERE r.assigned_to=? AND r.company_id=? AND m.sender_user_id != ? AND m.read_at IS NULL)
+                + (SELECT COUNT(*) FROM direct_messages
+                    WHERE driver_user_id=? AND sender_user_id != ? AND read_at IS NULL)""",
+        (session["user_id"], cid(), session["user_id"],
+         session["user_id"], session["user_id"]),
+    ).fetchone()[0]
 
     urgent_row = conn.execute(
         """SELECT id, body FROM messages
@@ -19510,12 +19556,16 @@ def route_messages(route_id):
 @app.route("/dm/<int:driver_id>/messages", methods=["GET", "POST"])
 @login_required
 def direct_messages_api(driver_id):
-    """Direct boss<->driver thread (no route). Same per-viewer unread semantics
-    as route_messages: unread = not sent by me AND read_at IS NULL. Drivers can
-    only touch their own thread; bosses can touch any driver in their company."""
+    """ONE thread per driver: direct messages + all of the driver's route
+    messages, merged chronologically. Route messages carry a route_label tag
+    ("Downtown run · Oct 13"); direct messages have none. POST accepts an
+    optional route_id to tag the new message with a route.
+    Unread = not sent by me AND read_at IS NULL. Drivers touch only their own
+    thread; bosses any driver in their company."""
     conn = get_db()
     me = session["user_id"]
     role = session.get("role")
+    company = cid()
     driver = conn.execute(
         "SELECT id, username, full_name FROM users WHERE id=? AND role='driver'",
         (driver_id,),
@@ -19526,7 +19576,7 @@ def direct_messages_api(driver_id):
     if role == "boss":
         same_co = conn.execute(
             "SELECT 1 FROM users WHERE id=? AND company_id=?",
-            (driver_id, cid()),
+            (driver_id, company),
         ).fetchone()
         if not same_co:
             conn.close()
@@ -19535,6 +19585,13 @@ def direct_messages_api(driver_id):
         conn.close()
         return jsonify({"error": "Access denied."}), 403
 
+    def _route_label(name, date):
+        try:
+            d = datetime.strptime((date or "")[:10], "%Y-%m-%d").strftime("%b %-d")
+        except Exception:
+            d = (date or "")[:10]
+        return ("%s · %s" % ((name or "Route").strip(), d)).strip(" ·")
+
     if request.method == "POST":
         data = request.get_json(silent=True) or {}
         body = (data.get("body") or "").strip()[:500]
@@ -19542,58 +19599,115 @@ def direct_messages_api(driver_id):
             conn.close()
             return jsonify({"error": "Message can't be empty."}), 400
         client_id = (str(data.get("client_id") or "").strip() or None)
-        if client_id:
-            dup = conn.execute(
-                "SELECT id FROM direct_messages WHERE driver_user_id=? AND sender_user_id=? AND client_id=?",
-                (driver_id, me, client_id),
+        try:
+            route_id = int(data.get("route_id")) if data.get("route_id") else None
+        except (TypeError, ValueError):
+            route_id = None
+        # A route tag must be one of THIS driver's routes in this company.
+        route = None
+        if route_id:
+            route = conn.execute(
+                "SELECT id FROM routes WHERE id=? AND company_id=? AND assigned_to=?",
+                (route_id, company, driver_id),
             ).fetchone()
+            if not route:
+                conn.close()
+                return jsonify({"error": "Route not found."}), 404
+        if client_id:
+            if route:
+                dup = conn.execute(
+                    "SELECT id FROM messages WHERE route_id=? AND sender_user_id=? AND client_id=?",
+                    (route_id, me, client_id),
+                ).fetchone()
+            else:
+                dup = conn.execute(
+                    "SELECT id FROM direct_messages WHERE driver_user_id=? AND sender_user_id=? AND client_id=?",
+                    (driver_id, me, client_id),
+                ).fetchone()
             if dup:
                 conn.close()
                 return jsonify({"success": True, "id": dup["id"], "duplicate": True})
         cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO direct_messages (company_id, driver_user_id, sender_user_id, body, created_at, client_id)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (cid(), driver_id, me, body, now_ts(), client_id),
-        )
+        if route:
+            cur.execute(
+                "INSERT INTO messages (route_id, sender_user_id, body, created_at, client_id)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (route_id, me, body, now_ts(), client_id),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO direct_messages (company_id, driver_user_id, sender_user_id, body, created_at, client_id)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (company, driver_id, me, body, now_ts(), client_id),
+            )
         msg_id = cur.lastrowid
+        # Only the driver's side raises an alert — the boss messaging their own
+        # driver should obviously not notify the boss.
+        if role != "boss":
+            notify(
+                conn, company, "DRIVER_MESSAGE",
+                _actor_name(conn) + " sent a message",
+                body,
+                link=url_for("messages_page"),
+                actor_user_id=me, entity_type="message", entity_id=msg_id,
+                # client_id is the sender's own offline-queue id, so a replayed
+                # send can never raise a second alert.
+                dedupe_key=("msg:%s" % client_id) if client_id else None,
+            )
         conn.commit()
         conn.close()
         return jsonify({"success": True, "id": msg_id})
 
-    # GET — mark the other party's messages read, then return the full thread.
+    # GET — mark the other party's messages read in BOTH tables, then return
+    # the merged thread, oldest first.
     conn.execute(
         "UPDATE direct_messages SET read_at=? WHERE driver_user_id=? AND sender_user_id != ? AND read_at IS NULL",
         (now_ts(), driver_id, me),
     )
+    conn.execute(
+        """UPDATE messages SET read_at=? WHERE sender_user_id != ? AND read_at IS NULL
+           AND route_id IN (SELECT id FROM routes WHERE assigned_to=? AND company_id=?)""",
+        (now_ts(), me, driver_id, company),
+    )
     conn.commit()
     rows = conn.execute("""
-        SELECT m.id, m.sender_user_id, u.username AS sender_username, u.role AS sender_role,
-               u.full_name AS sender_full_name, u.avatar_path AS sender_avatar,
-               m.body, m.created_at
-        FROM direct_messages m JOIN users u ON u.id = m.sender_user_id
-        WHERE m.driver_user_id=?
-        ORDER BY m.id ASC
-    """, (driver_id,)).fetchall()
+        SELECT x.body, x.created_at, x.sender_user_id, x.route_name, x.route_date,
+               u.username AS sender_username, u.role AS sender_role,
+               u.full_name AS sender_full_name, u.avatar_path AS sender_avatar
+        FROM (
+            SELECT m.body AS body, m.created_at AS created_at,
+                   m.sender_user_id AS sender_user_id,
+                   r.route_name AS route_name, r.route_date AS route_date
+            FROM messages m JOIN routes r ON r.id = m.route_id
+            WHERE r.assigned_to=? AND r.company_id=?
+            UNION ALL
+            SELECT d.body, d.created_at, d.sender_user_id, NULL, NULL
+            FROM direct_messages d WHERE d.driver_user_id=?
+        ) x JOIN users u ON u.id = x.sender_user_id
+        ORDER BY x.created_at ASC
+    """, (driver_id, company, driver_id)).fetchall()
     conn.close()
     return jsonify({"messages": [
         {
-            "id": r["id"], "sender_username": r["sender_username"], "sender_role": r["sender_role"],
+            # seq stands in for id: the merged thread has no single id space,
+            # and the client only uses it for new-bubble highlighting.
+            "id": i, "sender_username": r["sender_username"], "sender_role": r["sender_role"],
             "body": r["body"], "created_at": r["created_at"],
             "is_me": r["sender_user_id"] == me,
+            "route_label": _route_label(r["route_name"], r["route_date"]) if r["route_name"] else None,
             "sender_avatar": ("/" + r["sender_avatar"]) if (r["sender_avatar"] or "").strip() else None,
             "sender_initial": _avatar_initials(r["sender_full_name"], r["sender_username"]),
             "sender_color": _avatar_color(r["sender_user_id"]),
         }
-        for r in rows
+        for i, r in enumerate(rows)
     ]})
 
 
 @app.route("/api/messages/threads")
 @login_required
 def message_threads_api():
-    """Inbox data: direct boss<->driver thread(s) + per-route threads, each with
-    last-message preview, timestamp, and per-viewer unread count."""
+    """Inbox: ONE thread per driver (direct + route messages merged). The boss
+    sees one row per driver; the driver sees their single "Boss" thread."""
     conn = get_db()
     me = session["user_id"]
     role = session.get("role")
@@ -19608,80 +19722,55 @@ def message_threads_api():
         except Exception:
             return ts[:16]
 
-    def _route_title(r):
-        name = (r["route_name"] or "Route").strip()
-        try:
-            d = datetime.strptime((r["route_date"] or "")[:10], "%Y-%m-%d").strftime("%b %-d")
-        except Exception:
-            d = (r["route_date"] or "")[:10]
-        base = ("%s · %s" % (name, d)).strip(" ·")
-        if role == "boss" and r["driver_name"]:
-            base = "%s — %s" % (r["driver_name"], base)
-        return base
+    def _summary(driver_id):
+        row = conn.execute("""
+            SELECT body, created_at FROM (
+                SELECT m.body AS body, m.created_at AS created_at
+                FROM messages m JOIN routes r ON r.id = m.route_id
+                WHERE r.assigned_to=? AND r.company_id=?
+                UNION ALL
+                SELECT d.body, d.created_at FROM direct_messages d
+                WHERE d.driver_user_id=?
+                ORDER BY created_at DESC LIMIT 1
+            )
+        """, (driver_id, company, driver_id)).fetchone()
+        unread = conn.execute("""
+            SELECT (SELECT COUNT(*) FROM messages m JOIN routes r ON r.id=m.route_id
+                     WHERE r.assigned_to=? AND r.company_id=? AND m.sender_user_id != ? AND m.read_at IS NULL)
+                 + (SELECT COUNT(*) FROM direct_messages
+                     WHERE driver_user_id=? AND sender_user_id != ? AND read_at IS NULL)
+        """, (driver_id, company, me, driver_id, me)).fetchone()[0] or 0
+        if row:
+            return row["body"], _fmt_ts(row["created_at"]), unread
+        return None, "", unread
 
-    routes, direct = [], []
+    threads = []
     if role == "driver":
-        for r in conn.execute("""
-            SELECT r.id, r.route_name, r.route_date,
-                   (SELECT m2.body FROM messages m2 WHERE m2.route_id=r.id ORDER BY m2.id DESC LIMIT 1) AS last_body,
-                   MAX(m.created_at) AS last_at,
-                   SUM(CASE WHEN m.sender_user_id != ? AND m.read_at IS NULL THEN 1 ELSE 0 END) AS unread
-            FROM messages m JOIN routes r ON r.id = m.route_id
-            WHERE r.company_id=? AND r.assigned_to=?
-            GROUP BY r.id ORDER BY last_at DESC LIMIT 50
-        """, (me, company, me)).fetchall():
-            routes.append({
-                "kind": "route", "key": "route:%d" % r["id"], "route_id": r["id"],
-                "title": _route_title(r), "url": "/route/%d/messages" % r["id"],
-                "last_body": r["last_body"], "last_at": _fmt_ts(r["last_at"]),
-                "unread": r["unread"] or 0,
-            })
-        d = conn.execute("""
-            SELECT (SELECT d2.body FROM direct_messages d2 WHERE d2.driver_user_id=? ORDER BY d2.id DESC LIMIT 1) AS last_body,
-                   MAX(created_at) AS last_at,
-                   SUM(CASE WHEN sender_user_id != ? AND read_at IS NULL THEN 1 ELSE 0 END) AS unread
-            FROM direct_messages WHERE driver_user_id=?
-        """, (me, me, me)).fetchone()
-        direct.append({
+        last_body, last_at, unread = _summary(me)
+        threads.append({
             "kind": "direct", "key": "dm:%d" % me, "driver_id": me,
             "title": "Boss", "url": "/dm/%d/messages" % me,
-            "last_body": d["last_body"], "last_at": _fmt_ts(d["last_at"]),
-            "unread": d["unread"] or 0,
+            "last_body": last_body, "last_at": last_at, "unread": unread,
         })
     else:
-        for r in conn.execute("""
-            SELECT r.id, r.route_name, r.route_date, u.username AS driver_name,
-                   (SELECT m2.body FROM messages m2 WHERE m2.route_id=r.id ORDER BY m2.id DESC LIMIT 1) AS last_body,
-                   MAX(m.created_at) AS last_at,
-                   SUM(CASE WHEN m.sender_user_id != ? AND m.read_at IS NULL THEN 1 ELSE 0 END) AS unread
-            FROM messages m JOIN routes r ON r.id = m.route_id
-                 LEFT JOIN users u ON u.id = r.assigned_to
-            WHERE r.company_id=?
-            GROUP BY r.id ORDER BY last_at DESC LIMIT 30
-        """, (me, company)).fetchall():
-            routes.append({
-                "kind": "route", "key": "route:%d" % r["id"], "route_id": r["id"],
-                "title": _route_title(r), "url": "/route/%d/messages" % r["id"],
-                "last_body": r["last_body"], "last_at": _fmt_ts(r["last_at"]),
-                "unread": r["unread"] or 0,
-            })
-        for u in conn.execute("""
-            SELECT u.id, u.username, u.full_name,
-                   (SELECT d2.body FROM direct_messages d2 WHERE d2.driver_user_id=u.id ORDER BY d2.id DESC LIMIT 1) AS last_body,
-                   (SELECT MAX(d2.created_at) FROM direct_messages d2 WHERE d2.driver_user_id=u.id) AS last_at,
-                   (SELECT COUNT(*) FROM direct_messages d2 WHERE d2.driver_user_id=u.id AND d2.sender_user_id != ? AND d2.read_at IS NULL) AS unread
-            FROM users u WHERE u.company_id=? AND u.role='driver' AND COALESCE(u.is_active,1)=1
-            ORDER BY last_at DESC
-        """, (me, company)).fetchall():
-            direct.append({
+        for u in conn.execute(
+            """SELECT id, username, full_name FROM users
+               WHERE company_id=? AND role='driver' AND COALESCE(is_active,1)=1
+               ORDER BY COALESCE(full_name, username)""",
+            (company,),
+        ).fetchall():
+            last_body, last_at, unread = _summary(u["id"])
+            threads.append({
                 "kind": "direct", "key": "dm:%d" % u["id"], "driver_id": u["id"],
                 "title": (u["full_name"] or u["username"]).strip(),
                 "url": "/dm/%d/messages" % u["id"],
-                "last_body": u["last_body"], "last_at": _fmt_ts(u["last_at"]),
-                "unread": u["unread"] or 0,
+                "last_body": last_body, "last_at": last_at, "unread": unread,
             })
+        # Most-recent conversation first; never-contacted drivers sink
+        # ("" sorts below every real timestamp).
+        threads.sort(key=lambda t: t["last_at"], reverse=True)
     conn.close()
-    return jsonify({"direct": direct, "routes": routes})
+    return jsonify({"threads": threads})
 
 
 @app.route("/api/messages/unread-count")
@@ -19737,14 +19826,8 @@ def messages_page():
     </style>
     <div class="msg-inbox">
         <h1>Messages</h1>
-        <div id="msg-direct-wrap">
-            <div class="msg-sec-label">Direct</div>
-            <div id="msg-direct-list"></div>
-        </div>
-        <div id="msg-routes-wrap">
-            <div class="msg-sec-label">Routes</div>
-            <div id="msg-routes-list"></div>
-        </div>
+        <div class="msg-sec-label">Conversations</div>
+        <div id="msg-thread-list"></div>
         <div id="msg-inbox-loading" class="msg-inbox-empty">Loading…</div>
     </div>
     """ + _message_thread_modal_html(show_quick_taps=False) + """
@@ -19768,15 +19851,11 @@ def messages_page():
             fetch('/api/messages/threads', { credentials: 'same-origin' })
                 .then(function(r) { return r.json(); })
                 .then(function(d) {
-                    var dl = document.getElementById('msg-direct-list');
-                    var rl = document.getElementById('msg-routes-list');
+                    var list = document.getElementById('msg-thread-list');
                     document.getElementById('msg-inbox-loading').style.display = 'none';
-                    dl.innerHTML = (d.direct || []).map(rowHtml).join('')
-                        || '<div class="msg-inbox-empty">No direct messages.</div>';
-                    document.getElementById('msg-direct-wrap').style.display = (d.direct && d.direct.length) ? '' : 'none';
-                    rl.innerHTML = (d.routes || []).map(rowHtml).join('')
-                        || '<div class="msg-inbox-empty">No route messages yet.</div>';
-                    document.getElementById('msg-routes-wrap').style.display = (d.routes && d.routes.length) ? '' : 'none';
+                    var threads = d.threads || [];
+                    list.innerHTML = threads.map(rowHtml).join('')
+                        || '<div class="msg-inbox-empty">No conversations yet.</div>';
                 })
                 .catch(function() {
                     document.getElementById('msg-inbox-loading').textContent = 'Could not load messages \u2014 check your connection.';
