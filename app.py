@@ -14197,7 +14197,7 @@ def _message_thread_js():
             attemptSend(item).then(function(res) {
                 if (res.ok && res.j && res.j.success) {
                     removeItem(item.cid);
-                    fetchThread(routeId);
+                    fetchThread(key);
                 } else { setFailed(item.cid, res.status); }
             }).catch(function() { setFailed(item.cid, 0); });
         }
