@@ -19615,7 +19615,7 @@ def message_threads_api():
             FROM direct_messages WHERE driver_user_id=?
         """, (me, me, me)).fetchone()
         direct.append({
-            "kind": "direct", "key": "direct:%d" % me, "driver_id": me,
+            "kind": "direct", "key": "dm:%d" % me, "driver_id": me,
             "title": "Boss", "url": "/dm/%d/messages" % me,
             "last_body": d["last_body"], "last_at": _fmt_ts(d["last_at"]),
             "unread": d["unread"] or 0,
@@ -19646,7 +19646,7 @@ def message_threads_api():
             ORDER BY last_at DESC
         """, (me, company)).fetchall():
             direct.append({
-                "kind": "direct", "key": "direct:%d" % u["id"], "driver_id": u["id"],
+                "kind": "direct", "key": "dm:%d" % u["id"], "driver_id": u["id"],
                 "title": (u["full_name"] or u["username"]).strip(),
                 "url": "/dm/%d/messages" % u["id"],
                 "last_body": u["last_body"], "last_at": _fmt_ts(u["last_at"]),
