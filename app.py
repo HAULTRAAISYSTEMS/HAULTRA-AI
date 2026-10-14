@@ -10464,12 +10464,18 @@ def driver_dashboard():
     pay_period_start, pay_period_end = get_pay_period_bounds(co_settings)
 
     # 2026-10-14: clock status for the My Day header — today's entry plus any
-    # forgotten clock-outs from earlier days.
+    # forgotten clock-outs from earlier days. 2026-10-14 ~7:45 AM: only nag
+    # about the current pay week — older ones are stale (payroll's done) and
+    # just clutter the dashboard; they're still fixable in Clock In/Out and
+    # still flagged on the boss's Team Hours.
     _clk_now, _clk_today = _driver_clock_now(session["company_id"])
     _clk_today_entry = _driver_clock_entry(conn, session["company_id"], session["user_id"], _clk_today)
     _clk_on = bool(_clk_today_entry and _clk_today_entry["clock_in_at"] and not _clk_today_entry["clock_out_at"])
     _clk_in_at = (_clk_today_entry["clock_in_at"] or "")[11:16] if _clk_today_entry else ""
-    _forgot = _driver_open_clock_entries(conn, session["company_id"], session["user_id"], _clk_today)
+    _forgot_all = _driver_open_clock_entries(conn, session["company_id"], session["user_id"], _clk_today)
+    _forgot = [f for f in _forgot_all
+               if pay_period_start <= (f["date"] or "") <= pay_period_end]
+    _forgot_older = len(_forgot_all) - len(_forgot)
     conn.close()
 
     display_routes = [r for r in routes if pay_period_start <= r["route_date"] <= pay_period_end]
@@ -10537,6 +10543,16 @@ def driver_dashboard():
                           font-size:16px;min-height:48px;">
             <button type="submit" class="btn orange" style="min-height:48px;">Save</button>
         </form>
+    </div>
+        """
+    if _forgot_older:
+        _plural = "" if _forgot_older == 1 else "s"
+        _verb = "needs" if _forgot_older == 1 else "need"
+        _clock_cards += f"""
+    <div style="text-align:center;margin:2px 0 12px;">
+        <a href="{url_for('driver_clock')}" style="color:var(--text-dim);font-size:13px;font-weight:600;">
+            {_forgot_older} older day{_plural} still {_verb} a clock-out — fix in Clock In/Out &#8250;
+        </a>
     </div>
         """
 
