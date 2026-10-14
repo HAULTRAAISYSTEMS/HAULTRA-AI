@@ -17406,10 +17406,9 @@ def driver_route_detail(route_id):
         if (inited) {{ setTimeout(function() {{ map.invalidateSize(); }}, 60); return; }}
         if (typeof L === 'undefined') return;   // Leaflet not loaded yet
         map = L.map('cab-route-map', {{ scrollWheelZoom: true }}).setView([36.85, -76.28], 11);
-        L.tileLayer('https://{{s}}.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}{{r}}.png', {{
-            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
-            subdomains: 'abcd',
-            maxZoom: 20,
+        L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {{
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+            maxZoom: 19,
         }}).addTo(map);
 
         var latLngs = [];
@@ -27446,12 +27445,12 @@ def bin_tracker():
             }};
 
             var map = L.map('bin-map', {{ scrollWheelZoom: true }}).setView(FALLBACK_CENTER, 11);
-            // Carto Voyager: labelled street basemap — full street names stay
-            // readable at neighbourhood zoom so the boss can eyeball location.
-            L.tileLayer('https://{{s}}.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}{{r}}.png', {{
-                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
-                subdomains: 'abcd',
-                maxZoom: 20,
+            // OpenStreetMap standard tiles: labelled street basemap, no API key
+            // needed — full street names stay readable at neighbourhood zoom
+            // so the boss can eyeball location.
+            L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {{
+                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+                maxZoom: 19,
             }}).addTo(map);
 
             var markersByStopId = {{}};
