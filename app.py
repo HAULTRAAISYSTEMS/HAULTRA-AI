@@ -2428,7 +2428,12 @@ def _driver_clock_now(company_id):
         tz_name = ((co["timezone"] if co else None) or "America/New_York").strip()
         from zoneinfo import ZoneInfo
         now = datetime.now(ZoneInfo(tz_name))
-    except Exception:
+    except Exception as exc:
+        # 2026-10-14: never silently stamp clock times in UTC — see _company_local_now.
+        try:
+            app.logger.error("TIMEZONE FAILURE: ZoneInfo(%r) failed (%s) in clock path", tz_name, exc)
+        except Exception:
+            pass
         now = datetime.now(_EASTERN) if _EASTERN else datetime.now()
     finally:
         conn.close()
@@ -2532,7 +2537,15 @@ def _company_local_now(company_settings):
     try:
         from zoneinfo import ZoneInfo
         return datetime.now(ZoneInfo(tz_name))
-    except Exception:
+    except Exception as exc:
+        # 2026-10-14: NEVER silently fall back to UTC for payroll-adjacent
+        # times — a wrong "now" corrupts live hours and pay-week boundaries.
+        # Log loudly so a missing tzdata package is caught immediately.
+        try:
+            app.logger.error("TIMEZONE FAILURE: ZoneInfo(%r) failed (%s); "
+                             "falling back — live hours may be wrong", tz_name, exc)
+        except Exception:
+            pass
         try:
             return datetime.now(_EASTERN) if _EASTERN else datetime.now()
         except Exception:
