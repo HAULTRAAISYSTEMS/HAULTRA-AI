@@ -8324,7 +8324,7 @@ body {{
    BUTTONS
    ══════════════════════════════════════════════════════════*/
 .btn,
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.lane-word-btn):not(.lane-util-link):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-topbar-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip) {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.lane-word-btn):not(.lane-util-link):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-topbar-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip):not(.msg-thread-row):not(.msg-close-btn):not(.msg-retry-btn):not(.msg-quick-btn) {{
     display: inline-block;
     border: none;
     cursor: pointer;
@@ -8352,7 +8352,7 @@ button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact
     color: #FFE9D6;
     box-shadow: 0 0 16px rgba(206,98,36,0.22);
 }}
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.lane-word-btn):not(.lane-util-link):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-topbar-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip):hover {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.lane-word-btn):not(.lane-util-link):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-topbar-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip):not(.msg-thread-row):not(.msg-close-btn):not(.msg-retry-btn):not(.msg-quick-btn):hover {{
     filter: brightness(1.1);
     transform: translateY(-1px);
     text-decoration: none;
@@ -9043,17 +9043,17 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .msg-quick-btn:hover {{ background: rgba(255,107,26,0.2); }}
 .msg-list {{
     flex: 1; overflow-y: auto; min-height: 120px; max-height: 40vh;
-    display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px;
+    display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px;
     padding-right: 2px;
 }}
 .msg-empty {{ color: var(--text-muted); font-size: 13px; text-align: center; padding: 24px 0; }}
-.msg-bubble {{ max-width: 82%; padding: 8px 12px; border-radius: 12px; font-size: 13.5px; line-height: 1.4; }}
-.msg-bubble-meta {{ font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .3px; opacity: .65; margin-bottom: 2px; }}
-.msg-them {{ align-self: flex-start; background: rgba(255,255,255,0.07); color: #F0F0E8; border-bottom-left-radius: 3px; }}
-.msg-me {{
-    align-self: flex-end; background: linear-gradient(135deg, #FF8A42 0%, #FF6B1A 100%);
-    color: #1A1000; border-bottom-right-radius: 3px;
-}}
+/* Thread bubbles: iMessage-style, the rolloff way — quiet charcoal incoming,
+   deep ember outgoing. No neon gradients. */
+.msg-bubble {{ max-width: 78%; padding: 9px 14px; border-radius: 18px; font-size: 15px; line-height: 1.35; }}
+.msg-bubble-meta {{ font-size: 10px; font-weight: 600; letter-spacing: .2px; opacity: .55; margin-bottom: 3px; }}
+.msg-me .msg-bubble-meta {{ display: none; }}
+.msg-them {{ align-self: flex-start; background: #2E2E30; color: #F5F5F2; border-bottom-left-radius: 5px; }}
+.msg-me {{ align-self: flex-end; background: #DD5F16; color: #FFFFFF; border-bottom-right-radius: 5px; }}
 /* Optimistic / offline outbox bubbles: sending (dim), queued (dim), failed (red). */
 .msg-pending {{ opacity: .62; }}
 .msg-pending.msg-failed {{ opacity: 1; background: rgba(255,82,82,0.18); color: #FFC9C9;
@@ -9065,7 +9065,7 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .msg-compose textarea {{
     flex: 1; resize: none; min-height: 48px; max-height: 100px;
     background: var(--bg-0); border: 1px solid rgba(255,255,255,0.12);
-    border-radius: 10px; color: var(--text); font-family: inherit; font-size: 13px; padding: 10px 12px;
+    border-radius: 10px; color: var(--text); font-family: inherit; font-size: 16px; padding: 10px 12px;
 }}
 .msg-compose .btn {{ min-height: 48px; align-self: flex-end; }}
 
@@ -13548,7 +13548,7 @@ def _message_thread_modal_html(show_quick_taps=False):
     <div id="msg-modal" class="msg-modal" hidden>
         <div class="msg-modal-header">
             <div id="msg-modal-title">Messages</div>
-            <button type="button" onclick="closeMessageThread()" aria-label="Close">&times;</button>
+            <button type="button" class="msg-close-btn" onclick="closeMessageThread()" aria-label="Close">&times;</button>
         </div>
         {quick_taps_html}
         <div id="msg-list" class="msg-list"></div>
@@ -13820,7 +13820,7 @@ def _message_thread_js():
         if (el('msg-overlay')) el('msg-overlay').hidden = false;
         if (el('msg-modal')) el('msg-modal').hidden = false;
         renderThread();
-        fetchThread(routeId);
+        fetchThread(key);
     };
 
     // Called by the Cab View SSE stream when a new message lands while the
