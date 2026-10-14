@@ -6611,10 +6611,11 @@ def _bottom_tab(href, icon_html, label, current_path, badge=""):
 
 
 def _msg_nav_badge(n):
-    """Unread-messages badge (id="msg-nav-badge") for the driver tab and the
-    boss envelope. Inline display:none at zero — see _nav_badge's note."""
+    """Unread-messages badge for the driver tab, the boss topnav envelope, and
+    the board header. Class (not id) — several can be on one page at once.
+    Inline display:none at zero — see _nav_badge's note."""
     return (
-        '<span id="msg-nav-badge" style="display:%s;min-width:16px;padding:1px 6px;'
+        '<span class="msg-nav-badge" style="display:%s;min-width:16px;padding:1px 6px;'
         'margin-left:6px;border-radius:999px;background:var(--cyan);color:#121212;'
         'font-size:10px;font-weight:800;line-height:16px;text-align:center;'
         'vertical-align:middle;"%s>%s</span>'
@@ -6622,23 +6623,25 @@ def _msg_nav_badge(n):
     )
 
 
-# 2026-10-14: Keeps #msg-nav-badge fresh on every page — polls the unread count
-# every 30s and on tab refocus. Exposes window.refreshMsgBadge() so the inbox
-# can clear the badge the moment a thread is read.
+# 2026-10-14: Keeps every .msg-nav-badge fresh on the page — polls the unread
+# count every 30s and on tab refocus. Exposes window.refreshMsgBadge() so the
+# inbox can clear badges the moment a thread is read.
 _MSG_BADGE_POLL_JS = """
 <script>
 (function() {
-    function setBadge(n) {
-        var b = document.getElementById('msg-nav-badge');
-        if (!b) return;
-        b.style.display = n ? 'inline-block' : 'none';
-        if (n) b.removeAttribute('hidden');
-        b.textContent = n > 99 ? '99+' : (n || '');
+    function setBadges(n) {
+        var els = document.querySelectorAll('.msg-nav-badge');
+        for (var i = 0; i < els.length; i++) {
+            var b = els[i];
+            b.style.display = n ? 'inline-block' : 'none';
+            if (n) b.removeAttribute('hidden');
+            b.textContent = n > 99 ? '99+' : (n || '');
+        }
     }
     window.refreshMsgBadge = function() {
         fetch('/api/messages/unread-count', { credentials: 'same-origin' })
             .then(function(r) { return r.json(); })
-            .then(function(d) { setBadge(d.count || 0); })
+            .then(function(d) { setBadges(d.count || 0); })
             .catch(function() {});
     };
     window.refreshMsgBadge();
@@ -14599,13 +14602,38 @@ def routes_page():
     </div>
     """
 
+    # 2026-10-14: board header message envelope — the topnav (which carries the
+    # boss envelope) is hidden on the board for mobile, so the board gets its
+    # own indicator right in the header where the boss lives.
+    _board_msg_env = ""
+    if user["role"] == "boss":
+        _bmc = get_db()
+        try:
+            _board_msg_unread = _bmc.execute("""
+                SELECT (SELECT COUNT(*) FROM messages m JOIN routes r ON r.id=m.route_id
+                         WHERE r.company_id=? AND m.sender_user_id != ? AND m.read_at IS NULL)
+                     + (SELECT COUNT(*) FROM direct_messages
+                         WHERE company_id=? AND sender_user_id != ? AND read_at IS NULL)
+            """, (user["company_id"], user["id"],
+                  user["company_id"], user["id"])).fetchone()[0] or 0
+        except Exception:
+            _board_msg_unread = 0
+        finally:
+            _bmc.close()
+        _board_msg_env = (
+            f'<a href="{url_for("messages_page")}" aria-label="Messages" title="Messages" '
+            f'style="display:inline-flex;align-items:center;vertical-align:middle;'
+            f'margin-left:12px;color:inherit;text-decoration:none;">'
+            f'{icon("msg")}{_msg_nav_badge(_board_msg_unread)}</a>'
+        )
+
     header_html = f"""
     <div class="hero owner-header-row" style="position:relative;">
         <div>
             <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#55554C;margin-bottom:7px;">
                 {e(weekday)} &middot; {e(today)}
             </div>
-            <h1>Route Board</h1>
+            <h1>Route Board{_board_msg_env}</h1>
         </div>
         <div class="row" style="align-items:center;gap:18px;">
             <div class="board-legend">
