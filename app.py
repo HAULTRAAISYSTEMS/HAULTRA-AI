@@ -14189,6 +14189,14 @@ def _build_route_board_html(user):
                 f'<a class="lane-word-btn" href="/route/{_lane_route_id}/report" '
                 f'style="text-decoration:none;">Daily Log</a>'
             )
+            # 2026-10-13: Smart Optimize on the board — one tap per route, stays on the board
+            if len(stops) >= 2:
+                message_html += (
+                    f'<form class="inline" method="POST" '
+                    f'action="{url_for("optimize_route", route_id=_lane_route_id)}?next=board" '
+                    f'onsubmit="showOptimizeOverlay(event, {len(stops)})">'
+                    f'<button type="submit" class="lane-word-btn">&#9883; Optimize</button></form>'
+                )
             # Truck parked at a vendor (Go NOW) → offer a manual hold release.
             if any(dict(x).get("held_at") and x["stop_status"] != "completed" for x in stops):
                 message_html += (
@@ -14623,6 +14631,7 @@ def routes_page():
     {main_panel}
     {_message_thread_modal_html(show_quick_taps=False)}
     <script>{_message_thread_js()}</script>
+    {_OPTIMIZE_OVERLAY_HTML}
     """
     return render_template_string(shell_page("Route Board", body))
 
@@ -19605,6 +19614,56 @@ Truck: {e(route["truck_name"] or "—")} &nbsp;·&nbsp; Type: {e(route["route_ty
 </div></body></html>"""
 
 
+# Shared Smart-Optimize loading overlay (route detail + route board).
+# Plain string (NOT an f-string) so the JS braces stay single.
+_OPTIMIZE_OVERLAY_HTML = """
+    <!-- Optimize loading overlay -->
+    <div id="optimize-overlay" style="
+            display:none; position:fixed; inset:0; z-index:2000;
+            background:rgba(4,10,22,0.88); backdrop-filter:blur(6px);
+            flex-direction:column; align-items:center; justify-content:center;
+            color:#e5eefc; font-family:inherit;">
+        <div style="font-size:42px; margin-bottom:16px;">&#9883;</div>
+        <div style="font-size:20px; font-weight:900; margin-bottom:8px;">Optimizing Route&hellip;</div>
+        <div style="font-size:14px; color:#FF9D5C; margin-bottom:24px;">
+            Geocoding stops &mdash; this takes about 1 second per stop
+        </div>
+        <div style="width:240px; background:rgba(255,255,255,0.1); border-radius:999px; height:8px; overflow:hidden;">
+            <div id="optimize-progress-bar"
+                 style="height:100%; width:0%; border-radius:999px;
+                        background:linear-gradient(90deg,#CE6224,#A84C14);
+                        transition:width 1.1s linear;"></div>
+        </div>
+        <div id="optimize-step" style="font-size:12px; color:#8C8C82; margin-top:10px;"></div>
+    </div>
+
+    <script>
+    function showOptimizeOverlay(e, stopCount) {
+        var overlay = document.getElementById('optimize-overlay');
+        if (overlay) {
+            overlay.style.display = 'flex';
+            // Animate the fake progress bar in sync with geocoding (1.1s/stop)
+            var bar  = document.getElementById('optimize-progress-bar');
+            var step = document.getElementById('optimize-step');
+            var done = 0;
+            var interval = setInterval(function() {
+                done++;
+                if (done <= stopCount) {
+                    var pct = Math.round(done / stopCount * 85); // cap at 85% until redirect
+                    if (bar)  bar.style.width  = pct + '%';
+                    if (step) step.textContent = 'Geocoding stop ' + done + ' of ' + stopCount + '\u2026';
+                } else {
+                    clearInterval(interval);
+                    if (bar)  bar.style.width = '100%';
+                    if (step) step.textContent = 'Saving optimized order\u2026';
+                }
+            }, 1100);
+        }
+        // Let the form submit normally
+    }
+    </script>
+"""
+
 @app.route("/route/<int:route_id>")
 @login_required
 def view_route(route_id):
@@ -20216,51 +20275,8 @@ def view_route(route_id):
     {reorder_script}
     {move_script}
 
-    <!-- Optimize loading overlay -->
-    <div id="optimize-overlay" style="
-            display:none; position:fixed; inset:0; z-index:2000;
-            background:rgba(4,10,22,0.88); backdrop-filter:blur(6px);
-            flex-direction:column; align-items:center; justify-content:center;
-            color:#e5eefc; font-family:inherit;">
-        <div style="font-size:42px; margin-bottom:16px;">&#9883;</div>
-        <div style="font-size:20px; font-weight:900; margin-bottom:8px;">Optimizing Route&hellip;</div>
-        <div id="optimize-msg" style="font-size:14px; color:#FF9D5C; margin-bottom:24px;">
-            Geocoding stops &mdash; this takes about 1 second per stop
-        </div>
-        <div style="width:240px; background:rgba(255,255,255,0.1); border-radius:999px; height:8px; overflow:hidden;">
-            <div id="optimize-progress-bar"
-                 style="height:100%; width:0%; border-radius:999px;
-                        background:linear-gradient(90deg,#FF9D5C,#FF9D5C);
-                        transition:width 1.1s linear;"></div>
-        </div>
-        <div id="optimize-step" style="font-size:12px; color:#8C8C82; margin-top:10px;"></div>
-    </div>
+    {_OPTIMIZE_OVERLAY_HTML}
 
-    <script>
-    function showOptimizeOverlay(e, stopCount) {{
-        var overlay = document.getElementById('optimize-overlay');
-        if (overlay) {{
-            overlay.style.display = 'flex';
-            // Animate the fake progress bar in sync with geocoding (1.1s/stop)
-            var bar  = document.getElementById('optimize-progress-bar');
-            var step = document.getElementById('optimize-step');
-            var done = 0;
-            var interval = setInterval(function() {{
-                done++;
-                if (done <= stopCount) {{
-                    var pct = Math.round(done / stopCount * 85); // cap at 85% until redirect
-                    if (bar)  bar.style.width  = pct + '%';
-                    if (step) step.textContent = 'Geocoding stop ' + done + ' of ' + stopCount + '\u2026';
-                }} else {{
-                    clearInterval(interval);
-                    if (bar)  bar.style.width = '100%';
-                    if (step) step.textContent = 'Saving optimized order\u2026';
-                }}
-            }}, 1100);
-        }}
-        // Let the form submit normally
-    }}
-    </script>
     """
 
     return render_template_string(shell_page("Route", body, extra_head))
@@ -23223,6 +23239,9 @@ _EOD_KEYWORDS = ("end of day", "return to yard", "take to yard", "back to yard",
 @app.route("/route/<int:route_id>/optimize", methods=["POST"])
 @boss_required
 def optimize_route(route_id):
+    # Board-initiated optimize stays on the board instead of jumping to route detail.
+    _dest = url_for("routes_page") if request.values.get("next") == "board" \
+        else url_for("view_route", route_id=route_id)
     conn = get_db()
 
     stops = conn.execute(
@@ -23233,7 +23252,7 @@ def optimize_route(route_id):
     if len(stops) < 2:
         conn.close()
         flash("Need at least 2 stops to optimize.", "error")
-        return redirect(url_for("view_route", route_id=route_id))
+        return redirect(_dest)
 
     # ------------------------------------------------------------------
     # 1. Yard / base origin
@@ -23347,7 +23366,7 @@ def optimize_route(route_id):
     if len(stops_data) < 2:
         conn.close()
         flash("Not enough addresses could be geocoded to optimize the route.", "error")
-        return redirect(url_for("view_route", route_id=route_id))
+        return redirect(_dest)
 
     # ------------------------------------------------------------------
     # 5. Run dump-aware ordering with can-flow constraints
@@ -23378,7 +23397,7 @@ def optimize_route(route_id):
     if current_stop_ids != snapshotted_ids:
         conn.close()
         flash("Route was modified while optimizing. Please try again.", "error")
-        return redirect(url_for("view_route", route_id=route_id))
+        return redirect(_dest)
 
     for new_order, stop_id in enumerate(final_order, start=1):
         conn.execute("UPDATE stops SET stop_order=? WHERE id=?", (new_order, stop_id))
@@ -23435,7 +23454,7 @@ def optimize_route(route_id):
             "Those stops were kept in their original dispatcher order.",
             "warning"
         )
-    return redirect(url_for("view_route", route_id=route_id))
+    return redirect(_dest)
 
 
 @app.route("/stop/<int:stop_id>/drop-bin", methods=["POST"])
