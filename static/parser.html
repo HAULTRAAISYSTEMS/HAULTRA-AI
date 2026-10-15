@@ -50,7 +50,11 @@
   html, body { background: var(--bg-0); color: var(--text); min-height: 100vh; }
   body {
     font-family: var(--font-body);
-    padding-bottom: 152px;
+    padding-bottom: 24px;
+  }
+  /* Phone+: reserve space for the fixed bottom tab bar */
+  @media (max-width: 767px) {
+    body { padding-bottom: 152px; }
   }
 
   a { color: var(--teal); }
@@ -608,7 +612,6 @@
   /* iPad+: hide the mobile bottom tabs — the top nav handles navigation like other pages */
   @media (min-width: 768px) {
     .haul-tabbar { display: none; }
-    body { padding-bottom: 24px; }
   }
   .haul-tab {
     flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
