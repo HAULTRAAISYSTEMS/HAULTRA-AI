@@ -296,12 +296,17 @@ def _linkify(value):
 try:
     from zoneinfo import ZoneInfo as _ZoneInfo
     _EASTERN = _ZoneInfo("America/New_York")
-except Exception:
+except Exception as _e:
+    import logging as _logging
+    _logging.getLogger(__name__).error("now_ts: ZoneInfo America/New_York failed (%s) — timestamps will be UTC!", _e)
     _EASTERN = None
 
 def now_ts():
     if _EASTERN:
         return datetime.now(_EASTERN).strftime("%Y-%m-%d %H:%M:%S")
+    # Fallback: UTC with explicit marker so bad data is identifiable
+    import logging as _logging
+    _logging.getLogger(__name__).error("now_ts: _EASTERN is None, returning UTC — check tzdata install!")
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
