@@ -2452,7 +2452,7 @@ def _driver_clock_now(company_id):
             app.logger.error("TIMEZONE FAILURE: ZoneInfo(%r) failed (%s) in clock path", tz_name, exc)
         except Exception:
             pass
-        now = datetime.now(_EASTERN) if _EASTERN else datetime.now()
+        now = _eastern_now()
     finally:
         conn.close()
     return now.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d")
@@ -2565,7 +2565,7 @@ def _company_local_now(company_settings):
         except Exception:
             pass
         try:
-            return datetime.now(_EASTERN) if _EASTERN else datetime.now()
+            return _eastern_now()
         except Exception:
             return datetime.now()
 
@@ -27152,7 +27152,7 @@ def _days_out(since_str, asof_date=None):
         except Exception:
             return None
     else:
-        ref_date = datetime.now(_EASTERN).date() if _EASTERN else date.today()
+        ref_date = _eastern_now().date()
     return (ref_date - since_date).days
 
 
@@ -31632,7 +31632,7 @@ def customer_dashboard(token):
     # customer portal can show "denied — call us" and "Completed ✓" chips.
     # scheduled_date / driver_name come from the linked stop's route (the
     # boss's confirmed schedule), left-joined so unlinked requests still list.
-    _now_local = datetime.now(_EASTERN) if _EASTERN else datetime.now()
+    _now_local = _eastern_now()
     _24h_ago = (_now_local - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
     reqs = conn.execute(
         """SELECT r.*,
