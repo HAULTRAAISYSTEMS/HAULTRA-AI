@@ -293,25 +293,38 @@ def _linkify(value):
     )
 
 
-try:
-    from zoneinfo import ZoneInfo as _ZoneInfo
-    _EASTERN = _ZoneInfo("America/New_York")
-except Exception as _e:
-    import logging as _logging
-    _logging.getLogger(__name__).error("now_ts: ZoneInfo America/New_York failed (%s) — timestamps will be UTC!", _e)
-    _EASTERN = None
+def _eastern_now():
+    """Current time in America/New_York, without depending on tzdata.
+
+    Tries ZoneInfo first; falls back to a manual US DST calculation
+    (2nd Sunday in March to 1st Sunday in November = EDT/UTC-4,
+    otherwise EST/UTC-5) so timestamps are never silently UTC.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
+    except Exception:
+        pass
+    # Manual fallback: compute EDT vs EST from UTC
+    import calendar
+    utc_now = datetime.utcnow()
+    y = utc_now.year
+    # 2nd Sunday in March (DST starts 2:00 AM EST = 7:00 UTC)
+    mar_sundays = [w[6] for w in calendar.monthcalendar(y, 3) if w[6]]
+    dst_start = datetime(y, 3, mar_sundays[1], 7, 0, 0)
+    # 1st Sunday in November (DST ends 2:00 AM EDT = 6:00 UTC)
+    nov_sundays = [w[6] for w in calendar.monthcalendar(y, 11) if w[6]]
+    dst_end = datetime(y, 11, nov_sundays[0], 6, 0, 0)
+    offset = -4 if (dst_start <= utc_now < dst_end) else -5
+    return utc_now + timedelta(hours=offset)
+
 
 def now_ts():
-    if _EASTERN:
-        return datetime.now(_EASTERN).strftime("%Y-%m-%d %H:%M:%S")
-    # Fallback: UTC with explicit marker so bad data is identifiable
-    import logging as _logging
-    _logging.getLogger(__name__).error("now_ts: _EASTERN is None, returning UTC — check tzdata install!")
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return _eastern_now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def today_str():
-    return datetime.now(_EASTERN).strftime("%Y-%m-%d")
+    return _eastern_now().strftime("%Y-%m-%d")
 
 
 def _fmt_12h(ts):
