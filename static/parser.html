@@ -665,6 +665,12 @@
     background: var(--bg-2);
     border-top: 1px solid rgba(255,255,255,0.08);
   }
+  /* 2026-10-15: iPad has no bottom tabs — dock the action bar to the true
+     bottom edge instead of floating 68px above it over the cards. */
+  @media (min-width: 768px) {
+    body { padding-bottom: calc(118px + env(safe-area-inset-bottom, 0px)); }
+    .bottom-bar { bottom: env(safe-area-inset-bottom, 0px); }
+  }
   .assign-row {
     display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   }
