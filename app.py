@@ -14698,16 +14698,17 @@ _STOP_DRAG_JS = """
 """
 
 
-def _build_route_board_html(user):
+def _build_route_board_html(user, day=None):
     """Render the #lane-container contents for the Route Board — one lane per
     driver with stops today, built from real route/stop rows only. Shared by
     the initial page render and the 30s polling partial so both stay in sync.
+    `day` is YYYY-MM-DD; defaults to today (2026-10-16: board is day-navigable).
     """
     conn = get_db()
     company_id = cid()
-    today = today_str()
+    day = day or today_str()
 
-    params = [company_id, today]
+    params = [company_id, day]
     sql = """
         SELECT r.id AS route_id, r.route_name, r.assigned_to,
                COALESCE(r.route_type, 'rolloff') AS route_type,
@@ -14800,8 +14801,8 @@ def _build_route_board_html(user):
     breakdown_drivers = set()
     for _did in {r["assigned_to"] for r in board_rows if r["assigned_to"]}:
         driver_marks[_did] = (
-            _approved_off_on(conn, company_id, _did, today),
-            _late_active(conn, company_id, _did, today, _co_settings),
+            _approved_off_on(conn, company_id, _did, day),
+            _late_active(conn, company_id, _did, day, _co_settings),
         )
         if _driver_active_breakdown(conn, _did):
             breakdown_drivers.add(_did)
@@ -15124,7 +15125,12 @@ def _build_route_board_html(user):
 @app.route("/routes/board-partial")
 @login_required
 def route_board_partial():
-    return _build_route_board_html(get_current_user())
+    _day = (request.args.get("day") or "").strip() or today_str()
+    try:
+        datetime.strptime(_day, "%Y-%m-%d")
+    except ValueError:
+        _day = today_str()
+    return _build_route_board_html(get_current_user(), _day)
 
 
 @app.route("/api/board/reorder-lanes", methods=["POST"])
@@ -15171,7 +15177,60 @@ def routes_page():
     active_tab = "history" if request.args.get("tab") == "history" else "board"
 
     today = today_str()
-    weekday = datetime.strptime(today, "%Y-%m-%d").strftime("%A").upper()
+    # 2026-10-16: the board is day-navigable — ?day=YYYY-MM-DD, default today.
+    _board_day = (request.args.get("day") or "").strip() or today
+    try:
+        _board_dt = datetime.strptime(_board_day, "%Y-%m-%d")
+    except ValueError:
+        _board_day = today
+        _board_dt = datetime.strptime(_board_day, "%Y-%m-%d")
+    weekday = _board_dt.strftime("%A").upper()
+    _prev_day = (_board_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+    _next_day = (_board_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+    _tomorrow = (datetime.strptime(today, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    if _board_day == today:
+        _day_label = f"Today &middot; {_board_dt.strftime('%a %b %d')}"
+    elif _board_day == _tomorrow:
+        _day_label = f"Tomorrow &middot; {_board_dt.strftime('%a %b %d')}"
+    else:
+        _day_label = _board_dt.strftime("%a %b %d")
+    _day_nav = f"""
+    <style>
+    /* 2026-10-16: board day switcher — flip between today/tomorrow/any day */
+    .board-day-nav {{ display:flex; align-items:center; gap:6px; margin-top:10px; }}
+    .board-day-arrow {{
+        flex:none; width:44px; height:44px; display:inline-flex; align-items:center; justify-content:center;
+        font-size:1.6rem; font-weight:800; color:#FF8C42; text-decoration:none;
+        border:1px solid rgba(255,107,26,.35); border-radius:12px; background:rgba(255,107,26,.08);
+    }}
+    .board-day-arrow:active {{ background:rgba(255,107,26,.2); }}
+    .board-day-label {{
+        position:relative; flex:1; text-align:center; cursor:pointer;
+        font-size:.95rem; font-weight:800; letter-spacing:.6px; color:#fff;
+        border:1px solid rgba(255,255,255,.12); border-radius:12px; background:rgba(255,255,255,.04);
+        padding:12px 10px; min-height:44px; display:flex; align-items:center; justify-content:center;
+    }}
+    .board-day-label input[type=date] {{
+        position:absolute; inset:0; width:100%; height:100%; opacity:0; cursor:pointer;
+    }}
+    </style>
+    <div class="board-day-nav">
+        <a class="board-day-arrow" href="{url_for('routes_page')}?day={_prev_day}" aria-label="Previous day">&#8249;</a>
+        <label class="board-day-label" title="Tap to pick a day">
+            <span>{_day_label}</span>
+            <input type="date" id="board-day-picker" value="{_board_day}" max="2030-12-31">
+        </label>
+        <a class="board-day-arrow" href="{url_for('routes_page')}?day={_next_day}" aria-label="Next day">&#8250;</a>
+    </div>
+    <script>
+    (function(){{
+        var p = document.getElementById('board-day-picker');
+        if (p) p.addEventListener('change', function(){{
+            if (p.value) window.location.href = "{url_for('routes_page')}?day=" + p.value;
+        }});
+    }})();
+    </script>
+    """
 
     history_params = {"tab": "history"}
     if q:
@@ -15218,9 +15277,10 @@ def routes_page():
     <div class="hero owner-header-row" style="position:relative;margin-top:24px;">
         <div>
             <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#55554C;margin-bottom:7px;">
-                {e(weekday)} &middot; {e(today)}
+                {e(weekday)} &middot; {e(_board_day)}
             </div>
             <h1>Route Board{_board_msg_env}</h1>
+            {_day_nav}
         </div>
         <div class="row" style="align-items:center;gap:18px;">
             <div class="board-legend">
@@ -15234,7 +15294,7 @@ def routes_page():
     """
 
     if active_tab == "board":
-        board_inner = _build_route_board_html(user)
+        board_inner = _build_route_board_html(user, _board_day)
         # Boss-only: press-and-hold a route lane and drag to reorder the board.
         # The order persists per company; the 30s poll re-renders in that order,
         # and re-initialises the drag after replacing the lanes.
@@ -15284,7 +15344,7 @@ def routes_page():
             var container = document.getElementById('lane-container');
             if (!container) return;
             setInterval(function() {{
-                fetch('{url_for("route_board_partial")}', {{credentials: 'same-origin'}})
+                fetch('{url_for("route_board_partial")}?day={_board_day}', {{credentials: 'same-origin'}})
                     .then(function(r) {{ return r.ok ? r.text() : null; }})
                     .then(function(html) {{
                         if (html !== null) {{
