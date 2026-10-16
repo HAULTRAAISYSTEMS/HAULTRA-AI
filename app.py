@@ -15358,9 +15358,13 @@ def routes_page():
         conn.close()
 
         rows = ""
+        # 2026-10-16: group by driver — collapsible sections with per-driver
+        # stats. 10 drivers = 10 rows, tap to expand a driver's routes.
+        _groups = {}
         for r in routes:
-            # 2026-10-16: driver-dashboard-style card — status pill, progress
-            # bar, stop rows with dots + action pills, revenue, ghost actions.
+            _groups.setdefault(r["assigned_username"] or "Unassigned", []).append(r)
+
+        def _route_card_html(r):
             _rstops = [s for s in _stops_by_route.get(r["id"], []) if not stop_is_cancelled(dict(s))]
             _done = sum(1 for s in _rstops if s["status"] == "completed")
             _total = len(_rstops)
@@ -15398,7 +15402,7 @@ def routes_page():
                     <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
                     <button class="hist-ghost-btn danger" type="submit">Delete</button>
                 </form>''' if user['role'] == 'boss' else '')
-            rows += f"""
+            return f"""
             <div class="drv-lane hist-lane">
                 <div class="drv-lane-head">
                     <div>
@@ -15420,6 +15424,29 @@ def routes_page():
                 </div>
             </div>
             """
+
+        _first_group = True
+        for _driver, _droutes in _groups.items():
+            _g_n = len(_droutes)
+            _g_stops = _g_done = 0
+            for _r in _droutes:
+                _rs = [s for s in _stops_by_route.get(_r["id"], []) if not stop_is_cancelled(dict(s))]
+                _g_stops += len(_rs)
+                _g_done += sum(1 for s in _rs if s["status"] == "completed")
+            _g_rev = sum(_rev_by_route.get(_r["id"], 0) for _r in _droutes)
+            _cards = "".join(_route_card_html(_r) for _r in _droutes)
+            rows += f"""
+            <details class="hist-driver-group"{" open" if _first_group else ""}>
+                <summary class="hist-driver-head">
+                    <span class="hist-driver-caret">&#8250;</span>
+                    <span class="hist-driver-name">{e(_driver)}</span>
+                    <span class="hist-driver-stats">{_g_n} route{'s' if _g_n != 1 else ''} &middot; {_g_done}/{_g_stops} stops</span>
+                    <span class="hist-driver-rev">{_fmt_money(_g_rev)}</span>
+                </summary>
+                <div class="hist-driver-routes">{_cards}</div>
+            </details>
+            """
+            _first_group = False
 
         main_panel = f"""
         {f'''
@@ -15499,6 +15526,22 @@ def routes_page():
         .hist-ghost-btn.danger {{ color:#FF7A7A; }}
         .drv-lane-foot-link {{ color:#FF8C42; font-weight:700; font-size:.85rem;
             text-decoration:none; white-space:nowrap; }}
+        /* 2026-10-16: collapsible driver groups */
+        .hist-driver-group {{ margin-bottom:10px; border:1px solid rgba(255,255,255,.08);
+            border-radius:16px; background:rgba(255,255,255,.02); overflow:hidden; }}
+        .hist-driver-head {{ display:flex; align-items:center; gap:10px; padding:14px 16px;
+            cursor:pointer; list-style:none; }}
+        .hist-driver-head::-webkit-details-marker {{ display:none; }}
+        .hist-driver-caret {{ color:#FF8C42; font-weight:800; font-size:1.1rem;
+            transition:transform .15s; flex:none; }}
+        .hist-driver-group[open] .hist-driver-caret {{ transform:rotate(90deg); }}
+        .hist-driver-name {{ font-size:1.05rem; font-weight:800; flex:none; }}
+        .hist-driver-stats {{ color:var(--text-muted); font-size:.8rem; flex:1;
+            overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+        .hist-driver-rev {{ color:#3DDC84; font-weight:800; font-size:1rem; flex:none; }}
+        .hist-driver-routes {{ padding:0 12px 12px; }}
+        .hist-driver-routes .drv-lane.hist-lane {{ margin-bottom:10px; }}
+        .hist-driver-routes .drv-lane.hist-lane:last-child {{ margin-bottom:0; }}
         </style>
         """
 
