@@ -4160,6 +4160,45 @@ def init_db():
     if "qty" not in _rc_cols:
         cur.execute("ALTER TABLE rate_cards ADD COLUMN qty REAL")
 
+    # 2026-10-16: invoicing — HAULTRA builds the invoice from the job;
+    # QuickBooks stays the books (sync is phase 2).
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS invoices (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id     INTEGER NOT NULL,
+        invoice_number TEXT NOT NULL,
+        customer_name  TEXT NOT NULL DEFAULT '',
+        route_id       INTEGER,
+        status         TEXT NOT NULL DEFAULT 'draft',
+        terms          TEXT NOT NULL DEFAULT 'due_on_receipt',
+        issued_at      TEXT,
+        due_at         TEXT,
+        notes          TEXT NOT NULL DEFAULT '',
+        subtotal_cents INTEGER NOT NULL DEFAULT 0,
+        total_cents    INTEGER NOT NULL DEFAULT 0,
+        created_by     INTEGER,
+        created_at     TEXT NOT NULL,
+        sent_at        TEXT,
+        paid_at        TEXT,
+        qb_sync_status TEXT NOT NULL DEFAULT 'not_synced',
+        UNIQUE (company_id, invoice_number)
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS invoice_line_items (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        invoice_id   INTEGER NOT NULL,
+        kind         TEXT NOT NULL DEFAULT 'custom',
+        description  TEXT NOT NULL,
+        qty          REAL NOT NULL DEFAULT 1,
+        unit_cents   INTEGER NOT NULL DEFAULT 0,
+        amount_cents INTEGER NOT NULL DEFAULT 0,
+        stop_id      INTEGER,
+        sort_order   INTEGER NOT NULL DEFAULT 0
+    )
+    """)
+    safe_add_column(conn, "companies", "invoice_seq INTEGER DEFAULT 0")
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS sites (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -7053,6 +7092,8 @@ def shell_page(title, body, extra_head=""):
                 _parts.append(nav_link(url_for("requests_page"),
                               icon('inbox') + 'Requests' + _nav_badge('req-nav-badge', _pending_reqs), path))
                 _parts.append(nav_link(url_for("customers_page"), icon('users') + 'Customers', path))
+            if is_own:
+                _parts.append(nav_link(url_for("invoice_list"), icon('clipboard') + 'Invoices', path))
             if is_disp:
                 _parts.append(nav_link(url_for("bin_tracker"), icon('box') + 'Bin Tracker', path))
             # Maintenance/defects — any management role can view.
@@ -21430,6 +21471,7 @@ def view_route(route_id):
         <p>Progress: {completed_count}/{total_count} stops completed{f' &middot; {cancelled_count} cancelled' if cancelled_count else ''}{_route_rev_html}</p>
         <div class="row" style="margin-top:12px;">
             {route_action_buttons}
+            {f'<a class="btn gold" href="{url_for("invoice_new", route_id=route_id)}">&#x1F9FE; Create Invoice</a>' if session.get("role") == "boss" and completed_count else ''}
         </div>
     </div>
 
@@ -22364,6 +22406,337 @@ def delete_order(order_id):
 
 
 # =========================================================
+# =========================================================
+# INVOICING — HAULTRA builds the invoice from the job.
+# QuickBooks stays the books (sync = phase 2).
+# =========================================================
+@app.route("/invoices")
+@boss_required
+def invoice_list():
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT * FROM invoices WHERE company_id=? ORDER BY id DESC""",
+        (cid(),)).fetchall()
+    conn.close()
+    _status_badge = {"draft": "", "sent": "in_progress", "paid": "completed", "void": "cancelled"}
+    cards = ""
+    for inv in rows:
+        d = dict(inv)
+        cards += f"""
+        <a class="card" style="display:block;text-decoration:none;margin-bottom:12px;" href="{url_for('invoice_detail', invoice_id=d['id'])}">
+            <div class="row between">
+                <div><strong>{e(d['invoice_number'])}</strong> &middot; {e(d['customer_name'] or '—')}</div>
+                <span class="badge {_status_badge.get(d['status'], '')}">{e(d['status'].title())}</span>
+            </div>
+            <div class="row between" style="margin-top:8px;">
+                <span class="muted small">{e(d['issued_at'] or '')} &middot; {_invoice_terms_label(d['terms'])}</span>
+                <strong style="font-size:18px;">{_fmt_money(d['total_cents'])}</strong>
+            </div>
+        </a>"""
+    body = f"""
+    <div class="hero"><h1>Invoices</h1>
+    <p>Built from the job — haul, overage, and fees priced from your rate card.</p></div>
+    {cards or '<div class="card"><p class="muted">No invoices yet. Open a completed route and tap <strong>Create Invoice</strong>.</p></div>'}
+    """
+    return render_template_string(shell_page("Invoices", body))
+
+
+def _invoice_terms_label(terms):
+    return dict(_INVOICE_TERMS).get(terms, "Due on receipt")
+
+
+@app.route("/invoices/new")
+@boss_required
+def invoice_new():
+    conn = get_db()
+    route_id = request.args.get("route_id", "").strip()
+    route = None
+    pre_lines = []
+    suggest_customer = ""
+    if route_id.isdigit():
+        route = conn.execute(
+            "SELECT * FROM routes WHERE id=? AND company_id=?", (route_id, cid())).fetchone()
+        if route:
+            pre_lines = _build_invoice_lines_for_route(conn, cid(), int(route_id))
+            names = conn.execute(
+                "SELECT customer_name, COUNT(*) n FROM stops WHERE route_id=? AND status='completed' "
+                "AND customer_name IS NOT NULL AND customer_name != '' GROUP BY customer_name ORDER BY n DESC LIMIT 1",
+                (route_id,)).fetchone()
+            if names:
+                suggest_customer = names["customer_name"]
+    conn.close()
+    if route_id and not route:
+        flash("Route not found.", "error")
+        return redirect(url_for("invoice_list"))
+
+    _lines_preview = ""
+    for ln in pre_lines:
+        _lines_preview += f"""
+        <div class="row between" style="padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.06);">
+            <div><div style="font-weight:600;">{e(ln['description'])}</div>
+            <div class="muted small">{e(ln['kind'].replace('_', ' ').title())}</div></div>
+            <strong>{_fmt_money(ln['amount_cents'])}</strong>
+        </div>"""
+    _pre_total = sum(ln["amount_cents"] for ln in pre_lines)
+    body = f"""
+    <div class="hero"><h1>New Invoice</h1>
+    <p>{'From route: ' + e(route['route_name']) if route else 'Manual invoice'}</p></div>
+    <div class="card">
+        <form method="POST" action="{url_for('invoice_create')}">
+            <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+            <input type="hidden" name="route_id" value="{e(route_id)}">
+            <label>Bill to</label>
+            <input name="customer_name" value="{e(suggest_customer)}" placeholder="Customer name" required style="width:100%;margin-bottom:12px;">
+            <div class="grid" style="grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">
+                <div><label>Terms</label>
+                <select name="terms" style="width:100%;">
+                    {"".join(f'<option value="{t}">{lbl}</option>' for t, lbl in _INVOICE_TERMS)}
+                </select></div>
+                <div><label>Issue date</label>
+                <input type="date" name="issued_at" value="{date.today().strftime('%Y-%m-%d')}" style="width:100%;"></div>
+            </div>
+            <label>Notes (optional)</label>
+            <input name="notes" placeholder="Thank you for your business" style="width:100%;margin-bottom:16px;">
+            <h3 style="margin:0 0 8px;">Line items ({len(pre_lines)})</h3>
+            {_lines_preview or '<p class="muted">No priced stops on this route — add lines manually after creating.</p>'}
+            <div class="row between" style="margin:12px 0 20px;">
+                <strong>Total</strong><strong style="font-size:20px;">{_fmt_money(_pre_total)}</strong>
+            </div>
+            <button class="btn gold" type="submit" style="width:100%;min-height:52px;">Create Invoice</button>
+        </form>
+    </div>
+    """
+    return render_template_string(shell_page("New Invoice", body))
+
+
+@app.route("/invoices", methods=["POST"])
+@boss_required
+def invoice_create():
+    conn = get_db()
+    route_id = request.form.get("route_id", "").strip()
+    customer_name = request.form.get("customer_name", "").strip()
+    terms = request.form.get("terms", "due_on_receipt").strip()
+    if terms not in dict(_INVOICE_TERMS):
+        terms = "due_on_receipt"
+    issued = request.form.get("issued_at", "").strip() or date.today().strftime("%Y-%m-%d")
+    notes = request.form.get("notes", "").strip()
+    if not customer_name:
+        conn.close()
+        flash("Enter who this invoice is for.", "error")
+        return redirect(url_for("invoice_new", route_id=route_id))
+
+    number = _next_invoice_number(conn, cid())
+    due = _invoice_due_date(terms, issued)
+    cur = conn.execute(
+        """INSERT INTO invoices (company_id, invoice_number, customer_name, route_id,
+                                 status, terms, issued_at, due_at, notes, created_by, created_at)
+           VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?)""",
+        (cid(), number, customer_name,
+         int(route_id) if route_id.isdigit() else None,
+         terms, issued, due, notes, session["user_id"], now_ts()))
+    inv_id = cur.lastrowid
+    if route_id.isdigit():
+        for i, ln in enumerate(_build_invoice_lines_for_route(conn, cid(), int(route_id))):
+            conn.execute(
+                """INSERT INTO invoice_line_items
+                   (invoice_id, kind, description, qty, unit_cents, amount_cents, stop_id, sort_order)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (inv_id, ln["kind"], ln["description"], ln["qty"], ln["unit_cents"],
+                 ln["amount_cents"], ln["stop_id"], i))
+    _invoice_recalc_totals(conn, inv_id)
+    conn.commit()
+    conn.close()
+    flash(f"Invoice {number} created.", "success")
+    return redirect(url_for("invoice_detail", invoice_id=inv_id))
+
+
+@app.route("/invoices/<int:invoice_id>")
+@boss_required
+def invoice_detail(invoice_id):
+    conn = get_db()
+    inv = conn.execute("SELECT * FROM invoices WHERE id=? AND company_id=?",
+                       (invoice_id, cid())).fetchone()
+    if not inv:
+        conn.close()
+        abort(404)
+    d = dict(inv)
+    lines = conn.execute(
+        "SELECT * FROM invoice_line_items WHERE invoice_id=? ORDER BY sort_order, id",
+        (invoice_id,)).fetchall()
+    # evidence: photos from linked stops
+    stop_ids = [ln["stop_id"] for ln in lines if ln["stop_id"]]
+    photos = []
+    if stop_ids:
+        try:
+            photos = load_stop_photos(conn, stop_ids)
+            photos = [p for sid in stop_ids for p in photos.get(sid, [])][:12]
+        except Exception:
+            photos = []
+    conn.close()
+
+    _rows = ""
+    for ln in lines:
+        ld = dict(ln)
+        _rows += f"""
+        <div class="row between" style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.06);">
+            <div><div style="font-weight:600;">{e(ld['description'])}</div>
+            <div class="muted small">{e(ld['kind'].replace('_', ' ').title())}</div></div>
+            <div class="row" style="gap:12px;align-items:center;">
+                <strong>{_fmt_money(ld['amount_cents'])}</strong>
+                <form class="inline" method="POST" action="{url_for('invoice_delete_line', invoice_id=invoice_id, line_id=ld['id'])}"
+                      onsubmit="return confirm('Remove this line?')">
+                    <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+                    <button class="btn red" style="font-size:12px;padding:4px 10px;" type="submit">Remove</button>
+                </form>
+            </div>
+        </div>"""
+    _photos = "".join(
+        f'<a href="/{e(p["file_path"])}" target="_blank"><img src="/{e(p["file_path"])}" '
+        f'style="width:72px;height:72px;object-fit:cover;border-radius:8px;"></a>'
+        for p in photos)
+    _status_badge = {"draft": "", "sent": "in_progress", "paid": "completed", "void": "cancelled"}
+    _actions = ""
+    if d["status"] == "draft":
+        _actions = f"""
+        <form class="inline" method="POST" action="{url_for('invoice_set_status', invoice_id=invoice_id)}">
+            <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+            <input type="hidden" name="status" value="sent">
+            <button class="btn gold" type="submit">Mark Sent</button>
+        </form>"""
+    if d["status"] in ("draft", "sent"):
+        _actions += f"""
+        <form class="inline" method="POST" action="{url_for('invoice_set_status', invoice_id=invoice_id)}">
+            <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+            <input type="hidden" name="status" value="paid">
+            <button class="btn secondary" type="submit">Mark Paid</button>
+        </form>"""
+    if d["status"] != "void":
+        _actions += f"""
+        <form class="inline" method="POST" action="{url_for('invoice_set_status', invoice_id=invoice_id)}"
+              onsubmit="return confirm('Void this invoice?')">
+            <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+            <input type="hidden" name="status" value="void">
+            <button class="btn red" type="submit">Void</button>
+        </form>"""
+    body = f"""
+    <div class="hero">
+        <div class="row between" style="align-items:center;">
+            <div><h1>{e(d['invoice_number'])}</h1>
+            <p>{e(d['customer_name'])} &middot; Issued {e(d['issued_at'] or '')} &middot; Due {e(d['due_at'] or '')}</p></div>
+            <span class="badge {_status_badge.get(d['status'], '')}" style="font-size:14px;">{e(d['status'].title())}</span>
+        </div>
+    </div>
+    <div class="card">
+        <h3 style="margin:0 0 8px;">Line items</h3>
+        {_rows or '<p class="muted">No lines yet.</p>'}
+        <div class="row between" style="margin:12px 0;">
+            <strong>Total due</strong><strong style="font-size:22px;">{_fmt_money(d['total_cents'])}</strong>
+        </div>
+        {f'<div style="margin-bottom:16px;"><div class="muted small" style="margin-bottom:6px;">Evidence from the job</div><div class="row" style="gap:8px;flex-wrap:wrap;">{_photos}</div></div>' if _photos else ''}
+        <div class="row" style="gap:8px;flex-wrap:wrap;">{_actions}</div>
+        <p class="muted small" style="margin-top:12px;">QuickBooks sync: {e(d['qb_sync_status'].replace('_', ' '))} — sync arrives in phase 2.</p>
+    </div>
+    <div class="card">
+        <h3 style="margin:0 0 8px;">Add a line</h3>
+        <form method="POST" action="{url_for('invoice_add_line', invoice_id=invoice_id)}">
+            <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+            <input name="description" placeholder="Dry run fee, mattress, relocation…" required style="width:100%;margin-bottom:8px;">
+            <div class="grid" style="grid-template-columns:1fr 1fr;gap:8px;">
+                <input name="amount" type="number" min="0" step="0.01" inputmode="decimal" placeholder="Amount $" required>
+                <select name="kind">
+                    <option value="fee">Fee</option>
+                    <option value="haul">Haul</option>
+                    <option value="overage">Overage</option>
+                    <option value="extra_day">Extra day</option>
+                    <option value="custom">Other</option>
+                </select>
+            </div>
+            <button class="btn secondary" type="submit" style="width:100%;margin-top:8px;">Add Line</button>
+        </form>
+    </div>
+    """
+    return render_template_string(shell_page(d["invoice_number"], body))
+
+
+@app.route("/invoices/<int:invoice_id>/lines", methods=["POST"])
+@boss_required
+def invoice_add_line(invoice_id):
+    conn = get_db()
+    inv = conn.execute("SELECT id, status FROM invoices WHERE id=? AND company_id=?",
+                       (invoice_id, cid())).fetchone()
+    if not inv:
+        conn.close()
+        abort(404)
+    if inv["status"] == "void":
+        conn.close()
+        flash("Void invoices can't be edited.", "error")
+        return redirect(url_for("invoice_detail", invoice_id=invoice_id))
+    desc = request.form.get("description", "").strip()
+    kind = request.form.get("kind", "custom").strip()
+    try:
+        amount = int(round(float((request.form.get("amount") or "0").replace("$", "").replace(",", "")) * 100))
+    except (TypeError, ValueError):
+        amount = -1
+    if not desc or amount < 0:
+        conn.close()
+        flash("Enter a description and a valid amount.", "error")
+        return redirect(url_for("invoice_detail", invoice_id=invoice_id))
+    if kind not in ("haul", "delivery", "swap", "overage", "extra_day", "fee", "custom"):
+        kind = "custom"
+    conn.execute(
+        """INSERT INTO invoice_line_items (invoice_id, kind, description, qty, unit_cents, amount_cents, sort_order)
+           VALUES (?, ?, ?, 1, ?, ?, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM invoice_line_items WHERE invoice_id=?))""",
+        (invoice_id, kind, desc, amount, amount, invoice_id))
+    _invoice_recalc_totals(conn, invoice_id)
+    conn.commit()
+    conn.close()
+    flash("Line added.", "success")
+    return redirect(url_for("invoice_detail", invoice_id=invoice_id))
+
+
+@app.route("/invoices/<int:invoice_id>/lines/<int:line_id>/delete", methods=["POST"])
+@boss_required
+def invoice_delete_line(invoice_id, line_id):
+    conn = get_db()
+    inv = conn.execute("SELECT id FROM invoices WHERE id=? AND company_id=?",
+                       (invoice_id, cid())).fetchone()
+    if not inv:
+        conn.close()
+        abort(404)
+    conn.execute("DELETE FROM invoice_line_items WHERE id=? AND invoice_id=?", (line_id, invoice_id))
+    _invoice_recalc_totals(conn, invoice_id)
+    conn.commit()
+    conn.close()
+    return redirect(url_for("invoice_detail", invoice_id=invoice_id))
+
+
+@app.route("/invoices/<int:invoice_id>/status", methods=["POST"])
+@boss_required
+def invoice_set_status(invoice_id):
+    conn = get_db()
+    inv = conn.execute("SELECT id, status FROM invoices WHERE id=? AND company_id=?",
+                       (invoice_id, cid())).fetchone()
+    if not inv:
+        conn.close()
+        abort(404)
+    new = request.form.get("status", "").strip()
+    if new not in _INVOICE_STATUSES:
+        conn.close()
+        flash("Unknown status.", "error")
+        return redirect(url_for("invoice_detail", invoice_id=invoice_id))
+    ts = now_ts()
+    extra = ""
+    if new == "sent":
+        extra = ", sent_at=COALESCE(sent_at, '%s')" % ts
+    elif new == "paid":
+        extra = ", paid_at=COALESCE(paid_at, '%s')" % ts
+    conn.execute(f"UPDATE invoices SET status=?{extra} WHERE id=?", (new, invoice_id))
+    conn.commit()
+    conn.close()
+    flash(f"Invoice marked {new}.", "success")
+    return redirect(url_for("invoice_detail", invoice_id=invoice_id))
+
+
 # DELETE STOP
 # =========================================================
 @app.route("/stop/<int:stop_id>/weight", methods=["POST"])
@@ -27996,6 +28369,94 @@ def _fmt_tons(tons):
     if "." in s:
         s = s.rstrip("0").rstrip(".")
     return s + "t"
+
+
+# --- Invoicing ---------------------------------------------------------------
+# 2026-10-16: HAULTRA builds the invoice from the job (rate card + scale
+# weight + stops). QuickBooks stays the books — sync is phase 2.
+_INVOICE_TERMS = (
+    ("due_on_receipt", "Due on receipt"),
+    ("net_7", "Net 7"),
+    ("net_14", "Net 14"),
+    ("net_30", "Net 30"),
+)
+_INVOICE_STATUSES = ("draft", "sent", "paid", "void")
+
+
+def _next_invoice_number(conn, company_id):
+    """INV-0001, INV-0002… per company. Never raises."""
+    try:
+        conn.execute("UPDATE companies SET invoice_seq=COALESCE(invoice_seq,0)+1 WHERE id=?",
+                     (company_id,))
+        seq = conn.execute("SELECT COALESCE(invoice_seq,1) FROM companies WHERE id=?",
+                           (company_id,)).fetchone()[0]
+        return "INV-%04d" % int(seq)
+    except Exception:
+        return "INV-%s" % now_ts().replace("-", "").replace(" ", "").replace(":", "")[:12]
+
+
+def _invoice_due_date(terms, issued_day):
+    """issued_day 'YYYY-MM-DD' → due 'YYYY-MM-DD' per terms."""
+    try:
+        d = datetime.strptime(issued_day, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        d = date.today()
+    days = {"net_7": 7, "net_14": 14, "net_30": 30}.get(terms, 0)
+    return (d + timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def _build_invoice_lines_for_route(conn, company_id, route_id):
+    """Auto line items from a route's completed stops.
+
+    One haul line per priced stop + one overage line per overweight
+    pull/swap. Returns [dict(kind, description, qty, unit_cents,
+    amount_cents, stop_id)]. Never raises.
+    """
+    lines = []
+    try:
+        rate_card = _get_rate_card(conn, company_id)
+        tn_rates = _get_tonnage_rates(conn, company_id)
+        stops = conn.execute(
+            """SELECT id, action, container_size, weight_tons, address,
+                      customer_name
+               FROM stops WHERE route_id=? AND status='completed'
+               ORDER BY stop_order, id""", (route_id,)).fetchall()
+        for s in stops:
+            sd = dict(s)
+            action, size = sd.get("action"), sd.get("container_size")
+            svc = _classify_service(action)
+            haul = _stop_revenue_cents(rate_card, action, size)
+            if haul > 0 and svc in ("delivery", "pull", "swap"):
+                label = {"delivery": "Delivery", "pull": "Pull", "swap": "Swap (pickup & return)"}[svc]
+                bucket = size_bucket(size)
+                desc = f"{label} — {bucket or 'container'}"
+                if sd.get("address"):
+                    desc += f" ({sd['address']})"
+                lines.append({"kind": "haul", "description": desc, "qty": 1,
+                              "unit_cents": haul, "amount_cents": haul,
+                              "stop_id": sd["id"]})
+            over = _stop_overage_cents(tn_rates, action, size, sd.get("weight_tons"))
+            if over > 0:
+                allow = tn_rates[1] if _rate_tier(size) == "40yd" else tn_rates[0]
+                tons = float(sd.get("weight_tons") or 0)
+                desc = (f"Tonnage overage — {_fmt_tons(tons - allow)} over "
+                        f"({_fmt_tons(tons)} at {_fmt_money(tn_rates[2])}/ton)")
+                lines.append({"kind": "overage", "description": desc, "qty": 1,
+                              "unit_cents": over, "amount_cents": over,
+                              "stop_id": sd["id"]})
+    except Exception:
+        pass
+    return lines
+
+
+def _invoice_recalc_totals(conn, invoice_id):
+    """Sum lines → subtotal/total. Returns total_cents."""
+    total = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents),0) FROM invoice_line_items WHERE invoice_id=?",
+        (invoice_id,)).fetchone()[0] or 0
+    conn.execute("UPDATE invoices SET subtotal_cents=?, total_cents=? WHERE id=?",
+                 (total, total, invoice_id))
+    return total
 
 
 @app.route("/bin-tracker")
