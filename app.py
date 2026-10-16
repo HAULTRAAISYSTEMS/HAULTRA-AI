@@ -4141,6 +4141,20 @@ def init_db():
     safe_add_column(conn, "customers", "rental_days INTEGER")
     safe_add_column(conn, "customers", "extra_day_rate_cents INTEGER")
 
+    # 2026-10-16: company rate card — what the boss charges per service.
+    # Tiers: 'standard' (10/20/30yd share one price) and '40yd'.
+    # service 'extra_day' uses tier '*' (flat per-day default; per-customer
+    # rates from the address book win when set).
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS rate_cards (
+        company_id INTEGER NOT NULL,
+        service    TEXT NOT NULL,
+        tier       TEXT NOT NULL,
+        cents      INTEGER NOT NULL,
+        PRIMARY KEY (company_id, service, tier)
+    )
+    """)
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS sites (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -11012,6 +11026,27 @@ def dashboard():
     co_settings = {k: _co_row[k] for k in _co_row.keys()} if _co_row else {}
     pay_period_start, pay_period_end = get_pay_period_bounds(co_settings)
 
+    # 2026-10-16: revenue from the rate card — priced completed stops.
+    _rc_map = _get_rate_card(conn, company_id)
+    _rev_today_cents = 0
+    _rev_week_cents = 0
+    _rc_priced_any = bool(_rc_map)
+    if _rc_priced_any:
+        for _rs in conn.execute(
+            """SELECT s.action, s.container_size,
+                      substr(COALESCE(s.completed_at, r.route_date), 1, 10) AS done_day
+                 FROM stops s JOIN routes r ON s.route_id = r.id
+                WHERE r.company_id=? AND s.status='completed'
+                  AND substr(COALESCE(s.completed_at, r.route_date), 1, 10) BETWEEN ? AND ?""",
+            (company_id, pay_period_start, pay_period_end)).fetchall():
+            _c = _stop_revenue_cents(_rc_map, _rs["action"], _rs["container_size"])
+            _rev_week_cents += _c
+            if _rs["done_day"] == today:
+                _rev_today_cents += _c
+    _rev_today_label = _fmt_money(_rev_today_cents) if _rc_priced_any else "&mdash;"
+    _rev_week_sub = (f"this pay week: {_fmt_money(_rev_week_cents)}"
+                     if _rc_priced_any else "set prices in Settings &rarr; Rate Card")
+
     routes = conn.execute("""
         SELECT r.*, u.username AS assigned_username
         FROM routes r
@@ -11115,8 +11150,8 @@ def dashboard():
         </div>
         <div class="gauge-stat">
             <div class="label">Revenue</div>
-            <div class="num dim">&mdash;</div>
-            <div class="sub">not tracked yet</div>
+            <div class="num">{_rev_today_label}</div>
+            <div class="sub">{_rev_week_sub}</div>
         </div>
         <div class="gauge-stat">
             <div class="label">Containers Out</div>
@@ -20745,7 +20780,20 @@ def view_route(route_id):
                 LIMIT 50""",
             (cid(), route_id, route["route_date"]),
         ).fetchall()
+    # 2026-10-16: route revenue from the rate card (completed stops only).
+    _route_rev_cents = 0
+    try:
+        _rc_map = _get_rate_card(conn, cid())
+        for _s in stops:
+            if _s["status"] == "completed":
+                _route_rev_cents += _stop_revenue_cents(_rc_map, _s["action"], _s["container_size"])
+    except Exception:
+        _route_rev_cents = 0
     conn.close()
+
+    _route_rev_html = ""
+    if _route_rev_cents > 0:
+        _route_rev_html = f' &middot; <span style="color:var(--green);font-weight:700;">{_fmt_money(_route_rev_cents)} revenue</span>'
 
     _live_stops     = [s for s in stops if not stop_is_cancelled(s)]
     completed_count = sum(1 for s in _live_stops if s["status"] == "completed")
@@ -21292,7 +21340,7 @@ def view_route(route_id):
         <h1>{e(route['route_name'])}</h1>
         <p>{e(route['route_date'])} | Assigned to: {e(route['assigned_username'] or 'Unassigned')}</p>
         <p>Status: {'<span class="badge cancelled">cancelled</span>' if route['cancelled_at'] else f'<span class="badge {e(route["status"])}">{e(route["status"])}</span>'}</p>
-        <p>Progress: {completed_count}/{total_count} stops completed{f' &middot; {cancelled_count} cancelled' if cancelled_count else ''}</p>
+        <p>Progress: {completed_count}/{total_count} stops completed{f' &middot; {cancelled_count} cancelled' if cancelled_count else ''}{_route_rev_html}</p>
         <div class="row" style="margin-top:12px;">
             {route_action_buttons}
         </div>
@@ -25754,6 +25802,51 @@ def settings_page():
             conn.execute("UPDATE companies SET photo_proof_mode=? WHERE id=?", (mode, cid()))
             conn.commit()
             flash("Photo proof setting saved.", "success")
+        elif action == "rate_card":
+            # 2026-10-16: company rate card — dollars in, integer cents stored.
+            # Tiers: standard (10/20/30yd share one price), 40yd.
+            def _dollars_to_cents(raw):
+                raw = (raw or "").strip().replace("$", "").replace(",", "")
+                if not raw:
+                    return None
+                try:
+                    v = int(round(float(raw) * 100))
+                except (TypeError, ValueError):
+                    return "invalid"
+                return v if 0 <= v <= 10000000 else "invalid"
+            _rc_errors = []
+            _rc_rows = []
+            for svc in ("delivery", "pull", "swap"):
+                for tier in ("standard", "40yd"):
+                    cents = _dollars_to_cents(request.form.get(f"rate_{svc}_{tier}"))
+                    if cents == "invalid":
+                        _rc_errors.append(svc)
+                    elif cents is not None:
+                        _rc_rows.append((cid(), svc, tier, cents))
+            _ed_cents = _dollars_to_cents(request.form.get("rate_extra_day"))
+            if _ed_cents == "invalid":
+                _rc_errors.append("extra_day")
+            elif _ed_cents is not None:
+                _rc_rows.append((cid(), "extra_day", "*", _ed_cents))
+            if _rc_errors:
+                flash("Rate card not saved — check the dollar amounts.", "error")
+            else:
+                for _r in _rc_rows:
+                    conn.execute(
+                        "INSERT INTO rate_cards (company_id, service, tier, cents)"
+                        " VALUES (?, ?, ?, ?)"
+                        " ON CONFLICT(company_id, service, tier) DO UPDATE SET cents=excluded.cents",
+                        _r)
+                # Blank fields clear the rate (delete the row).
+                _want = {(svc, tier) for svc in ("delivery", "pull", "swap")
+                         for tier in ("standard", "40yd")} | {("extra_day", "*")}
+                _have = {(r[1], r[2]) for r in _rc_rows}
+                for svc, tier in _want - _have:
+                    conn.execute(
+                        "DELETE FROM rate_cards WHERE company_id=? AND service=? AND tier=?",
+                        (cid(), svc, tier))
+                conn.commit()
+                flash("Rate card saved.", "success")
         else:
             new_name = request.form.get("company_name", "").strip()
             new_email = request.form.get("email", "").strip()
@@ -25797,6 +25890,19 @@ def settings_page():
     photo_mode = _co.get("photo_proof_mode") or "encouraged"
 
     _yard_set = bool(yard_addr or yard_city)
+
+    # 2026-10-16: rate card values for the form (dollars, blank when unset).
+    _rc = _get_rate_card(conn, cid())
+    def _rc_dollars(svc, tier):
+        v = _rc.get((svc, tier))
+        return "" if not v else (_fmt_money(v).lstrip("$"))
+    _rc_delivery_std = _rc_dollars("delivery", "standard")
+    _rc_delivery_40  = _rc_dollars("delivery", "40yd")
+    _rc_pull_std     = _rc_dollars("pull", "standard")
+    _rc_pull_40      = _rc_dollars("pull", "40yd")
+    _rc_swap_std     = _rc_dollars("swap", "standard")
+    _rc_swap_40      = _rc_dollars("swap", "40yd")
+    _rc_extra_day    = _rc_dollars("extra_day", "*")
     _yard_status = (
         f'<span style="color:#00e87d;font-size:12px;">&#10003; Set — {e(yard_addr)}, {e(yard_city)}, {e(yard_state)} {e(yard_zip)}</span>'
         if _yard_set else
@@ -25955,6 +26061,52 @@ def settings_page():
             </div>
             <div style="margin-top:16px;">
                 <button type="submit" class="btn gold">Save Photo Proof Setting</button>
+            </div>
+        </form>
+    </div>
+
+    <div class="card" id="rate-card">
+        <h2>&#128176; Rate Card</h2>
+        <p style="color:#B8B8AE;font-size:13px;margin-bottom:16px;">
+            What you charge per job. 10, 20 and 30-yard cans share one price;
+            40-yard has its own. The app uses these to total revenue per route
+            and per day. Blank = unpriced.
+        </p>
+        <form method="POST">
+            <input type="hidden" name="_action" value="rate_card">
+            <div style="overflow-x:auto;">
+            <table style="width:100%;border-collapse:collapse;min-width:320px;">
+                <thead><tr>
+                    <th style="text-align:left;padding:8px 6px;font-size:12px;color:#B8B8AE;text-transform:uppercase;letter-spacing:.5px;">Service</th>
+                    <th style="padding:8px 6px;font-size:12px;color:#B8B8AE;text-transform:uppercase;letter-spacing:.5px;">10&ndash;30 yd</th>
+                    <th style="padding:8px 6px;font-size:12px;color:#B8B8AE;text-transform:uppercase;letter-spacing:.5px;">40 yd</th>
+                </tr></thead>
+                <tbody>
+                <tr>
+                    <td style="padding:6px;font-weight:600;">Delivery <span class="muted small">(drop empty)</span></td>
+                    <td style="padding:6px;"><input name="rate_delivery_standard" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_delivery_std}" style="width:100%;"></td>
+                    <td style="padding:6px;"><input name="rate_delivery_40yd" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_delivery_40}" style="width:100%;"></td>
+                </tr>
+                <tr>
+                    <td style="padding:6px;font-weight:600;">Pull <span class="muted small">(haul full)</span></td>
+                    <td style="padding:6px;"><input name="rate_pull_standard" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_pull_std}" style="width:100%;"></td>
+                    <td style="padding:6px;"><input name="rate_pull_40yd" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_pull_40}" style="width:100%;"></td>
+                </tr>
+                <tr>
+                    <td style="padding:6px;font-weight:600;">Swap <span class="muted small">(pickup &amp; return)</span></td>
+                    <td style="padding:6px;"><input name="rate_swap_standard" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_swap_std}" style="width:100%;"></td>
+                    <td style="padding:6px;"><input name="rate_swap_40yd" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_swap_40}" style="width:100%;"></td>
+                </tr>
+                </tbody>
+            </table>
+            </div>
+            <div style="margin-top:12px;max-width:280px;">
+                <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Extra-day default ($/day)</label>
+                <input name="rate_extra_day" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_extra_day}" style="width:100%;">
+                <p class="muted small" style="margin-top:6px;">Used when a customer has no per-customer extra-day rate in the address book.</p>
+            </div>
+            <div style="margin-top:16px;">
+                <button type="submit" class="btn gold">Save Rate Card</button>
             </div>
         </form>
     </div>
@@ -27434,10 +27586,11 @@ def _customer_rental_terms(conn, company_id, address, city, customer_name):
 
     2026-10-16: per-customer bin rental terms. Returns
     (customer_id, site_id, customer_label, rental_days, rate_cents).
-    rental_days falls back to OVERDUE_RENTAL_DAYS; rate_cents to 0.
+    rental_days falls back to OVERDUE_RENTAL_DAYS; rate_cents falls back to
+    the company rate-card extra-day default, then 0.
     customer_id/site_id are None when the address isn't in the book.
     """
-    rental_days, rate_cents = OVERDUE_RENTAL_DAYS, 0
+    rental_days, rate_cents = OVERDUE_RENTAL_DAYS, None
     cust_id, site_id, label = None, None, ""
     try:
         # 1) address → site → customer
@@ -27456,9 +27609,9 @@ def _customer_rental_terms(conn, company_id, address, city, customer_name):
                 if site_addr and _norm_addr(site_addr["address"]) == addr_key:
                     cust_id, site_id = r["cust_id"], r["site_id"]
                     label = r["label"] or ""
-                    if r["rental_days"]:
+                    if r["rental_days"] is not None:
                         rental_days = int(r["rental_days"])
-                    if r["extra_day_rate_cents"]:
+                    if r["extra_day_rate_cents"] is not None:
                         rate_cents = int(r["extra_day_rate_cents"])
                     break
         # 2) fallback: customer name → customer
@@ -27473,9 +27626,9 @@ def _customer_rental_terms(conn, company_id, address, city, customer_name):
                 if _norm_addr(r["label"]) == nm and nm:
                     cust_id = r["id"]
                     label = r["label"] or ""
-                    if r["rental_days"]:
+                    if r["rental_days"] is not None:
                         rental_days = int(r["rental_days"])
-                    if r["extra_day_rate_cents"]:
+                    if r["extra_day_rate_cents"] is not None:
                         rate_cents = int(r["extra_day_rate_cents"])
                     # first site of this customer, if any
                     s = conn.execute(
@@ -27487,6 +27640,12 @@ def _customer_rental_terms(conn, company_id, address, city, customer_name):
         pass
     if rental_days < 1:
         rental_days = OVERDUE_RENTAL_DAYS
+    # Per-customer rate wins; otherwise the company rate-card default.
+    if rate_cents is None:
+        try:
+            rate_cents = _extra_day_default_cents(conn, company_id)
+        except Exception:
+            rate_cents = 0
     if rate_cents < 0:
         rate_cents = 0
     return cust_id, site_id, label, rental_days, rate_cents
@@ -27522,6 +27681,72 @@ def _fmt_money(cents):
     if cents % 100 == 0:
         return "$%d" % (cents // 100)
     return "$%.2f" % (cents / 100.0)
+
+
+# --- Rate card / revenue -----------------------------------------------------
+# 2026-10-16: what the boss charges. Tiers: 10/20/30yd share the 'standard'
+# price; 40yd has its own. Mirrors the action semantics used by the
+# container-flow replay so pricing and tracking never disagree.
+_RATE_SERVICES = ("delivery", "pull", "swap")
+
+
+def _classify_service(action):
+    """Map a stop action to a rate-card service (or None if unpriced)."""
+    a = (action or "").lower()
+    if "pickup and return" in a or ("swap" in a and "pull" not in a):
+        return "swap"
+    if "delivery" in a or "drop" in a:
+        return "delivery"
+    if "pull" in a:
+        return "pull"
+    return None
+
+
+def _rate_tier(size):
+    """'40yd' gets its own tier; everything else (10/20/30/unknown) is standard."""
+    return "40yd" if size_bucket(size) == "40yd" else "standard"
+
+
+def _get_rate_card(conn, company_id):
+    """{(service, tier): cents} for the company. Missing = 0."""
+    rows = conn.execute(
+        "SELECT service, tier, cents FROM rate_cards WHERE company_id=?",
+        (company_id,)).fetchall()
+    return {(r["service"], r["tier"]): (r["cents"] or 0) for r in rows}
+
+
+def _stop_revenue_cents(rate_card, action, size):
+    """Priced revenue for one stop. Unpriced actions/sizes → 0. Never raises."""
+    try:
+        svc = _classify_service(action)
+        if not svc:
+            return 0
+        return int(rate_card.get((svc, _rate_tier(size)), 0) or 0)
+    except Exception:
+        return 0
+
+
+def _route_revenue_cents(conn, company_id, route_id, rate_card=None):
+    """Sum of priced COMPLETED stops on a route."""
+    if rate_card is None:
+        rate_card = _get_rate_card(conn, company_id)
+    total = 0
+    for s in conn.execute(
+            "SELECT action, container_size FROM stops WHERE route_id=? AND status='completed'",
+            (route_id,)).fetchall():
+        total += _stop_revenue_cents(rate_card, s["action"], s["container_size"])
+    return total
+
+
+def _extra_day_default_cents(conn, company_id):
+    """Company default extra-day rate (per-customer address-book rates win)."""
+    row = conn.execute(
+        "SELECT cents FROM rate_cards WHERE company_id=? AND service='extra_day'",
+        (company_id,)).fetchone()
+    try:
+        return int(row["cents"]) if row and row["cents"] else 0
+    except (TypeError, ValueError):
+        return 0
 
 
 @app.route("/bin-tracker")
