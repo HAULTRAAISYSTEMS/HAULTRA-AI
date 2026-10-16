@@ -20241,7 +20241,10 @@ def _thread_access_ok(conn, thread_key, user_id, role, company_id):
 
 def _thread_typers(conn, thread_key, me_id):
     """Usernames (not me) with a fresh typing heartbeat in this thread."""
-    cutoff = (datetime.now() - timedelta(seconds=_TYPING_TTL_SEC)).strftime("%Y-%m-%d %H:%M:%S")
+    # 2026-10-16 fix: cutoff must be Eastern like the stored stamps
+    # (now_ts) — datetime.now() is UTC on Render and sat 4h ahead, so
+    # typing never showed.
+    cutoff = (_eastern_now() - timedelta(seconds=_TYPING_TTL_SEC)).strftime("%Y-%m-%d %H:%M:%S")
     rows = conn.execute(
         "SELECT username FROM typing_indicators WHERE thread_key=? AND user_id != ? AND updated_at > ?",
         (thread_key, me_id, cutoff)).fetchall()
@@ -20270,8 +20273,8 @@ def message_typing_heartbeat():
         " VALUES (?, ?, ?, ?)"
         " ON CONFLICT(thread_key, user_id) DO UPDATE SET username=excluded.username, updated_at=excluded.updated_at",
         (thread_key, me, name, now))
-    # Prune anything older than 30s — keeps the table tiny.
-    cutoff = (datetime.now() - timedelta(seconds=30)).strftime("%Y-%m-%d %H:%M:%S")
+    # Prune anything older than 30s — keeps the table tiny. Eastern, like the stamps.
+    cutoff = (_eastern_now() - timedelta(seconds=30)).strftime("%Y-%m-%d %H:%M:%S")
     conn.execute("DELETE FROM typing_indicators WHERE updated_at < ?", (cutoff,))
     conn.commit()
     conn.close()
