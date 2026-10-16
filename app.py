@@ -3828,6 +3828,20 @@ def init_db():
     )
     """)
 
+    # --- Typing indicators: ephemeral "X is typing..." heartbeats, one row per
+    # (thread, user). The client heartbeats while typing; rows older than a few
+    # seconds are treated as stopped. SQLite (not memory) so both gunicorn
+    # workers see the same state. ---
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS typing_indicators (
+        thread_key TEXT NOT NULL,
+        user_id    INTEGER NOT NULL,
+        username   TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (thread_key, user_id)
+    )
+    """)
+
     # --- Password reset tokens: single-use, 1-hour expiry, only the hash is stored ---
     cur.execute("""
     CREATE TABLE IF NOT EXISTS password_reset_tokens (
@@ -9278,6 +9292,19 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     background: var(--bg-0); border: 1px solid rgba(255,255,255,0.12);
     border-radius: 10px; color: var(--text); font-family: inherit; font-size: 16px; padding: 10px 12px;
 }}
+/* Typing indicator: "tim is typing" + animated dots. */
+.msg-typing .msg-bubble-body {{ padding: 2px 0; }}
+.typing-dots {{ display: inline-flex; gap: 4px; align-items: center; padding: 4px 2px; }}
+.typing-dots span {{
+    width: 7px; height: 7px; border-radius: 50%; background: #B9B9B4;
+    animation: typingBounce 1.2s infinite ease-in-out;
+}}
+.typing-dots span:nth-child(2) {{ animation-delay: .15s; }}
+.typing-dots span:nth-child(3) {{ animation-delay: .3s; }}
+@keyframes typingBounce {{
+    0%, 60%, 100% {{ transform: translateY(0); opacity: .5; }}
+    30% {{ transform: translateY(-5px); opacity: 1; }}
+}}
 .msg-compose .btn {{ min-height: 48px; align-self: flex-end; }}
 
 /* Driver workflow buttons (Cab View: Arrived / Box In-Out / Go To Dump) */
@@ -14085,6 +14112,9 @@ def _message_thread_js():
 
     var serverMessages = [];        // last-known server thread
     var lastRenderedMax = 0;        // for new-bubble highlight
+    var currentTypers = [];         // usernames (not me) typing right now
+    var threadPollTimer = null;     // live refresh while the modal is open
+    var lastTypingSent = 0;         // throttle for typing heartbeats
     var QKEY = 'haultra_msg_queue'; // offline/optimistic outbox (localStorage)
 
     function loadQueue() {
@@ -14116,9 +14146,23 @@ def _message_thread_js():
             (extra || '') + '</div>';
     }
 
+    function typingBubbleHtml(names) {
+        var label = names.length === 1 ? names[0] + ' is typing'
+                  : names.length === 2 ? names[0] + ' and ' + names[1] + ' are typing'
+                  : 'Several people are typing';
+        return '<div class="msg-bubble msg-them msg-typing">'
+             + '<div class="msg-bubble-meta">' + escapeHtml(label) + '</div>'
+             + '<div class="msg-bubble-body"><span class="typing-dots"><span></span><span></span><span></span></span></div>'
+             + '</div>';
+    }
+
     function renderThread() {
         var list = el('msg-list');
         if (!list) return;
+        // Don't yank the scroll if the user scrolled up to read history —
+        // only auto-scroll when already near the bottom (or first load).
+        var nearBottom = (list.scrollHeight - list.scrollTop - list.clientHeight) < 140;
+        var firstLoad = !lastRenderedMax;
         var html = serverMessages.map(function(m) {
             var isNew = m.id > lastRenderedMax;
             var cls = (m.is_me ? 'msg-me' : 'msg-them') + (isNew && lastRenderedMax ? ' rt-new' : '');
@@ -14135,6 +14179,7 @@ def _message_thread_js():
             } else { meta = (it.state === 'queued') ? 'Queued — will send' : 'Sending…'; }
             html += bubbleHtml(meta, it.body, 'msg-me msg-pending msg-' + it.state);
         });
+        if (currentTypers.length) { html += typingBubbleHtml(currentTypers); }
         if (!html) { html = '<div class="msg-empty">No messages yet.</div>'; }
         list.innerHTML = html;
         list.querySelectorAll('.msg-retry-btn').forEach(function(b) {
@@ -14144,15 +14189,28 @@ def _message_thread_js():
             lastRenderedMax = Math.max(lastRenderedMax,
                 serverMessages[serverMessages.length - 1].id);
         }
-        list.scrollTop = list.scrollHeight;
+        if (firstLoad || nearBottom) { list.scrollTop = list.scrollHeight; }
+    }
+
+    function sameTypers(a, b) {
+        if (a.length !== b.length) return false;
+        for (var i = 0; i < a.length; i++) { if (a[i] !== b[i]) return false; }
+        return true;
     }
 
     function fetchThread(key, cb) {
         fetch(threadUrl(key), { credentials: 'same-origin' })
             .then(function(r) { return r.json(); })
             .then(function(data) {
-                serverMessages = data.messages || [];
-                renderThread();
+                var msgs = data.messages || [];
+                var typers = data.typing || [];
+                // Skip the re-render when nothing changed — rebuilding
+                // innerHTML would kill text selection mid-copy.
+                var newMax = msgs.length ? msgs[msgs.length - 1].id : 0;
+                var changed = (newMax !== lastRenderedMax) || !sameTypers(typers, currentTypers);
+                serverMessages = msgs;
+                currentTypers = typers;
+                if (changed) { renderThread(); }
                 if (cb) cb();
             })
             .catch(function() {
@@ -14163,6 +14221,20 @@ def _message_thread_js():
             });
     }
 
+    function stopThreadPoll() {
+        if (threadPollTimer) { clearInterval(threadPollTimer); threadPollTimer = null; }
+    }
+
+    function startThreadPoll() {
+        stopThreadPoll();
+        // 2026-10-16: live thread — new messages appear without closing and
+        // reopening the modal. Skips work when the tab is backgrounded.
+        threadPollTimer = setInterval(function() {
+            if (currentThreadKey == null || document.hidden) return;
+            fetchThread(currentThreadKey);
+        }, 3000);
+    }
+
     // key: "dm:<driver_id>" (the one thread per driver). tagRouteId optionally
     // files new messages under a route so they render with a route tag.
     window.openMessageThread = function(key, title, tagRouteId) {
@@ -14171,11 +14243,13 @@ def _message_thread_js():
         currentThreadTitle = title || 'Messages';
         lastRenderedMax = 0;
         serverMessages = [];
+        currentTypers = [];
         if (el('msg-modal-title')) el('msg-modal-title').textContent = 'Messages \\u2014 ' + currentThreadTitle;
         if (el('msg-overlay')) el('msg-overlay').hidden = false;
         if (el('msg-modal')) el('msg-modal').hidden = false;
         renderThread();
         fetchThread(key);
+        startThreadPoll();
     };
 
     // Called by the Cab View SSE stream when a new message lands while the
@@ -14197,6 +14271,9 @@ def _message_thread_js():
     };
 
     window.closeMessageThread = function() {
+        stopThreadPoll();
+        currentTypers = [];
+        currentThreadKey = null;
         if (el('msg-overlay')) el('msg-overlay').hidden = true;
         if (el('msg-modal')) el('msg-modal').hidden = true;
     };
@@ -14305,6 +14382,29 @@ def _message_thread_js():
     document.querySelectorAll('.msg-quick-btn').forEach(function(b) {
         b.addEventListener('click', function() { sendQuickMessage(b.dataset.msg); });
     });
+
+    // 2026-10-16: typing indicator — heartbeat while the user types so the
+    // other side sees "X is typing...". Throttled; the server expires the
+    // heartbeat a few seconds after typing stops, so no explicit "stopped"
+    // signal is needed.
+    function sendTypingHeartbeat() {
+        if (currentThreadKey == null) return;
+        var now = Date.now();
+        if (now - lastTypingSent < 2500) return;
+        lastTypingSent = now;
+        fetch('/api/messages/typing', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF },
+            credentials: 'same-origin',
+            body: JSON.stringify({ thread_key: currentThreadKey }),
+        }).catch(function() {});
+    }
+    var _msgInput = document.getElementById('msg-input');
+    if (_msgInput) {
+        _msgInput.addEventListener('input', function() {
+            if ((_msgInput.value || '').trim()) { sendTypingHeartbeat(); }
+        });
+    }
 
     // Flush the outbox when connectivity returns (landfill dead zones) or on load.
     window.addEventListener('online', flushQueue);
@@ -19925,6 +20025,7 @@ def route_messages(route_id):
         WHERE m.route_id=?
         ORDER BY m.id ASC
     """, (route_id,)).fetchall()
+    typers = _thread_typers(conn, "route:%d" % route_id, session["user_id"])
     conn.close()
 
     return jsonify({"messages": [
@@ -19939,7 +20040,7 @@ def route_messages(route_id):
             "sender_color": _avatar_color(r["sender_user_id"]),
         }
         for r in rows
-    ]})
+    ], "typing": typers})
 
 
 @app.route("/dm/<int:driver_id>/messages", methods=["GET", "POST"])
@@ -20075,6 +20176,7 @@ def direct_messages_api(driver_id):
         ) x JOIN users u ON u.id = x.sender_user_id
         ORDER BY x.created_at ASC
     """, (driver_id, company, driver_id)).fetchall()
+    typers = _thread_typers(conn, "dm:%d" % driver_id, me)
     conn.close()
     return jsonify({"messages": [
         {
@@ -20089,7 +20191,91 @@ def direct_messages_api(driver_id):
             "sender_color": _avatar_color(r["sender_user_id"]),
         }
         for i, r in enumerate(rows)
-    ]})
+    ], "typing": typers})
+
+
+# --- Typing indicators -------------------------------------------------------
+# 2026-10-16: "X is typing..." for message threads. The client heartbeats
+# while the user types; the server treats rows older than a few seconds as
+# stopped typing. Keyed by the modal's thread key ("dm:<driver_id>",
+# "route:<id>" — the "route:" prefix is stripped for normalization).
+_TYPING_TTL_SEC = 6
+
+
+def _normalize_thread_key(key):
+    """Modal thread keys: 'dm:<driver_id>' or 'route:<id>' (legacy callers may
+    pass a bare numeric route id)."""
+    s = (key or "").strip()
+    if s.startswith("route:"):
+        return s
+    if s.isdigit():
+        return "route:" + s
+    return s
+
+
+def _thread_access_ok(conn, thread_key, user_id, role, company_id):
+    """Can this user see/type in this thread? Mirrors the GET endpoints."""
+    if thread_key.startswith("dm:"):
+        try:
+            driver_id = int(thread_key[3:])
+        except (TypeError, ValueError):
+            return False
+        if role == "boss":
+            return bool(conn.execute(
+                "SELECT 1 FROM users WHERE id=? AND company_id=?",
+                (driver_id, company_id)).fetchone())
+        return driver_id == user_id
+    if thread_key.startswith("route:"):
+        try:
+            route_id = int(thread_key[6:])
+        except (TypeError, ValueError):
+            return False
+        route = conn.execute(
+            "SELECT id, assigned_to FROM routes WHERE id=? AND company_id=?",
+            (route_id, company_id)).fetchone()
+        if not route:
+            return False
+        return role == "boss" or route["assigned_to"] == user_id
+    return False
+
+
+def _thread_typers(conn, thread_key, me_id):
+    """Usernames (not me) with a fresh typing heartbeat in this thread."""
+    cutoff = (datetime.now() - timedelta(seconds=_TYPING_TTL_SEC)).strftime("%Y-%m-%d %H:%M:%S")
+    rows = conn.execute(
+        "SELECT username FROM typing_indicators WHERE thread_key=? AND user_id != ? AND updated_at > ?",
+        (thread_key, me_id, cutoff)).fetchall()
+    return [r["username"] for r in rows]
+
+
+@app.route("/api/messages/typing", methods=["POST"])
+@login_required
+def message_typing_heartbeat():
+    """Client heartbeat: 'I'm typing in this thread'. No body needed beyond
+    the thread key; the server stamps the time. Stale rows are pruned here."""
+    data = request.get_json(silent=True) or {}
+    thread_key = _normalize_thread_key(data.get("thread_key"))
+    if not thread_key:
+        return jsonify({"error": "thread_key required."}), 400
+    conn = get_db()
+    me = session["user_id"]
+    if not _thread_access_ok(conn, thread_key, me, session.get("role"), cid()):
+        conn.close()
+        return jsonify({"error": "Access denied."}), 403
+    user = conn.execute("SELECT username, full_name FROM users WHERE id=?", (me,)).fetchone()
+    name = ((user["full_name"] or "").strip() if user else "") or (user["username"] if user else "Someone")
+    now = now_ts()
+    conn.execute(
+        "INSERT INTO typing_indicators (thread_key, user_id, username, updated_at)"
+        " VALUES (?, ?, ?, ?)"
+        " ON CONFLICT(thread_key, user_id) DO UPDATE SET username=excluded.username, updated_at=excluded.updated_at",
+        (thread_key, me, name, now))
+    # Prune anything older than 30s — keeps the table tiny.
+    cutoff = (datetime.now() - timedelta(seconds=30)).strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute("DELETE FROM typing_indicators WHERE updated_at < ?", (cutoff,))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True})
 
 
 @app.route("/api/messages/threads")
