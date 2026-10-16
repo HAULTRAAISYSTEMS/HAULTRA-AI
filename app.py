@@ -2455,13 +2455,66 @@ def _driver_clock_now(company_id):
         now = _eastern_now()
     finally:
         conn.close()
+    if tz_name.upper() == "UTC":
+        # 2026-10-16: a company timezone of UTC silently stamps UTC times
+        # (ZoneInfo("UTC") never fails) — loud log so it's visible in Render.
+        try:
+            app.logger.warning("CLOCK company %s timezone is UTC — clock taps will stamp UTC, not local", company_id)
+        except Exception:
+            pass
     return now.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d")
 
 
-def _driver_clock_in_now(conn, company_id, driver_id, note=""):
+# 2026-10-16: the phone's clock is the source of truth for a tap. The driver
+# sees their phone time, so the stamp must match it — immune to any server
+# timezone misconfiguration. Injected by JS into clock forms as phone_ts.
+_PHONE_TS_JS = (
+    "<script>"
+    "document.addEventListener('submit', function(ev) {"
+    "  var f = ev.target;"
+    "  if (!f || !f.querySelector) return;"
+    "  var inp = f.querySelector('input[name=\"phone_ts\"]');"
+    "  if (inp) {"
+    "    var d = new Date();"
+    "    function p(n){ return (n < 10 ? '0' : '') + n; }"
+    "    inp.value = d.getFullYear() + '-' + p(d.getMonth()+1) + '-' + p(d.getDate())"
+    "      + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());"
+    "  }"
+    "}, true);"
+    "</script>"
+)
+_PHONE_TS_INPUT = '<input type="hidden" name="phone_ts" value="">'
+
+
+def _resolve_tap_time(company_id, phone_ts=""):
+    """Resolve the timestamp for a driver clock tap.
+
+    Prefers the phone's local time (what the driver actually sees), with a
+    loose sanity window against true UTC — a timezone bug shifts whole hours,
+    never 48 of them, so garbage is rejected while a misconfigured server
+    timezone can never silently win again. Falls back to server Eastern.
+    Returns (ts 'YYYY-MM-DD HH:MM:SS', date 'YYYY-MM-DD').
+    """
+    server_ts, server_today = _driver_clock_now(company_id)
+    pts = (phone_ts or "").strip()[:19]
+    if pts:
+        try:
+            ph = datetime.strptime(pts, "%Y-%m-%d %H:%M:%S")
+            skew_h = abs((ph - datetime.utcnow()).total_seconds()) / 3600.0
+            if skew_h <= 48:
+                return ph.strftime("%Y-%m-%d %H:%M:%S"), ph.strftime("%Y-%m-%d")
+            app.logger.warning("CLOCK phone_ts %r rejected (%.1fh from UTC now)", pts, skew_h)
+        except Exception as exc:
+            app.logger.warning("CLOCK phone_ts %r unparseable: %s", pts, exc)
+    return server_ts, server_today
+
+
+def _driver_clock_in_now(conn, company_id, driver_id, note="", ts=None, today=None):
     """Record a clock-in at this instant. Idempotent: if already clocked in
-    today, returns the existing entry unchanged."""
-    ts, today = _driver_clock_now(company_id)
+    today, returns the existing entry unchanged. ts/today override the tap
+    time (e.g. the phone's clock via _resolve_tap_time)."""
+    if not ts or not today:
+        ts, today = _driver_clock_now(company_id)
     row = _driver_clock_entry(conn, company_id, driver_id, today)
     if row and row["clock_in_at"]:
         return row
@@ -10585,9 +10638,11 @@ def dashboard():
         <form method="POST" action="{url_for('driver_clock_in_now_ep')}" class="drv-clock off">
             <input type="hidden" name="_csrf_token" value="{_csrf_tok}">
             <input type="hidden" name="next" value="{e(request.path)}">
+            {_PHONE_TS_INPUT}
             <span>Not clocked in</span>
             <button type="submit">&#9200; CLOCK IN</button>
-        </form>"""
+        </form>
+        {_PHONE_TS_JS}"""
 
         # Forgot prompts (pay week only)
         _forgot_html = ""
@@ -15499,8 +15554,10 @@ def _cab_preflight_body(route, stops, total_count, csrf, clocked_in=True):
     <form method="POST" action="{_clock_in_action}">
       <input type="hidden" name="_csrf_token" value="{csrf}">
       <input type="hidden" name="next" value="{e(_cab_url)}">
+      {_PHONE_TS_INPUT}
       <button class="pf-start-btn" type="submit">&#9200; CLOCK IN</button>
     </form>
+    {_PHONE_TS_JS}
     <p class="muted small" style="margin-top:10px;text-align:center;">Clock in when you get to the truck — then start your route.</p>"""
 
     return f"""
@@ -16694,10 +16751,12 @@ def driver_route_detail(route_id):
             <form method="POST" action="{url_for('driver_clock_out_now')}" style="width:100%;margin-top:6px;">
                 <input type="hidden" name="_csrf_token" value="{_csrf}">
                 <input type="hidden" name="next" value="{e(request.path)}">
+                {_PHONE_TS_INPUT}
                 <button type="submit" class="pf-start-btn" style="background:var(--green,#2E9E5B);color:#fff;">
                     &#9200; CLOCK OUT{" — on since " + _co_in_at if _co_in_at else ""}
                 </button>
             </form>
+            {_PHONE_TS_JS}
             <p class="muted small" style="margin-top:8px;">Back at the yard? Clock out to end your day.</p>
             """
         body = f"""
@@ -29997,7 +30056,18 @@ def driver_clock():
     # ── POST: all clock actions ──────────────────────────────────────────────
     if request.method == "POST":
         action = request.form.get("clock_action", "").strip()
-        ts  = now_ts()
+        # 2026-10-16: taps stamp the phone's time; explicit edits keep the
+        # driver's typed time. Either way, never the server's bare guess.
+        tap_ts, _tap_today = _resolve_tap_time(cid(), request.form.get("phone_ts", ""))
+        ts  = tap_ts
+        if _tap_today != today:
+            # Phone and server disagree on the date (midnight edge) — the
+            # phone's date wins; re-fetch the entry for it.
+            today = _tap_today
+            entry = conn.execute(
+                "SELECT * FROM driver_clock_entries WHERE driver_id=? AND date=?",
+                (driver_id, today)
+            ).fetchone()
         _e  = {k: entry[k] for k in entry.keys()} if entry else {}
 
         def _note(base, msg):
@@ -30238,7 +30308,7 @@ def driver_clock():
         return (
             '<form method="POST" style="margin-bottom:' + mb + ';"'
             + (' onsubmit="' + onsubmit + '"' if onsubmit else '') + '>'
-            + _hid(action_val) + btn_html + '</form>'
+            + _hid(action_val) + _PHONE_TS_INPUT + btn_html + '</form>'
         )
 
     def _edit_form(action_val, lbl_text, hhmm_val):
@@ -30405,6 +30475,8 @@ def driver_clock():
         + correction_card_html
         # ── TIME OFF (below weekly hours) ────────────────────────────────
         + time_off_card_html
+        # 2026-10-16: stamps the phone's tap time into clock forms.
+        + _PHONE_TS_JS
     )
     return render_template_string(shell_page("Clock In / Out", body))
 
@@ -30457,16 +30529,18 @@ def driver_clock_in_now_ep():
     driver_id = session["user_id"]
     company_id = cid()
     conn = get_db()
-    now_ts_str, today_local = _driver_clock_now(company_id)
+    # 2026-10-16: stamp the phone's tap time, not the server's guess.
+    tap_ts, today_local = _resolve_tap_time(company_id, request.form.get("phone_ts", ""))
     next_url = (request.form.get("next") or "").strip() or request.referrer or url_for("driver_dashboard")
     if not next_url.startswith("/"):
         next_url = url_for("driver_dashboard")
-    _driver_clock_in_now(conn, company_id, driver_id, note="clock_in via pre-flight")
+    _driver_clock_in_now(conn, company_id, driver_id, note="clock_in via pre-flight",
+                         ts=tap_ts, today=today_local)
     # Clocking in auto-clears today's "running late" check-in, mirroring the
     # clock page (the row stays for the record; the amber chips clear).
     conn.execute(
         "UPDATE late_checkins SET cleared_at=? WHERE company_id=? AND driver_id=? AND work_date=? AND cleared_at IS NULL",
-        (now_ts_str, company_id, driver_id, today_local))
+        (tap_ts, company_id, driver_id, today_local))
     conn.commit()
     conn.close()
     flash("Clocked in.", "success")
@@ -30485,7 +30559,8 @@ def driver_clock_out_now():
     driver_id = session["user_id"]
     company_id = cid()
     conn = get_db()
-    now_ts_str, today_local = _driver_clock_now(company_id)
+    # 2026-10-16: "right now" means the phone's now, not the server's guess.
+    tap_ts, today_local = _resolve_tap_time(company_id, request.form.get("phone_ts", ""))
     date_str = (request.form.get("date") or "").strip() or today_local
     time_str = (request.form.get("time") or "").strip()
     next_url = (request.form.get("next") or "").strip() or request.referrer or url_for("driver_dashboard")
@@ -30497,7 +30572,7 @@ def driver_clock_out_now():
             # "Right now" keeps full-second precision — a minute-truncated
             # "now" could land before a same-minute clock-in.
             ok, err = _driver_clock_out_at(
-                conn, company_id, driver_id, date_str, now_ts_str, "driver")
+                conn, company_id, driver_id, date_str, tap_ts, "driver")
         else:
             conn.close()
             flash("Pick the time you finished.", "error")
