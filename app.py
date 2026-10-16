@@ -33078,6 +33078,7 @@ def api_dispatch():
         "driver": driver["username"],
         "stop_count": len(clean_stops),
         "appended": appended_to_existing,
+        "route_date": route_date,
         "notices": _chain_notices(_chain_res),
     })
 
@@ -40841,6 +40842,10 @@ def parser_view():
                 '<label for="driver-select">Assign to</label>'
                 '<select id="driver-select" class="driver-select">'
                 f'<option value="">Select a driver&hellip;</option>{options}</select>'
+                # 2026-10-16: route date picker — dispatching for tomorrow (or
+                # any day) instead of everything landing on today's route.
+                '<label for="route-date">Date</label>'
+                f'<input type="date" id="route-date" class="driver-select date-select" value="{today_str()}">'
             )
         else:
             assign_html = (
