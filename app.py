@@ -24287,10 +24287,11 @@ def dump_ticket(stop_id):
             </div>
             <label>Notes</label>
             <textarea name="notes" placeholder="Issues, observations, gate info...">{_fv("notes")}</textarea>
-            <label>Ticket Photo / Scan</label>
+            <label>Ticket Photo</label>
             <!-- Camera-first capture: opens the camera on iOS (capture=environment).
                  Photographing reads the ticket and PREFILLS the fields above for
-                 the driver to confirm — it never auto-saves. -->
+                 the driver to confirm — it never auto-saves. One photo is enough:
+                 the auto-fill shot IS the ticket photo. -->
             <input type="file" id="f-ocr-photo" accept="image/*" capture="environment" style="display:none;">
             <button type="button" class="btn" id="dt-ocr-btn"
                     style="width:100%;min-height:52px;margin-bottom:8px;background:var(--teal-dim,rgba(0,229,204,0.12));
@@ -24298,10 +24299,22 @@ def dump_ticket(stop_id):
                 &#128247; Photo of Ticket &mdash; auto-fill
             </button>
             <div id="dt-ocr-status" class="muted" style="font-size:13px;margin-bottom:8px;min-height:16px;"></div>
-            <!-- Manual attach still available (also accepts PDF). -->
-            <input type="file" name="ticket_photo" id="f-photo" accept=".png,.jpg,.jpeg,.webp,.pdf"
-                   style="margin-bottom:6px;">
-            <div id="dt-photo-note" class="muted" style="font-size:12px;margin-bottom:16px;min-height:16px;"></div>
+            <!-- 2026-10-16: one-photo flow — once a photo exists (saved or
+                 attached), show the saved state and hide the manual attach
+                 behind a "different photo" link so drivers don't take two. -->
+            <div id="dt-photo-done" style="display:none;margin-bottom:8px;padding:12px 14px;border-radius:10px;
+                 background:rgba(61,220,132,.08);border:1px solid rgba(61,220,132,.35);">
+                <div style="font-weight:700;color:#3DDC84;" id="dt-photo-done-msg">&#10003; Ticket photo saved.</div>
+                <button type="button" id="dt-photo-change" class="small muted"
+                        style="background:none;border:none;padding:4px 0 0;color:var(--text-dim);text-decoration:underline;cursor:pointer;">
+                    Use a different photo</button>
+            </div>
+            <div id="dt-manual-photo">
+                <!-- Manual attach still available (also accepts PDF). -->
+                <input type="file" name="ticket_photo" id="f-photo" accept=".png,.jpg,.jpeg,.webp,.pdf"
+                       style="margin-bottom:6px;">
+                <div id="dt-photo-note" class="muted" style="font-size:12px;margin-bottom:16px;min-height:16px;"></div>
+            </div>
             <div id="dt-error" role="alert" style="display:none;margin-bottom:12px;padding:12px 14px;
                  border-radius:10px;background:var(--red-dim);border:1px solid rgba(255,82,82,0.40);
                  color:var(--red);font-size:14px;font-weight:600;"></div>
@@ -24363,6 +24376,25 @@ def dump_ticket(stop_id):
         var errBox = document.getElementById('dt-error');
         var photoInput = document.getElementById('f-photo');
         var photoNote  = document.getElementById('dt-photo-note');
+        var photoDone  = document.getElementById('dt-photo-done');
+        var photoDoneMsg = document.getElementById('dt-photo-done-msg');
+        var manualPhoto = document.getElementById('dt-manual-photo');
+        var photoChange = document.getElementById('dt-photo-change');
+        // 2026-10-16: one-photo flow — once a photo exists, show the saved
+        // state and hide the manual attach so drivers don't take two pictures.
+        function showPhotoSaved(msg) {{
+            if (photoDoneMsg && msg) photoDoneMsg.innerHTML = '&#10003; ' + msg;
+            if (photoDone) photoDone.style.display = 'block';
+            if (manualPhoto) manualPhoto.style.display = 'none';
+        }}
+        function showManualPhoto() {{
+            if (photoDone) photoDone.style.display = 'none';
+            if (manualPhoto) manualPhoto.style.display = 'block';
+        }}
+        if (photoChange) photoChange.addEventListener('click', showManualPhoto);
+        // Existing ticket photo on file (page load) → skip the attach step.
+        var HAS_PHOTO = {('true' if (ticket and (ticket['photo_path'] or '').strip()) else 'false')};
+        if (HAS_PHOTO) showPhotoSaved('Ticket photo on file.');
         var fallbackRedirect = {_fallback_redirect!r};
         var SAVE_TIMEOUT_MS = 20000;
         var COMPRESS_MAX_EDGE = 1200;
@@ -24582,17 +24614,19 @@ def dump_ticket(stop_id):
                         if (d && d.ok && !d.unreadable && applyPrefill(d)) {{
                             ocrStatus.textContent = 'Read from the photo — check the numbers below.';
                             try {{ photoInput.value = ''; }} catch (e) {{}}   // saved server-side; avoid re-upload
-                            if (photoNote) photoNote.textContent = 'Ticket photo saved.';
+                            showPhotoSaved('Ticket photo saved.');
                             if (ocrQueued) ocrQueued.value = '0';
                         }} else {{
                             // Failure is NORMAL — quiet fallback, photo stays attached.
                             ocrStatus.textContent = 'Couldn\\u2019t read this one — enter the numbers below (photo is saved).';
+                            showPhotoSaved('Ticket photo attached.');
                             if (ocrQueued) ocrQueued.value = '0';
                         }}
                     }})
                     .catch(function() {{
                         clearTimeout(to); if (ocrBtn) ocrBtn.disabled = false;
                         queueOcr(small);                    // no signal → queue, keep photo on the form
+                        showPhotoSaved('Ticket photo saved — will read when back online.');
                         if (ocrQueued) ocrQueued.value = '1';
                         ocrStatus.textContent = 'No signal — photo saved with the ticket; it\\u2019ll read when you\\u2019re back online.';
                     }});
