@@ -14831,7 +14831,7 @@ def _build_route_board_html(user, day=None):
     if not lanes:
         return (
             '<div class="board-empty"><p>No dispatches yet today.</p>'
-            f'<a class="btn gold" href="/parser" style="min-height:48px;display:inline-flex;align-items:center;">+ New Dispatch</a></div>'
+            f'<a class="btn gold" href="/parser?day={day}" style="min-height:48px;display:inline-flex;align-items:center;">+ New Dispatch</a></div>'
         )
 
     # Stable lane key for ordering/persistence: driver id (string), or
@@ -15288,7 +15288,7 @@ def routes_page():
                 <span class="board-legend-item"><span class="board-legend-dot dropswap"></span>Drop/Swap</span>
                 <span class="board-legend-item"><span class="board-legend-dot urgent"></span>Urgent</span>
             </div>
-            <a class="btn gold" href="/parser" style="min-height:48px;display:inline-flex;align-items:center;white-space:nowrap;">+ New Dispatch</a>
+            <a class="btn gold" href="/parser?day={_board_day}" style="min-height:48px;display:inline-flex;align-items:center;white-space:nowrap;">+ New Dispatch</a>
         </div>
     </div>
     """
@@ -40821,6 +40821,22 @@ def parser_view():
     route_id_arg = (request.args.get('route_id') or '').strip()
     route_mode_js = "null"
     route_seq_html = ""
+    # 2026-10-16: dispatch inherits the board's day (?day=) — the board's day
+    # switcher is the one date control. No picker here, just a label.
+    _dispatch_day = (request.args.get("day") or "").strip() or today_str()
+    try:
+        _dispatch_dt = datetime.strptime(_dispatch_day, "%Y-%m-%d")
+    except ValueError:
+        _dispatch_day = today_str()
+        _dispatch_dt = datetime.strptime(_dispatch_day, "%Y-%m-%d")
+    _today_s = today_str()
+    _tmr_s = (datetime.strptime(_today_s, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    if _dispatch_day == _today_s:
+        _dispatch_label = "Today"
+    elif _dispatch_day == _tmr_s:
+        _dispatch_label = f"Tomorrow &middot; {_dispatch_dt.strftime('%a %b %d')}"
+    else:
+        _dispatch_label = _dispatch_dt.strftime("%a %b %d")
 
     if route_id_arg.isdigit():
         if session.get("role") != "boss":
@@ -40902,10 +40918,10 @@ def parser_view():
                 '<label for="driver-select">Assign to</label>'
                 '<select id="driver-select" class="driver-select">'
                 f'<option value="">Select a driver&hellip;</option>{options}</select>'
-                # 2026-10-16: route date picker — dispatching for tomorrow (or
-                # any day) instead of everything landing on today's route.
-                '<label for="route-date">Date</label>'
-                f'<input type="date" id="route-date" class="driver-select date-select" value="{today_str()}">'
+                # 2026-10-16: no date picker — the board's day switcher owns the
+                # date. Dispatch inherits ?day= (or today for direct visits).
+                f'<span class="dispatch-day-label">{_dispatch_label}</span>'
+                f'<input type="hidden" id="route-date" value="{_dispatch_day}">'
             )
         else:
             assign_html = (
@@ -40948,6 +40964,9 @@ def parser_view():
     html = html.replace('__CSRF_TOKEN__', get_csrf_token())
     html = html.replace('<!--ASSIGN_SLOT-->', assign_html)
     html = html.replace('<!--ROUTE_SEQ_SLOT-->', route_seq_html)
+    # 2026-10-16: back link returns to the board day dispatch came from.
+    html = html.replace('<a class="back-link" href="/routes">',
+                        f'<a class="back-link" href="/routes?day={_dispatch_day}">')
     html = html.replace('__ROUTE_MODE_JSON__', route_mode_js)
     html = html.replace('__DUMP_SITES_JSON__', _js(dump_sites))
     html = html.replace('__RETURN_SITES_JSON__', _js(return_sites))
