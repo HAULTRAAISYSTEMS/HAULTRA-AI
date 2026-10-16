@@ -4199,6 +4199,21 @@ def init_db():
     """)
     safe_add_column(conn, "companies", "invoice_seq INTEGER DEFAULT 0")
 
+    # 2026-10-16: field fees — driver one-tap fee log (dry run, restricted
+    # item, relocation…). Flows straight onto the invoice.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS stop_fees (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id   INTEGER NOT NULL,
+        stop_id      INTEGER NOT NULL,
+        kind         TEXT NOT NULL DEFAULT 'custom',
+        description  TEXT NOT NULL,
+        amount_cents INTEGER NOT NULL,
+        created_by   INTEGER,
+        created_at   TEXT NOT NULL
+    )
+    """)
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS sites (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -15308,31 +15323,101 @@ def routes_page():
             params.append(status)
         sql += " ORDER BY r.route_date DESC, r.id DESC"
         routes = conn.execute(sql, tuple(params)).fetchall()
+        # 2026-10-16: stops + revenue per route for the driver-style cards.
+        _route_ids = [r["id"] for r in routes]
+        _stops_by_route = {}
+        _rev_by_route = {}
+        if _route_ids:
+            _q = ",".join("?" * len(_route_ids))
+            for _s in conn.execute(
+                f"SELECT route_id, action, customer_name, address, status FROM stops "
+                f"WHERE route_id IN ({_q}) ORDER BY route_id, stop_order, id",
+                tuple(_route_ids)).fetchall():
+                _stops_by_route.setdefault(_s["route_id"], []).append(_s)
+            try:
+                _rc_map_h = _get_rate_card(conn, cid())
+                _tn_h = _get_tonnage_rates(conn, cid())
+            except Exception:
+                _rc_map_h, _tn_h = {}, (0.0, 0.0, 0)
+            for _rid in _route_ids:
+                _rev = 0
+                for _s in conn.execute(
+                    "SELECT action, container_size, weight_tons FROM stops WHERE route_id=? AND status='completed'",
+                    (_rid,)).fetchall():
+                    _rev += _stop_revenue_cents(_rc_map_h, _s["action"], _s["container_size"])
+                    _rev += _stop_overage_cents(_tn_h, _s["action"], _s["container_size"], _s["weight_tons"])
+                # + logged field fees
+                try:
+                    _rev += conn.execute(
+                        """SELECT COALESCE(SUM(f.amount_cents),0) FROM stop_fees f
+                           JOIN stops s ON f.stop_id = s.id WHERE s.route_id=?""",
+                        (_rid,)).fetchone()[0] or 0
+                except Exception:
+                    pass
+                _rev_by_route[_rid] = _rev
         conn.close()
 
         rows = ""
         for r in routes:
-            # 2026-10-10: Card layout instead of table rows — matches cab design language.
+            # 2026-10-16: driver-dashboard-style card — status pill, progress
+            # bar, stop rows with dots + action pills, revenue, ghost actions.
+            _rstops = [s for s in _stops_by_route.get(r["id"], []) if not stop_is_cancelled(dict(s))]
+            _done = sum(1 for s in _rstops if s["status"] == "completed")
+            _total = len(_rstops)
+            _pct = int(_done / _total * 100) if _total else 0
+            _st = r["status"]
+            _st_cls = {"in_progress": "progress", "completed": "done"}.get(_st, "open")
+            _st_lbl = {"in_progress": "IN PROGRESS", "completed": "DONE", "open": "OPEN"}.get(_st, _st.upper())
+            _rev = _rev_by_route.get(r["id"], 0)
+            _rev_txt = f' &middot; <span style="color:#3DDC84;font-weight:700;">{_fmt_money(_rev)}</span>' if _rev else ""
+            _stop_rows = ""
+            for _s in _rstops[:5]:
+                _sd = dict(_s)
+                if _sd["status"] == "completed":
+                    _dot = '<span class="drv-dot done">&#10003;</span>'
+                elif (_sd["status"] or "") == "in_progress":
+                    _dot = '<span class="drv-dot cur">&#9654;</span>'
+                else:
+                    _dot = '<span class="drv-dot todo"></span>'
+                _act = (_sd["action"] or "").strip().upper()
+                _who = (_sd["customer_name"] or _sd["address"] or "Stop").strip()
+                _where = (_sd["address"] or "").strip()
+                _sub = (" — " + _where) if _where and _where != _who else ""
+                _stop_rows += (
+                    f'<div class="drv-stop">{_dot}'
+                    + (f'<span class="drv-act">{e(_act)}</span>' if _act else "")
+                    + f'<span class="drv-stop-name">{e(_who)}{e(_sub)}</span></div>'
+                )
+            if _total > 5:
+                _stop_rows += f'<div class="drv-stop"><span class="drv-stop-name muted">+{_total - 5} more stops</span></div>'
+            if not _stop_rows:
+                _stop_rows = '<div class="drv-stop"><span class="drv-stop-name muted">No stops yet.</span></div>'
+            _del = (f'''
+                <form class="inline" method="POST" action="{url_for('delete_route', route_id=r['id'])}"
+                      onsubmit="return confirm('Delete this entire route?')">
+                    <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+                    <button class="hist-ghost-btn danger" type="submit">Delete</button>
+                </form>''' if user['role'] == 'boss' else '')
             rows += f"""
-            <div class="hist-route-card">
-                <div class="hist-route-top">
+            <div class="drv-lane hist-lane">
+                <div class="drv-lane-head">
                     <div>
-                        <div class="hist-route-name"><a href="{url_for('view_route', route_id=r['id'])}">{e(r['route_name'])}</a></div>
-                        <div class="hist-route-meta">{e(r['route_date'])} &middot; {e(r['assigned_username'] or 'Unassigned')}</div>
+                        <div class="drv-lane-name">{e(r['route_name'])}</div>
+                        <div class="drv-lane-date">{e(r['route_date'])} &middot; {e(r['assigned_username'] or 'Unassigned')}{_rev_txt}</div>
                     </div>
-                    <span class="badge {e(r['status'])}">{e(r['status'])}</span>
+                    <div class="drv-pills"><span class="drv-status {_st_cls}">{_st_lbl}</span></div>
                 </div>
-                <div class="hist-route-actions">
-                        <a class="btn secondary" href="{url_for('view_route', route_id=r['id'])}">Open</a>
-                        <a class="btn green" href="{url_for('export_route_csv', route_id=r['id'])}">CSV</a>
-                        {f'''
-                        <form class="inline" method="POST"
-                              action="{url_for('delete_route', route_id=r['id'])}"
-                              onsubmit="return confirm('Delete this entire route?')">
-                            <button class="btn red" type="submit">Delete</button>
-                        </form>
-                        ''' if user['role'] == 'boss' else ''}
-                    </div>
+                <div class="drv-progress"><div style="width:{_pct}%;"></div></div>
+                <div class="drv-progress-lbl">{_done} of {_total} stops</div>
+                <div class="drv-stops">{_stop_rows}</div>
+                <div class="hist-lane-foot">
+                    <span class="hist-ghost-actions">
+                        <a class="hist-ghost-btn" href="{url_for('view_route', route_id=r['id'])}">Open</a>
+                        <a class="hist-ghost-btn" href="{url_for('export_route_csv', route_id=r['id'])}">CSV</a>
+                        {_del}
+                    </span>
+                    <a class="drv-lane-foot-link" href="{url_for('view_route', route_id=r['id'])}">Open Route &#8250;</a>
+                </div>
             </div>
             """
 
@@ -15372,6 +15457,49 @@ def routes_page():
                 {rows if rows else '<div class="empty">No routes found.</div>'}
             </div>
         </div>
+        <style>
+        /* 2026-10-16: history cards mirror the driver dashboard cards */
+        .drv-lane.hist-lane {{ display:block; background:var(--card-bg,#171717);
+            border:1px solid rgba(255,255,255,.08); border-radius:16px; padding:16px;
+            margin-bottom:14px; }}
+        .drv-lane-head {{ display:flex; align-items:flex-start; justify-content:space-between;
+            gap:10px; margin-bottom:10px; }}
+        .drv-lane-name {{ font-size:1.15rem; font-weight:800; word-break:break-word; }}
+        .drv-lane-date {{ color:var(--text-muted); font-size:.85rem; margin-top:2px; }}
+        .drv-status {{ flex:none; font-size:.68rem; font-weight:800; letter-spacing:.6px;
+            padding:6px 10px; border-radius:999px; }}
+        .drv-status.open {{ background:rgba(255,255,255,.08); color:var(--text-dim); }}
+        .drv-status.progress {{ background:rgba(255,107,26,.16); color:#FF8C42; }}
+        .drv-status.done {{ background:rgba(61,220,132,.14); color:#3DDC84; }}
+        .drv-pills {{ flex:none; display:flex; gap:6px; align-items:center; }}
+        .drv-progress {{ height:8px; border-radius:4px; background:rgba(255,255,255,.08);
+            overflow:hidden; }}
+        .drv-progress div {{ height:100%; border-radius:4px;
+            background:linear-gradient(90deg,#FF6B1A,#FF9D5C); }}
+        .drv-progress-lbl {{ font-size:.75rem; color:var(--text-muted); margin:6px 0 10px; }}
+        .drv-stop {{ display:flex; align-items:center; gap:8px; padding:7px 0;
+            border-top:1px solid rgba(255,255,255,.05); font-size:.9rem; }}
+        .drv-dot {{ flex:none; width:22px; height:22px; border-radius:50%;
+            display:inline-flex; align-items:center; justify-content:center; font-size:.7rem; }}
+        .drv-dot.done {{ background:rgba(61,220,132,.18); color:#3DDC84; }}
+        .drv-dot.cur {{ background:rgba(255,107,26,.2); color:#FF8C42; }}
+        .drv-dot.todo {{ border:2px solid rgba(255,255,255,.18); }}
+        .drv-act {{ flex:none; font-size:.66rem; font-weight:800; letter-spacing:.4px;
+            color:#FF8C42; background:rgba(255,107,26,.12); padding:4px 8px; border-radius:6px; }}
+        .drv-stop-name {{ color:var(--text); overflow:hidden; text-overflow:ellipsis;
+            white-space:nowrap; }}
+        .drv-stop-name.muted {{ color:var(--text-muted); }}
+        .hist-lane-foot {{ margin-top:10px; display:flex; justify-content:space-between;
+            align-items:center; gap:8px; }}
+        .hist-ghost-actions {{ display:flex; gap:6px; align-items:center; }}
+        .hist-ghost-btn {{ font-size:12px; font-weight:600; color:var(--text-dim);
+            background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.1);
+            border-radius:8px; padding:6px 12px; text-decoration:none; cursor:pointer; }}
+        .hist-ghost-btn:hover {{ color:#fff; border-color:rgba(255,255,255,.25); }}
+        .hist-ghost-btn.danger {{ color:#FF7A7A; }}
+        .drv-lane-foot-link {{ color:#FF8C42; font-weight:700; font-size:.85rem;
+            text-decoration:none; white-space:nowrap; }}
+        </style>
         """
 
     # 2026-10-13: Hide the global topnav on Route Board — the header card IS the header
@@ -17413,12 +17541,61 @@ def driver_route_detail(route_id):
         input.addEventListener('input', upd); upd();
     }})();
     </script>"""
+    # 2026-10-16: one-tap field fees in the cab. Tap a fee → amount (preset,
+    # editable) → logged to the stop and onto the invoice.
+    _cab_fee_block = ""
+    try:
+        _fee_conn = get_db()
+        _fee_presets_cab = _get_fee_presets(_fee_conn, session["company_id"])
+        _fee_conn.close()
+    except Exception:
+        _fee_presets_cab = {k: d for k, _, d in _FEE_KINDS}
+        try:
+            _fee_conn.close()
+        except Exception:
+            pass
+    _fee_btns = ""
+    for _fk, _flabel, _fdef in _FEE_KINDS:
+        _famt = _fee_presets_cab.get(_fk, _fdef)
+        _fee_btns += (
+            f'<button type="button" class="btn secondary" style="font-size:13px;" '
+            f'onclick="cabFeePick(\'{_fk}\', {int(_famt)})">{_flabel}'
+            + (f' ({_fmt_money(_famt)})' if _famt else '') + '</button>')
+    _cab_fee_block = f"""
+    <div style="margin-bottom:12px;padding:12px;border:1px solid rgba(255,255,255,0.12);border-radius:10px;background:rgba(255,255,255,0.03);">
+        <div style="font-size:13px;font-weight:600;margin-bottom:8px;">&#x1F4CB; Log a fee</div>
+        <div class="row" style="gap:8px;flex-wrap:wrap;">{_fee_btns}</div>
+        <form method="POST" action="{url_for('log_stop_fee', stop_id=stop_id)}" id="cab-fee-form" hidden
+              style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);">
+            <input type="hidden" name="_csrf_token" value="{_csrf}">
+            <input type="hidden" name="kind" id="cab-fee-kind" value="">
+            <div class="grid" style="grid-template-columns:1fr 1fr;gap:8px;">
+                <input name="description" id="cab-fee-desc" placeholder="What happened?" required style="font-size:15px;padding:10px;">
+                <input name="amount" id="cab-fee-amount" type="number" min="0" step="0.01" inputmode="decimal" placeholder="$" required style="font-size:15px;padding:10px;">
+            </div>
+            <div class="row" style="gap:8px;margin-top:8px;">
+                <button class="btn gold" type="submit" style="flex:1;min-height:48px;">Log Fee</button>
+                <button class="btn secondary" type="button" onclick="document.getElementById('cab-fee-form').hidden=true;">Cancel</button>
+            </div>
+        </form>
+    </div>
+    <script>
+    function cabFeePick(kind, cents){{
+        var labels = {{'dry_run':'Dry run','restricted_item':'Restricted item','relocation':'Relocation','overweight':'Overweight surcharge','custom':'Fee'}};
+        document.getElementById('cab-fee-kind').value = kind;
+        document.getElementById('cab-fee-desc').value = labels[kind] || 'Fee';
+        document.getElementById('cab-fee-amount').value = (cents/100).toFixed(2).replace(/\\.00$/,'');
+        document.getElementById('cab-fee-form').hidden = false;
+        document.getElementById('cab-fee-desc').focus();
+    }}
+    </script>"""
     complete_section = f"""
     <form method="POST" action="{url_for('toggle_stop_complete', stop_id=stop_id)}" id="cab-complete-form"
           data-has-photo="{'1' if has_photo else '0'}" data-photo-mode="{e(photo_proof_mode)}">
         <input type="hidden" name="_csrf_token" value="{_csrf}">
         <input type="hidden" name="intent" value="complete">
         {_cab_weight_block}
+        {_cab_fee_block}
         <button class="cab-complete-btn" type="submit" {"disabled" if required_locked else ""}>&#9989; Complete Stop</button>
     </form>
     {'<div class="cab-photo-status">Take at least one photo to unlock Complete Stop</div>' if required_locked else ''}
@@ -21086,6 +21263,31 @@ def view_route(route_id):
                        style="width:90px;padding:4px 8px;font-size:13px;">
                 <button class="btn secondary" type="submit" style="font-size:12px;padding:4px 10px;">Save</button>
             </form></p>"""
+    # 2026-10-16: field fees logged on the stop (boss sees/removes).
+    def _fee_row_html(s):
+        if session.get("role") != "boss":
+            return ""
+        try:
+            _fc = get_db()
+            _fees = _stop_fees(_fc, s["id"])
+            _fc.close()
+        except Exception:
+            return ""
+        if not _fees:
+            return ""
+        _items = ""
+        for _f in _fees:
+            _fd = dict(_f)
+            _items += (f'<div class="row between" style="padding:4px 0;">'
+                       f'<span>&#x1F4CB; {e(_fd["description"])}</span>'
+                       f'<span class="row" style="gap:8px;align-items:center;">'
+                       f'<strong>{_fmt_money(_fd["amount_cents"])}</strong>'
+                       f'<form class="inline" method="POST" action="{url_for("delete_stop_fee", stop_id=s["id"], fee_id=_fd["id"])}" '
+                       f'onsubmit="return confirm(\'Remove this fee?\')">'
+                       f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
+                       f'<button class="btn red" style="font-size:11px;padding:2px 8px;" type="submit">×</button>'
+                       f'</form></span></div>')
+        return f'<p><strong>Fees:</strong></p><div style="margin:-6px 0 6px;">{_items}</div>'
     # Stop numbers are DISPLAY POSITION (1..N in current order), never the stored
     # stop_order — so a deleted/reordered stop always renumbers cleanly.
     for _pos, s in enumerate(stops, start=1):
@@ -21284,6 +21486,7 @@ def view_route(route_id):
             <p><strong>Container:</strong> {e(s['container_size'] or '')}</p>
             <p><strong>Ticket:</strong> {e(s['ticket_number'] or '')}</p>
             {_weight_row_html(s)}
+            {_fee_row_html(s)}
             <p><strong>Reference:</strong> {e(s['reference_number'] or '')}</p>
             <p><strong>Notes:</strong><br>{e(_display_note(s['notes'])).replace(chr(10), '<br>')}</p>
             <p><strong>Signature:</strong> {e(s['driver_signature'] or '')}</p>
@@ -22739,6 +22942,60 @@ def invoice_set_status(invoice_id):
 
 # DELETE STOP
 # =========================================================
+@app.route("/stop/<int:stop_id>/fee", methods=["POST"])
+@login_required
+def log_stop_fee(stop_id):
+    """Driver or boss logs a field fee on a stop (dry run, restricted item…)."""
+    conn = get_db()
+    stop = conn.execute(
+        """SELECT s.route_id, r.assigned_to FROM stops s
+           JOIN routes r ON s.route_id = r.id
+           WHERE s.id=? AND r.company_id=?""",
+        (stop_id, cid())).fetchone()
+    if not stop:
+        conn.close()
+        abort(404)
+    if session.get("role") != "boss" and stop["assigned_to"] != session["user_id"]:
+        conn.close()
+        abort(403)
+    kind = request.form.get("kind", "custom").strip()
+    if kind not in [k for k, _, _ in _FEE_KINDS]:
+        kind = "custom"
+    desc = request.form.get("description", "").strip()[:120]
+    try:
+        amount = int(round(float((request.form.get("amount") or "0").replace("$", "").replace(",", "")) * 100))
+    except (TypeError, ValueError):
+        amount = -1
+    if not desc or amount < 0:
+        conn.close()
+        flash("Enter what happened and a valid amount.", "error")
+        return redirect(request.referrer or url_for("dashboard"))
+    conn.execute(
+        """INSERT INTO stop_fees (company_id, stop_id, kind, description, amount_cents, created_by, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (cid(), stop_id, kind, desc, amount, session["user_id"], now_ts()))
+    conn.commit()
+    conn.close()
+    flash(f"Fee logged: {desc} ({_fmt_money(amount)}).", "success")
+    return redirect(request.referrer or url_for("dashboard"))
+
+
+@app.route("/stop/<int:stop_id>/fee/<int:fee_id>/delete", methods=["POST"])
+@boss_required
+def delete_stop_fee(stop_id, fee_id):
+    conn = get_db()
+    ok = conn.execute(
+        "SELECT id FROM stop_fees WHERE id=? AND stop_id=? AND company_id=?",
+        (fee_id, stop_id, cid())).fetchone()
+    if not ok:
+        conn.close()
+        abort(404)
+    conn.execute("DELETE FROM stop_fees WHERE id=?", (fee_id,))
+    conn.commit()
+    conn.close()
+    return redirect(request.referrer or url_for("dashboard"))
+
+
 @app.route("/stop/<int:stop_id>/weight", methods=["POST"])
 @boss_required
 def set_stop_weight(stop_id):
@@ -26348,6 +26605,15 @@ def settings_page():
                 _rc_errors.append("tonnage_overage")
             elif _ov_cents is not None:
                 _rc_rows.append((cid(), "tonnage_overage", "*", _ov_cents, None))
+            # 2026-10-16: field fee presets (driver one-tap fees).
+            for kind, _label, _default in _FEE_KINDS:
+                if kind == "custom":
+                    continue
+                fc = _dollars_to_cents(request.form.get(f"fee_{kind}"))
+                if fc == "invalid":
+                    _rc_errors.append(f"fee_{kind}")
+                elif fc is not None:
+                    _rc_rows.append((cid(), f"fee_{kind}", "*", fc, None))
             if _rc_errors:
                 flash("Rate card not saved — check the dollar amounts.", "error")
             else:
@@ -26360,7 +26626,8 @@ def settings_page():
                 # Blank fields clear the rate (delete the row).
                 _want = {(svc, tier) for svc in ("delivery", "pull", "swap")
                          for tier in ("standard", "40yd")} | {("extra_day", "*")} | \
-                        {("tonnage_allow", "standard"), ("tonnage_allow", "40yd"), ("tonnage_overage", "*")}
+                        {("tonnage_allow", "standard"), ("tonnage_allow", "40yd"), ("tonnage_overage", "*")} | \
+                        {(f"fee_{k}", "*") for k, _, _ in _FEE_KINDS if k != "custom"}
                 _have = {(r[1], r[2]) for r in _rc_rows}
                 for svc, tier in _want - _have:
                     conn.execute(
@@ -26437,6 +26704,20 @@ def settings_page():
     _rc_tons_std = _rc_tons("tonnage_allow", "standard")
     _rc_tons_40  = _rc_tons("tonnage_allow", "40yd")
     _rc_tonnage_over = _rc_dollars("tonnage_overage", "*")
+    # 2026-10-16: field fee presets for the form.
+    _fee_presets = _get_fee_presets(conn, cid())
+    def _fee_dollars(kind):
+        v = _fee_presets.get(kind, 0)
+        return "" if not v else (_fmt_money(v).lstrip("$"))
+    _fee_inputs = ""
+    for kind, label, _d in _FEE_KINDS:
+        if kind == "custom":
+            continue
+        _fee_inputs += f"""
+                <div>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">{label}</label>
+                    <input name="fee_{kind}" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_fee_dollars(kind)}" style="width:100%;">
+                </div>"""
     _yard_status = (
         f'<span style="color:#00e87d;font-size:12px;">&#10003; Set — {e(yard_addr)}, {e(yard_city)}, {e(yard_state)} {e(yard_zip)}</span>'
         if _yard_set else
@@ -26657,6 +26938,13 @@ def settings_page():
                     <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Overage ($/ton)</label>
                     <input name="rate_tonnage_overage" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_tonnage_over}" style="width:100%;">
                 </div>
+            </div>
+            <h3 style="margin:20px 0 8px;font-size:14px;">&#x1F4CB; Field Fees</h3>
+            <p style="color:#B8B8AE;font-size:13px;margin-bottom:12px;">
+                One-tap fees for drivers — logged in the cab, billed on the invoice.
+            </p>
+            <div class="grid" style="grid-template-columns:1fr 1fr;gap:12px;max-width:560px;">
+                {_fee_inputs}
             </div>
             <div style="margin-top:16px;">
                 <button type="submit" class="btn gold">Save Rate Card</button>
@@ -28444,6 +28732,12 @@ def _build_invoice_lines_for_route(conn, company_id, route_id):
                 lines.append({"kind": "overage", "description": desc, "qty": 1,
                               "unit_cents": over, "amount_cents": over,
                               "stop_id": sd["id"]})
+            for fee in _stop_fees(conn, sd["id"]):
+                fd = dict(fee)
+                lines.append({"kind": "fee", "description": fd["description"],
+                              "qty": 1, "unit_cents": fd["amount_cents"],
+                              "amount_cents": fd["amount_cents"],
+                              "stop_id": sd["id"]})
     except Exception:
         pass
     return lines
@@ -28457,6 +28751,45 @@ def _invoice_recalc_totals(conn, invoice_id):
     conn.execute("UPDATE invoices SET subtotal_cents=?, total_cents=? WHERE id=?",
                  (total, total, invoice_id))
     return total
+
+
+# --- Field fees --------------------------------------------------------------
+# 2026-10-16: driver one-tap fees (dry run, restricted item…). Presets live
+# in the rate card as service='fee_<kind>'; logged fees live in stop_fees
+# and flow onto invoices.
+_FEE_KINDS = (
+    ("dry_run", "Dry run", 15000),
+    ("restricted_item", "Restricted item", 7500),
+    ("relocation", "Relocation", 10000),
+    ("overweight", "Overweight surcharge", 15000),
+    ("custom", "Other", 0),
+)
+
+
+def _get_fee_presets(conn, company_id):
+    """{kind: cents} — boss's preset, else the default."""
+    presets = {k: d for k, _, d in _FEE_KINDS}
+    try:
+        for r in conn.execute(
+            "SELECT service, cents FROM rate_cards WHERE company_id=? AND service LIKE 'fee\\_%' ESCAPE '\\'",
+            (company_id,)).fetchall():
+            kind = r["service"][4:]
+            if kind in presets:
+                try:
+                    presets[kind] = max(0, int(r["cents"] or 0))
+                except (TypeError, ValueError):
+                    pass
+    except Exception:
+        pass
+    return presets
+
+
+def _stop_fees(conn, stop_id):
+    try:
+        return conn.execute(
+            "SELECT * FROM stop_fees WHERE stop_id=? ORDER BY id", (stop_id,)).fetchall()
+    except Exception:
+        return []
 
 
 @app.route("/bin-tracker")
