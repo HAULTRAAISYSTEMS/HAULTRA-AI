@@ -10621,7 +10621,7 @@ def dashboard():
         _clk_entry = _driver_clock_entry(conn, company_id, user["id"], _clk_today)
         _clk_on = bool(_clk_entry and _clk_entry["clock_in_at"]
                        and not _clk_entry["clock_out_at"])
-        _clk_in_at = (_clk_entry["clock_in_at"] or "")[11:16] if _clk_entry else ""
+        _clk_in_at = _fmt_12h((_clk_entry["clock_in_at"] or "") if _clk_entry else "")
         _co_row = conn.execute("SELECT * FROM companies WHERE id=?", (company_id,)).fetchone()
         _co_s = {k: _co_row[k] for k in _co_row.keys()} if _co_row else {}
         _pp_start, _pp_end = get_pay_period_bounds(_co_s)
@@ -10679,7 +10679,7 @@ def dashboard():
                 _flbl = datetime.strptime(_fdate, "%Y-%m-%d").strftime("%a, %b %-d")
             except Exception:
                 _flbl = _fdate
-            _fin = (_f["clock_in_at"] or "")[11:16]
+            _fin = _fmt_12h(_f["clock_in_at"])
             _forgot_html += f"""
         <div class="drv-forgot">
             <div class="drv-forgot-title">&#9888; You didn't clock out {_flbl}</div>
@@ -16842,7 +16842,7 @@ def driver_route_detail(route_id):
             _co_now, _co_today = _driver_clock_now(cid())
             _co_entry = _driver_clock_entry(_co_conn, cid(), session["user_id"], _co_today)
             _co_show = bool(_co_entry and _co_entry["clock_in_at"] and not _co_entry["clock_out_at"])
-            _co_in_at = (_co_entry["clock_in_at"] or "")[11:16] if _co_entry else ""
+            _co_in_at = _fmt_12h((_co_entry["clock_in_at"] or "") if _co_entry else "")
         finally:
             _co_conn.close()
         _clock_out_html = ""
@@ -28556,7 +28556,7 @@ def driver_hours_page():
                        'background:rgba(255,107,26,0.10);color:#FF9D5C;')
 
     def _hhmm(ts):
-        return str(ts)[11:16] if ts and len(str(ts)) >= 16 else ""
+        return _fmt_12h(ts)
 
     activity_html = ""
     for ar in activity_rows:
@@ -35369,7 +35369,7 @@ def maintenance_page():
                     f'<div style="margin-top:6px;"><span style="display:inline-block;padding:2px 9px;'
                     f'border-radius:999px;font-size:11px;font-weight:800;background:var(--green-dim);'
                     f'color:var(--green);border:1px solid rgba(61,220,132,0.45);">'
-                    f'✓ Driver got it · {e((d["dispatch_ack"] or "")[11:16])}</span></div>')
+                    f'✓ Driver got it · {e(_fmt_12h(d["dispatch_ack"]))}</span></div>')
             else:
                 dispatch_chip = (
                     f'<div style="margin-top:6px;"><span style="display:inline-block;padding:2px 9px;'
