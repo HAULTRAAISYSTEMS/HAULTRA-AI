@@ -4154,6 +4154,11 @@ def init_db():
         PRIMARY KEY (company_id, service, tier)
     )
     """)
+    # 2026-10-16: qty holds included tons for tonnage_allow rows
+    # (service='tonnage_allow', tier standard/40yd) and is unused otherwise.
+    _rc_cols = [r[1] for r in cur.execute("PRAGMA table_info(rate_cards)").fetchall()]
+    if "qty" not in _rc_cols:
+        cur.execute("ALTER TABLE rate_cards ADD COLUMN qty REAL")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS sites (
@@ -11028,18 +11033,20 @@ def dashboard():
 
     # 2026-10-16: revenue from the rate card — priced completed stops.
     _rc_map = _get_rate_card(conn, company_id)
+    _tn_rates = _get_tonnage_rates(conn, company_id)
     _rev_today_cents = 0
     _rev_week_cents = 0
     _rc_priced_any = bool(_rc_map)
     if _rc_priced_any:
         for _rs in conn.execute(
-            """SELECT s.action, s.container_size,
+            """SELECT s.action, s.container_size, s.weight_tons,
                       substr(COALESCE(s.completed_at, r.route_date), 1, 10) AS done_day
                  FROM stops s JOIN routes r ON s.route_id = r.id
                 WHERE r.company_id=? AND s.status='completed'
                   AND substr(COALESCE(s.completed_at, r.route_date), 1, 10) BETWEEN ? AND ?""",
             (company_id, pay_period_start, pay_period_end)).fetchall():
             _c = _stop_revenue_cents(_rc_map, _rs["action"], _rs["container_size"])
+            _c += _stop_overage_cents(_tn_rates, _rs["action"], _rs["container_size"], _rs["weight_tons"])
             _rev_week_cents += _c
             if _rs["done_day"] == today:
                 _rev_today_cents += _c
@@ -17313,11 +17320,64 @@ def driver_route_detail(route_id):
     """
 
     required_locked = (photo_proof_mode == "required" and not has_photo)
+    # 2026-10-16: scale-ticket weight entry on pull/swap stops — the driver
+    # types the tons, the overage prices itself live, and it saves with the stop.
+    _cab_weight_block = ""
+    _cab_svcd = dict(s)
+    _cab_svc = _classify_service(_cab_svcd.get("action"))
+    if _cab_svc in ("pull", "swap"):
+        try:
+            _tn_conn = get_db()
+            _tn_allow_std, _tn_allow_40, _tn_over_cents = _get_tonnage_rates(_tn_conn, session["company_id"])
+            _tn_conn.close()
+        except Exception:
+            _tn_allow_std, _tn_allow_40, _tn_over_cents = 0.0, 0.0, 0
+            try:
+                _tn_conn.close()
+            except Exception:
+                pass
+        _tn_allow = _tn_allow_40 if _rate_tier(_cab_svcd.get("container_size")) == "40yd" else _tn_allow_std
+        if _tn_over_cents > 0:
+            _cab_weight_block = f"""
+    <div class="cab-weight-block" style="margin-bottom:12px;padding:12px;border:1px solid rgba(255,255,255,0.12);border-radius:10px;background:rgba(255,255,255,0.03);">
+        <label for="cab-weight-input" style="display:block;font-size:13px;font-weight:600;margin-bottom:6px;">&#9878; Scale ticket tons <span class="muted" style="font-weight:400;">(optional)</span></label>
+        <input name="weight_tons" id="cab-weight-input" type="number" min="0" max="999" step="0.01" inputmode="decimal"
+               placeholder="e.g. 6.2" style="width:100%;font-size:17px;padding:10px;"
+               value="{e(str(_cab_svcd.get('weight_tons') or ''))}">
+        <div id="cab-overage-preview" class="muted small" style="margin-top:6px;min-height:18px;"></div>
+    </div>
+    <script>
+    (function(){{
+        var input = document.getElementById('cab-weight-input');
+        var preview = document.getElementById('cab-overage-preview');
+        if (!input || !preview) return;
+        var allow = {float(_tn_allow)};
+        var rateCents = {int(_tn_over_cents)};
+        function money(cents){{
+            var d = (cents/100);
+            return '$' + (d % 1 === 0 ? d.toFixed(0) : d.toFixed(2));
+        }}
+        function upd(){{
+            var t = parseFloat(input.value);
+            if (!(t > 0)) {{ preview.textContent = ''; return; }}
+            var over = Math.max(0, t - allow);
+            if (over > 0.004) {{
+                var charge = Math.round(over * rateCents);
+                preview.innerHTML = t.toFixed(1) + 't &middot; <strong style="color:#FF9D5C;">' +
+                    over.toFixed(1) + 't over &rarr; +' + money(charge) + '</strong>';
+            }} else {{
+                preview.textContent = t.toFixed(1) + 't \\u2014 within the ' + allow + 't included';
+            }}
+        }}
+        input.addEventListener('input', upd); upd();
+    }})();
+    </script>"""
     complete_section = f"""
     <form method="POST" action="{url_for('toggle_stop_complete', stop_id=stop_id)}" id="cab-complete-form"
           data-has-photo="{'1' if has_photo else '0'}" data-photo-mode="{e(photo_proof_mode)}">
         <input type="hidden" name="_csrf_token" value="{_csrf}">
         <input type="hidden" name="intent" value="complete">
+        {_cab_weight_block}
         <button class="cab-complete-btn" type="submit" {"disabled" if required_locked else ""}>&#9989; Complete Stop</button>
     </form>
     {'<div class="cab-photo-status">Take at least one photo to unlock Complete Stop</div>' if required_locked else ''}
@@ -20784,9 +20844,11 @@ def view_route(route_id):
     _route_rev_cents = 0
     try:
         _rc_map = _get_rate_card(conn, cid())
+        _tn_rates = _get_tonnage_rates(conn, cid())
         for _s in stops:
             if _s["status"] == "completed":
                 _route_rev_cents += _stop_revenue_cents(_rc_map, _s["action"], _s["container_size"])
+                _route_rev_cents += _stop_overage_cents(_tn_rates, _s["action"], _s["container_size"], _s["weight_tons"])
     except Exception:
         _route_rev_cents = 0
     conn.close()
@@ -20959,6 +21021,30 @@ def view_route(route_id):
 
     next_open_stop_id = None
     stop_cards = ""
+    # 2026-10-16: per-stop scale-weight row (boss). Shows tons + overage
+    # charge, with an inline editor. Pull/swap stops only.
+    def _weight_row_html(s):
+        if session.get("role") != "boss":
+            return ""
+        _sd = dict(s)
+        if _classify_service(_sd.get("action")) not in ("pull", "swap"):
+            return ""
+        _tons = _sd.get("weight_tons")
+        _over = _stop_overage_cents(_tn_rates, _sd.get("action"), _sd.get("container_size"), _tons)
+        _over_txt = ""
+        if _tons:
+            _over_txt = f" &middot; {_fmt_tons(_tons)}"
+            if _over > 0:
+                _over_txt += f' &middot; <strong style="color:#FF9D5C;">+{_fmt_money(_over)} overage</strong>'
+        return f"""
+            <p><strong>Scale Weight:</strong>{_over_txt or ' <span class="muted">&mdash;</span>'}
+            <form class="inline" method="POST" action="{url_for('set_stop_weight', stop_id=s['id'])}" style="margin-left:8px;">
+                <input type="hidden" name="_csrf_token" value="{_csrf}">
+                <input name="weight_tons" type="number" min="0" max="999" step="0.01" inputmode="decimal"
+                       placeholder="tons" value="{e(str(_tons) if _tons else '')}"
+                       style="width:90px;padding:4px 8px;font-size:13px;">
+                <button class="btn secondary" type="submit" style="font-size:12px;padding:4px 10px;">Save</button>
+            </form></p>"""
     # Stop numbers are DISPLAY POSITION (1..N in current order), never the stored
     # stop_order — so a deleted/reordered stop always renumbers cleanly.
     for _pos, s in enumerate(stops, start=1):
@@ -21156,6 +21242,7 @@ def view_route(route_id):
             {_swap_warning}
             <p><strong>Container:</strong> {e(s['container_size'] or '')}</p>
             <p><strong>Ticket:</strong> {e(s['ticket_number'] or '')}</p>
+            {_weight_row_html(s)}
             <p><strong>Reference:</strong> {e(s['reference_number'] or '')}</p>
             <p><strong>Notes:</strong><br>{e(_display_note(s['notes'])).replace(chr(10), '<br>')}</p>
             <p><strong>Signature:</strong> {e(s['driver_signature'] or '')}</p>
@@ -22279,6 +22366,35 @@ def delete_order(order_id):
 # =========================================================
 # DELETE STOP
 # =========================================================
+@app.route("/stop/<int:stop_id>/weight", methods=["POST"])
+@boss_required
+def set_stop_weight(stop_id):
+    """Boss sets/clears the scale-ticket tons on a stop (tonnage overage)."""
+    conn = get_db()
+    row = conn.execute(
+        """SELECT s.route_id FROM stops s
+           JOIN routes r ON s.route_id = r.id
+           WHERE s.id=? AND r.company_id=?""",
+        (stop_id, cid())).fetchone()
+    if not row:
+        conn.close()
+        abort(404)
+    raw = (request.form.get("weight_tons") or "").strip()
+    tons = None
+    if raw:
+        try:
+            tons = max(0.0, min(float(raw), 999))
+        except (TypeError, ValueError):
+            conn.close()
+            flash("Enter the tons as a number, like 6.2.", "error")
+            return redirect(url_for("view_route", route_id=row["route_id"]))
+    conn.execute("UPDATE stops SET weight_tons=? WHERE id=?", (tons, stop_id))
+    conn.commit()
+    conn.close()
+    flash("Scale weight saved." if tons is not None else "Scale weight cleared.", "success")
+    return redirect(url_for("view_route", route_id=row["route_id"]))
+
+
 @app.route("/stop/<int:stop_id>/delete", methods=["POST"])
 @boss_required
 def delete_stop(stop_id):
@@ -22407,6 +22523,15 @@ def toggle_stop_complete(stop_id):
 
     new_status = "completed" if stop["status"] == "open" else "open"
     completed_at = now_ts() if new_status == "completed" else None
+    # 2026-10-16: scale-ticket tons from the cab weight field (pull/swap).
+    _wtons = None
+    if new_status == "completed":
+        _wraw = (request.form.get("weight_tons") or "").strip()
+        if _wraw:
+            try:
+                _wtons = max(0.0, min(float(_wraw), 999))
+            except (TypeError, ValueError):
+                _wtons = None
     _skeys = stop.keys()
     _prev_ds = (stop["driver_status_before_complete"]
                 if "driver_status_before_complete" in _skeys else None)
@@ -22442,11 +22567,12 @@ def toggle_stop_complete(stop_id):
     conn.execute("""
         UPDATE stops SET status=?, completed_at=?, driver_status=?,
                driver_status_before_complete=?,
-               gps_lat=?, gps_lng=?, gps_accuracy=?, gps_captured_at=?
+               gps_lat=?, gps_lng=?, gps_accuracy=?, gps_captured_at=?,
+               weight_tons=COALESCE(?, weight_tons)
         WHERE id=?
     """, (new_status, completed_at, new_driver_status, _save_before,
           gps_lat, gps_lng, gps_accuracy, (now_ts() if got_gps else None),
-          stop_id))
+          _wtons, stop_id))
     if new_status == "completed":
         update_container_flow(conn, stop_id)
     # Customer Request System: mirror completion/reopen onto a linked request
@@ -25822,24 +25948,46 @@ def settings_page():
                     if cents == "invalid":
                         _rc_errors.append(svc)
                     elif cents is not None:
-                        _rc_rows.append((cid(), svc, tier, cents))
+                        _rc_rows.append((cid(), svc, tier, cents, None))
             _ed_cents = _dollars_to_cents(request.form.get("rate_extra_day"))
             if _ed_cents == "invalid":
                 _rc_errors.append("extra_day")
             elif _ed_cents is not None:
-                _rc_rows.append((cid(), "extra_day", "*", _ed_cents))
+                _rc_rows.append((cid(), "extra_day", "*", _ed_cents, None))
+            # 2026-10-16: tonnage — included tons per tier + $/ton overage.
+            def _tons(raw):
+                raw = (raw or "").strip()
+                if not raw:
+                    return None
+                try:
+                    v = float(raw)
+                except (TypeError, ValueError):
+                    return "invalid"
+                return v if 0 <= v <= 999 else "invalid"
+            for tier, field in (("standard", "tons_allow_standard"), ("40yd", "tons_allow_40yd")):
+                t = _tons(request.form.get(field))
+                if t == "invalid":
+                    _rc_errors.append(field)
+                elif t is not None:
+                    _rc_rows.append((cid(), "tonnage_allow", tier, 0, t))
+            _ov_cents = _dollars_to_cents(request.form.get("rate_tonnage_overage"))
+            if _ov_cents == "invalid":
+                _rc_errors.append("tonnage_overage")
+            elif _ov_cents is not None:
+                _rc_rows.append((cid(), "tonnage_overage", "*", _ov_cents, None))
             if _rc_errors:
                 flash("Rate card not saved — check the dollar amounts.", "error")
             else:
                 for _r in _rc_rows:
                     conn.execute(
-                        "INSERT INTO rate_cards (company_id, service, tier, cents)"
-                        " VALUES (?, ?, ?, ?)"
-                        " ON CONFLICT(company_id, service, tier) DO UPDATE SET cents=excluded.cents",
+                        "INSERT INTO rate_cards (company_id, service, tier, cents, qty)"
+                        " VALUES (?, ?, ?, ?, ?)"
+                        " ON CONFLICT(company_id, service, tier) DO UPDATE SET cents=excluded.cents, qty=excluded.qty",
                         _r)
                 # Blank fields clear the rate (delete the row).
                 _want = {(svc, tier) for svc in ("delivery", "pull", "swap")
-                         for tier in ("standard", "40yd")} | {("extra_day", "*")}
+                         for tier in ("standard", "40yd")} | {("extra_day", "*")} | \
+                        {("tonnage_allow", "standard"), ("tonnage_allow", "40yd"), ("tonnage_overage", "*")}
                 _have = {(r[1], r[2]) for r in _rc_rows}
                 for svc, tier in _want - _have:
                     conn.execute(
@@ -25903,6 +26051,19 @@ def settings_page():
     _rc_swap_std     = _rc_dollars("swap", "standard")
     _rc_swap_40      = _rc_dollars("swap", "40yd")
     _rc_extra_day    = _rc_dollars("extra_day", "*")
+    # 2026-10-16: tonnage values for the form.
+    def _rc_tons(svc, tier):
+        for r in conn.execute(
+                "SELECT qty FROM rate_cards WHERE company_id=? AND service=? AND tier=?",
+                (cid(), svc, tier)).fetchall():
+            try:
+                return ("%g" % float(r["qty"] or 0))
+            except (TypeError, ValueError):
+                return ""
+        return ""
+    _rc_tons_std = _rc_tons("tonnage_allow", "standard")
+    _rc_tons_40  = _rc_tons("tonnage_allow", "40yd")
+    _rc_tonnage_over = _rc_dollars("tonnage_overage", "*")
     _yard_status = (
         f'<span style="color:#00e87d;font-size:12px;">&#10003; Set — {e(yard_addr)}, {e(yard_city)}, {e(yard_state)} {e(yard_zip)}</span>'
         if _yard_set else
@@ -26104,6 +26265,25 @@ def settings_page():
                 <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Extra-day default ($/day)</label>
                 <input name="rate_extra_day" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_extra_day}" style="width:100%;">
                 <p class="muted small" style="margin-top:6px;">Used when a customer has no per-customer extra-day rate in the address book.</p>
+            </div>
+            <h3 style="margin:20px 0 8px;font-size:14px;">&#9878; Included Weight</h3>
+            <p style="color:#B8B8AE;font-size:13px;margin-bottom:12px;">
+                Tons included per haul. Anything over bills automatically at the overage rate
+                once the driver enters the scale-ticket weight.
+            </p>
+            <div class="grid" style="grid-template-columns:1fr 1fr 1fr;gap:12px;max-width:560px;">
+                <div>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">10&ndash;30 yd (tons)</label>
+                    <input name="tons_allow_standard" type="number" min="0" step="0.5" inputmode="decimal" placeholder="0" value="{_rc_tons_std}" style="width:100%;">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">40 yd (tons)</label>
+                    <input name="tons_allow_40yd" type="number" min="0" step="0.5" inputmode="decimal" placeholder="0" value="{_rc_tons_40}" style="width:100%;">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Overage ($/ton)</label>
+                    <input name="rate_tonnage_overage" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_tonnage_over}" style="width:100%;">
+                </div>
             </div>
             <div style="margin-top:16px;">
                 <button type="submit" class="btn gold">Save Rate Card</button>
@@ -27726,15 +27906,18 @@ def _stop_revenue_cents(rate_card, action, size):
         return 0
 
 
-def _route_revenue_cents(conn, company_id, route_id, rate_card=None):
-    """Sum of priced COMPLETED stops on a route."""
+def _route_revenue_cents(conn, company_id, route_id, rate_card=None, tonnage_rates=None):
+    """Sum of priced COMPLETED stops on a route (haul + tonnage overage)."""
     if rate_card is None:
         rate_card = _get_rate_card(conn, company_id)
+    if tonnage_rates is None:
+        tonnage_rates = _get_tonnage_rates(conn, company_id)
     total = 0
     for s in conn.execute(
-            "SELECT action, container_size FROM stops WHERE route_id=? AND status='completed'",
+            "SELECT action, container_size, weight_tons FROM stops WHERE route_id=? AND status='completed'",
             (route_id,)).fetchall():
         total += _stop_revenue_cents(rate_card, s["action"], s["container_size"])
+        total += _stop_overage_cents(tonnage_rates, s["action"], s["container_size"], s["weight_tons"])
     return total
 
 
@@ -27747,6 +27930,72 @@ def _extra_day_default_cents(conn, company_id):
         return int(row["cents"]) if row and row["cents"] else 0
     except (TypeError, ValueError):
         return 0
+
+
+def _get_tonnage_rates(conn, company_id):
+    """(allow_std_tons, allow_40_tons, overage_cents_per_ton).
+
+    2026-10-16: included tons per size tier + $/ton overage from the
+    rate card. Missing = 0 (no allowance / no overage billing).
+    """
+    allow_std = allow_40 = 0.0
+    over_cents = 0
+    try:
+        for r in conn.execute(
+            """SELECT service, tier, qty, cents FROM rate_cards
+               WHERE company_id=? AND service IN ('tonnage_allow','tonnage_overage')""",
+            (company_id,)).fetchall():
+            if r["service"] == "tonnage_allow":
+                try:
+                    t = max(0.0, float(r["qty"] or 0))
+                except (TypeError, ValueError):
+                    t = 0.0
+                if r["tier"] == "40yd":
+                    allow_40 = t
+                else:
+                    allow_std = t
+            else:
+                try:
+                    over_cents = max(0, int(r["cents"] or 0))
+                except (TypeError, ValueError):
+                    over_cents = 0
+    except Exception:
+        pass
+    return allow_std, allow_40, over_cents
+
+
+def _stop_overage_cents(tonnage_rates, action, size, tons):
+    """Tonnage overage charge for one pull/swap stop. Never raises.
+
+    tons = scale-ticket weight. Only pull/swap stops can go over; the
+    allowance follows the 40yd/standard tier split like haul pricing.
+    """
+    try:
+        if _classify_service(action) not in ("pull", "swap"):
+            return 0
+        tons = float(tons or 0)
+        if tons <= 0:
+            return 0
+        allow_std, allow_40, over_cents = tonnage_rates
+        allow = allow_40 if _rate_tier(size) == "40yd" else allow_std
+        over_tons = max(0.0, tons - allow)
+        if over_tons <= 0 or over_cents <= 0:
+            return 0
+        return int(round(over_tons * over_cents))
+    except Exception:
+        return 0
+
+
+def _fmt_tons(tons):
+    """6.2 → '6.2t'; 6.0 → '6t'."""
+    try:
+        t = float(tons)
+    except (TypeError, ValueError):
+        return "0t"
+    s = "%g" % t
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s + "t"
 
 
 @app.route("/bin-tracker")
