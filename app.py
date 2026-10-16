@@ -17633,12 +17633,12 @@ def driver_route_detail(route_id):
     }}
     </script>"""
     complete_section = f"""
+    {_cab_fee_block}
     <form method="POST" action="{url_for('toggle_stop_complete', stop_id=stop_id)}" id="cab-complete-form"
           data-has-photo="{'1' if has_photo else '0'}" data-photo-mode="{e(photo_proof_mode)}">
         <input type="hidden" name="_csrf_token" value="{_csrf}">
         <input type="hidden" name="intent" value="complete">
         {_cab_weight_block}
-        {_cab_fee_block}
         <button class="cab-complete-btn" type="submit" {"disabled" if required_locked else ""}>&#9989; Complete Stop</button>
     </form>
     {'<div class="cab-photo-status">Take at least one photo to unlock Complete Stop</div>' if required_locked else ''}
