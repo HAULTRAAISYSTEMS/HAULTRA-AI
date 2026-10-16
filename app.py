@@ -27514,7 +27514,8 @@ def bin_tracker():
             }}
 
             function makeIcon(overdue) {{
-                var color = overdue ? '#FF5252' : '#FF6B1A';
+                // 2026-10-16: overdue pins stay red; everything else is green.
+                var color = overdue ? '#FF5252' : '#3DDC84';
                 // White halo ring (via box-shadow) + a solid dark border keeps
                 // the pin popping against light-tile features of any color —
                 // pale roads, water, parks — not just a plain background.
