@@ -688,6 +688,11 @@
     font-family: var(--font-body);
     font-size: 0.92rem;
   }
+  /* 2026-10-16: route date picker — fixed width, dark calendar icon */
+  .date-select {
+    flex: none; min-width: 0; width: 150px;
+    color-scheme: dark;
+  }
   .no-drivers-msg {
     font-size: 0.85rem; color: var(--text-dim);
   }
@@ -1445,9 +1450,11 @@
       var driverSelect = el('driver-select');
       var driverId = driverSelect ? driverSelect.value : '';
       if (!driverId) return;
+      var dateEl = el('route-date');
       url = '/api/dispatch';
       payload = {
         driver_id: driverId,
+        route_date: dateEl && dateEl.value ? dateEl.value : '',
         stops: TraySeq.sortBySeq(currentStops).map(function (s) {
           return {
             action: s.action,
@@ -1492,7 +1499,8 @@
         }
         successMsg = ROUTE_MODE
           ? ('✓ ' + res.data.stop_count + ' stop' + (res.data.stop_count === 1 ? '' : 's') + ' added to the route')
-          : ('✓ Route dispatched to ' + res.data.driver + ' — ' + res.data.stop_count + ' stops');
+          : ('✓ Route dispatched to ' + res.data.driver + ' — ' + res.data.stop_count + ' stops'
+             + (res.data.route_date ? ' (' + res.data.route_date + ')' : ''));
         // Commit succeeded: clear the tray, the raw box, and reset the counters so
         // the boss can immediately build the NEXT batch on a clean slate. We do NOT
         // redirect — the batch workflow is type → eyeball → send → next batch.
