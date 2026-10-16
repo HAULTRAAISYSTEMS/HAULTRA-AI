@@ -4136,6 +4136,10 @@ def init_db():
     )
     """)
     safe_add_column(conn, "customers", "email TEXT")
+    # 2026-10-16: per-customer bin rental terms (address book). NULL =
+    # company default (10 days included, no extra-day billing).
+    safe_add_column(conn, "customers", "rental_days INTEGER")
+    safe_add_column(conn, "customers", "extra_day_rate_cents INTEGER")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS sites (
@@ -9014,6 +9018,17 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .bin-addr {{ font-family: var(--font-mono); font-size: 13px; color: #F5F5F0; }}
 .bin-customer {{ font-size: 12px; color: var(--text-muted); margin-top: 2px; }}
 .bin-overdue-tag {{ font-size: 11px; font-weight: 700; color: var(--red); margin-top: 8px; letter-spacing: .3px; }}
+/* 2026-10-16: per-customer rental terms + pull dispatch. */
+.bin-terms {{ font-size: 11px; color: var(--text-muted); margin-top: 6px; }}
+.bin-owed-total {{ display: block; color: var(--green); font-size: 13px; font-weight: 800; margin-top: 2px; }}
+.bin-card-actions {{ margin-top: 10px; display: flex; gap: 8px; }}
+.bin-dispatch-btn {{
+    flex: 1; min-height: 44px; padding: 10px 14px; border-radius: 10px; cursor: pointer;
+    border: 1px solid rgba(255,107,26,0.45); background: rgba(255,107,26,0.12);
+    color: #FF9D5C; font-weight: 800; font-size: 13px; font-family: inherit;
+}}
+.bin-dispatch-btn:active {{ transform: scale(.98); }}
+.bin-dispatch-btn:disabled {{ opacity: .5; cursor: default; }}
 
 /* ══════════════════════════════════════════════════════════
    CAB VIEW — single-stop mobile-first driver flow
@@ -10946,7 +10961,11 @@ def dashboard():
     out_count = len(containers_out)
     for c in containers_out:
         c["days_out"] = _days_out(c["since"])
-    overdue_count = sum(1 for c in containers_out if (c["days_out"] or 0) >= OVERDUE_RENTAL_DAYS)
+    # 2026-10-16: overdue is per-customer rental terms, not a flat 10 days.
+    overdue_count = sum(
+        1 for c in containers_out
+        if _container_money(conn, company_id, c)["overdue"]
+    )
 
     # ── Overdue 7-day trend — reconstructed from real stop history, not stored snapshots ──
     overdue_trend_sub = ""
@@ -10959,7 +10978,7 @@ def dashboard():
         containers_out_7d_ago = compute_containers_out(conn, company_id, asof_date=window_start)
         overdue_7d_ago = sum(
             1 for c in containers_out_7d_ago
-            if (_days_out(c["since"], asof_date=window_start) or 0) >= OVERDUE_RENTAL_DAYS
+            if _container_money(conn, company_id, c, asof_date=window_start)["overdue"]
         )
         delta = overdue_count - overdue_7d_ago
         if delta == 0:
@@ -11107,7 +11126,7 @@ def dashboard():
         <div class="gauge-stat">
             <div class="label">Overdue</div>
             <div class="num {'red' if overdue_count else ''}">{overdue_count}</div>
-            <div class="sub">{OVERDUE_RENTAL_DAYS}+ days out</div>
+            <div class="sub">past rental window</div>
             {overdue_trend_sub}
         </div>
     </div>
@@ -14648,10 +14667,11 @@ def _build_route_board_html(user):
     # already been sitting overdue at that address (from compute_containers_out,
     # the same replay used for the Owner Dashboard / Bin Tracker overdue counts).
     containers_out = compute_containers_out(conn, company_id)
+    # 2026-10-16: per-customer rental terms.
     overdue_addr_keys = {
         (c["address"] or "").strip().lower() + "|" + (c["city"] or "").strip().lower()
         for c in containers_out
-        if (_days_out(c["since"]) or 0) >= OVERDUE_RENTAL_DAYS
+        if _container_money(conn, company_id, c)["overdue"]
     }
 
     # 2026-10-14: one thread per driver — the lane badge is the DRIVER's total
@@ -27404,18 +27424,122 @@ def _days_out(since_str, asof_date=None):
     return (ref_date - since_date).days
 
 
+def _norm_addr(s):
+    """Normalize an address for matching: lowercase, collapse whitespace."""
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def _customer_rental_terms(conn, company_id, address, city, customer_name):
+    """Match a container-out address to an address-book customer.
+
+    2026-10-16: per-customer bin rental terms. Returns
+    (customer_id, site_id, customer_label, rental_days, rate_cents).
+    rental_days falls back to OVERDUE_RENTAL_DAYS; rate_cents to 0.
+    customer_id/site_id are None when the address isn't in the book.
+    """
+    rental_days, rate_cents = OVERDUE_RENTAL_DAYS, 0
+    cust_id, site_id, label = None, None, ""
+    try:
+        # 1) address → site → customer
+        addr_key = _norm_addr(address)
+        if addr_key:
+            rows = conn.execute(
+                """SELECT s.id AS site_id, c.id AS cust_id,
+                          COALESCE(c.business_name, c.contact_name, '') AS label,
+                          c.rental_days, c.extra_day_rate_cents
+                     FROM sites s JOIN customers c ON c.id = s.customer_id
+                    WHERE c.company_id = ? AND c.is_active = 1""",
+                (company_id,)).fetchall()
+            for r in rows:
+                site_addr = conn.execute(
+                    "SELECT address FROM sites WHERE id=?", (r["site_id"],)).fetchone()
+                if site_addr and _norm_addr(site_addr["address"]) == addr_key:
+                    cust_id, site_id = r["cust_id"], r["site_id"]
+                    label = r["label"] or ""
+                    if r["rental_days"]:
+                        rental_days = int(r["rental_days"])
+                    if r["extra_day_rate_cents"]:
+                        rate_cents = int(r["extra_day_rate_cents"])
+                    break
+        # 2) fallback: customer name → customer
+        if cust_id is None and (customer_name or "").strip():
+            nm = _norm_addr(customer_name)
+            c = conn.execute(
+                """SELECT id, COALESCE(business_name, contact_name, '') AS label,
+                          rental_days, extra_day_rate_cents
+                     FROM customers WHERE company_id = ? AND is_active = 1""",
+                (company_id,)).fetchall()
+            for r in c:
+                if _norm_addr(r["label"]) == nm and nm:
+                    cust_id = r["id"]
+                    label = r["label"] or ""
+                    if r["rental_days"]:
+                        rental_days = int(r["rental_days"])
+                    if r["extra_day_rate_cents"]:
+                        rate_cents = int(r["extra_day_rate_cents"])
+                    # first site of this customer, if any
+                    s = conn.execute(
+                        "SELECT id FROM sites WHERE customer_id=? ORDER BY id LIMIT 1",
+                        (cust_id,)).fetchone()
+                    site_id = s["id"] if s else None
+                    break
+    except Exception:
+        pass
+    if rental_days < 1:
+        rental_days = OVERDUE_RENTAL_DAYS
+    if rate_cents < 0:
+        rate_cents = 0
+    return cust_id, site_id, label, rental_days, rate_cents
+
+
+def _container_money(conn, company_id, container, asof_date=None):
+    """Per-customer overdue + owed for one container-out dict.
+
+    Returns dict with days_out, rental_days, overdue (bool), days_over,
+    owed_cents, customer_id, site_id, customer_label. Never raises —
+    falls back to the company default terms.
+    """
+    days = _days_out(container.get("since"), asof_date=asof_date)
+    cust_id, site_id, label, rental_days, rate_cents = _customer_rental_terms(
+        conn, company_id, container.get("address"), container.get("city"),
+        container.get("customer_name"))
+    overdue = days is not None and days >= rental_days
+    days_over = max(0, (days or 0) - rental_days)
+    return {
+        "days_out": days, "rental_days": rental_days, "overdue": overdue,
+        "days_over": days_over, "owed_cents": days_over * rate_cents,
+        "rate_cents": rate_cents,
+        "customer_id": cust_id, "site_id": site_id, "customer_label": label,
+    }
+
+
+def _fmt_money(cents):
+    """18000 → '$180'; 1850 → '$18.50'."""
+    try:
+        cents = int(cents or 0)
+    except (TypeError, ValueError):
+        return "$0"
+    if cents % 100 == 0:
+        return "$%d" % (cents // 100)
+    return "$%.2f" % (cents / 100.0)
+
+
 @app.route("/bin-tracker")
 @boss_required
 def bin_tracker():
     conn = get_db()
     out = compute_containers_out(conn, cid())
-    conn.close()
-
+    # 2026-10-16: per-customer rental terms + owed, computed while conn is open.
     for c in out:
         c["days_out"] = _days_out(c["since"])
+        c["_money"] = _container_money(conn, cid(), c)
+    conn.close()
+
     out.sort(key=lambda c: c["days_out"] if c["days_out"] is not None else -1, reverse=True)
 
-    overdue_count = sum(1 for c in out if (c["days_out"] or 0) >= OVERDUE_RENTAL_DAYS)
+    overdue_count = sum(1 for c in out if c["_money"]["overdue"])
+    # Total owed across all overdue cans — the money view.
+    total_owed_cents = sum(c["_money"]["owed_cents"] for c in out)
     geocoded = [c for c in out if c["lat"] is not None and c["lng"] is not None]
 
     rows_html = ""
@@ -27423,8 +27547,9 @@ def bin_tracker():
         rows_html = '<div class="empty-state">No containers currently out. Delivery and pull history will populate this list as stops are completed.</div>'
     else:
         for c in out:
+            m = c["_money"]
             days = c["days_out"]
-            overdue = days is not None and days >= OVERDUE_RENTAL_DAYS
+            overdue = m["overdue"]
             if days is None:
                 days_label = "&mdash;"
             elif days == 0:
@@ -27441,6 +27566,37 @@ def bin_tracker():
                 if has_coords else ""
             )
             no_map_note = "" if has_coords else '<div class="bin-no-map">&#128205; No map location</div>'
+            # Overdue tag: per-customer window + running tab when a rate is set.
+            if overdue:
+                if m["owed_cents"] > 0:
+                    overdue_tag = (
+                        f'<div class="bin-overdue-tag">&#9888; OVERDUE &mdash; '
+                        f'{m["days_over"]} day{"s" if m["days_over"] != 1 else ""} over '
+                        f'&middot; <span style="font-size:14px;">{_fmt_money(m["owed_cents"])} owed</span></div>'
+                    )
+                else:
+                    overdue_tag = (
+                        f'<div class="bin-overdue-tag">&#9888; OVERDUE &mdash; '
+                        f'past {m["rental_days"]}-day window</div>'
+                    )
+            else:
+                overdue_tag = ""
+            # Subtle terms line when the customer has custom terms.
+            custom_terms = (m["customer_id"] is not None
+                            and (m["rental_days"] != OVERDUE_RENTAL_DAYS or m["rate_cents"] > 0))
+            if custom_terms:
+                terms_bits = f'{m["rental_days"]} days included'
+                if m["rate_cents"] > 0:
+                    terms_bits += f' &middot; {_fmt_money(m["rate_cents"])}/day after'
+                terms_html = f'<div class="bin-terms">{terms_bits}</div>'
+            else:
+                terms_html = ""
+            # One-tap pull dispatch → lands in Unassigned for driver+date.
+            dispatch_html = (
+                f'<button type="button" class="bin-dispatch-btn" '
+                f'onclick="event.stopPropagation();dispatchPull({c["stop_id"]}, this)">'
+                f'&#128666; Dispatch pull</button>'
+            )
             rows_html += f"""
             <div class="{card_cls}" id="bin-card-{c['stop_id']}"{card_click}>
                 <div class="bin-card-top">
@@ -27449,8 +27605,10 @@ def bin_tracker():
                 </div>
                 <div class="bin-addr">{addr_line}</div>
                 {f'<div class="bin-customer">{e(c["customer_name"])}</div>' if c["customer_name"] else ''}
-                {f'<div class="bin-overdue-tag">&#9888; OVERDUE &mdash; past {OVERDUE_RENTAL_DAYS}-day window</div>' if overdue else ''}
+                {overdue_tag}
+                {terms_html}
                 {no_map_note}
+                <div class="bin-card-actions">{dispatch_html}</div>
             </div>
             """
 
@@ -27481,7 +27639,7 @@ def bin_tracker():
                     "Out today" if c["days_out"] == 0 else
                     f'{c["days_out"]} day{"s" if c["days_out"] != 1 else ""} out'
                 ),
-                "overdue": bool(c["days_out"] is not None and c["days_out"] >= OVERDUE_RENTAL_DAYS),
+                "overdue": bool(c["_money"]["overdue"]),
                 "is_gps": bool(c["is_gps"]),
             }
             for c in geocoded
@@ -27642,6 +27800,7 @@ def bin_tracker():
                 <div class="bin-list-stats">
                     <span class="bin-count">{len(out)}</span> out
                     {f'<span class="bin-overdue-count">&#9888; {overdue_count} overdue</span>' if overdue_count else ''}
+                    {f'<span class="bin-owed-total">{_fmt_money(total_owed_cents)} owed</span>' if total_owed_cents > 0 else ''}
                 </div>
             </div>
             <div class="bin-list">
@@ -27650,8 +27809,99 @@ def bin_tracker():
         </div>
     </div>
     {map_script}
+    <script>
+    // 2026-10-16: one-tap pull dispatch from a bin card.
+    window.dispatchPull = function(stopId, btn) {{
+        if (!confirm('Dispatch a pull for this container? It will land in Unassigned for driver + date.')) return;
+        if (btn) {{ btn.disabled = true; btn.textContent = 'Dispatching…'; }}
+        var csrf = (document.querySelector('meta[name="csrf-token"]') || {{}}).content || '';
+        fetch('/bin-tracker/dispatch-pull', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json', 'X-CSRF-Token': csrf }},
+            credentials: 'same-origin',
+            body: JSON.stringify({{ stop_id: stopId }})
+        }})
+        .then(function(r) {{ return r.json().then(function(j) {{ return {{ ok: r.ok, j: j }}; }}); }})
+        .then(function(res) {{
+            if (res.ok && res.j.success) {{
+                if (confirm('Pull dispatched — open Unassigned to assign a driver and date?')) {{
+                    window.location.href = '/unassigned';
+                }} else if (btn) {{
+                    btn.textContent = '✓ Dispatched';
+                }}
+            }} else {{
+                alert((res.j && res.j.message) || 'Could not dispatch the pull.');
+                if (btn) {{ btn.disabled = false; btn.innerHTML = '&#128666; Dispatch pull'; }}
+            }}
+        }})
+        .catch(function() {{
+            alert('Network error — try again.');
+            if (btn) {{ btn.disabled = false; btn.innerHTML = '&#128666; Dispatch pull'; }}
+        }});
+    }};
+    </script>
     """
     return render_template_string(shell_page("Bin Tracker", body, extra_head=map_head))
+
+
+@app.route("/bin-tracker/dispatch-pull", methods=["POST"])
+@boss_required
+def bin_dispatch_pull():
+    """One-tap pull dispatch from a Bin Tracker card.
+
+    2026-10-16: creates an 'accepted' pull request for the container's
+    customer/site, which lands in Unassigned Work for driver + date
+    assignment. The address must match the address book — otherwise the
+    boss gets a clear pointer to add it first.
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        stop_id = int(data.get("stop_id") or 0)
+    except (TypeError, ValueError):
+        return jsonify({"error": "stop_id required."}), 400
+    conn = get_db()
+    company_id = cid()
+    out = compute_containers_out(conn, company_id)
+    target = next((c for c in out if c.get("stop_id") == stop_id), None)
+    if target is None:
+        conn.close()
+        return jsonify({"error": "That container is no longer out."}), 404
+    cust_id, site_id, label, rental_days, rate_cents = _customer_rental_terms(
+        conn, company_id, target.get("address"), target.get("city"),
+        target.get("customer_name"))
+    if not cust_id or not site_id:
+        conn.close()
+        return jsonify({
+            "error": "no_customer",
+            "message": "This address isn't in your address book yet — add the customer first, then dispatch.",
+        }), 409
+    # Don't double-dispatch: an open pull request for this site already exists.
+    dupe = conn.execute(
+        """SELECT id FROM requests
+            WHERE customer_id=? AND site_id=? AND type='P'
+              AND status IN ('pending','accepted')""",
+        (cust_id, site_id)).fetchone()
+    if dupe:
+        conn.close()
+        return jsonify({
+            "error": "duplicate",
+            "message": "A pull is already queued for this address — check Unassigned.",
+        }), 409
+    size = target.get("size") or ""
+    notes = "Dispatched from Bin Tracker%s." % (
+        " (%s days over)" % _container_money(conn, company_id, target)["days_over"]
+        if _container_money(conn, company_id, target)["overdue"] else "")
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO requests
+               (customer_id, site_id, type, bin_id, size_requested,
+                preferred_date, notes, status, stop_id, created_at, updated_at)
+           VALUES (?, ?, 'P', NULL, ?, 'asap', ?, 'accepted', NULL, ?, ?)""",
+        (cust_id, site_id, size or None, notes, now_ts(), now_ts()))
+    req_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "request_id": req_id})
 
 
 # =========================================================
@@ -33277,6 +33527,22 @@ def _load_customer_scoped(conn, customer_id):
     ).fetchone()
 
 
+def _rental_terms_label(cust):
+    """'14 days included · $15/day after' or the default-terms fallback."""
+    try:
+        rd = int(cust["rental_days"]) if cust["rental_days"] else OVERDUE_RENTAL_DAYS
+    except (TypeError, ValueError, KeyError):
+        rd = OVERDUE_RENTAL_DAYS
+    try:
+        rate = int(cust["extra_day_rate_cents"]) if cust["extra_day_rate_cents"] else 0
+    except (TypeError, ValueError, KeyError):
+        rate = 0
+    label = f"{rd} days included"
+    if rate > 0:
+        label += f" · {_fmt_money(rate)}/day after"
+    return label
+
+
 @app.route("/customers")
 @roles_required("customer_manager")
 def customers_page():
@@ -33547,7 +33813,8 @@ def add_customer_bin(customer_id):
 @app.route("/api/customers/<int:customer_id>", methods=["PATCH"])
 @login_required
 def update_customer(customer_id):
-    """Edit a customer's business name / contact / phone / email. cm/owner only."""
+    """Edit a customer's business name / contact / phone / email / rental terms.
+    cm/owner only."""
     if not has_role("customer_manager"):
         return jsonify({"error": "forbidden"}), 403
     data = request.get_json(silent=True) or {}
@@ -33563,9 +33830,38 @@ def update_customer(customer_id):
     if not business and not contact:
         conn.close()
         return jsonify({"error": "a business or contact name is required"}), 400
+    # Rental terms: blank → NULL (company default). 2026-10-16.
+    def _opt_int(raw, lo, hi):
+        raw = (str(raw) if raw is not None else "").strip()
+        if not raw:
+            return None
+        try:
+            v = int(float(raw))
+        except (TypeError, ValueError):
+            return "invalid"
+        if v < lo or v > hi:
+            return "invalid"
+        return v
+    rental_days = _opt_int(data.get("rental_days"), 1, 365)
+    # Rate arrives as dollars ("15" / "18.50"); stored as integer cents.
+    rate_raw = (str(data.get("extra_day_rate") or "")).strip()
+    if not rate_raw:
+        rate_cents = None
+    else:
+        try:
+            rate_cents = int(round(float(rate_raw) * 100))
+        except (TypeError, ValueError):
+            rate_cents = "invalid"
+        if rate_cents != "invalid" and (rate_cents < 0 or rate_cents > 100000):
+            rate_cents = "invalid"
+    if rental_days == "invalid" or rate_cents == "invalid":
+        conn.close()
+        return jsonify({"error": "rental days must be 1–365 and day rate a valid dollar amount"}), 400
     conn.execute(
-        "UPDATE customers SET business_name=?, contact_name=?, phone=?, email=? WHERE id=?",
-        (business or None, contact or None, phone or None, email or None, customer_id),
+        "UPDATE customers SET business_name=?, contact_name=?, phone=?, email=?,"
+        " rental_days=?, extra_day_rate_cents=? WHERE id=?",
+        (business or None, contact or None, phone or None, email or None,
+         rental_days, rate_cents, customer_id),
     )
     conn.commit()
     conn.close()
@@ -33752,6 +34048,7 @@ def customer_detail_page(customer_id):
             <div style="font-size:14px;">👤 {e(contact) or "—"}</div>
             <div style="font-size:14px;color:var(--slate);margin-top:4px;">📞 {e(cust["phone"] or "—")}</div>
             <div style="font-size:14px;color:var(--slate);margin-top:4px;">✉ {e(cust["email"] or "—")}</div>
+            <div style="font-size:14px;color:var(--slate);margin-top:4px;">📦 {_rental_terms_label(cust)}</div>
         </div>
         <div id="cust-edit" hidden style="margin-top:10px;">
             <div id="edit-err" hidden style="color:#FF5252;font-size:12px;margin-bottom:8px;"></div>
@@ -33762,7 +34059,11 @@ def customer_detail_page(customer_id):
             <label class="uw-lbl">Phone</label>
             <input id="ed-phone" style="width:100%;margin-bottom:10px;" value="{e(cust["phone"] or "")}">
             <label class="uw-lbl">Email</label>
-            <input id="ed-email" type="email" style="width:100%;margin-bottom:12px;" value="{e(cust["email"] or "")}">
+            <input id="ed-email" type="email" style="width:100%;margin-bottom:10px;" value="{e(cust["email"] or "")}">
+            <label class="uw-lbl">Rental days included (blank = {OVERDUE_RENTAL_DAYS} default)</label>
+            <input id="ed-rental-days" type="number" min="1" max="365" inputmode="numeric" style="width:100%;margin-bottom:10px;" value="{e(cust["rental_days"] or "")}" placeholder="{OVERDUE_RENTAL_DAYS}">
+            <label class="uw-lbl">Extra-day rate $/day (blank = none)</label>
+            <input id="ed-day-rate" type="number" min="0" step="0.01" inputmode="decimal" style="width:100%;margin-bottom:12px;" value="{(_fmt_money(cust["extra_day_rate_cents"]).lstrip("$") if cust["extra_day_rate_cents"] else "")}" placeholder="0.00">
             <div style="display:flex;gap:8px;">
                 <button class="btn green" style="flex:1;" onclick="submitEdit()">Save</button>
                 <button class="btn secondary" onclick="toggleEdit()">Cancel</button>
@@ -33857,7 +34158,9 @@ def _customer_detail_js(customer_id):
     var body={{business_name:(document.getElementById('ed-business')||{{}}).value||'',
               contact_name:(document.getElementById('ed-contact')||{{}}).value||'',
               phone:(document.getElementById('ed-phone')||{{}}).value||'',
-              email:(document.getElementById('ed-email')||{{}}).value||''}};
+              email:(document.getElementById('ed-email')||{{}}).value||'',
+              rental_days:(document.getElementById('ed-rental-days')||{{}}).value||'',
+              extra_day_rate:(document.getElementById('ed-day-rate')||{{}}).value||''}};
     fetch('/api/customers/'+CID, {{method:'PATCH',
         headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},
         body:JSON.stringify(body)}})
