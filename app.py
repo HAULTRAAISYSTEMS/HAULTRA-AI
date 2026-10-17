@@ -8749,7 +8749,7 @@ body {{
    BUTTONS
    ══════════════════════════════════════════════════════════*/
 .btn,
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.lane-word-btn):not(.lane-util-link):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-topbar-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip):not(.msg-thread-row):not(.msg-close-btn):not(.msg-retry-btn):not(.msg-quick-btn) {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.lane-word-btn):not(.lane-util-link):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-topbar-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip):not(.msg-thread-row):not(.msg-close-btn):not(.msg-retry-btn):not(.msg-quick-btn):not(.cab-quick-btn) {{
     display: inline-block;
     border: none;
     cursor: pointer;
@@ -8777,7 +8777,7 @@ button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact
     color: #FFE9D6;
     box-shadow: 0 0 16px rgba(206,98,36,0.22);
 }}
-button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.lane-word-btn):not(.lane-util-link):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-topbar-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip):not(.msg-thread-row):not(.msg-close-btn):not(.msg-retry-btn):not(.msg-quick-btn):hover {{
+button:not(.nav-item):not(.btn-reassign):not([class*="btn-driver"]):not(.compact-select):not(.cab-copy-btn):not(.cab-gear-btn):not(.lane-message-btn):not(.lane-word-btn):not(.lane-util-link):not(.cab-neutral):not(.cab-navstrip-copy):not(.cab-sticky-end):not(.cab-topbar-end):not(.cab-issue-btn):not(.cab-cancel-btn):not(.pw-toggle):not(.late-chip):not(.late-open):not(.alert-resolve):not(.cab-leg-chip):not(.msg-thread-row):not(.msg-close-btn):not(.msg-retry-btn):not(.msg-quick-btn):not(.cab-quick-btn):hover {{
     filter: brightness(1.1);
     transform: translateY(-1px);
     text-decoration: none;
@@ -18454,6 +18454,12 @@ def driver_route_detail(route_id):
   .cab-quick-btn .lane-msg-badge {{
       position: absolute; top: 6px; right: 8px;
   }}
+  /* 2026-10-17: centered cab hero — badge + name stack centered, legs centered */
+  .cab-action-row {{
+      flex-direction: column; align-items: center; text-align: center; gap: 8px;
+  }}
+  .cab-action-name {{ font-size: 26px; }}
+  .cab-legs {{ justify-content: center; text-align: center; }}
   .cab-fee-tray {{
       overflow: hidden; max-height: 0; opacity: 0;
       transition: max-height .28s ease, opacity .22s ease, margin .28s ease;
