@@ -6996,6 +6996,17 @@ _REQ_BADGE_POLLER_JS = """
 """
 
 
+def _cmd_header(title, meta_html=""):
+    """2026-10-17: Command-center page header — centered, alive. Same feel as
+    the dispatch pages: SYSTEM ONLINE pill, gradient shine title, live meta."""
+    meta = f'<div class="cmd-meta">{meta_html}</div>' if meta_html else ""
+    return (
+        '<header class="cmd"><div class="cmd-glow"></div>'
+        '<div class="cmd-status"><span class="cmd-live-dot"></span>SYSTEM ONLINE</div>'
+        f'<h1 class="cmd-title">{title}</h1>{meta}</header>'
+    )
+
+
 def shell_page(title, body, extra_head=""):
     user = get_current_user()
     path = request.path
@@ -8100,6 +8111,48 @@ a:hover {{ color: #FF9D5C; }}
     0%, 100% {{ transform: scale(1); }}
     50% {{ transform: scale(1.1); }}
 }}
+
+/* 2026-10-17: Command-center page headers — the dispatch future AI center.
+   Shared by the board, requests, customers, invoices, bins, messages. */
+.cmd {{
+    position: relative; text-align: center; overflow: hidden;
+    padding: calc(26px + env(safe-area-inset-top, 0px)) 16px 22px;
+    margin: calc(-1 * env(safe-area-inset-top, 0px)) -16px 0;
+}}
+.cmd-glow {{
+    position: absolute; left: -20px; right: -20px; top: -60px; height: 250px;
+    background: radial-gradient(ellipse 65% 100% at 50% 0%, rgba(255,107,26,.16), transparent 70%);
+    pointer-events: none; animation: cmd-breathe 6s ease-in-out infinite;
+}}
+@keyframes cmd-breathe {{ 0%, 100% {{ opacity: .65; }} 50% {{ opacity: 1; }} }}
+.cmd-status {{
+    position: relative; display: inline-flex; align-items: center; gap: 8px;
+    font-size: 10px; font-weight: 800; letter-spacing: 3px; color: #FF8C42;
+    border: 1px solid rgba(255,107,26,.35); background: rgba(255,107,26,.08);
+    padding: 7px 14px 7px 12px; border-radius: 999px; margin-bottom: 14px;
+}}
+.cmd-live-dot {{
+    width: 9px; height: 9px; border-radius: 50%; flex: none;
+    background: #3DDC84; box-shadow: 0 0 10px rgba(61,220,132,.9);
+    animation: cmd-live-pulse 2.2s ease-in-out infinite;
+}}
+@keyframes cmd-live-pulse {{
+    0%, 100% {{ opacity: 1; transform: scale(1); }}
+    50% {{ opacity: .45; transform: scale(.75); }}
+}}
+.cmd-title {{
+    position: relative; font-size: 32px; font-weight: 800; letter-spacing: .5px; margin: 0 0 10px;
+    background: linear-gradient(110deg, #fff 42%, #FF8C42 50%, #fff 58%);
+    background-size: 220% auto;
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    animation: cmd-shine 7s linear infinite;
+}}
+@keyframes cmd-shine {{ to {{ background-position: 220% center; }} }}
+.cmd-meta {{
+    position: relative; display: flex; align-items: center; justify-content: center; gap: 10px;
+    font-size: 13px; color: var(--text-dim, #A6A69E); font-weight: 600; flex-wrap: wrap;
+}}
+.cmd-sep {{ width: 4px; height: 4px; border-radius: 50%; background: #FF6B1A; flex: none; }}
 
 .haul-tabbar::before {{
     content: '';
@@ -15273,22 +15326,19 @@ def routes_page():
             f'{icon("msg")}{_msg_nav_badge(_board_msg_unread)}</a>'
         )
 
+    _board_meta = f"<span>{e(weekday)} &middot; {e(_board_day)}</span>"
     header_html = f"""
-    <div class="hero owner-header-row" style="position:relative;margin-top:24px;">
-        <div>
-            <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#55554C;margin-bottom:7px;">
-                {e(weekday)} &middot; {e(_board_day)}
-            </div>
-            <h1>Route Board{_board_msg_env}</h1>
-            {_day_nav}
-        </div>
-        <div class="row" style="align-items:center;gap:18px;">
+    {_cmd_header("Route Board", _board_meta)}
+    <div class="board-controls" style="margin-bottom:16px;">
+        {_day_nav}
+        <div class="row" style="align-items:center;gap:18px;margin-top:12px;">
             <div class="board-legend">
                 <span class="board-legend-item"><span class="board-legend-dot pickup"></span>Pickup</span>
                 <span class="board-legend-item"><span class="board-legend-dot dropswap"></span>Drop/Swap</span>
                 <span class="board-legend-item"><span class="board-legend-dot urgent"></span>Urgent</span>
             </div>
             <a class="btn gold" href="/parser?day={_board_day}" style="min-height:48px;display:inline-flex;align-items:center;white-space:nowrap;">+ New Dispatch</a>
+            {_board_msg_env}
         </div>
     </div>
     """
@@ -20839,7 +20889,7 @@ def messages_page():
     .msg-inbox-empty{text-align:center;color:var(--text-dim,#8b8b8b);padding:40px 20px;font-size:14px;}
     </style>
     <div class="msg-inbox">
-        <h1>Messages</h1>
+        """ + _cmd_header("Messages") + """
         <div class="msg-sec-label">Conversations</div>
         <div id="msg-thread-list"></div>
         <div id="msg-inbox-loading" class="msg-inbox-empty">Loading…</div>
@@ -22725,6 +22775,12 @@ def invoice_list():
         (cid(),)).fetchall()
     conn.close()
     _status_badge = {"draft": "", "sent": "in_progress", "paid": "completed", "void": "cancelled"}
+    # 2026-10-17: command header meta — open count + outstanding.
+    _open = [d for d in rows if d["status"] in ("draft", "sent")]
+    _owed_cents = sum(d["total_cents"] or 0 for d in _open)
+    _inv_meta = (f"<span>{len(_open)} open</span><span class=\"cmd-sep\"></span>"
+                 f"<span>{_fmt_money(_owed_cents)} outstanding</span>" if _open
+                 else "<span>All paid up</span>")
     cards = ""
     for inv in rows:
         d = dict(inv)
@@ -22740,8 +22796,7 @@ def invoice_list():
             </div>
         </a>"""
     body = f"""
-    <div class="hero"><h1>Invoices</h1>
-    <p>Built from the job — haul, overage, and fees priced from your rate card.</p></div>
+    {_cmd_header("Invoices", _inv_meta)}
     {cards or '<div class="card"><p class="muted">No invoices yet. Open a completed route and tap <strong>Create Invoice</strong>.</p></div>'}
     """
     return render_template_string(shell_page("Invoices", body))
@@ -28943,6 +28998,10 @@ def bin_tracker():
     out.sort(key=lambda c: c["days_out"] if c["days_out"] is not None else -1, reverse=True)
 
     overdue_count = sum(1 for c in out if c["_money"]["overdue"])
+    # 2026-10-17: command header meta — bins out + overdue.
+    _bin_meta = (f"<span>{len(out)} out</span><span class=\"cmd-sep\"></span>"
+                 f"<span>{overdue_count} overdue</span>" if out
+                 else "<span>Yard is clear</span>")
     # Total owed across all overdue cans — the money view.
     total_owed_cents = sum(c["_money"]["owed_cents"] for c in out)
     geocoded = [c for c in out if c["lat"] is not None and c["lng"] is not None]
@@ -29186,10 +29245,7 @@ def bin_tracker():
         """
 
     body = f"""
-    <div class="hero">
-        <h1>Bin Tracker</h1>
-        <p>Rental clocks for every container currently out at a customer site.</p>
-    </div>
+    {_cmd_header("Bin Tracker", _bin_meta)}
 
     <div class="bin-tracker-grid">
         <div class="bin-map-col">
@@ -34999,12 +35055,10 @@ def customers_page():
         """
 
     empty_hidden = "" if not rows else " hidden"
+    _cust_meta = f"<span>{len(rows)} customer{'s' if len(rows) != 1 else ''} on the books</span>"
     body = f"""
-    <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
-        <div>
-            <h1>Customers</h1>
-            <p>Everyone you serve. Add a customer to generate their self-service portal link.</p>
-        </div>
+    {_cmd_header("Customers", _cust_meta)}
+    <div style="display:flex;justify-content:flex-end;margin-bottom:12px;">
         {_export_link(url_for('export_customers_csv'), "⬇ Export CSV")}
     </div>
     <div style="max-width:640px;margin-bottom:16px;">
@@ -38944,12 +38998,11 @@ def requests_page():
         if can_assign else ""
     )
     empty_hidden = "" if not reqs else " hidden"
+    _req_meta = (f"<span>{len(reqs)} awaiting review</span>" if reqs
+                 else "<span>All caught up</span>")
     body = f"""
-    <div class="hero" style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
-        <div>
-            <h1>Requests</h1>
-            <p>Customer requests awaiting your review. <strong>Accept</strong> confirms the job and sends it to Unassigned Work for scheduling{accept_assign_hint}.</p>
-        </div>
+    {_cmd_header("Requests", _req_meta)}
+    <div style="display:flex;justify-content:flex-end;margin-bottom:12px;">
         {_export_link(url_for('export_requests_csv'), "⬇ History CSV")}
     </div>
     <div id="req-empty" class="empty-state" style="padding:32px 0;"{empty_hidden}>No pending requests.</div>
