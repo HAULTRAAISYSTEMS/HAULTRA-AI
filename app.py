@@ -6876,6 +6876,22 @@ _APP_BACKDROP = """
 </svg>
 """
 
+# 2026-10-17: Ambient command-center background — fixed glow orbs + dot grid
+# + rising motes, behind .app-shell (z-index 0 vs 1).
+_AMBIENT_BG = """
+<div class="ambient-bg" aria-hidden="true">
+  <div class="ambient-orb o1"></div>
+  <div class="ambient-orb o2"></div>
+  <div class="ambient-orb o3"></div>
+  <div class="ambient-grid"></div>
+  <span class="ambient-mote" style="left:8%;animation-delay:-3s"></span>
+  <span class="ambient-mote" style="left:22%;animation-delay:-9s"></span>
+  <span class="ambient-mote" style="left:48%;animation-delay:-14s"></span>
+  <span class="ambient-mote" style="left:71%;animation-delay:-6s"></span>
+  <span class="ambient-mote" style="left:88%;animation-delay:-11s"></span>
+</div>
+"""
+
 
 def brand_mark(px=26, cls="brand-mark"):
     """The HAULTRA hex mark at any size, from the one sprite definition."""
@@ -7822,6 +7838,59 @@ a:hover {{ color: #FF9D5C; }}
 }}
 .app-shell {{ position: relative; z-index: 1; }}
 @media (prefers-reduced-motion: reduce) {{ .app-backdrop {{ opacity: .32; }} }}
+
+/* 2026-10-17: Ambient command-center page background — drifting glow orbs,
+   faint dot grid, rising data motes. Fixed at z-index 0, behind .app-shell. */
+.ambient-bg {{
+    position: fixed; inset: 0; z-index: 0;
+    pointer-events: none; overflow: hidden;
+}}
+.ambient-orb {{
+    position: absolute; border-radius: 50%;
+    filter: blur(90px); will-change: transform;
+    animation: ambient-drift 45s ease-in-out infinite alternate;
+}}
+.ambient-orb.o1 {{
+    width: 520px; height: 520px; left: -160px; top: -140px;
+    background: radial-gradient(circle, rgba(255,107,26,.16), transparent 70%);
+}}
+.ambient-orb.o2 {{
+    width: 460px; height: 460px; right: -140px; top: 32%;
+    background: radial-gradient(circle, rgba(255,140,66,.12), transparent 70%);
+    animation-duration: 60s; animation-delay: -20s;
+}}
+.ambient-orb.o3 {{
+    width: 420px; height: 420px; left: 24%; bottom: -160px;
+    background: radial-gradient(circle, rgba(255,107,26,.10), transparent 70%);
+    animation-duration: 52s; animation-delay: -35s;
+}}
+@keyframes ambient-drift {{
+    from {{ transform: translate(0, 0) scale(1); }}
+    to {{ transform: translate(70px, 50px) scale(1.12); }}
+}}
+.ambient-grid {{
+    position: absolute; inset: 0;
+    background-image: radial-gradient(rgba(255,255,255,.045) 1px, transparent 1.5px);
+    background-size: 30px 30px;
+    -webkit-mask-image: radial-gradient(ellipse 100% 60% at 50% 0%, black 20%, transparent 70%);
+    mask-image: radial-gradient(ellipse 100% 60% at 50% 0%, black 20%, transparent 70%);
+}}
+.ambient-mote {{
+    position: absolute; bottom: -10px; width: 3px; height: 3px; border-radius: 50%;
+    background: rgba(255,170,90,.55);
+    box-shadow: 0 0 6px rgba(255,140,66,.6);
+    animation: ambient-rise 22s linear infinite;
+    opacity: 0;
+}}
+@keyframes ambient-rise {{
+    0% {{ transform: translateY(0); opacity: 0; }}
+    12% {{ opacity: .8; }}
+    80% {{ opacity: .25; }}
+    100% {{ transform: translateY(-105vh); opacity: 0; }}
+}}
+@media (prefers-reduced-motion: reduce) {{
+    .ambient-orb, .ambient-mote {{ animation: none; }}
+}}
 
 /* ── Brand lockup ───────────────────────────────────────────*/
 .brand-mark {{ flex: none; display: block; }}
@@ -9678,6 +9747,7 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     <body>
         {_BRAND_SPRITE}
         {_APP_BACKDROP}
+        {_AMBIENT_BG}
         <div class="app-shell">
             {sidebar}
             <main class="content">
@@ -40644,6 +40714,33 @@ def garbage_dispatch_view():
   .dispatch-row { display: flex; gap: 12px; }
   .dispatch-row .btn-secondary { flex: 0 0 auto; min-width: 100px; }
   .dispatch-row #gd-dispatch { flex: 1; }
+  /* 2026-10-17: Ambient command-center page background — drifting glow orbs,
+     faint dot grid, rising data motes. Behind content (z-index 0 vs 1). */
+  .ambient-bg { position: fixed; inset: 0; z-index: 0; pointer-events: none; overflow: hidden; }
+  .ambient-orb { position: absolute; border-radius: 50%; filter: blur(90px);
+    will-change: transform; animation: ambient-drift 45s ease-in-out infinite alternate; }
+  .ambient-orb.o1 { width: 520px; height: 520px; left: -160px; top: -140px;
+    background: radial-gradient(circle, rgba(255,107,26,.16), transparent 70%); }
+  .ambient-orb.o2 { width: 460px; height: 460px; right: -140px; top: 32%;
+    background: radial-gradient(circle, rgba(255,140,66,.12), transparent 70%);
+    animation-duration: 60s; animation-delay: -20s; }
+  .ambient-orb.o3 { width: 420px; height: 420px; left: 24%; bottom: -160px;
+    background: radial-gradient(circle, rgba(255,107,26,.10), transparent 70%);
+    animation-duration: 52s; animation-delay: -35s; }
+  @keyframes ambient-drift { from { transform: translate(0,0) scale(1); }
+    to { transform: translate(70px,50px) scale(1.12); } }
+  .ambient-grid { position: absolute; inset: 0;
+    background-image: radial-gradient(rgba(255,255,255,.045) 1px, transparent 1.5px);
+    background-size: 30px 30px;
+    -webkit-mask-image: radial-gradient(ellipse 100% 60% at 50% 0%, black 20%, transparent 70%);
+    mask-image: radial-gradient(ellipse 100% 60% at 50% 0%, black 20%, transparent 70%); }
+  .ambient-mote { position: absolute; bottom: -10px; width: 3px; height: 3px; border-radius: 50%;
+    background: rgba(255,170,90,.55); box-shadow: 0 0 6px rgba(255,140,66,.6);
+    animation: ambient-rise 22s linear infinite; opacity: 0; }
+  @keyframes ambient-rise { 0% { transform: translateY(0); opacity: 0; }
+    12% { opacity: .8; } 80% { opacity: .25; } 100% { transform: translateY(-105vh); opacity: 0; } }
+  /* Lift page content above the ambient background */
+  body > :not(.ambient-bg):not(nav):not(svg):not(script) { position: relative; z-index: 1; }
 
   .toast { position: fixed; left: 50%; bottom: 190px; transform: translateX(-50%);
     background: var(--bg-2); border: 1px solid var(--green); color: var(--green);
@@ -40714,6 +40811,17 @@ def garbage_dispatch_view():
   .haul-more-handle { width: 40px; height: 4px; background: rgba(255,255,255,.2); border-radius: 2px; margin: 12px auto 8px; }
   .haul-more-items .nav-item { display: block; padding: 14px 20px; color: #fff; text-decoration: none; font-size: 16px; border-bottom: 1px solid rgba(255,255,255,.05); }
 </style></head><body>
+<div class="ambient-bg" aria-hidden="true">
+  <div class="ambient-orb o1"></div>
+  <div class="ambient-orb o2"></div>
+  <div class="ambient-orb o3"></div>
+  <div class="ambient-grid"></div>
+  <span class="ambient-mote" style="left:8%;animation-delay:-3s"></span>
+  <span class="ambient-mote" style="left:22%;animation-delay:-9s"></span>
+  <span class="ambient-mote" style="left:48%;animation-delay:-14s"></span>
+  <span class="ambient-mote" style="left:71%;animation-delay:-6s"></span>
+  <span class="ambient-mote" style="left:88%;animation-delay:-11s"></span>
+</div>
 <svg style="display:none" aria-hidden="true">
 <defs>
 <symbol id="i-board" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
