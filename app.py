@@ -11017,10 +11017,20 @@ def dashboard():
                 _where = (_s["address"] or "").strip()
                 _sub = (" — " + _where) if _where and _where != _who else ""
                 _act = (_s["action"] or "").strip().upper()
+                # 2026-10-17: cancel button on upcoming stops (not done, not current)
+                _cancel_btn = ""
+                _row_cls = "drv-stop"
+                if not _s_done and _cur_marked:
+                    _cancel_btn = (
+                        f'<button type="button" class="drv-stop-cancel" '
+                        f'onclick="event.preventDefault();event.stopPropagation();drvCancelStop({_s["id"]}, \'{e(_who)}\')" '
+                        f'title="Cancel this stop">&#10005;</button>'
+                    )
+                    _row_cls = "drv-stop has-cancel"
                 _stop_rows += (
-                    f'<div class="drv-stop">{_dot}'
+                    f'<div class="{_row_cls}">{_dot}'
                     + (f'<span class="drv-act">{e(_act)}</span>' if _act else "")
-                    + f'<span class="drv-stop-name">{e(_who)}{e(_sub)}</span></div>'
+                    + f'<span class="drv-stop-name">{e(_who)}{e(_sub)}</span>{_cancel_btn}</div>'
                 )
             if not _stop_rows:
                 _stop_rows = '<div class="drv-stop"><span class="drv-stop-name muted">No stops yet.</span></div>'
@@ -11039,6 +11049,12 @@ def dashboard():
             <div class="drv-progress"><div style="width:{_pct}%;"></div></div>
             <div class="drv-progress-lbl">{_done} of {_total} stops</div>
             <div class="drv-stops">{_stop_rows}</div>
+            <div class="drv-actions" onclick="event.preventDefault();">
+                <button type="button" class="drv-act-btn"
+                        onclick="event.stopPropagation();drvOpenReorder({_r["id"]})">&#8645; Rearrange</button>
+                <button type="button" class="drv-act-btn"
+                        onclick="event.stopPropagation();drvOpenAddStop({_r["id"]})">&#65291; Add Stop</button>
+            </div>
             <div class="drv-lane-foot">Open in Cab View &#8250;</div>
         </a>"""
         if not _lanes:
@@ -11120,6 +11136,21 @@ def dashboard():
       .drv-empty {{ text-align:center; color:var(--text-muted); padding:30px 0; }}
       .drv-more {{ text-align:center; margin-top:4px; }}
       .drv-more a {{ color:var(--text-dim); font-size:13px; font-weight:600; }}
+      /* 2026-10-17: driver dashboard actions — rearrange / add stop / cancel */
+      .drv-actions {{ display:flex; gap:8px; margin-top:12px; padding-top:12px;
+        border-top:1px solid rgba(255,255,255,0.07); }}
+      .drv-act-btn {{ flex:1; display:flex; align-items:center; justify-content:center; gap:6px;
+        min-height:46px; padding:8px 6px; background:rgba(255,255,255,0.05);
+        border:1px solid rgba(255,255,255,0.12); border-radius:12px; color:#E8E8E2;
+        font-size:13px; font-weight:700; cursor:pointer; }}
+      .drv-act-btn:active {{ background:rgba(255,255,255,0.10); }}
+      .drv-stop {{ position:relative; }}
+      .drv-stop-cancel {{ position:absolute; right:0; top:50%; transform:translateY(-50%);
+        width:32px; height:32px; border-radius:8px; background:transparent;
+        border:1px solid rgba(255,82,82,0.3); color:rgba(255,122,122,0.7);
+        font-size:14px; cursor:pointer; display:flex; align-items:center; justify-content:center; }}
+      .drv-stop-cancel:active {{ background:rgba(255,82,82,0.12); }}
+      .drv-stop.has-cancel {{ padding-right:40px; }}
     </style>
     <div class="hero">
         <h1>Driver Dashboard</h1>
@@ -11152,7 +11183,170 @@ def dashboard():
         tick();
         setInterval(tick, 1000);
     }})();
+    <!-- 2026-10-17: driver dashboard modals — reorder stops, add stop -->
+    <div id="drv-modal-overlay" class="no-photo-confirm-overlay" hidden
+         onclick="drvCloseModal()"></div>
+    <div id="drv-reorder-modal" class="no-photo-confirm-modal haul-dropdown" hidden style="max-width:440px;text-align:left;">
+        <div class="haul-dropdown-title">&#8645; Rearrange Stops</div>
+        <p style="color:var(--text-muted);font-size:13px;margin-bottom:12px;">Use the arrows to reorder your upcoming stops. The boss is notified.</p>
+        <div id="drv-reorder-list" style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;"></div>
+        <div class="no-photo-confirm-actions">
+            <button type="button" class="btn gold" id="drv-reorder-save" style="flex:1;min-height:52px;">Save Order</button>
+            <button type="button" class="btn secondary" style="min-height:52px;" onclick="drvCloseModal()">Cancel</button>
+        </div>
+        <div id="drv-reorder-err" hidden style="color:#FF5252;font-size:12px;margin-top:8px;"></div>
+    </div>
+    <div id="drv-addstop-modal" class="no-photo-confirm-modal haul-dropdown" hidden style="max-width:440px;text-align:left;">
+        <div class="haul-dropdown-title">&#65291; Add a Stop</div>
+        <p style="color:var(--text-muted);font-size:13px;margin-bottom:12px;">Boss called with an extra? Add it here — they'll see it instantly.</p>
+        <label class="uw-lbl">Customer / Name</label>
+        <input id="drv-add-name" maxlength="120" placeholder="e.g. Marlyn"
+               style="width:100%;min-height:48px;margin-bottom:10px;border-radius:12px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.16);color:#E6E6E0;padding:0 14px;">
+        <label class="uw-lbl">Address</label>
+        <input id="drv-add-addr" maxlength="200" placeholder="e.g. 697 Independence Pkwy, Chesapeake"
+               style="width:100%;min-height:48px;margin-bottom:10px;border-radius:12px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.16);color:#E6E6E0;padding:0 14px;">
+        <label class="uw-lbl">Action</label>
+        <select id="drv-add-action"
+                style="width:100%;min-height:48px;margin-bottom:14px;border-radius:12px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.16);color:#E6E6E0;padding:0 14px;">
+            <option value="P">Pickup</option>
+            <option value="D">Delivery</option>
+            <option value="S">Swap</option>
+            <option value="PR">Pickup and Return</option>
+        </select>
+        <div class="no-photo-confirm-actions">
+            <button type="button" class="btn gold" id="drv-add-save" style="flex:1;min-height:52px;">Add Stop</button>
+            <button type="button" class="btn secondary" style="min-height:52px;" onclick="drvCloseModal()">Cancel</button>
+        </div>
+        <div id="drv-add-err" hidden style="color:#FF5252;font-size:12px;margin-top:8px;"></div>
+    </div>
+    <script>
+    (function(){{
+        var csrf = document.querySelector('meta[name="csrf-token"]');
+        var CSRF = csrf ? csrf.getAttribute('content') : '';
+        var curRoute = null;
+        var reorderIds = [];
+        var reorderNames = {{}};
+
+        window.drvCloseModal = function(){{
+            document.getElementById('drv-modal-overlay').hidden = true;
+            document.getElementById('drv-reorder-modal').hidden = true;
+            document.getElementById('drv-addstop-modal').hidden = true;
+        }};
+        function openModal(id){{
+            document.getElementById('drv-modal-overlay').hidden = false;
+            document.getElementById(id).hidden = false;
+        }};
+        function renderReorderList(){{
+            var list = document.getElementById('drv-reorder-list');
+            list.innerHTML = '';
+            reorderIds.forEach(function(id, i){{
+                var row = document.createElement('div');
+                row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:10px 12px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:10px;';
+                var nm = (reorderNames[id] || 'Stop').replace(/</g,'&lt;');
+                row.innerHTML =
+                    '<span style="flex:1;font-weight:600;">' + nm + '</span>' +
+                    '<button type="button" data-i="' + i + '" data-d="-1" style="width:36px;height:36px;border-radius:8px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.14);color:#fff;font-size:16px;">&uarr;</button>' +
+                    '<button type="button" data-i="' + i + '" data-d="1" style="width:36px;height:36px;border-radius:8px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.14);color:#fff;font-size:16px;">&darr;</button>';
+                list.appendChild(row);
+            }});
+            list.querySelectorAll('button').forEach(function(b){{
+                b.onclick = function(){{
+                    var i = parseInt(b.getAttribute('data-i'), 10);
+                    var d = parseInt(b.getAttribute('data-d'), 10);
+                    var j = i + d;
+                    if (j < 0 || j >= reorderIds.length) return;
+                    var t = reorderIds[i]; reorderIds[i] = reorderIds[j]; reorderIds[j] = t;
+                    renderReorderList();
+                }};
+            }});
+        }};
+
+        window.drvOpenReorder = function(routeId){{
+            curRoute = routeId;
+            var err = document.getElementById('drv-reorder-err');
+            err.hidden = true;
+            var list = document.getElementById('drv-reorder-list');
+            list.innerHTML = '<div style="color:var(--text-muted);">Loading stops…</div>';
+            openModal('drv-reorder-modal');
+            fetch('/api/driver/route/' + routeId + '/stops', {{credentials:'same-origin'}})
+                .then(function(r){{ return r.json(); }})
+                .then(function(j){{
+                    var stops = (j.stops || []).filter(function(s){{ return s.reorderable; }});
+                    if (!stops.length) {{
+                        list.innerHTML = '<div style="color:var(--text-muted);">No upcoming stops to reorder.</div>';
+                        reorderIds = [];
+                        return;
+                    }};
+                    reorderIds = stops.map(function(s){{ return s.id; }});
+                    reorderNames = {{}};
+                    stops.forEach(function(s){{ reorderNames[s.id] = s.name || 'Stop'; }});
+                    renderReorderList();
+                }})
+                .catch(function(){{ err.textContent = 'Could not load stops.'; err.hidden = false; }});
+        }};
+        document.getElementById('drv-reorder-save').onclick = function(){{
+            var err = document.getElementById('drv-reorder-err');
+            err.hidden = true;
+            fetch('/api/driver/route/' + curRoute + '/reorder', {{
+                method: 'POST', credentials: 'same-origin',
+                headers: {{'Content-Type':'application/json','X-CSRF-Token':CSRF}},
+                body: JSON.stringify({{stop_ids: reorderIds}})
+            }})
+            .then(function(r){{ return r.json().then(function(j){{ return {{s:r.status, j:j}}; }}); }})
+            .then(function(x){{
+                if (x.s === 200 && x.j.success) {{ location.reload(); return; }};
+                err.textContent = (x.j && x.j.error) || 'Could not save order.';
+                err.hidden = false;
+            }})
+            .catch(function(){{ err.textContent = 'Network error.'; err.hidden = false; }});
+        }};
+
+        window.drvOpenAddStop = function(routeId){{
+            curRoute = routeId;
+            document.getElementById('drv-add-err').hidden = true;
+            document.getElementById('drv-add-name').value = '';
+            document.getElementById('drv-add-addr').value = '';
+            openModal('drv-addstop-modal');
+            setTimeout(function(){{ document.getElementById('drv-add-name').focus(); }}, 100);
+        }};
+        document.getElementById('drv-add-save').onclick = function(){{
+            var err = document.getElementById('drv-add-err');
+            err.hidden = true;
+            var name = document.getElementById('drv-add-name').value.trim();
+            var addr = document.getElementById('drv-add-addr').value.trim();
+            var act = document.getElementById('drv-add-action').value;
+            if (!addr) {{ err.textContent = 'Address is required.'; err.hidden = false; return; }};
+            fetch('/api/driver/route/' + curRoute + '/add-stop', {{
+                method: 'POST', credentials: 'same-origin',
+                headers: {{'Content-Type':'application/json','X-CSRF-Token':CSRF}},
+                body: JSON.stringify({{customer_name: name, address: addr, action: act}})
+            }})
+            .then(function(r){{ return r.json().then(function(j){{ return {{s:r.status, j:j}}; }}); }})
+            .then(function(x){{
+                if (x.s === 200 && x.j.success) {{ location.reload(); return; }};
+                err.textContent = (x.j && x.j.error) || 'Could not add stop.';
+                err.hidden = false;
+            }})
+            .catch(function(){{ err.textContent = 'Network error.'; err.hidden = false; }});
+        }};
+
+        window.drvCancelStop = function(stopId, name){{
+            if (!confirm('Cancel "' + name + '"? The boss will be notified.')) return;
+            fetch('/stop/' + stopId + '/cancel', {{
+                method: 'POST', credentials: 'same-origin',
+                headers: {{'X-CSRF-Token':CSRF,'Accept':'application/json'}},
+                body: new URLSearchParams({{_csrf_token: CSRF}})
+            }})
+            .then(function(r){{ return r.json().then(function(j){{ return {{s:r.status, j:j}}; }}).catch(function(){{ return {{s:r.status, j:{{}}}}; }}); }})
+            .then(function(x){{
+                if (x.s === 200) {{ location.reload(); return; }};
+                alert((x.j && x.j.error) || 'Could not cancel stop.');
+            }})
+            .catch(function(){{ alert('Network error.'); }});
+        }};
+    }})();
     </script>
+
     """
         return render_template_string(shell_page("Driver Dashboard", body))
 
@@ -25358,6 +25552,103 @@ def driver_reorder_stops(route_id):
     conn.commit()
     conn.close()
     return jsonify({"success": True})
+
+
+@app.route("/api/driver/route/<int:route_id>/stops", methods=["GET"])
+@driver_required
+def driver_route_stops(route_id):
+    """Driver dashboard: list stops for reorder/add/cancel UI.
+
+    Returns each stop with a reorderable flag (upcoming, open, not held,
+    not the current stop) matching the reorder API's guardrails.
+    """
+    conn = get_db()
+    route = conn.execute(
+        "SELECT id, status FROM routes WHERE id=? AND company_id=? AND assigned_to=?",
+        (route_id, cid(), session["user_id"])).fetchone()
+    if not route:
+        conn.close()
+        return jsonify({"error": "route not found"}), 404
+    rows = conn.execute(
+        "SELECT id, customer_name, address, status, cancelled_at, held_at"
+        " FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
+        (route_id,)).fetchall()
+    conn.close()
+    cur_id = None
+    for r in rows:
+        if r["status"] != "completed" and not r["cancelled_at"]:
+            cur_id = r["id"]
+            break
+    out = []
+    for r in rows:
+        cancelled = bool(r["cancelled_at"])
+        done = r["status"] == "completed"
+        out.append({
+            "id": r["id"],
+            "name": (r["customer_name"] or r["address"] or "Stop").strip(),
+            "address": (r["address"] or "").strip(),
+            "status": r["status"],
+            "cancelled": cancelled,
+            "reorderable": (not done and not cancelled and not r["held_at"]
+                            and r["id"] != cur_id
+                            and route["status"] == "in_progress"),
+        })
+    return jsonify({"stops": out})
+
+
+@app.route("/api/driver/route/<int:route_id>/add-stop", methods=["POST"])
+@driver_required
+def driver_add_stop(route_id):
+    """Driver adds a stop to their own in-progress route (2026-10-17).
+
+    For the mid-day 'boss called with an extra' flow. Guardrails: route must
+    be assigned to the driver and in progress. The boss is notified so the
+    board stays the source of truth.
+    """
+    data = request.get_json(silent=True) or {}
+    address = (data.get("address") or "").strip()
+    if not address:
+        return jsonify({"error": "Address is required."}), 400
+    customer_name = (data.get("customer_name") or "").strip()
+    action = (data.get("action") or "P").strip().upper()[:4]
+    conn = get_db()
+    route = conn.execute(
+        "SELECT id, status, route_name FROM routes"
+        " WHERE id=? AND company_id=? AND assigned_to=?",
+        (route_id, cid(), session["user_id"])).fetchone()
+    if not route:
+        conn.close()
+        return jsonify({"error": "route not found"}), 404
+    if route["status"] != "in_progress":
+        conn.close()
+        return jsonify({"error": "route not in progress"}), 400
+    last = conn.execute(
+        "SELECT MAX(stop_order) as m FROM stops WHERE route_id=?",
+        (route_id,)).fetchone()["m"] or 0
+    cur = conn.execute(
+        """INSERT INTO stops (
+               route_id, stop_order, customer_name, address,
+               action, status, created_at
+           ) VALUES (?, ?, ?, ?, ?, 'open', ?)""",
+        (route_id, last + 1, expand_abbrev(customer_name),
+         expand_abbrev(address), expand_abbrev(action), now_ts()))
+    stop_id = cur.lastrowid
+    conn.commit()
+    compute_can_flow(conn, route_id)
+    conn.commit()
+    upsert_saved_address(conn, cid(), expand_abbrev(customer_name),
+                         expand_abbrev(address), "", "", "", expand_abbrev(action),
+                         "", "")
+    conn.commit()
+    _driver_name = (session.get("username") or "Driver").strip()
+    notify(conn, cid(), "DRIVER_ADD_STOP",
+           f"{_driver_name} added a stop to {route['route_name']}",
+           f"{customer_name or address} \u2014 {address}",
+           link=url_for("view_route", route_id=route_id),
+           actor_user_id=session["user_id"], entity_type="route", entity_id=route_id)
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "stop_id": stop_id})
 
 
 @app.route("/api/board/reorder-stops", methods=["POST"])
