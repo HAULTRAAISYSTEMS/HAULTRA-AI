@@ -79,6 +79,7 @@ def main():
             png = os.path.join(outdir, f"{name}_{label}_{w}.png")
             subprocess.run(
                 [CHROME, "--headless", "--disable-gpu", "--no-sandbox",
+                 "--virtual-time-budget=4000",
                  f"--window-size={w},{HEIGHT}",
                  f"--screenshot={png}", f"file://{html_path}"],
                 capture_output=True, timeout=60)
