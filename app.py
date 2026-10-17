@@ -40420,6 +40420,12 @@ def garbage_dispatch_view():
         _dispatch_label = "Tomorrow &middot; " + _dispatch_dt.strftime("%a %b %d")
     else:
         _dispatch_label = _dispatch_dt.strftime("%a %b %d")
+    # 2026-10-17: command-center header meta — live day + driver count.
+    _driver_count = len(drivers)
+    _cmd_day = _dispatch_dt.strftime("%a · %b %d")
+    _cmd_meta = (f'<span>{_cmd_day}</span><span class="cmd-sep"></span>'
+                 f'<span>{_driver_count} driver{"s" if _driver_count != 1 else ""} ready</span>'
+                 if _driver_count else f'<span>{_cmd_day}</span>')
     page = r"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Garbage Dispatch — HAULTRA</title>
@@ -40456,6 +40462,36 @@ def garbage_dispatch_view():
   .page-title { font-size: 18px; font-weight: 800; color: var(--text); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     display: flex; align-items: center; gap: 10px; }
   .page-title .accent { color: var(--orange); }
+  /* 2026-10-17: Command-center header — the dispatch future AI center */
+  .cmd {
+    position: relative; text-align: center; overflow: hidden;
+    padding: calc(26px + env(safe-area-inset-top, 0px)) 16px 22px;
+  }
+  .cmd-glow {
+    position: absolute; left: -20px; right: -20px; top: -60px; height: 250px;
+    background: radial-gradient(ellipse 65% 100% at 50% 0%, rgba(255,107,26,.16), transparent 70%);
+    pointer-events: none; animation: cmd-breathe 6s ease-in-out infinite;
+  }
+  @keyframes cmd-breathe { 0%, 100% { opacity: .65; } 50% { opacity: 1; } }
+  .cmd-status {
+    position: relative; display: inline-flex; align-items: center; gap: 8px;
+    font-size: 10px; font-weight: 800; letter-spacing: 3px; color: #FF8C42;
+    border: 1px solid rgba(255,107,26,.35); background: rgba(255,107,26,.08);
+    padding: 7px 14px 7px 12px; border-radius: 999px; margin-bottom: 14px;
+  }
+  .cmd-title {
+    position: relative; font-size: 32px; font-weight: 800; letter-spacing: .5px; margin: 0 0 10px;
+    background: linear-gradient(110deg, #fff 42%, #FF8C42 50%, #fff 58%);
+    background-size: 220% auto;
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    animation: cmd-shine 7s linear infinite;
+  }
+  @keyframes cmd-shine { to { background-position: 220% center; } }
+  .cmd-meta {
+    position: relative; display: flex; align-items: center; justify-content: center; gap: 10px;
+    font-size: 13px; color: var(--text-dim); font-weight: 600;
+  }
+  .cmd-sep { width: 4px; height: 4px; border-radius: 50%; background: var(--orange); flex: none; }
   /* 2026-10-17: live-system headline — pulsing dot, 2027 AI feel */
   .live-dot {
     width: 9px; height: 9px; border-radius: 50%; flex: none;
@@ -40613,9 +40649,13 @@ def garbage_dispatch_view():
 </defs>
 </svg>
 
-<div class="topbar">
-  <div class="page-title"><span class="live-dot"></span>Garbage Dispatch</div>
-</div>
+<!-- 2026-10-17: Command-center header — centered, alive -->
+<header class="cmd">
+  <div class="cmd-glow"></div>
+  <div class="cmd-status"><span class="live-dot"></span>SYSTEM ONLINE</div>
+  <h1 class="cmd-title">Garbage Dispatch</h1>
+  <div class="cmd-meta">__CMD_META__</div>
+</header>
 
 <!-- Pull-to-refresh with HAULTRA logo -->
 <div class="haul-ptr" id="haul-ptr">
@@ -41026,6 +41066,7 @@ function fetchT(url, opts, ms){
 """
     page = page.replace("__OPTS__", opts).replace("__CSRF__", csrf)
     page = page.replace("__DAY__", _dispatch_day).replace("__DAY_LABEL__", _dispatch_label)
+    page = page.replace("__CMD_META__", _cmd_meta)
     page = page.replace("__MODE__", e(mode_note) if mode_note else "")
     page = page.replace("__APPENDRID__", json.dumps(append_route_id))
     return page
@@ -41057,6 +41098,7 @@ def parser_view():
         _dispatch_label = f"Tomorrow &middot; {_dispatch_dt.strftime('%a %b %d')}"
     else:
         _dispatch_label = _dispatch_dt.strftime("%a %b %d")
+    _driver_count = 0
 
     if route_id_arg.isdigit():
         if session.get("role") != "boss":
@@ -41128,6 +41170,7 @@ def parser_view():
             (cid(),)
         ).fetchall()
         conn.close()
+        _driver_count = len(drivers)
 
         if drivers:
             options = "".join(
@@ -41184,6 +41227,12 @@ def parser_view():
     html = html.replace('__CSRF_TOKEN__', get_csrf_token())
     html = html.replace('<!--ASSIGN_SLOT-->', assign_html)
     html = html.replace('<!--ROUTE_SEQ_SLOT-->', route_seq_html)
+    # 2026-10-17: command-center header meta — live day + driver count.
+    _cmd_day = _dispatch_dt.strftime("%a · %b %d")
+    _cmd_meta = (f'<span>{_cmd_day}</span><span class="cmd-sep"></span>'
+                 f'<span>{_driver_count} driver{"s" if _driver_count != 1 else ""} ready</span>'
+                 if _driver_count else f'<span>{_cmd_day}</span>')
+    html = html.replace('__CMD_META__', _cmd_meta)
     html = html.replace('__ROUTE_MODE_JSON__', route_mode_js)
     html = html.replace('__DUMP_SITES_JSON__', _js(dump_sites))
     html = html.replace('__RETURN_SITES_JSON__', _js(return_sites))
