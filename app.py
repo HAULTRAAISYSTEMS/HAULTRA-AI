@@ -18454,6 +18454,8 @@ def driver_route_detail(route_id):
   .cab-quick-btn .lane-msg-badge {{
       position: absolute; top: 6px; right: 8px;
   }}
+  /* Lone quick-btn outside the grid (pre-arrival Message) stretches full width */
+  .cab-card > .cab-quick-btn {{ width: 100%; box-sizing: border-box; margin: 10px 0; }}
   /* 2026-10-17: centered cab hero — badge + name stack centered, legs centered */
   .cab-action-row {{
       flex-direction: column; align-items: center; text-align: center; gap: 8px;
@@ -18522,7 +18524,7 @@ def driver_route_detail(route_id):
      above, so the chips whisper "what's next" instead of shouting. */
   .cab-leg-head {{ display:none; }}
   .cab-legs-switch {{ display:flex; flex-direction:column; gap:8px; align-items:stretch; margin-bottom:10px;
-      padding:12px; background:rgba(255,255,255,0.02);
+      padding:12px; background:rgba(255,255,255,0.02); width:100%; box-sizing:border-box;
       border:1px solid rgba(255,255,255,0.06); border-radius:14px; }}
   .cab-leg-header {{ width:100%; font-size:11px; font-weight:600; letter-spacing:.8px;
       color:var(--text-muted); margin-bottom:2px; text-align:center; }}
