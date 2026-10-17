@@ -15331,14 +15331,8 @@ def routes_page():
     {_cmd_header("Route Board", _board_meta)}
     <div class="board-controls" style="margin-bottom:16px;">
         {_day_nav}
-        <div class="row" style="align-items:center;gap:18px;margin-top:12px;">
-            <div class="board-legend">
-                <span class="board-legend-item"><span class="board-legend-dot pickup"></span>Pickup</span>
-                <span class="board-legend-item"><span class="board-legend-dot dropswap"></span>Drop/Swap</span>
-                <span class="board-legend-item"><span class="board-legend-dot urgent"></span>Urgent</span>
-            </div>
+        <div style="display:flex;justify-content:center;margin-top:12px;">
             <a class="btn gold" href="/parser?day={_board_day}" style="min-height:48px;display:inline-flex;align-items:center;white-space:nowrap;">+ New Dispatch</a>
-            {_board_msg_env}
         </div>
     </div>
     """
@@ -40738,9 +40732,6 @@ def garbage_dispatch_view():
 <!-- 2026-10-17: Top nav for tablet/desktop — bottom tabs are hidden at ≥768px -->
 <nav class="topnav" aria-label="Main">
   <div class="topnav-inner">
-    <a class="topnav-brand" href="/routes" aria-label="HAULTRA home">
-      <span class="logo-h">H</span><span class="logo-rest">AULTRA</span>
-    </a>
     <div class="topnav-links">
       <a class="nav-item" href="/routes">Route Board</a>
       <a class="nav-item" href="/parser">Roll-Off</a>
@@ -40748,6 +40739,11 @@ def garbage_dispatch_view():
       <a class="nav-item" href="/unassigned">Unassigned</a>
       <a class="nav-item" href="/requests">Requests</a>
       <a class="nav-item" href="/customers">Customers</a>
+      <a class="nav-item" href="/invoices">Invoices</a>
+      <a class="nav-item" href="/bin-tracker">Bin Tracker</a>
+      <a class="nav-item" href="/maintenance">Maintenance</a>
+      <a class="nav-item" href="/dashboard">Owner</a>
+      <a class="nav-item" href="/boss/notifications">Alerts</a>
     </div>
   </div>
 </nav>
