@@ -7444,7 +7444,7 @@ def shell_page(title, body, extra_head=""):
 /* ── Design Tokens ─────────────────────────────────────────*/
 :root {{
   --bg:          #121212;
-  --bg-card:     rgba(23,23,23,0.92);
+  --bg-card:     rgba(23,23,23,0.55);
   --bg-sidebar:  #141414;
   --border:      rgba(255,107,26,0.12);
   --border-glow: rgba(255,107,26,0.30);
@@ -8673,12 +8673,16 @@ body {{
    CARDS
    ══════════════════════════════════════════════════════════*/
 .card {{
-    background: var(--bg-card);
-    border: 1px solid rgba(255,107,26,0.10);
+    background: linear-gradient(180deg, rgba(30,30,34,0.58), rgba(18,18,22,0.48));
+    border: 1px solid rgba(255,255,255,0.08);
     border-radius: var(--radius-lg);
     padding: 22px;
     margin-bottom: 16px;
-    box-shadow: 0 2px 24px rgba(0,0,0,0.35);
+    box-shadow: 0 8px 32px rgba(0,0,0,0.35),
+                inset 0 1px 0 rgba(255,190,120,0.10),
+                0 0 60px rgba(255,107,26,0.04);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
 }}
 
 .card h2 {{
@@ -8969,11 +8973,16 @@ tr:hover td {{ background: rgba(255,107,26,0.025); }}
 
 /* ── Stop cards (boss route view) ───────────────────────────*/
 .stop-card {{
-    background: rgba(20,20,20,0.82);
-    border: 1px solid rgba(255,107,26,0.12);
+    background: linear-gradient(180deg, rgba(30,30,34,0.58), rgba(18,18,22,0.48));
+    border: 1px solid rgba(255,255,255,0.08);
     border-radius: var(--radius);
     padding: 16px;
     margin-bottom: 10px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.35),
+                inset 0 1px 0 rgba(255,190,120,0.10),
+                0 0 60px rgba(255,107,26,0.04);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
 }}
 
 .next-stop-glow {{
@@ -9202,10 +9211,15 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 
 .bin-list {{ display: flex; flex-direction: column; gap: 10px; max-height: 74vh; overflow-y: auto; }}
 .bin-card {{
-    background: rgba(20,20,20,0.75);
-    border: 1px solid rgba(255,255,255,0.07);
+    background: linear-gradient(180deg, rgba(30,30,34,0.58), rgba(18,18,22,0.48));
+    border: 1px solid rgba(255,255,255,0.08);
     border-radius: var(--radius);
     padding: 14px 16px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.35),
+                inset 0 1px 0 rgba(255,190,120,0.10),
+                0 0 60px rgba(255,107,26,0.04);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
 }}
 .bin-card.overdue {{ border-color: rgba(255,82,82,0.45); background: rgba(255,82,82,0.05); }}
 .bin-card-top {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }}
@@ -9289,11 +9303,16 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 }}
 
 .cab-card {{
-    background: rgba(20,20,20,0.85);
-    border: 1px solid rgba(255,107,26,0.16);
+    background: linear-gradient(180deg, rgba(30,30,34,0.58), rgba(18,18,22,0.48));
+    border: 1px solid rgba(255,255,255,0.08);
     border-radius: var(--radius-lg);
     padding: 24px 22px;
     margin-bottom: 14px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.35),
+                inset 0 1px 0 rgba(255,190,120,0.10),
+                0 0 60px rgba(255,107,26,0.04);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
     /* 2026-10-13: right padding clears the absolute un-arrive button */
     padding-right: 58px;
 }}
@@ -9620,10 +9639,14 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 
 .lane {{
     display: flex; gap: 18px; align-items: stretch;
-    background: linear-gradient(135deg, rgba(28,28,32,0.92), rgba(18,18,22,0.88));
-    border: 1px solid rgba(255,140,66,0.12);
+    background: linear-gradient(180deg, rgba(32,32,36,0.58), rgba(18,18,22,0.48));
+    border: 1px solid rgba(255,255,255,0.08);
     border-radius: 18px; padding: 20px; margin-bottom: 16px;
-    box-shadow: 0 4px 24px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.04);
+    box-shadow: 0 8px 32px rgba(0,0,0,0.40),
+                inset 0 1px 0 rgba(255,190,120,0.10),
+                0 0 60px rgba(255,107,26,0.04);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
     position: relative; overflow: hidden;
 }}
 .lane::before {{
@@ -40643,7 +40666,10 @@ def garbage_dispatch_view():
   @keyframes haul-ring-spin { to { transform: rotate(360deg); } }
 
   .wrap { max-width: 680px; margin: 0 auto; padding: 16px; }
-  .card { background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; margin-bottom: 14px; }
+  .card { background: linear-gradient(180deg, rgba(30,30,34,0.58), rgba(18,18,22,0.48));
+    border: 1px solid rgba(255,255,255,0.08); border-radius: var(--radius); padding: 16px; margin-bottom: 14px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,190,120,0.10), 0 0 60px rgba(255,107,26,0.04);
+    backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); }
   .lbl { display: block; margin: 0 0 10px; font-weight: 800; font-size: 12px; letter-spacing: 1px; color: var(--text-dim); text-transform: uppercase; }
   .mode { color: var(--blue); font-size: 13px; margin-bottom: 12px; }
 
