@@ -40453,11 +40453,41 @@ def garbage_dispatch_view():
     color: var(--text); font-size: 15px; font-weight: 700; text-decoration: none; white-space: nowrap;
   }
   .back-link:active { background: #222; }
-  .page-title { font-size: 18px; font-weight: 800; color: var(--text); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .page-title { font-size: 18px; font-weight: 800; color: var(--text); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    display: flex; align-items: center; gap: 10px; }
   .page-title .accent { color: var(--orange); }
-  .reloadbtn { display: inline-flex; align-items: center; justify-content: center; min-width: 44px; min-height: 44px;
-    border-radius: 12px; border: 1px solid var(--line); background: var(--bg-1); color: var(--text); font-size: 20px; cursor: pointer; }
-  .reloadbtn:active { background: #222; }
+  /* 2026-10-17: live-system headline — pulsing dot, 2027 AI feel */
+  .live-dot {
+    width: 9px; height: 9px; border-radius: 50%; flex: none;
+    background: #3DDC84; box-shadow: 0 0 10px rgba(61,220,132,.9);
+    animation: live-pulse 2.2s ease-in-out infinite;
+  }
+  @keyframes live-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: .45; transform: scale(.75); }
+  }
+  /* Pull-to-refresh with HAULTRA logo */
+  .haul-ptr {
+    position: fixed; top: env(safe-area-inset-top, 0px); left: 0; right: 0; z-index: 350;
+    display: flex; justify-content: center; padding-top: 12px; pointer-events: none;
+    opacity: 0; transform: translateY(-20px); transition: opacity .2s, transform .2s;
+  }
+  .haul-ptr.visible { opacity: 1; transform: translateY(0); }
+  .haul-ptr-logo {
+    width: 64px; height: 64px; border-radius: 50%; overflow: visible; border: none;
+    background: transparent; position: relative; display: flex; align-items: center; justify-content: center;
+  }
+  .haul-ptr-logo::before {
+    content: ''; position: absolute; inset: -6px; border-radius: 50%;
+    border: 2px solid transparent; border-top-color: #FF6B1A; border-right-color: rgba(255,107,26,.3);
+    animation: haul-ring-spin 1.2s linear infinite; opacity: 0; transition: opacity .3s;
+  }
+  .haul-ptr.loading .haul-ptr-logo::before, .haul-ptr.pulling .haul-ptr-logo::before { opacity: 1; }
+  .haul-ptr-logo img {
+    width: 100%; height: 100%; object-fit: contain; display: block;
+    mix-blend-mode: screen; filter: drop-shadow(0 0 12px rgba(255,107,26,.6));
+  }
+  @keyframes haul-ring-spin { to { transform: rotate(360deg); } }
 
   .wrap { max-width: 680px; margin: 0 auto; padding: 16px; }
   .card { background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; margin-bottom: 14px; }
@@ -40584,9 +40614,12 @@ def garbage_dispatch_view():
 </svg>
 
 <div class="topbar">
-  <a class="back-link" href="/routes?day=__DAY__">&#8592; Board</a>
-  <div class="page-title"><span class="accent">&#128666;</span> Garbage Dispatch</div>
-  <button class="reloadbtn" id="reload-btn" type="button" title="Reload page">&#10227;</button>
+  <div class="page-title"><span class="live-dot"></span>Garbage Dispatch</div>
+</div>
+
+<!-- Pull-to-refresh with HAULTRA logo -->
+<div class="haul-ptr" id="haul-ptr">
+  <div class="haul-ptr-logo"><img src="/static/haultra-logo.jpg" alt="HAULTRA" /></div>
 </div>
 
 <div class="wrap">
@@ -40937,7 +40970,49 @@ loadTemplates();
 loadRecent();
 renderPreview();
 
-document.getElementById('reload-btn').addEventListener('click', function(){ location.reload(); });
+// 2026-10-17: Pull-to-refresh with HAULTRA logo — replaces the old reload button.
+// Disabled when More sheet is open (no gesture conflict).
+(function haulPullToRefresh() {
+  var ptr = document.getElementById('haul-ptr');
+  if (!ptr) return;
+  var startY = 0, pulling = false, threshold = 80;
+  function sheetOpen() {
+    var s = document.getElementById('haul-more-sheet');
+    return s && s.classList.contains('open');
+  }
+  document.addEventListener('touchstart', function(e) {
+    if (window.scrollY > 0 || sheetOpen()) return;
+    startY = e.touches[0].clientY;
+    pulling = true;
+  }, {passive: true});
+  document.addEventListener('touchmove', function(e) {
+    if (!pulling) return;
+    var dy = e.touches[0].clientY - startY;
+    if (dy > 0 && window.scrollY <= 0) {
+      var progress = Math.min(dy / threshold, 1);
+      ptr.classList.add('visible', 'pulling');
+      ptr.style.transform = 'translateY(' + (dy * 0.4) + 'px)';
+      ptr.style.opacity = progress;
+    }
+  }, {passive: true});
+  document.addEventListener('touchend', function(e) {
+    if (!pulling) return;
+    pulling = false;
+    var dy = e.changedTouches[0].clientY - startY;
+    if (dy > threshold && window.scrollY <= 0) {
+      ptr.classList.remove('pulling');
+      ptr.classList.add('loading');
+      ptr.style.transform = 'translateY(0)';
+      ptr.style.opacity = '1';
+      setTimeout(function() { window.location.reload(); }, 600);
+    } else {
+      ptr.classList.remove('visible', 'pulling');
+      ptr.style.transform = '';
+      ptr.style.opacity = '';
+    }
+    startY = 0;
+  });
+})();
 
 function fetchT(url, opts, ms){
   ms = ms || 25000;
@@ -41109,9 +41184,6 @@ def parser_view():
     html = html.replace('__CSRF_TOKEN__', get_csrf_token())
     html = html.replace('<!--ASSIGN_SLOT-->', assign_html)
     html = html.replace('<!--ROUTE_SEQ_SLOT-->', route_seq_html)
-    # 2026-10-16: back link returns to the board day dispatch came from.
-    html = html.replace('<a class="back-link" href="/routes">',
-                        f'<a class="back-link" href="/routes?day={_dispatch_day}">')
     html = html.replace('__ROUTE_MODE_JSON__', route_mode_js)
     html = html.replace('__DUMP_SITES_JSON__', _js(dump_sites))
     html = html.replace('__RETURN_SITES_JSON__', _js(return_sites))
