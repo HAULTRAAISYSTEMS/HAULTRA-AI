@@ -9358,15 +9358,13 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 }}
 .cab-meta-line {{ font-size: 14px; color: var(--text-muted); margin-bottom: 4px; }}
 .cab-legs {{
-    display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px;
-    font-size: 14px; font-weight: 700; color: var(--orange); margin: 0 0 10px;
-    padding: 8px 12px; border-radius: 10px;
-    background: rgba(255,107,26,0.10); border: 1px solid rgba(255,107,26,0.28);
+    display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px;
+    font-size: 13px; font-weight: 600; color: var(--text-muted); margin: 2px 0 12px;
 }}
 .cab-leg {{ white-space: nowrap; }}
 .cab-leg-lbl {{
     font-size: 10px; font-weight: 800; letter-spacing: .5px; text-transform: uppercase;
-    color: var(--text-muted); margin-right: 3px;
+    color: var(--orange); margin-right: 3px;
 }}
 .cab-meta-line strong {{ color: #D8D8D0; }}
 
@@ -17748,14 +17746,16 @@ def driver_route_detail(route_id):
 
     upload_widget = f"""
     <form method="POST" action="{url_for('upload_stop_photo', stop_id=stop_id)}"
-          enctype="multipart/form-data" id="cab-photo-form" style="margin-bottom:10px;">
+          enctype="multipart/form-data" id="cab-photo-form" style="margin:0;">
         <input type="file" name="photos" accept=".png,.jpg,.jpeg,.webp,.pdf" multiple
                capture="environment" id="cab-photo-input" style="display:none;">
-        <button type="button" class="btn secondary" id="cab-add-photo-btn" style="width:100%;min-height:48px;"
+        <button type="button" class="cab-quick-btn" id="cab-add-photo-btn" style="width:100%;"
                 onclick="triggerAddPhoto();">
-            &#128247; {"Add Another Photo" if has_photo else "Add Photo"}
+            &#128247; Photo
         </button>
     </form>
+    """
+    photo_gallery_html = f"""
     {photo_gallery}
     """
 
@@ -17833,8 +17833,9 @@ def driver_route_detail(route_id):
             f'onclick="cabFeePick(\'{_fk}\', {int(_famt)})">{_flabel}'
             + (f' ({_fmt_money(_famt)})' if _famt else '') + '</button>')
     _cab_fee_block = f"""
-    <div style="margin-bottom:12px;padding:12px;border:1px solid rgba(255,255,255,0.12);border-radius:10px;background:rgba(255,255,255,0.03);">
-        <div style="font-size:13px;font-weight:600;margin-bottom:8px;">&#x1F4CB; Log a fee</div>
+    <div class="cab-fee-tray" id="cab-fee-tray">
+    <div style="padding:12px;border:1px solid rgba(255,255,255,0.12);border-radius:14px;background:rgba(255,255,255,0.03);">
+        <div style="font-size:13px;font-weight:700;margin-bottom:8px;">&#x1F4CB; Log a fee</div>
         <div class="row" style="gap:8px;flex-wrap:wrap;">{_fee_btns}</div>
         <form method="POST" action="{url_for('log_stop_fee', stop_id=stop_id)}" id="cab-fee-form" hidden
               style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);">
@@ -17850,6 +17851,7 @@ def driver_route_detail(route_id):
             </div>
         </form>
     </div>
+    </div>
     <script>
     function cabFeePick(kind, cents){{
         var labels = {{'dry_run':'Dry run','restricted_item':'Restricted item','relocation':'Relocation','overweight':'Overweight surcharge','custom':'Fee'}};
@@ -17861,7 +17863,6 @@ def driver_route_detail(route_id):
     }}
     </script>"""
     complete_section = f"""
-    {_cab_fee_block}
     <form method="POST" action="{url_for('toggle_stop_complete', stop_id=stop_id)}" id="cab-complete-form"
           data-has-photo="{'1' if has_photo else '0'}" data-photo-mode="{e(photo_proof_mode)}">
         <input type="hidden" name="_csrf_token" value="{_csrf}">
@@ -18324,8 +18325,8 @@ def driver_route_detail(route_id):
     _dis_aria = "false" if nav_has_addr else "true"
     _copy_dis = "" if nav_has_addr else " disabled"
     _msg_boss_html = (
-        f'<button type="button" class="cab-neutral" id="msg-boss-btn" onclick="openMessageThread(\'{_dm_key}\', \'Boss\', {route_id})">'
-        f'{icon("msg")} Message Boss<span id="msg-boss-badge" class="lane-msg-badge" '
+        f'<button type="button" class="cab-quick-btn" id="msg-boss-btn" onclick="openMessageThread(\'{_dm_key}\', \'Boss\', {route_id})">'
+        f'{icon("msg")} Message<span id="msg-boss-badge" class="lane-msg-badge" '
         f'{"hidden" if not unread_messages else ""}>{unread_messages or ""}</span></button>'
     )
     _arrive_action = url_for('stop_driver_action', stop_id=stop_id)
@@ -18354,11 +18355,19 @@ def driver_route_detail(route_id):
         {access_line}
         {blocked_line}
         {phone_line}
-        {_msg_boss_html}
+        <div class="cab-quick-row">
+            {upload_widget}
+            {_msg_boss_html}
+            <button type="button" class="cab-quick-btn" id="cab-fee-toggle"
+                    onclick="document.getElementById('cab-fee-tray').classList.toggle('open');">
+                &#x1F4CB; Fee
+            </button>
+        </div>
+        {_cab_fee_block}
+        {photo_gallery_html}
         <div class="cab-workzone">
             {workflow_btn_html}
             {empty_can_picker_html}
-            {upload_widget}
             {after_dump_summary_html}
         </div>
         <div class="cab-primary-zone">{complete_section}</div>
@@ -18425,6 +18434,32 @@ def driver_route_detail(route_id):
       font-weight: 800; font-size: 0.9rem; color: #fff;
       padding: 4px 8px 10px; letter-spacing: 0.5px;
   }}
+  /* 2026-10-17: FOCUS cab view — quick actions row + collapsible fee tray.
+     The stop screen now has two heroes (workflow button, Complete Stop) and
+     everything else tucks into three quiet buttons: Photo / Message / Fee. */
+  .cab-quick-row {{
+      display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px;
+      margin: 14px 0 4px;
+  }}
+  .cab-quick-btn {{
+      display: flex; align-items: center; justify-content: center; gap: 6px;
+      min-height: 52px; padding: 8px 4px;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 14px; color: #E8E8E2;
+      font-size: 13px; font-weight: 700; cursor: pointer;
+      position: relative; text-decoration: none;
+  }}
+  .cab-quick-btn:active {{ background: rgba(255,255,255,0.10); }}
+  .cab-quick-btn .lane-msg-badge {{
+      position: absolute; top: 6px; right: 8px;
+  }}
+  .cab-fee-tray {{
+      overflow: hidden; max-height: 0; opacity: 0;
+      transition: max-height .28s ease, opacity .22s ease, margin .28s ease;
+      margin: 0;
+  }}
+  .cab-fee-tray.open {{ max-height: 480px; opacity: 1; margin: 10px 0 4px; }}
   /* 2026-10-10: UNIFIED dropdown design — one language for Rearrange, More,
      and settings. Same container, same rows, same type. No more "different pages". */
   .haul-dropdown {{
