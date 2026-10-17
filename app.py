@@ -8961,9 +8961,9 @@ tr:hover td {{ background: rgba(255,107,26,0.025); }}
     font-size: 13px;
 }}
 .flash.success {{
-    background: rgba(0,80,36,0.38);
-    border: 1px solid rgba(61,220,132,0.28);
-    color: #5cffa7;
+    background: rgba(90,48,12,0.42);
+    border: 1px solid rgba(255,170,80,0.30);
+    color: #FFC98A;
 }}
 .flash.error {{
     background: rgba(100,10,20,0.45);
@@ -9448,7 +9448,38 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .cab-all-done {{
     text-align: center; padding: 60px 20px;
 }}
-.cab-all-done-icon {{ font-size: 48px; margin-bottom: 14px; }}
+/* Victory badge — glowing ember checkmark instead of the stock green emoji */
+.cab-all-done-icon {{
+    width: 92px; height: 92px; margin: 0 auto 20px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #FF9A3D, #E85D10 72%);
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 0 44px rgba(255,107,26,0.38), 0 10px 28px rgba(0,0,0,0.45),
+                inset 0 2px 5px rgba(255,255,255,0.28), inset 0 -3px 8px rgba(120,40,0,0.35);
+    animation: done-glow 2.6s ease-in-out infinite;
+}}
+.cab-all-done-icon::after {{
+    content: ''; width: 24px; height: 44px;
+    border: solid #FFF7EF; border-width: 0 8px 8px 0; border-radius: 2px;
+    transform: rotate(43deg); margin-top: -8px;
+    filter: drop-shadow(0 2px 3px rgba(120,40,0,0.4));
+}}
+@keyframes done-glow {{
+    0%, 100% {{ box-shadow: 0 0 32px rgba(255,107,26,0.28), 0 10px 28px rgba(0,0,0,0.45),
+                inset 0 2px 5px rgba(255,255,255,0.28), inset 0 -3px 8px rgba(120,40,0,0.35); }}
+    50% {{ box-shadow: 0 0 62px rgba(255,107,26,0.52), 0 10px 28px rgba(0,0,0,0.45),
+                inset 0 2px 5px rgba(255,255,255,0.28), inset 0 -3px 8px rgba(120,40,0,0.35); }}
+}}
+/* Cancelled route — muted, clearly not a celebration */
+.cab-cancelled-icon {{
+    width: 92px; height: 92px; margin: 0 auto 20px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #3A3A3E, #232326 72%);
+    border: 1px solid rgba(255,255,255,0.10);
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 10px 28px rgba(0,0,0,0.45), inset 0 2px 5px rgba(255,255,255,0.06);
+    color: #8A8A84; font-size: 40px; font-weight: 300; line-height: 1;
+}}
 .cab-all-done h2 {{ font-family: var(--font-head); font-size: 30px; letter-spacing: .5px; color: #F5F5F0; }}
 
 /* Photo-proof "Encouraged" nudge (Cab View: complete with zero photos) */
@@ -14977,7 +15008,7 @@ def _build_route_board_html(user, day=None):
     if not lanes:
         return (
             '<div class="board-empty"><p>No dispatches yet today.</p>'
-            f'<a class="btn gold" href="/parser?day={day}" style="min-height:48px;display:inline-flex;align-items:center;">+ New Dispatch</a></div>'
+            f'<a class="lane-add-stops" href="/parser?day={day}">+ Add</a></div>'
         )
 
     # Stable lane key for ordering/persistence: driver id (string), or
@@ -17127,7 +17158,7 @@ def driver_route_detail(route_id):
     <div class="cab-progress-label">{e(route['route_name'])} &middot; {e(route['route_date'])}</div>
 
     <div class="cab-all-done">
-        <div class="cab-all-done-icon">&#10005;</div>
+        <div class="cab-cancelled-icon">&#10005;</div>
         <h2 style="color:#A6A69E;">Route Cancelled</h2>
         <p style="color:var(--text-muted);margin-top:8px;">
             {e(cancel_label(route['cancel_reason']))} &mdash; cancelled by {_cx_by}.
@@ -17225,7 +17256,7 @@ def driver_route_detail(route_id):
             # handoff banner's fallback on this same screen.
             _y_href = "https://www.google.com/maps/dir/?api=1&destination=" + _y_enc
         _yard_nav_html = (
-            '<a class="btn green" style="min-height:48px;" href="' + e(_y_href) + '" '
+            '<a class="btn gold" style="min-height:48px;" href="' + e(_y_href) + '" '
             'target="_blank" rel="noopener">&#128205; Navigate to Yard</a>'
         )
     else:
@@ -17323,7 +17354,7 @@ def driver_route_detail(route_id):
                 <input type="hidden" name="_csrf_token" value="{_csrf}">
                 <input type="hidden" name="next" value="{e(request.path)}">
                 {_PHONE_TS_INPUT}
-                <button type="submit" class="pf-start-btn" style="background:var(--green,#2E9E5B);color:#fff;">
+                <button type="submit" class="pf-start-btn">
                     &#9200; CLOCK OUT{" — on since " + _co_in_at if _co_in_at else ""}
                 </button>
             </form>
@@ -17345,7 +17376,7 @@ def driver_route_detail(route_id):
     <div class="cab-progress-track"><div class="cab-progress-fill" style="width:100%;"></div></div>
 
     <div class="cab-all-done">
-        <div class="cab-all-done-icon">&#9989;</div>
+        <div class="cab-all-done-icon"></div>
         <h2>All Stops Done</h2>
         <p style="color:var(--text-muted);margin-top:8px;">{total_count} of {total_count} stops completed.</p>
         <div style="margin-top:22px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
