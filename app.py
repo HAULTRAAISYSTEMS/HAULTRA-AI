@@ -40664,6 +40664,39 @@ def garbage_dispatch_view():
     border-top: 1px solid rgba(255,107,26,.25); box-shadow: 0 -8px 32px rgba(255,107,26,.08);
     padding-bottom: env(safe-area-inset-bottom, 0px); }
   @media (min-width: 768px) { .haul-tabbar { display: none; } }
+  /* 2026-10-17: Top nav for tablet/desktop — the bottom tabs are hidden at ≥768px */
+  .topnav { display: none; }
+  @media (min-width: 768px) {
+    .topnav { display: block; background: #141412;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+      position: sticky; top: 0; z-index: 200;
+      padding-top: env(safe-area-inset-top, 0px);
+      box-shadow: 0 1px 0 rgba(255,107,26,.05), 0 2px 20px rgba(0,0,0,.4); }
+    .topnav-inner { display: flex; align-items: center; gap: 18px;
+      max-width: 1400px; margin: 0 auto; padding: 10px 20px; }
+    .topnav-brand { display: flex; align-items: baseline; gap: 1px;
+      text-decoration: none; flex-shrink: 0; }
+    .topnav-brand .logo-h, .topnav-brand .logo-rest {
+      font-size: 19px; font-weight: 400; letter-spacing: 2px;
+      background: linear-gradient(130deg, #fff 0%, #F5F5F0 55%, #FF6B1A 100%);
+      -webkit-background-clip: text; background-clip: text;
+      -webkit-text-fill-color: transparent; color: transparent; }
+    .topnav-brand .logo-h { filter: drop-shadow(0 0 10px rgba(255,107,26,.35)); }
+    .topnav-links { display: flex; align-items: center; gap: 2px; flex: 1; min-width: 0;
+      overflow-x: auto; scrollbar-width: none; }
+    .topnav-links::-webkit-scrollbar { display: none; }
+    .topnav-links .nav-item { display: inline-flex; align-items: center; gap: 7px;
+      white-space: nowrap; padding: 10px 14px; border-radius: 9px; flex-shrink: 0;
+      background: transparent; border: 1px solid transparent;
+      color: #8C8C82; font-weight: 600; font-size: 13px; text-decoration: none; }
+    .topnav-links .nav-item:hover { background: rgba(255,107,26,.06); color: #E0E0D8; }
+    .topnav-links .nav-item.active {
+      background: linear-gradient(180deg, rgba(255,107,26,.13), rgba(255,107,26,.04));
+      border-color: rgba(255,107,26,.25); color: #4fd1ff; font-weight: 700; position: relative; }
+    .topnav-links .nav-item.active::before { content: ''; position: absolute;
+      left: 16%; right: 16%; bottom: 2px; height: 2px; border-radius: 2px;
+      background: #4fd1ff; box-shadow: 0 0 8px #4fd1ff; }
+  }
   .haul-tab { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
     padding: 10px 4px 8px; background: none; border: none; color: #8a8a8a;
     text-decoration: none; cursor: pointer; position: relative; font-family: inherit; }
@@ -40701,6 +40734,23 @@ def garbage_dispatch_view():
   <circle cx="9" cy="8" r="3.2"/><path d="M2.8 20a6.4 6.4 0 0 1 12.4 0M16.5 5.2a3.2 3.2 0 0 1 0 5.9M18 20a6 6 0 0 0-2.2-4.4"/></symbol>
 </defs>
 </svg>
+
+<!-- 2026-10-17: Top nav for tablet/desktop — bottom tabs are hidden at ≥768px -->
+<nav class="topnav" aria-label="Main">
+  <div class="topnav-inner">
+    <a class="topnav-brand" href="/routes" aria-label="HAULTRA home">
+      <span class="logo-h">H</span><span class="logo-rest">AULTRA</span>
+    </a>
+    <div class="topnav-links">
+      <a class="nav-item" href="/routes">Route Board</a>
+      <a class="nav-item" href="/parser">Roll-Off</a>
+      <a class="nav-item active" href="/garbage-dispatch">Garbage</a>
+      <a class="nav-item" href="/unassigned">Unassigned</a>
+      <a class="nav-item" href="/requests">Requests</a>
+      <a class="nav-item" href="/customers">Customers</a>
+    </div>
+  </div>
+</nav>
 
 <!-- 2026-10-17: Command-center header — centered, alive -->
 <header class="cmd">
