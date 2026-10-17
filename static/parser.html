@@ -88,6 +88,36 @@
     flex: 1;
   }
   .page-title .accent { color: var(--orange); }
+  /* 2026-10-17: Command-center header — the dispatch future AI center */
+  .cmd {
+    position: relative; text-align: center; overflow: hidden;
+    padding: calc(26px + env(safe-area-inset-top, 0px)) 16px 22px;
+  }
+  .cmd-glow {
+    position: absolute; left: -20px; right: -20px; top: -60px; height: 250px;
+    background: radial-gradient(ellipse 65% 100% at 50% 0%, rgba(255,107,26,.16), transparent 70%);
+    pointer-events: none; animation: cmd-breathe 6s ease-in-out infinite;
+  }
+  @keyframes cmd-breathe { 0%, 100% { opacity: .65; } 50% { opacity: 1; } }
+  .cmd-status {
+    position: relative; display: inline-flex; align-items: center; gap: 8px;
+    font-size: 10px; font-weight: 800; letter-spacing: 3px; color: #FF8C42;
+    border: 1px solid rgba(255,107,26,.35); background: rgba(255,107,26,.08);
+    padding: 7px 14px 7px 12px; border-radius: 999px; margin-bottom: 14px;
+  }
+  .cmd-title {
+    position: relative; font-size: 32px; font-weight: 800; letter-spacing: .5px; margin: 0 0 10px;
+    background: linear-gradient(110deg, #fff 42%, #FF8C42 50%, #fff 58%);
+    background-size: 220% auto;
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    animation: cmd-shine 7s linear infinite;
+  }
+  @keyframes cmd-shine { to { background-position: 220% center; } }
+  .cmd-meta {
+    position: relative; display: flex; align-items: center; justify-content: center; gap: 10px;
+    font-size: 13px; color: var(--text-dim); font-weight: 600;
+  }
+  .cmd-sep { width: 4px; height: 4px; border-radius: 50%; background: var(--orange); flex: none; }
   /* 2026-10-17: live-system headline — pulsing dot, 2027 AI feel */
   .page-title { display: flex; align-items: center; gap: 10px; }
   .live-dot {
@@ -766,9 +796,13 @@
 </svg>
 
 
-<div class="topbar">
-  <div class="page-title"><span class="live-dot"></span>Roll-Off Dispatch</div>
-</div>
+<!-- 2026-10-17: Command-center header — centered, alive -->
+<header class="cmd">
+  <div class="cmd-glow"></div>
+  <div class="cmd-status"><span class="live-dot"></span>SYSTEM ONLINE</div>
+  <h1 class="cmd-title">Roll-Off Dispatch</h1>
+  <div class="cmd-meta">__CMD_META__</div>
+</header>
 
 <!-- Pull-to-refresh with HAULTRA logo -->
 <div class="haul-ptr" id="haul-ptr">
