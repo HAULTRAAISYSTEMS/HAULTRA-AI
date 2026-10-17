@@ -40692,10 +40692,10 @@ def garbage_dispatch_view():
     .topnav-links .nav-item:hover { background: rgba(255,107,26,.06); color: #E0E0D8; }
     .topnav-links .nav-item.active {
       background: linear-gradient(180deg, rgba(255,107,26,.13), rgba(255,107,26,.04));
-      border-color: rgba(255,107,26,.25); color: #4fd1ff; font-weight: 700; position: relative; }
+      border-color: rgba(255,107,26,.25); color: #FF6B1A; font-weight: 700; position: relative; }
     .topnav-links .nav-item.active::before { content: ''; position: absolute;
       left: 16%; right: 16%; bottom: 2px; height: 2px; border-radius: 2px;
-      background: #4fd1ff; box-shadow: 0 0 8px #4fd1ff; }
+      background: #FF6B1A; box-shadow: 0 0 8px #FF6B1A; }
   }
   .haul-tab { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
     padding: 10px 4px 8px; background: none; border: none; color: #8a8a8a;
