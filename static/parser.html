@@ -653,8 +653,9 @@
   .haul-more-items .nav-item { display: block; padding: 14px 20px; color: #fff; text-decoration: none; font-size: 16px; border-bottom: 1px solid rgba(255,255,255,0.05); }
   /* 2026-10-13: Action bar sits above the tabs */
   body { padding-bottom: calc(150px + env(safe-area-inset-bottom, 0px)); }
+  /* 2026-10-16: docked by JS to the measured tab bar height (no magic 68px) */
   .bottom-bar {
-    position: fixed; left: 0; right: 0; bottom: calc(68px + env(safe-area-inset-bottom, 0px)); z-index: 100;
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 100;
     display: flex; flex-direction: column; gap: 10px;
     /* Home-indicator inset, same as .sheet-foot above. contentInset is "never"
        in capacitor.config.json, so this bar really does reach the physical
@@ -726,6 +727,8 @@
   <path d="M3.5 13 6 5h12l2.5 8v6h-17z"/><path d="M3.5 13H9l1 2.5h4l1-2.5h5.5"/></symbol>
 <symbol id="i-users" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
   <circle cx="9" cy="8" r="3.2"/><path d="M2.8 20a6.4 6.4 0 0 1 12.4 0M16.5 5.2a3.2 3.2 0 0 1 0 5.9M18 20a6 6 0 0 0-2.2-4.4"/></symbol>
+<symbol id="i-truck" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M1.5 6h12v10h-12z"/><path d="M13.5 10h4l3.5 3.5V16h-7.5z"/><circle cx="6" cy="18" r="1.8"/><circle cx="17" cy="18" r="1.8"/></symbol>
 </defs>
 </svg>
 
@@ -1991,6 +1994,11 @@
     <span class="haul-tab-label">Roll-Off</span>
     <span class="haul-tab-glow"></span>
   </a>
+  <a class="haul-tab" href="/garbage-dispatch">
+    <span class="haul-tab-icon"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-truck"/></svg></span>
+    <span class="haul-tab-label">Garbage</span>
+    <span class="haul-tab-glow"></span>
+  </a>
   <a class="haul-tab" href="/requests">
     <span class="haul-tab-icon"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-inbox"/></svg></span>
     <span class="haul-tab-label">Requests</span>
@@ -2026,6 +2034,22 @@ function openMoreSheet() {
 function closeMoreSheet() {
   document.getElementById('haul-more-sheet').classList.remove('open');
 }
+// 2026-10-16: dock the action bar directly atop the tab bar — measured, not
+// magic. Kills the gap on phones; on iPad the tabs are hidden so it docks to 0.
+(function dockBottomBar() {
+  function dock() {
+    var tabbar = document.getElementById('haul-tabbar');
+    var bar = document.querySelector('.bottom-bar');
+    if (!bar) return;
+    var h = 0;
+    if (tabbar && getComputedStyle(tabbar).display !== 'none') h = tabbar.offsetHeight;
+    bar.style.bottom = h + 'px';
+  }
+  window.addEventListener('resize', dock);
+  window.addEventListener('orientationchange', dock);
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', dock);
+  else dock();
+})();
 </script>
 </body>
 </html>
