@@ -18456,6 +18456,10 @@ def driver_route_detail(route_id):
   }}
   /* Lone quick-btn outside the grid (pre-arrival Message) stretches full width */
   .cab-card > .cab-quick-btn {{ width: 100%; box-sizing: border-box; margin: 10px 0; }}
+  /* 2026-10-17: centered everything — address, meta lines, navstrip all centered */
+  .cab-card .cab-address, .cab-card .cab-meta-line {{ text-align: center; }}
+  .cab-card .cab-navstrip {{ justify-content: center; text-align: center; }}
+  .cab-card .cab-navstrip-addr {{ text-align: center; }}
   /* 2026-10-17: centered cab hero — badge + name stack centered, legs centered */
   .cab-action-row {{
       flex-direction: column; align-items: center; text-align: center; gap: 8px;
