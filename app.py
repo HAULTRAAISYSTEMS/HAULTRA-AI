@@ -18521,24 +18521,24 @@ def driver_route_detail(route_id):
      primary buttons. Quiet strip: the active leg is already the hero card
      above, so the chips whisper "what's next" instead of shouting. */
   .cab-leg-head {{ display:none; }}
-  .cab-legs-switch {{ display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-bottom:10px;
-      padding:8px 12px; background:rgba(255,255,255,0.02);
-      border:1px solid rgba(255,255,255,0.06); border-radius:10px; }}
-  .cab-leg-header {{ width:auto; font-size:11px; font-weight:600; letter-spacing:.8px;
-      color:var(--text-muted); margin-bottom:0; margin-right:2px; }}
-  .cab-leg-chip {{ flex:0 1 auto; min-width:0; min-height:34px; padding:5px 10px; cursor:pointer;
-      display:inline-flex; align-items:center; justify-content:center; text-align:center;
-      background:transparent; border:1px solid rgba(255,255,255,0.08); border-radius:999px;
+  .cab-legs-switch {{ display:flex; flex-direction:column; gap:8px; align-items:stretch; margin-bottom:10px;
+      padding:12px; background:rgba(255,255,255,0.02);
+      border:1px solid rgba(255,255,255,0.06); border-radius:14px; }}
+  .cab-leg-header {{ width:100%; font-size:11px; font-weight:600; letter-spacing:.8px;
+      color:var(--text-muted); margin-bottom:2px; text-align:center; }}
+  .cab-leg-chip {{ flex:1 1 auto; width:100%; min-height:48px; padding:10px 14px; cursor:pointer;
+      display:flex; align-items:center; justify-content:flex-start; text-align:left;
+      background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.10); border-radius:12px;
       color:var(--text-dim, #A6A69E); transition: all .2s ease; }}
   .cab-leg-chip.active {{
-      background:rgba(255,255,255,0.06);
-      border-color:rgba(255,255,255,0.14); color:var(--text, #F5F5F0);
-      box-shadow:none;
+      background: rgba(255,107,26,0.12);
+      border-color: rgba(255,107,26,0.45); color: #FFF;
+      box-shadow: 0 0 16px rgba(255,107,26,0.15);
       animation:none;
   }}
   .cab-leg-chip-lbl {{ font-weight:700; letter-spacing:.5px; font-size:.68rem; text-transform:uppercase; }}
   .cab-leg-chip.active .cab-leg-chip-lbl {{ color:var(--text-muted); }}
-  .cab-leg-chip-sub {{ font-size:.78rem; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:110px; }}
+  .cab-leg-chip-sub {{ font-size:.85rem; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
   .cab-leg-chip-sub::before {{ content:'\\00B7'; margin:0 6px; opacity:.55; font-weight:700; }}
   .cab-noaddr {{ margin-top:10px; padding:10px 12px; border-radius:10px; font-size:.85rem;
       color: var(--text-muted); background: rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.12); }}
