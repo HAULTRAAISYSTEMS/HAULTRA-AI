@@ -40404,94 +40404,191 @@ def garbage_dispatch_view():
         for d in drivers)
     mode_note = ("Appending to the existing garbage route — new stops go at the end."
                  if append_route_id else "")
-    mode_note = ("Appending to the existing garbage route — new stops go at the end."
-                 if append_route_id else "")
+    # 2026-10-17: dispatch inherits the board's day (?day=) — the board's day
+    # switcher is the one date control, same as Roll-Off Dispatch.
+    _dispatch_day = (request.args.get("day") or "").strip() or today_str()
+    try:
+        _dispatch_dt = datetime.strptime(_dispatch_day, "%Y-%m-%d")
+    except ValueError:
+        _dispatch_day = today_str()
+        _dispatch_dt = datetime.strptime(_dispatch_day, "%Y-%m-%d")
+    _today_s = today_str()
+    _tmr_s = (datetime.strptime(_today_s, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    if _dispatch_day == _today_s:
+        _dispatch_label = "Today"
+    elif _dispatch_day == _tmr_s:
+        _dispatch_label = "Tomorrow &middot; " + _dispatch_dt.strftime("%a %b %d")
+    else:
+        _dispatch_label = _dispatch_dt.strftime("%a %b %d")
     page = r"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Garbage Dispatch — HAULTRA</title>
 <style>
-:root{--bg:#0B0B0D;--card:#141417;--card2:#1A1A1F;--line:rgba(255,255,255,.08);
---text:#F5F5F0;--muted:#A6A69E;--orange:#FF6B1A;--orange2:#FF8A3D;
---blue:#8FB8FF;--purple:#CFA8FF;--amber:#FFB74D;--green:#3DDC84;--red:#FF6B6B;}
-*{box-sizing:border-box;}
-body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif;margin:0;padding:0 0 40px;}
-.topbar{position:sticky;top:0;z-index:10;background:rgba(11,11,13,.92);backdrop-filter:blur(8px);
-border-bottom:1px solid var(--line);padding:12px 16px;padding-top:max(12px, env(safe-area-inset-top));display:flex;align-items:center;gap:12px;}
-.backbtn{display:inline-flex;align-items:center;gap:6px;min-height:44px;padding:0 16px;border-radius:12px;
-border:1px solid var(--line);background:var(--card);color:var(--text);font-size:15px;font-weight:700;
-text-decoration:none;white-space:nowrap;flex-shrink:0;}
-.backbtn:active{background:#222;}
-.toptitle{font-size:18px;font-weight:800;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.reloadbtn{display:inline-flex;align-items:center;justify-content:center;min-width:44px;min-height:44px;
-border-radius:12px;border:1px solid var(--line);background:var(--card);color:var(--text);
-font-size:20px;cursor:pointer;}
-.reloadbtn:active{background:#222;transform:rotate(40deg);transition:transform .2s;}
-.wrap{max-width:680px;margin:0 auto;padding:16px;}
-.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:16px;margin-bottom:14px;}
-.card h2{font-size:13px;font-weight:800;letter-spacing:1px;color:var(--muted);margin:0 0 12px;text-transform:uppercase;}
-.scanbtn{display:flex;align-items:center;gap:14px;width:100%;min-height:76px;border-radius:14px;border:1px dashed rgba(255,138,61,.5);
-background:linear-gradient(135deg,rgba(255,107,26,.12),rgba(255,138,61,.04));color:var(--text);font-size:16px;font-weight:700;cursor:pointer;padding:12px 16px;}
-.scanbtn .em{font-size:32px;}
-.scanbtn small{display:block;font-weight:400;color:var(--muted);font-size:13px;margin-top:2px;}
-.scanbtn:active{transform:scale(.99);}
-.row2{display:flex;gap:10px;}
-.field{flex:1;min-width:0;}
-.lbl{display:block;margin:0 0 6px;font-weight:700;font-size:12px;letter-spacing:.6px;color:var(--muted);text-transform:uppercase;}
-select,input[type=date],input[type=text]{width:100%;min-height:52px;border-radius:12px;font-size:16px;color:var(--text);
-background:var(--card2);border:1px solid var(--line);padding:0 14px;}
-select{appearance:none;}
-textarea{width:100%;min-height:170px;border-radius:12px;font-size:15px;line-height:1.5;color:var(--text);
-background:var(--card2);border:1px solid var(--line);padding:12px 14px;font-family:ui-monospace,monospace;resize:vertical;}
-textarea:focus{outline:none;border-color:var(--orange);}
-.chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;}
-.chip{min-height:40px;padding:0 14px;border-radius:999px;border:1px solid var(--line);background:var(--card2);
-color:var(--text);font-size:14px;font-weight:600;cursor:pointer;}
-.chip.on{border-color:var(--orange);color:var(--orange2);background:rgba(255,107,26,.1);}
-.hint{color:var(--muted);font-size:13px;margin-top:8px;line-height:1.5;}
-.hint code{color:var(--blue);font-size:12px;}
-.preview{margin-top:12px;display:flex;flex-direction:column;gap:8px;}
-.pv{display:flex;align-items:center;gap:10px;background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:10px 12px;}
-.pv.bad{border-color:rgba(255,107,107,.5);}
-.pv .n{font-weight:800;color:var(--muted);min-width:24px;font-size:13px;}
-.badge{display:inline-flex;align-items:center;justify-content:center;min-width:34px;height:26px;padding:0 8px;border-radius:8px;
-font-size:12px;font-weight:800;letter-spacing:.5px;}
-.b-t{background:rgba(66,135,245,.18);border:1px solid rgba(66,135,245,.5);color:var(--blue);}
-.b-h{background:rgba(178,102,255,.16);border:1px solid rgba(178,102,255,.5);color:var(--purple);}
-.b-l{background:rgba(255,171,64,.14);border:1px solid rgba(255,171,64,.5);color:var(--amber);}
-.pv .a{flex:1;min-width:0;font-size:14px;}
-.pv .a small{display:block;color:var(--muted);font-size:12px;}
-.pv .nb{font-size:11px;font-weight:800;color:var(--amber);white-space:nowrap;}
-.pv .err{color:var(--red);font-size:13px;flex:1;}
-.pv .ok{color:var(--green);font-size:16px;}
-.summary{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;}
-.sum{font-size:13px;font-weight:700;padding:6px 12px;border-radius:999px;background:rgba(255,255,255,.05);border:1px solid var(--line);}
-.btn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;min-height:60px;border:none;border-radius:14px;
-font-size:18px;font-weight:800;cursor:pointer;margin-top:10px;}
-.btn-go{background:linear-gradient(135deg,var(--orange),var(--orange2));color:#1a0d02;box-shadow:0 4px 20px rgba(255,107,26,.35);}
-.btn-go:active{transform:scale(.99);}
-.btn-save{background:var(--card2);border:1px solid var(--line);color:var(--text);min-height:52px;font-size:15px;}
-.btn-save:active{background:#222;}
-.status{min-height:24px;margin-top:10px;font-size:14px;color:var(--muted);text-align:center;}
-.status.ok{color:var(--green);}
-.tcard{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:10px;}
-.tcard .t{font-weight:800;font-size:15px;}
-.tcard .m{color:var(--muted);font-size:13px;margin-top:4px;}
-.tcard .row{display:flex;gap:8px;margin-top:10px;}
-.tbtn{flex:1;min-height:44px;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;border:1px solid var(--line);}
-.t-use{background:rgba(255,107,26,.14);border-color:rgba(255,107,26,.5);color:var(--orange2);}
-.t-quick{background:rgba(61,220,132,.1);border-color:rgba(61,220,132,.4);color:var(--green);}
-.t-del{background:transparent;color:var(--muted);flex:0 0 44px;}
-.empty{color:var(--muted);font-size:14px;text-align:center;padding:18px 0;}
-.mode{color:var(--blue);font-size:13px;margin-bottom:12px;}
-#scan-file{display:none;}
-.spin{display:inline-block;width:18px;height:18px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:sp 1s linear infinite;}
-@keyframes sp{to{transform:rotate(360deg);}}
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg-0: #0B0B0D; --bg-1: #141417; --bg-2: #1A1A1F;
+    --text: #F5F5F0; --text-dim: #A6A69E; --text-faint: #78786F;
+    --orange: #FF6B1A; --orange2: #FF8A3D;
+    --orange-dim: rgba(255,107,26,.14); --orange-border: rgba(255,107,26,.55);
+    --green: #3DDC84; --blue: #8FB8FF; --purple: #CFA8FF; --amber: #FFB74D;
+    --red: #FF6B6B; --line: rgba(255,255,255,.08);
+    --radius: 16px; --radius-sm: 12px;
+  }
+  html { -webkit-text-size-adjust: 100%; }
+  html, body { background: var(--bg-0); color: var(--text); min-height: 100vh; }
+  body { font-family: system-ui,-apple-system,'Segoe UI',sans-serif; padding-bottom: calc(170px + env(safe-area-inset-bottom, 0px)); animation: haul-page-in .35s ease-out; }
+  @keyframes haul-page-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+  .topbar {
+    position: sticky; top: 0; z-index: 200;
+    display: flex; align-items: center; gap: 12px;
+    padding: calc(12px + env(safe-area-inset-top, 0px)) 16px 12px;
+    background: rgba(11,11,13,.92); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--line);
+  }
+  .back-link {
+    display: inline-flex; align-items: center; gap: 6px;
+    min-height: 44px; padding: 0 16px; border-radius: 12px;
+    border: 1px solid var(--line); background: var(--bg-1);
+    color: var(--text); font-size: 15px; font-weight: 700; text-decoration: none; white-space: nowrap;
+  }
+  .back-link:active { background: #222; }
+  .page-title { font-size: 18px; font-weight: 800; color: var(--text); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .page-title .accent { color: var(--orange); }
+  .reloadbtn { display: inline-flex; align-items: center; justify-content: center; min-width: 44px; min-height: 44px;
+    border-radius: 12px; border: 1px solid var(--line); background: var(--bg-1); color: var(--text); font-size: 20px; cursor: pointer; }
+  .reloadbtn:active { background: #222; }
+
+  .wrap { max-width: 680px; margin: 0 auto; padding: 16px; }
+  .card { background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; margin-bottom: 14px; }
+  .lbl { display: block; margin: 0 0 10px; font-weight: 800; font-size: 12px; letter-spacing: 1px; color: var(--text-dim); text-transform: uppercase; }
+  .mode { color: var(--blue); font-size: 13px; margin-bottom: 12px; }
+
+  .scanbtn { display: flex; align-items: center; gap: 14px; width: 100%; min-height: 76px; border-radius: 14px;
+    border: 1px dashed rgba(255,138,61,.5);
+    background: linear-gradient(135deg,rgba(255,107,26,.12),rgba(255,138,61,.04));
+    color: var(--text); font-size: 16px; font-weight: 700; cursor: pointer; padding: 12px 16px; font-family: inherit; }
+  .scanbtn .em { font-size: 32px; }
+  .scanbtn small { display: block; font-weight: 400; color: var(--text-dim); font-size: 13px; margin-top: 2px; }
+  .scanbtn:active { transform: scale(.99); }
+  #scan-file { display: none; }
+  .scan-status { min-height: 20px; margin-top: 8px; font-size: 14px; color: var(--text-dim); }
+  .spin { display: inline-block; width: 18px; height: 18px; border: 2px solid rgba(255,255,255,.3); border-top-color: #fff; border-radius: 50%; animation: sp 1s linear infinite; vertical-align: -4px; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+
+  textarea { width: 100%; min-height: 170px; border-radius: var(--radius-sm); font-size: 15px; line-height: 1.5; color: var(--text);
+    background: var(--bg-2); border: 1px solid var(--line); padding: 12px 14px; font-family: ui-monospace,monospace; resize: vertical; }
+  textarea:focus { outline: none; border-color: var(--orange); }
+  .hint { color: var(--text-dim); font-size: 13px; margin-top: 8px; line-height: 1.5; }
+  .hint code { color: var(--blue); font-size: 12px; }
+  .preview { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+  .pv { display: flex; align-items: center; gap: 10px; background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 10px 12px; }
+  .pv.bad { border-color: rgba(255,107,107,.5); }
+  .pv .n { font-weight: 800; color: var(--text-dim); min-width: 24px; font-size: 13px; }
+  .badge { display: inline-flex; align-items: center; justify-content: center; min-width: 34px; height: 26px; padding: 0 8px; border-radius: 8px; font-size: 12px; font-weight: 800; letter-spacing: .5px; }
+  .b-t { background: rgba(66,135,245,.18); border: 1px solid rgba(66,135,245,.5); color: var(--blue); }
+  .b-h { background: rgba(178,102,255,.16); border: 1px solid rgba(178,102,255,.5); color: var(--purple); }
+  .b-l { background: rgba(255,171,64,.14); border: 1px solid rgba(255,171,64,.5); color: var(--amber); }
+  .pv .a { flex: 1; min-width: 0; font-size: 14px; }
+  .pv .a small { display: block; color: var(--text-dim); font-size: 12px; }
+  .pv .nb { font-size: 11px; font-weight: 800; color: var(--amber); white-space: nowrap; }
+  .pv .err { color: var(--red); font-size: 13px; flex: 1; }
+  .pv .ok { color: var(--green); font-size: 16px; }
+  .summary { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .summary:empty { display: none; }
+  .sum { font-size: 13px; font-weight: 700; padding: 6px 12px; border-radius: 999px; background: rgba(255,255,255,.05); border: 1px solid var(--line); }
+
+  .tcard { background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 12px 14px; margin-bottom: 10px; }
+  .tcard .t { font-weight: 800; font-size: 15px; }
+  .tcard .m { color: var(--text-dim); font-size: 13px; margin-top: 4px; }
+  .tcard .row { display: flex; gap: 8px; margin-top: 10px; }
+  .tbtn { flex: 1; min-height: 44px; border-radius: 10px; font-size: 14px; font-weight: 700; cursor: pointer; border: 1px solid var(--line); font-family: inherit; }
+  .t-use { background: rgba(255,107,26,.14); border-color: rgba(255,107,26,.5); color: var(--orange2); }
+  .t-quick { background: rgba(61,220,132,.1); border-color: rgba(61,220,132,.4); color: var(--green); }
+  .t-del { background: transparent; color: var(--text-dim); flex: 0 0 44px; }
+  .empty { color: var(--text-dim); font-size: 14px; text-align: center; padding: 18px 0; }
+
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 52px; padding: 0 20px;
+    border-radius: 14px; font-size: 16px; font-weight: 800; cursor: pointer; border: 1px solid transparent; font-family: inherit;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .btn-secondary { background: transparent; border-color: rgba(255,255,255,.15); color: var(--text-dim); }
+  .btn-secondary:active:not(:disabled) { color: var(--text); border-color: rgba(255,255,255,.3); }
+  .btn-orange-outline { background: transparent; border-color: var(--orange-border); color: var(--orange); }
+  .btn-orange-outline:active:not(:disabled) { background: var(--orange-dim); }
+
+  /* Bottom action bar — mirrors Roll-Off Dispatch */
+  .bottom-bar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 100;
+    display: flex; flex-direction: column; gap: 10px;
+    padding: 12px 18px calc(14px + env(safe-area-inset-bottom, 0px));
+    background: var(--bg-2); border-top: 1px solid var(--line); }
+  .assign-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .assign-row .lbl { margin: 0; }
+  .driver-select { flex: 1; min-width: 0; min-height: 48px; border-radius: 12px; font-size: 16px; color: var(--text);
+    background: var(--bg-1); border: 1px solid var(--line); padding: 0 14px; font-family: inherit; appearance: none; }
+  .dispatch-day-label { flex: none; font-size: .85rem; font-weight: 800; letter-spacing: .4px; color: #FF8C42;
+    background: rgba(255,107,26,.1); border: 1px solid rgba(255,107,26,.3); border-radius: 8px; padding: 10px 14px; white-space: nowrap; }
+  .dispatch-row { display: flex; gap: 12px; }
+  .dispatch-row .btn-secondary { flex: 0 0 auto; min-width: 100px; }
+  .dispatch-row #gd-dispatch { flex: 1; }
+
+  .toast { position: fixed; left: 50%; bottom: 190px; transform: translateX(-50%);
+    background: var(--bg-2); border: 1px solid var(--green); color: var(--green);
+    padding: 12px 20px; border-radius: var(--radius-sm); font-weight: 600; font-size: .9rem;
+    z-index: 502; box-shadow: 0 8px 24px rgba(0,0,0,.5); max-width: calc(100vw - 40px); text-align: center;
+    opacity: 0; pointer-events: none; transition: opacity .25s ease; }
+  .toast.show { opacity: 1; }
+
+  /* Bottom tab bar — same as Roll-Off Dispatch */
+  .haul-tabbar { display: flex; position: fixed; bottom: 0; left: 0; right: 0; z-index: 300;
+    background: rgba(8,8,10,.92); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+    border-top: 1px solid rgba(255,107,26,.25); box-shadow: 0 -8px 32px rgba(255,107,26,.08);
+    padding-bottom: env(safe-area-inset-bottom, 0px); }
+  @media (min-width: 768px) { .haul-tabbar { display: none; } }
+  .haul-tab { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 10px 4px 8px; background: none; border: none; color: #8a8a8a;
+    text-decoration: none; cursor: pointer; position: relative; font-family: inherit; }
+  .haul-tab:active { transform: scale(.93); }
+  .haul-tab-icon { font-size: 24px; line-height: 1; margin-bottom: 4px; }
+  .haul-tab-label { font-size: 10px; font-weight: 600; letter-spacing: .5px; text-transform: uppercase; }
+  .haul-tab-glow { position: absolute; bottom: 2px; width: 24px; height: 3px; border-radius: 2px;
+    background: #FF6B1A; box-shadow: 0 0 12px rgba(255,107,26,.8); opacity: 0; transform: scaleX(0); transition: opacity .25s, transform .25s; }
+  .haul-tab.active { color: #FF8C42; }
+  .haul-tab.active::before { content: ''; position: absolute; inset: 6px 8px;
+    background: rgba(255,107,26,.1); border-radius: 14px; border: 1px solid rgba(255,107,26,.2); }
+  .haul-tab.active .haul-tab-icon { position: relative; transform: translateY(-2px); }
+  .haul-tab.active .haul-tab-label { position: relative; }
+  .haul-tab.active .haul-tab-glow { opacity: 1; transform: scaleX(1); }
+  .haul-more-sheet { display: none; position: fixed; inset: 0; z-index: 400; }
+  .haul-more-sheet.open { display: block; }
+  .haul-more-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,.6); }
+  .haul-more-panel { position: absolute; bottom: 0; left: 0; right: 0; background: #121214;
+    border-top: 1px solid rgba(255,107,26,.3); border-radius: 20px 20px 0 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px); max-height: 70vh; overflow-y: auto; }
+  .haul-more-handle { width: 40px; height: 4px; background: rgba(255,255,255,.2); border-radius: 2px; margin: 12px auto 8px; }
+  .haul-more-items .nav-item { display: block; padding: 14px 20px; color: #fff; text-decoration: none; font-size: 16px; border-bottom: 1px solid rgba(255,255,255,.05); }
 </style></head><body>
+<svg style="display:none" aria-hidden="true">
+<defs>
+<symbol id="i-board" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3" y="4" width="7" height="16" rx="1.6"/><rect x="14" y="4" width="7" height="9" rx="1.6"/></symbol>
+<symbol id="i-box" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M12 3.3 20.2 8v8L12 20.7 3.8 16V8z"/><path d="M3.8 8 12 12.6 20.2 8M12 12.6v8.1"/></symbol>
+<symbol id="i-truck" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M1.5 6h12v10h-12z"/><path d="M13.5 10h4l3.5 3.5V16h-7.5z"/><circle cx="6" cy="18" r="1.8"/><circle cx="17" cy="18" r="1.8"/></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M3.5 13 6 5h12l2.5 8v6h-17z"/><path d="M3.5 13H9l1 2.5h4l1-2.5h5.5"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="9" cy="8" r="3.2"/><path d="M2.8 20a6.4 6.4 0 0 1 12.4 0M16.5 5.2a3.2 3.2 0 0 1 0 5.9M18 20a6 6 0 0 0-2.2-4.4"/></symbol>
+</defs>
+</svg>
+
 <div class="topbar">
-  <a class="backbtn" href="/routes">&#8592; Board</a>
-  <div class="toptitle">&#128666; Garbage Dispatch</div>
+  <a class="back-link" href="/routes?day=__DAY__">&#8592; Board</a>
+  <div class="page-title"><span class="accent">&#128666;</span> Garbage Dispatch</div>
   <button class="reloadbtn" id="reload-btn" type="button" title="Reload page">&#10227;</button>
 </div>
+
 <div class="wrap">
   <div class="mode">__MODE__</div>
 
@@ -40501,20 +40598,11 @@ font-size:18px;font-weight:800;cursor:pointer;margin-top:10px;}
       <span>Scan a paper route sheet<small>Snap the daily log — stops fill in automatically</small></span>
     </button>
     <input type="file" id="scan-file" accept="image/*" capture="environment">
-    <div class="status" id="scan-status"></div>
+    <div class="scan-status" id="scan-status"></div>
   </div>
 
   <div class="card">
-    <h2>Route</h2>
-    <div class="row2">
-      <div class="field"><label class="lbl">Driver</label><select id="gd-driver"><option value="">— pick —</option>__OPTS__</select></div>
-      <div class="field"><label class="lbl">Date</label><input type="date" id="gd-date" value="__TODAY__"></div>
-    </div>
-    <div class="chips" id="day-chips"></div>
-  </div>
-
-  <div class="card">
-    <h2>Stops</h2>
+    <span class="lbl">Stops</span>
     <textarea id="gd-lines" placeholder="toter 2545 Squadron Ct, VB&#10;hpu 800 Gas Light Ln, VB !7am #132 units&#10;landfill GFL Transfer, Chesapeake"></textarea>
     <div class="hint">One per line: <code>toter</code> · <code>hpu</code> · <code>landfill</code> &nbsp;+ address &nbsp;·&nbsp; <code>!7am</code> = not before &nbsp;·&nbsp; <code>#note</code></div>
     <div class="summary" id="gd-summary"></div>
@@ -40522,25 +40610,89 @@ font-size:18px;font-weight:800;cursor:pointer;margin-top:10px;}
   </div>
 
   <div class="card">
-    <button class="btn btn-go" id="gd-dispatch" type="button">&#128666; Dispatch Route</button>
-    <button class="btn btn-save" id="gd-save-tpl" type="button">&#128190; Save as reusable route</button>
-    <div class="status" id="status"></div>
-  </div>
-
-  <div class="card">
-    <h2>&#128190; Saved routes</h2>
+    <span class="lbl">&#128190; Saved routes</span>
     <div id="tpl-list"><div class="empty">No saved routes yet — build one above, tap Save, and never retype it again.</div></div>
   </div>
 
   <div class="card">
-    <h2>&#128260; Recent dispatches</h2>
+    <span class="lbl">&#128260; Recent dispatches</span>
     <div id="recent-list"><div class="empty">Nothing dispatched yet.</div></div>
+  </div>
+</div>
+
+<div class="bottom-bar">
+  <div class="assign-row">
+    <span class="lbl">Assign to</span>
+    <select id="gd-driver" class="driver-select"><option value="">Select a driver&hellip;</option>__OPTS__</select>
+    <span class="dispatch-day-label">__DAY_LABEL__</span>
+  </div>
+  <div class="dispatch-row">
+    <button id="gd-save-tpl" class="btn btn-secondary" type="button">&#128190; Save</button>
+    <button id="gd-dispatch" class="btn btn-orange-outline" type="button" disabled>&#128666; Dispatch 0 Stops</button>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<nav class="haul-tabbar" id="haul-tabbar">
+  <a class="haul-tab" href="/routes">
+    <span class="haul-tab-icon"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-board"/></svg></span>
+    <span class="haul-tab-label">Board</span>
+    <span class="haul-tab-glow"></span>
+  </a>
+  <a class="haul-tab" href="/parser">
+    <span class="haul-tab-icon"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-box"/></svg></span>
+    <span class="haul-tab-label">Roll-Off</span>
+    <span class="haul-tab-glow"></span>
+  </a>
+  <a class="haul-tab active" href="/garbage-dispatch">
+    <span class="haul-tab-icon"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-truck"/></svg></span>
+    <span class="haul-tab-label">Garbage</span>
+    <span class="haul-tab-glow"></span>
+  </a>
+  <a class="haul-tab" href="/requests">
+    <span class="haul-tab-icon"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-inbox"/></svg></span>
+    <span class="haul-tab-label">Requests</span>
+    <span class="haul-tab-glow"></span>
+  </a>
+  <a class="haul-tab" href="/customers">
+    <span class="haul-tab-icon"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-users"/></svg></span>
+    <span class="haul-tab-label">Customers</span>
+    <span class="haul-tab-glow"></span>
+  </a>
+  <a class="haul-tab" href="javascript:void(0)" onclick="openMoreSheet()">
+    <span class="haul-tab-icon" style="font-size:22px;letter-spacing:2px;">&#183;&#183;&#183;</span>
+    <span class="haul-tab-label">More</span>
+    <span class="haul-tab-glow"></span>
+  </a>
+</nav>
+<div class="haul-more-sheet" id="haul-more-sheet">
+  <div class="haul-more-backdrop" onclick="closeMoreSheet()"></div>
+  <div class="haul-more-panel">
+    <div class="haul-more-handle"></div>
+    <div class="haul-more-items">
+      <a class="nav-item" href="/invoices">Invoices</a>
+      <a class="nav-item" href="/bins">Bin Tracker</a>
+      <a class="nav-item" href="/rate-card">Rate Card</a>
+      <a class="nav-item" href="/messages">Messages</a>
+    </div>
   </div>
 </div>
 
 <script>
 var GD_CSRF = "__CSRF__";
 var APPEND_RID = __APPENDRID__;
+var GD_DAY = "__DAY__";
+
+function toast(msg){
+  var t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(t._h);
+  t._h = setTimeout(function(){ t.classList.remove('show'); }, 3200);
+}
+function openMoreSheet(){ document.getElementById('haul-more-sheet').classList.add('open'); }
+function closeMoreSheet(){ document.getElementById('haul-more-sheet').classList.remove('open'); }
 
 function parseLine(line){
   var m = line.match(/^(toter|hpu|landfill)\s+(.+)$/i);
@@ -40561,6 +40713,11 @@ function badgeFor(st){
 }
 function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
+function countValid(){
+  var lines = document.getElementById('gd-lines').value.split('\n'), n = 0;
+  for(var i=0;i<lines.length;i++){ if(lines[i].trim() && !parseLine(lines[i].trim()).error) n++; }
+  return n;
+}
 function renderPreview(){
   var lines = document.getElementById('gd-lines').value.split('\n');
   var pv = document.getElementById('gd-preview'), sum = document.getElementById('gd-summary');
@@ -40591,6 +40748,10 @@ function renderPreview(){
       +(counts.landfill?'<span class="sum">'+counts.landfill+' landfill</span>':'')
       +(bad?'<span class="sum" style="color:var(--red)">'+bad+' need fixing</span>':'')
     : '';
+  var btn = document.getElementById('gd-dispatch');
+  var good = countValid();
+  btn.innerHTML = '&#128666; Dispatch ' + good + ' Stop' + (good === 1 ? '' : 's');
+  btn.disabled = !good;
 }
 document.getElementById('gd-lines').addEventListener('input', renderPreview);
 
@@ -40607,41 +40768,34 @@ function collectStops(){
   return {stops: stops};
 }
 
-function setStatus(msg, ok){
-  var st = document.getElementById('status');
-  st.textContent = msg;
-  st.className = 'status' + (ok ? ' ok' : '');
-}
-
 document.getElementById('gd-dispatch').addEventListener('click', function(){
   var drv = document.getElementById('gd-driver').value;
-  var date = document.getElementById('gd-date').value;
-  if(!drv && !APPEND_RID){ setStatus('Pick a driver first.'); return; }
+  if(!drv && !APPEND_RID){ toast('Pick a driver first.'); return; }
   var c = collectStops();
-  if(c.error){ setStatus(c.error); return; }
-  if(!c.stops.length){ setStatus('Add at least one stop.'); return; }
-  setStatus('Dispatching…');
+  if(c.error){ toast(c.error); return; }
+  if(!c.stops.length){ toast('Add at least one stop.'); return; }
+  toast('Dispatching…');
   var url = APPEND_RID ? '/api/route/' + APPEND_RID + '/insert-stops' : '/api/dispatch';
   var payload = APPEND_RID ? {stops: c.stops}
-    : {route_type:'garbage', driver_id: parseInt(drv,10), route_date: date, stops: c.stops};
+    : {route_type:'garbage', driver_id: parseInt(drv,10), route_date: GD_DAY, stops: c.stops};
   fetchT(url, {method:'POST', credentials:'same-origin',
     headers:{'Content-Type':'application/json','X-CSRF-Token':GD_CSRF},
     body: JSON.stringify(payload)
   }).then(function(r){ return r.json().then(function(j){ return {s:r.status, j:j}; }); })
   .then(function(x){
     if(x.s===200 && x.j.success){
-      setStatus(APPEND_RID ? '✓ Added '+x.j.stop_count+' stops to the route.'
-        : '✓ Dispatched '+x.j.stop_count+' stops to '+x.j.driver+'.', true);
+      toast(APPEND_RID ? '✓ Added '+x.j.stop_count+' stops to the route.'
+        : '✓ Dispatched '+x.j.stop_count+' stops to '+x.j.driver+' — ' + GD_DAY);
       document.getElementById('gd-lines').value='';
       renderPreview(); loadRecent();
-    } else setStatus((x.j && x.j.error) || 'Dispatch failed.');
-  }).catch(function(){ setStatus('Network error.'); });
+    } else toast((x.j && x.j.error) || 'Dispatch failed.');
+  }).catch(function(){ toast('Network error.'); });
 });
 
 document.getElementById('gd-save-tpl').addEventListener('click', function(){
   var c = collectStops();
-  if(c.error){ setStatus(c.error); return; }
-  if(!c.stops.length){ setStatus('Add at least one stop first.'); return; }
+  if(c.error){ toast(c.error); return; }
+  if(!c.stops.length){ toast('Add at least one stop first.'); return; }
   var name = prompt('Name this route (e.g. "Friday — Michael"):');
   if(!name) return;
   fetchT('/api/garbage/templates', {method:'POST', credentials:'same-origin',
@@ -40649,9 +40803,9 @@ document.getElementById('gd-save-tpl').addEventListener('click', function(){
     body: JSON.stringify({name: name, driver_id: document.getElementById('gd-driver').value || null, stops: c.stops})
   }).then(function(r){ return r.json().then(function(j){ return {s:r.status, j:j}; }); })
   .then(function(x){
-    if(x.s===200 && x.j.success){ setStatus('✓ Saved "'+name+'" — '+x.j.stop_count+' stops.', true); loadTemplates(); }
-    else setStatus((x.j && x.j.error) || 'Save failed.');
-  }).catch(function(){ setStatus('Network error.'); });
+    if(x.s===200 && x.j.success){ toast('✓ Saved "'+name+'" — '+x.j.stop_count+' stops.'); loadTemplates(); }
+    else toast((x.j && x.j.error) || 'Save failed.');
+  }).catch(function(){ toast('Network error.'); });
 });
 
 function stopToLine(s){
@@ -40683,24 +40837,23 @@ function loadTemplates(){
         if(t.driver_id) document.getElementById('gd-driver').value = t.driver_id;
         renderPreview();
         document.getElementById('gd-lines').scrollIntoView({behavior:'smooth', block:'center'});
-        setStatus('Loaded "'+t.name+'" — pick a date and hit Dispatch.', true);
+        toast('Loaded "'+t.name+'" — pick a driver and hit Dispatch.');
       });
     });
     el.querySelectorAll('[data-quick]').forEach(function(b){
       b.addEventListener('click', function(){
         var tid = b.getAttribute('data-quick');
         var drv = document.getElementById('gd-driver').value;
-        var date = document.getElementById('gd-date').value;
-        if(!drv){ setStatus('Pick a driver first (top of page).'); return; }
-        if(!confirm('Dispatch this route for '+date+'?')) return;
+        if(!drv){ toast('Pick a driver first (bottom of page).'); return; }
+        if(!confirm('Dispatch this route for '+GD_DAY+'?')) return;
         fetchT('/api/garbage/templates/'+tid+'/dispatch', {method:'POST', credentials:'same-origin',
           headers:{'Content-Type':'application/json','X-CSRF-Token':GD_CSRF},
-          body: JSON.stringify({driver_id: parseInt(drv,10), route_date: date})
+          body: JSON.stringify({driver_id: parseInt(drv,10), route_date: GD_DAY})
         }).then(function(r){ return r.json().then(function(j){ return {s:r.status, j:j}; }); })
         .then(function(x){
-          if(x.s===200 && x.j.success){ setStatus('✓ Dispatched '+x.j.stop_count+' stops to '+x.j.driver+'.', true); loadRecent(); loadTemplates(); }
-          else setStatus((x.j && x.j.error) || 'Dispatch failed.');
-        }).catch(function(){ setStatus('Network error.'); });
+          if(x.s===200 && x.j.success){ toast('✓ Dispatched '+x.j.stop_count+' stops to '+x.j.driver+'.'); loadRecent(); loadTemplates(); }
+          else toast((x.j && x.j.error) || 'Dispatch failed.');
+        }).catch(function(){ toast('Network error.'); });
       });
     });
     el.querySelectorAll('[data-del]').forEach(function(b){
@@ -40726,29 +40879,7 @@ function loadRecent(){
   });
 }
 
-// Day quick chips
-(function(){
-  var wrap = document.getElementById('day-chips');
-  var dateEl = document.getElementById('gd-date');
-  function fmt(d){ return d.toISOString().slice(0,10); }
-  var today = new Date();
-  var chips = [{l:'Today', d:0}, {l:'Tomorrow', d:1}];
-  var names = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-  for(var i=2;i<7;i++){ var dt = new Date(today); dt.setDate(dt.getDate()+i); chips.push({l:names[dt.getDay()], d:i}); }
-  chips.forEach(function(c){
-    var b = document.createElement('button');
-    b.type = 'button'; b.className = 'chip'; b.textContent = c.l;
-    b.addEventListener('click', function(){
-      var dt = new Date(today); dt.setDate(dt.getDate()+c.d);
-      dateEl.value = fmt(dt);
-      wrap.querySelectorAll('.chip').forEach(function(x){ x.classList.remove('on'); });
-      b.classList.add('on');
-    });
-    wrap.appendChild(b);
-  });
-})();
-
-// Scan
+// Scan a paper route sheet
 (function(){
   var file = document.getElementById('scan-file');
   var btn = document.getElementById('scan-btn');
@@ -40786,16 +40917,28 @@ function loadRecent(){
   });
 })();
 
+// Dock the action bar directly atop the tab bar — measured, not magic.
+(function dockBottomBar(){
+  function dock(){
+    var tabbar = document.getElementById('haul-tabbar');
+    var bar = document.querySelector('.bottom-bar');
+    if(!bar) return;
+    var h = 0;
+    if(tabbar && getComputedStyle(tabbar).display !== 'none') h = tabbar.offsetHeight;
+    bar.style.bottom = h + 'px';
+  }
+  window.addEventListener('resize', dock);
+  window.addEventListener('orientationchange', dock);
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', dock);
+  else dock();
+})();
+
 loadTemplates();
 loadRecent();
 renderPreview();
 
-// Reload button — bails out of any stuck state.
-document.getElementById('reload-btn').addEventListener('click', function(){
-  location.reload();
-});
+document.getElementById('reload-btn').addEventListener('click', function(){ location.reload(); });
 
-// fetch with a timeout so a hung request fails fast instead of spinning forever.
 function fetchT(url, opts, ms){
   ms = ms || 25000;
   var ctrl = new AbortController();
@@ -40804,8 +40947,10 @@ function fetchT(url, opts, ms){
   opts.signal = ctrl.signal;
   return fetch(url, opts).finally(function(){ clearTimeout(t); });
 }
-</script></body></html>"""
-    page = page.replace("__OPTS__", opts).replace("__CSRF__", csrf).replace("__TODAY__", today_str())
+</script></body></html>
+"""
+    page = page.replace("__OPTS__", opts).replace("__CSRF__", csrf)
+    page = page.replace("__DAY__", _dispatch_day).replace("__DAY_LABEL__", _dispatch_label)
     page = page.replace("__MODE__", e(mode_note) if mode_note else "")
     page = page.replace("__APPENDRID__", json.dumps(append_route_id))
     return page
