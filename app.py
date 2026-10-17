@@ -18392,16 +18392,45 @@ def driver_route_detail(route_id):
 
     body = f"""
 <style>
-  /* Running-state sticky bar: keeps progress + END ROUTE pinned so nothing
-     important sits below the fold while the driver works a stop. */
-  .cab-sticky-bar {{ position: sticky; top: var(--haul-topnav-h, 0px); z-index: 50; display:flex; align-items:center;
-      justify-content:space-between; gap:10px; padding:8px 14px; margin-bottom:8px;
-      background: var(--bg-0, #121212); border-bottom:1px solid rgba(255,255,255,0.08); }}
-  .cab-sticky-progress {{ font-weight:800; letter-spacing:1px; font-size:.98rem; }}
-  .cab-sticky-end {{ min-height:44px; padding:0 16px; border:1px solid var(--red, #FF5252);
-      background:transparent; color: var(--red, #FF5252); border-radius:10px; font-weight:800;
-      letter-spacing:.5px; cursor:pointer; }}
-  .cab-sticky-end:active {{ background: rgba(255,82,82,0.12); }}
+  /* 2026-10-17: MISSION HEADER — stop counter and progress fused into one
+     command bar. The progress track is the header's foundation, not a
+     detached line. Counter never wraps. */
+  .cab-mission {{
+      position: sticky; top: var(--haul-topnav-h, 0px); z-index: 50;
+      background: var(--bg-0, #121212);
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+      margin: 0 -14px 12px; padding: 10px 14px 0;
+  }}
+  .cab-mission-row {{
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      padding-bottom: 10px;
+  }}
+  .cab-mission-count {{
+      font-weight: 800; letter-spacing: 1px; font-size: .95rem; white-space: nowrap;
+      display: flex; align-items: center; gap: 8px;
+  }}
+  .cab-mission-count .cab-mission-dot {{
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #FF6B1A; box-shadow: 0 0 8px rgba(255,107,26,0.8);
+      animation: cab-mission-pulse 2s ease-in-out infinite;
+  }}
+  @keyframes cab-mission-pulse {{
+      0%, 100% {{ opacity: 1; }} 50% {{ opacity: .4; }}
+  }}
+  .cab-mission-track {{
+      height: 10px; background: rgba(255,255,255,0.07); border-radius: 6px;
+      overflow: hidden; position: relative;
+  }}
+  .cab-mission-fill {{
+      height: 100%; border-radius: 6px;
+      background: linear-gradient(90deg, #FF8A42, #FF6B1A);
+      box-shadow: 0 0 12px rgba(255,107,26,0.5);
+      transition: width .4s ease; position: relative;
+  }}
+  .cab-mission-fill::after {{
+      content: ''; position: absolute; inset: 0; border-radius: 6px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.25), transparent 60%);
+  }}
   /* 2026-10-10: unified topbar — one row for stop counter + controls + quiet End */
   .cab-topbar {{ justify-content: space-between !important; gap: 8px; padding: 8px 12px !important; }}
   .cab-topbar-controls {{ display: flex; align-items: center; gap: 8px; margin-left: auto; }}
@@ -18630,20 +18659,23 @@ def driver_route_detail(route_id):
 <div class="cab-wrap">
     <!-- 2026-10-10: unified top bar — stop counter, controls, and a quiet End link in one row.
          2026-10-10: Reorder and More live here as dropdowns, not in the scroll body. -->
-    <div class="cab-sticky-bar cab-topbar">
-        <span class="cab-sticky-progress" id="cab-sticky-progress">STOP {current_stop_num} OF {total_count}</span>
-        <span class="cab-topbar-controls">
-            <!-- 2026-10-13: reload button removed per user request -->
-            {f'<button type="button" class="cab-topbar-icon" onclick="toggleCabReorder()" title="Rearrange route">&#8645;</button>' if _reorderable else ''}
-            <button type="button" class="cab-topbar-icon" onclick="toggleCabMore()" title="More">&#183;&#183;&#183;</button>
-            {cab_map_toggle_btn}
-            <span class="cab-online-badge" id="online-badge"><span class="cab-online-dot"></span>ONLINE</span>
-            <form method="POST" action="{url_for('mark_route_completed', route_id=route_id)}" class="inline"
-                  onsubmit="return confirm('End this route now? Any stops not marked done will stay incomplete.');">
-                <input type="hidden" name="_csrf_token" value="{_csrf}">
-                <button type="submit" class="cab-topbar-end">End</button>
-            </form>
-        </span>
+    <div class="cab-mission">
+        <div class="cab-mission-row">
+            <span class="cab-mission-count" id="cab-sticky-progress"><span class="cab-mission-dot"></span>STOP {current_stop_num} OF {total_count}</span>
+            <span class="cab-topbar-controls">
+                <!-- 2026-10-13: reload button removed per user request -->
+                {f'<button type="button" class="cab-topbar-icon" onclick="toggleCabReorder()" title="Rearrange route">&#8645;</button>' if _reorderable else ''}
+                <button type="button" class="cab-topbar-icon" onclick="toggleCabMore()" title="More">&#183;&#183;&#183;</button>
+                {cab_map_toggle_btn}
+                <span class="cab-online-badge" id="online-badge"><span class="cab-online-dot"></span>ONLINE</span>
+                <form method="POST" action="{url_for('mark_route_completed', route_id=route_id)}" class="inline"
+                      onsubmit="return confirm('End this route now? Any stops not marked done will stay incomplete.');">
+                    <input type="hidden" name="_csrf_token" value="{_csrf}">
+                    <button type="submit" class="cab-topbar-end">End</button>
+                </form>
+            </span>
+        </div>
+        <div class="cab-mission-track"><div class="cab-mission-fill" id="cab-progress-fill" style="width:{pct}%;"></div></div>
     </div>
     <!-- Dropdowns anchored to the top bar -->
     <div id="cab-reorder-dropdown" class="cab-topbar-dropdown haul-dropdown" hidden>
@@ -18664,8 +18696,6 @@ def driver_route_detail(route_id):
         <span id="route-updated-text"></span>
         <button type="button" onclick="document.getElementById('route-updated-banner').hidden=true;" aria-label="Dismiss">&times;</button>
     </div>
-
-    <div class="cab-progress-track"><div class="cab-progress-fill" id="cab-progress-fill" style="width:{pct}%;"></div></div>
 
     {f'''
     <form method="POST" action="{url_for('toggle_stop_complete', stop_id=prev_stop['id'])}" style="margin-bottom:14px;"
