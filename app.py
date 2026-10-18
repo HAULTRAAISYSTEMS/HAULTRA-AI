@@ -9084,23 +9084,74 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 
 .gauge-stat {{
     position: relative;
-    background: rgba(20,20,20,0.70);
-    border: 1px solid rgba(255,255,255,0.06);
+    background: linear-gradient(180deg, rgba(30,30,34,0.58), rgba(18,18,22,0.48));
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(255,255,255,0.08);
     border-top: 3px solid var(--cyan);
     border-radius: var(--radius);
     padding: 18px 20px 16px;
+    overflow: hidden;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,190,120,0.10),
+                0 0 60px rgba(255,107,26,0.04);
+}}
+/* 2026-10-17: owner stats feel alive — shimmer sweep across the top edge */
+.gauge-stat::before {{
+    content: ""; position: absolute; top: 0; left: -60%; width: 40%; height: 3px;
+    background: linear-gradient(90deg, transparent, rgba(255,200,140,0.9), transparent);
+    animation: gauge-shimmer 4s ease-in-out infinite;
+}}
+@keyframes gauge-shimmer {{
+    0% {{ left: -60%; }} 55%, 100% {{ left: 130%; }}
 }}
 .gauge-stat .label {{
     font-size: 10px; font-weight: 700; letter-spacing: 1px;
     text-transform: uppercase; color: var(--text-muted);
+    display: flex; align-items: center; gap: 7px;
+}}
+/* live dot on each stat label */
+.gauge-stat .label::before {{
+    content: ""; width: 6px; height: 6px; border-radius: 50%;
+    background: #7CFC90; box-shadow: 0 0 8px rgba(124,252,144,0.9);
+    animation: cmd-blink 2.4s ease-in-out infinite; flex: none;
 }}
 .gauge-stat .num {{
     font-family: var(--font-head); font-size: 40px; font-weight: 400;
     color: #F5F5F0; line-height: 1; margin-top: 8px; letter-spacing: .5px;
+    text-shadow: 0 0 24px rgba(255,140,50,0.25);
 }}
 .gauge-stat .num.red   {{ color: var(--red); }}
 .gauge-stat .num.dim   {{ color: #55554C; }}
 .gauge-stat .sub {{ font-size: 11px; color: var(--text-muted); margin-top: 6px; }}
+/* overdue card breathes red when containers are past their window */
+.gauge-stat.is-hot {{
+    border-top-color: var(--red);
+    animation: gauge-hot 3s ease-in-out infinite;
+}}
+.gauge-stat.is-hot .label::before {{
+    background: #FF5252; box-shadow: 0 0 8px rgba(255,82,82,0.9);
+}}
+@keyframes gauge-hot {{
+    0%, 100% {{ box-shadow: 0 8px 32px rgba(0,0,0,0.35), 0 0 24px rgba(255,82,82,0.06); }}
+    50% {{ box-shadow: 0 8px 32px rgba(0,0,0,0.35), 0 0 44px rgba(255,82,82,0.16); }}
+}}
+/* animated fill on the driver/inventory bars */
+.bar-chart-fill {{
+    position: relative; overflow: hidden;
+}}
+.bar-chart-fill::after {{
+    content: ""; position: absolute; inset: 0;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.35), transparent);
+    transform: translateX(-100%);
+    animation: bar-sweep 3.5s ease-in-out infinite;
+}}
+@keyframes bar-sweep {{
+    0% {{ transform: translateX(-100%); }} 60%, 100% {{ transform: translateX(100%); }}
+}}
+@media (prefers-reduced-motion: reduce) {{
+    .gauge-stat::before, .bar-chart-fill::after {{ animation: none; }}
+    .gauge-stat.is-hot {{ animation: none; }}
+}}
 
 .bar-chart-row {{
     display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
@@ -11562,16 +11613,12 @@ def dashboard():
 </tr>
 """
 
+    _owner_meta = (f"{e(today)} &middot; {pulls_today} pull{'s' if pulls_today != 1 else ''} today"
+                   f" &middot; {containers_out_num} containers out")
     body = f"""
-    <div class="hero owner-header-row">
-        <div>
-            <div style="font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#55554C;margin-bottom:7px;">
-                OWNER &middot; {e(today)}
-            </div>
-            <h1>Yard Overview</h1>
-            <p style="margin-top:6px;">Real-time pulls, containers, and driver activity for today.</p>
-        </div>
-        <a class="btn gold" href="{url_for('export_day_csv')}" style="align-self:flex-start;white-space:nowrap;">
+    {_cmd_header("Yard Overview", _owner_meta)}
+    <div style="display:flex;justify-content:flex-end;margin:-8px 0 18px;">
+        <a class="btn gold" href="{url_for('export_day_csv')}" style="white-space:nowrap;">
             &#8615; Export Day
         </a>
     </div>
@@ -11592,7 +11639,7 @@ def dashboard():
             <div class="num">{containers_out_num}</div>
             <div class="sub">{containers_out_sub}</div>
         </div>
-        <div class="gauge-stat">
+        <div class="gauge-stat{' is-hot' if overdue_count else ''}">
             <div class="label">Overdue</div>
             <div class="num {'red' if overdue_count else ''}">{overdue_count}</div>
             <div class="sub">past rental window</div>
@@ -11602,11 +11649,17 @@ def dashboard():
 
     <div class="row" style="align-items:stretch;gap:16px;flex-wrap:wrap;margin-bottom:16px;">
         <div class="card" style="flex:1;min-width:300px;margin-bottom:0;">
-            <h2>Pulls by Driver</h2>
+            <div class="row between" style="margin-bottom:12px;">
+                <h2 style="margin:0;">Pulls by Driver</h2>
+                <span style="font-size:10px;font-weight:700;letter-spacing:1px;color:#7CFC90;display:flex;align-items:center;gap:6px;"><span style="width:7px;height:7px;border-radius:50%;background:#7CFC90;box-shadow:0 0 8px rgba(124,252,144,0.9);display:inline-block;"></span>LIVE</span>
+            </div>
             {bar_rows}
         </div>
         <div class="card" style="flex:1;min-width:300px;margin-bottom:0;">
-            <h2>Container Inventory</h2>
+            <div class="row between" style="margin-bottom:12px;">
+                <h2 style="margin:0;">Container Inventory</h2>
+                <span style="font-size:10px;font-weight:700;letter-spacing:1px;color:#7CFC90;display:flex;align-items:center;gap:6px;"><span style="width:7px;height:7px;border-radius:50%;background:#7CFC90;box-shadow:0 0 8px rgba(124,252,144,0.9);display:inline-block;"></span>LIVE</span>
+            </div>
             {inv_html}
         </div>
     </div>
