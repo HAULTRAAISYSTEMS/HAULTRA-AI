@@ -9152,6 +9152,68 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     .gauge-stat::before, .bar-chart-fill::after {{ animation: none; }}
     .gauge-stat.is-hot {{ animation: none; }}
 }}
+/* 2026-10-17: driver pay-week hours on the Owner dashboard */
+.pay-driver {{
+    background: linear-gradient(180deg, rgba(30,30,34,0.58), rgba(18,18,22,0.48));
+    backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(255,255,255,0.08); border-radius: 16px;
+    padding: 16px 18px; margin-bottom: 12px;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,190,120,0.10);
+}}
+.pay-driver:last-child {{ margin-bottom: 0; }}
+.pay-driver-head {{ display: flex; align-items: center; gap: 14px; margin-bottom: 14px; }}
+.pay-avatar {{
+    width: 44px; height: 44px; border-radius: 50%; flex: none;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; font-weight: 800; color: #1A1208;
+    background: linear-gradient(135deg, #FFB35C, #FF6B1A);
+    box-shadow: 0 0 20px rgba(255,107,26,0.35);
+}}
+.pay-driver-meta {{ flex: 1; min-width: 0; }}
+.pay-driver-name {{ font-size: 16px; font-weight: 700; color: #F5F5F0;
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }}
+.pay-driver-sub {{ font-size: 12px; color: var(--text-muted); margin-top: 2px; }}
+.pay-live {{
+    font-size: 10px; font-weight: 800; letter-spacing: 1px; color: #7CFC90;
+    display: inline-flex; align-items: center; gap: 4px;
+    animation: cmd-blink 2s ease-in-out infinite;
+}}
+.pay-miss {{ font-size: 11px; font-weight: 700; color: #FF8A7A; }}
+.pay-total {{ text-align: right; flex: none; }}
+.pay-total-num {{
+    font-family: var(--font-head); font-size: 34px; font-weight: 400; color: #F5F5F0;
+    line-height: 1; text-shadow: 0 0 24px rgba(255,140,50,0.25);
+}}
+.pay-total-num span {{ font-size: 16px; color: var(--text-muted); margin-left: 2px; }}
+.pay-total-lbl {{ font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--text-muted); margin-top: 4px; }}
+.pay-week-strip {{
+    display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px;
+    align-items: end;
+}}
+.pay-day {{ display: flex; flex-direction: column; align-items: center; gap: 6px; }}
+.pay-day-bar {{
+    width: 100%; border-radius: 6px; min-height: 4px;
+    transition: height .4s ease; position: relative; overflow: hidden;
+}}
+.pay-day.is-live .pay-day-bar {{
+    box-shadow: 0 0 12px rgba(124,252,144,0.5);
+    animation: pay-live-pulse 2s ease-in-out infinite;
+}}
+@keyframes pay-live-pulse {{
+    0%, 100% {{ box-shadow: 0 0 12px rgba(124,252,144,0.5); }}
+    50% {{ box-shadow: 0 0 20px rgba(124,252,144,0.85); }}
+}}
+.pay-day-lbl {{
+    font-size: 10px; font-weight: 700; color: var(--text-muted);
+    text-transform: uppercase;
+}}
+.pay-day.is-live .pay-day-lbl {{ color: #7CFC90; }}
+.pay-day.is-missing .pay-day-lbl {{ color: #FF8A7A; }}
+@media (prefers-reduced-motion: reduce) {{
+    .pay-day.is-live .pay-day-bar {{ animation: none; }}
+    .pay-live {{ animation: none; }}
+}}
 
 .bar-chart-row {{
     display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
@@ -11539,6 +11601,65 @@ def dashboard():
         WHERE r.company_id = ? AND r.route_date BETWEEN ? AND ?
         ORDER BY r.route_date DESC, r.id DESC
     """, (company_id, pay_period_start, pay_period_end)).fetchall()
+
+    # ── Driver pay-week hours (2026-10-17) ─────────────────────────
+    # One row per driver: total hours + 7-day strip. Uses the same
+    # get_driver_week_summary the Clock page uses, so payroll never disagrees.
+    _drivers = conn.execute(
+        "SELECT id, username, full_name FROM users WHERE company_id=? AND role='driver' ORDER BY username",
+        (company_id,)).fetchall()
+    _now_local = _company_local_now(co_settings)
+    _week_start = company_week_start_for(co_settings, _now_local.date())
+    _pay_hours_html = ""
+    for _d in _drivers:
+        _ws = get_driver_week_summary(conn, _d["id"], _week_start, co_settings, _now_local)
+        _dname = (_d["full_name"] or _d["username"] or "Driver").strip()
+        _initial = _dname[0].upper() if _dname else "?"
+        # 7-day strip: each day a mini bar, height scaled to 12h max
+        _day_cells = ""
+        for _day in _ws["days"]:
+            _h = _day["hours"]
+            _pct = min(100, int((_h / 12.0) * 100)) if _h else 0
+            if _day["live"]:
+                _bar_bg = "linear-gradient(180deg,#7CFC90,#2E9E5B)"
+                _cls = "is-live"
+            elif _day["missing_out"]:
+                _bar_bg = "rgba(255,82,82,0.55)"
+                _cls = "is-missing"
+            elif _h:
+                _bar_bg = "linear-gradient(180deg,#FF9A3C,#FF6B1A)"
+                _cls = ""
+            else:
+                _bar_bg = "rgba(255,255,255,0.08)"
+                _cls = "is-empty"
+            _title = (f"{_day['weekday']} {_day['date']}: {_h:.1f}h" if _h is not None
+                      else f"{_day['weekday']} {_day['date']}: no clock-out ⚠" if _day["missing_out"]
+                      else f"{_day['weekday']} {_day['date']}: off")
+            _day_cells += (
+                f'<div class="pay-day {_cls}" title="{e(_title)}">'
+                f'<div class="pay-day-bar" style="height:{max(4,_pct)}%;background:{_bar_bg};"></div>'
+                f'<div class="pay-day-lbl">{_day["weekday"][0]}</div></div>'
+            )
+        _live_tag = (' <span class="pay-live">● ON CLOCK</span>' if _ws["has_live"] else '')
+        _miss_tag = (f' <span class="pay-miss">⚠ {_ws["missing_days"]} missing clock-out</span>'
+                     if _ws["missing_days"] else '')
+        _pay_hours_html += f"""
+        <div class="pay-driver">
+            <div class="pay-driver-head">
+                <div class="pay-avatar">{e(_initial)}</div>
+                <div class="pay-driver-meta">
+                    <div class="pay-driver-name">{e(_dname)}{_live_tag}{_miss_tag}</div>
+                    <div class="pay-driver-sub">{len([d for d in _ws['days'] if d['hours']])} days worked</div>
+                </div>
+                <div class="pay-total">
+                    <div class="pay-total-num">{_ws['total']:.1f}<span>h</span></div>
+                    <div class="pay-total-lbl">this pay week</div>
+                </div>
+            </div>
+            <div class="pay-week-strip">{_day_cells}</div>
+        </div>"""
+    if not _pay_hours_html:
+        _pay_hours_html = '<div class="card muted">No drivers on the roster yet.</div>'
     conn.close()
 
     # ── Pulls by Driver bar chart ───────────────────────────────
@@ -11666,20 +11787,11 @@ def dashboard():
 
     <div class="card">
         <div class="row between" style="margin-bottom:4px;">
-            <h2 style="margin:0;">This Pay Week</h2>
-            <a class="btn secondary" style="font-size:12px;padding:7px 14px;" href="{url_for("routes_page")}">All Routes &rarr;</a>
+            <h2 style="margin:0;">Driver Pay Week</h2>
+            <span style="font-size:10px;font-weight:700;letter-spacing:1px;color:#7CFC90;display:flex;align-items:center;gap:6px;"><span style="width:7px;height:7px;border-radius:50%;background:#7CFC90;box-shadow:0 0 8px rgba(124,252,144,0.9);display:inline-block;"></span>LIVE</span>
         </div>
-        <p class="muted small" style="margin-bottom:14px;">{e(pay_period_start)} &ndash; {e(pay_period_end)}</p>
-        <div class="table-wrap">
-            <table>
-                <thead>
-                    <tr><th>Date</th><th>Route</th><th>Assigned</th><th>Status</th><th></th></tr>
-                </thead>
-                <tbody>
-                    {route_rows if route_rows else '<tr><td colspan="5" style="color:#55554C;padding:20px 12px;">No routes dispatched this pay week yet.</td></tr>'}
-                </tbody>
-            </table>
-        </div>
+        <p class="muted small" style="margin-bottom:14px;">{e(pay_period_start)} &ndash; {e(pay_period_end)} &middot; from clock in/out</p>
+        {_pay_hours_html}
     </div>
     """
     return render_template_string(shell_page("Owner", body))
