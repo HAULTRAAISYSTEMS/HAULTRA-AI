@@ -11757,7 +11757,8 @@ def dashboard():
             if y == 0 and x == 0:
                 continue
             if y == 0:
-                count_label = f"{x} out &middot; fleet not registered"
+                count_label = (f'{x} out &middot; <a href="{url_for("containers_page")}" '
+                               f'style="color:var(--orange);">register fleet</a>')
                 pct = 100
             else:
                 count_label = f"{x} / {y} out"
@@ -11780,7 +11781,8 @@ def dashboard():
         containers_out_sub = f"{in_yard} in yard"
     else:
         containers_out_num = str(out_count)
-        containers_out_sub = "fleet not registered in Containers"
+        containers_out_sub = (f'<a href="{url_for("containers_page")}" style="color:var(--orange);">'
+                              f'register fleet in Containers</a>')
 
     route_rows = ""
     for r in routes:
