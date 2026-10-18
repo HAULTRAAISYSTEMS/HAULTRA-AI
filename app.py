@@ -7207,9 +7207,29 @@ def shell_page(title, body, extra_head=""):
             # Grouped More menu (fix/menu-shorthand-addressbook): small section
             # headers, in the order TEAM → FLEET → (Team) → SETUP, then a
             # separator + Logout. A header only renders if its group has items.
+            # 2026-10-17: Owner/Invoices/Bin Tracker/Alerts are top-nav-only on
+            # tablet/desktop — on iPhone they'd be unreachable. They live here
+            # now, with Owner as a hero card.
             def _mhead(label):
                 return f'<div class="topnav-more-head">{label}</div>'
             _mparts = []
+            # OWNER HERO — the boss's home base, one tap from anywhere
+            _mparts.append(
+                f'<a href="{url_for("dashboard")}" class="haul-more-owner-hero">'
+                f'<div class="haul-more-owner-title">{icon("board")} Owner</div>'
+                f'<div class="haul-more-owner-sub">Yard overview &middot; pulls &middot; revenue &middot; pay week</div>'
+                f'</a>'
+            )
+            # MONEY & OPS — the daily-driver pages missing from the tab bar
+            _mparts.append(_mhead("Money & Ops"))
+            if is_own:
+                _mparts.append(nav_link(url_for("invoice_list"), icon('clipboard') + 'Invoices', path))
+            if is_disp:
+                _mparts.append(nav_link(url_for("bin_tracker"), icon('box') + 'Bin Tracker', path))
+            _mparts.append(nav_link(
+                url_for("boss_notifications_page"),
+                icon('bell') + 'Alerts' + _nav_badge("account-alert-nav-badge", _alert_open),
+                path))
             # TEAM
             _mparts.append(_mhead("Team"))
             _mparts.append(nav_link(url_for("team_hours_page"), icon('clock') + 'Team Hours', path))
@@ -8386,6 +8406,29 @@ body {{
 }}
 .haul-more-items .nav-item:active {{
     background: rgba(255, 107, 26, 0.1);
+}}
+/* 2026-10-17: Owner hero card at the top of the More sheet */
+.haul-more-owner-hero {{
+    display: block; margin: 6px 16px 14px; padding: 18px 20px;
+    border-radius: 16px; text-decoration: none; position: relative; overflow: hidden;
+    background: linear-gradient(135deg, rgba(255,107,26,0.18), rgba(255,107,26,0.06));
+    border: 1px solid rgba(255,107,26,0.35);
+    box-shadow: 0 0 32px rgba(255,107,26,0.12), inset 0 1px 0 rgba(255,190,120,0.15);
+}}
+.haul-more-owner-hero::before {{
+    content: ""; position: absolute; top: 0; left: -60%; width: 40%; height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255,200,140,0.15), transparent);
+    animation: gauge-shimmer 4s ease-in-out infinite;
+}}
+.haul-more-owner-title {{
+    font-size: 18px; font-weight: 800; color: #FFB35C;
+    display: flex; align-items: center; gap: 10px; margin-bottom: 4px;
+}}
+.haul-more-owner-sub {{
+    font-size: 12px; color: rgba(255,255,255,0.6);
+}}
+.haul-more-owner-hero:active {{
+    background: linear-gradient(135deg, rgba(255,107,26,0.25), rgba(255,107,26,0.10));
 }}
 .haul-more-logout {{
     width: 100%;
@@ -31335,27 +31378,50 @@ def team_hours_page():
     rows_html = ""
     for d, summ in driver_rows:
         miss = summ["missing_days"]
-        warn = ''
-        if miss:
-            warn = ('<span style="margin-left:8px;padding:2px 8px;border-radius:999px;'
-                    'background:var(--red-dim);color:var(--red);font-size:11px;'
-                    'font-weight:700;white-space:nowrap;">&#9888; %d</span>' % miss)
+        # 2026-10-17: match the Driver Pay Week card style — 7-day strip,
+        # live pulse, missing clock-out flags.
+        _day_cells = ""
+        for _day in summ["days"]:
+            _h = _day["hours"]
+            _pct = min(100, int((_h / 12.0) * 100)) if _h else 0
+            if _day["live"]:
+                _bar_bg = "linear-gradient(180deg,#7CFC90,#2E9E5B)"
+                _cls = "is-live"
+            elif _day["missing_out"]:
+                _bar_bg = "rgba(255,82,82,0.55)"
+                _cls = "is-missing"
+            elif _h:
+                _bar_bg = "linear-gradient(180deg,#FF9A3C,#FF6B1A)"
+                _cls = ""
+            else:
+                _bar_bg = "rgba(255,255,255,0.08)"
+                _cls = "is-empty"
+            _title = (f"{_day['weekday']} {_day['date']}: {_h:.1f}h" if _h is not None
+                      else f"{_day['weekday']} {_day['date']}: no clock-out" if _day["missing_out"]
+                      else f"{_day['weekday']} {_day['date']}: off")
+            _day_cells += (
+                f'<div class="pay-day {_cls}" title="{e(_title)}">'
+                f'<div class="pay-day-bar" style="height:{max(4,_pct)}%;background:{_bar_bg};"></div>'
+                f'<div class="pay-day-lbl">{_day["weekday"][0]}</div></div>'
+            )
+        _dname = (d.get("full_name") or d["username"] or "Driver").strip()
+        _live_tag = (' <span class="pay-live">● ON CLOCK</span>' if summ["has_live"] else '')
+        _miss_tag = (f' <span class="pay-miss">⚠ {miss} missing</span>' if miss else '')
         href = "%s?w=%d&driver_id=%d" % (url_for("team_hours_page"), w, d["id"])
-        rows_html += (
-            '<a href="' + href + '" '
-            'style="display:flex;align-items:center;gap:12px;min-height:56px;'
-            'padding:12px 14px;text-decoration:none;color:var(--text);'
-            'border-top:1px solid rgba(255,255,255,0.05);">'
-            + avatar_html(d, 34) +
-            '<div style="flex:1;font-weight:700;font-size:15px;">'
-            + e(d["username"]) + warn + '</div>'
-            '<div style="flex:none;text-align:right;">'
-            '<span style="font-family:var(--font-head);font-size:24px;line-height:1;'
-            'color:var(--orange);">' + ("%.1f" % summ["total"]) + '</span>'
-            '<span style="color:var(--text-dim);font-size:12px;"> hrs</span></div>'
-            '<div style="flex:none;color:var(--text-faint);font-size:20px;">&#8250;</div>'
-            '</a>'
-        )
+        rows_html += f"""
+        <a href="{href}" class="pay-driver" style="display:block;text-decoration:none;color:inherit;">
+            <div class="pay-driver-head">
+                <div class="pay-avatar">{e(_dname[0].upper() if _dname else '?')}</div>
+                <div class="pay-driver-meta">
+                    <div class="pay-driver-name">{e(_dname)}{_live_tag}{_miss_tag}</div>
+                    <div class="pay-driver-sub">tap for daily breakdown ›</div>
+                </div>
+                <div class="pay-total">
+                    <div class="pay-total-num">{summ["total"]:.1f}<span>h</span></div>
+                </div>
+            </div>
+            <div class="pay-week-strip">{_day_cells}</div>
+        </a>"""
 
     warn_banner = ""
     if missing_all:
@@ -31369,36 +31435,33 @@ def team_hours_page():
         )
 
     body = (
-        '<div class="hero"><h1>&#128337; Team Hours</h1>'
-        '<p>Weekly totals &mdash; tap a driver for their daily breakdown</p></div>'
+        _cmd_header("Team Hours", week_lbl)
         + warn_banner +
-        '<div class="card" style="max-width:460px;margin:0 auto;padding:0;overflow:hidden;">'
-        # header: week label + arrows
-        '<div style="display:flex;align-items:center;justify-content:space-between;'
-        'gap:10px;padding:14px 14px 12px;">'
+        '<div style="max-width:640px;margin:0 auto;">'
+        # week nav: label + arrows
+        '<div class="card" style="display:flex;align-items:center;justify-content:space-between;'
+        'gap:10px;margin-bottom:14px;">'
         '<div><div style="font-size:12px;font-weight:800;letter-spacing:.10em;'
-        'text-transform:uppercase;color:var(--orange);">This Week</div>'
+        'text-transform:uppercase;color:var(--orange);">Pay Week</div>'
         '<div style="font-size:13px;color:var(--text-dim);margin-top:2px;">'
         + week_lbl + '</div></div>'
         '<div style="display:flex;gap:8px;">' + prev_arrow + next_arrow + '</div>'
         '</div>'
         + rows_html +
         # team total footer
-        '<div style="display:flex;align-items:baseline;justify-content:space-between;'
-        'padding:14px;border-top:2px solid var(--orange-border);">'
+        '<div class="pay-driver" style="display:flex;align-items:baseline;justify-content:space-between;">'
         '<div style="font-size:13px;font-weight:800;letter-spacing:.08em;'
         'text-transform:uppercase;color:var(--text-dim);">Team Total</div>'
-        '<div style="font-family:var(--font-head);font-size:30px;line-height:1;'
-        'color:var(--orange);">' + ("%.1f" % round(total_all, 1)) +
-        '<span style="font-size:15px;color:var(--text-dim);"> HRS</span></div>'
+        '<div class="pay-total-num">' + ("%.1f" % round(total_all, 1)) +
+        '<span> HRS</span></div>'
         '</div>'
         '</div>'
 
         # ── Export CSV (this week's breakdown, payroll-ready) ────────────
-        '<div style="max-width:460px;margin:14px auto 0;">'
+        '<div style="max-width:640px;margin:14px auto 0;">'
         '<a href="' + url_for("team_hours_export") + ('?w=%d' % w) + '" '
         'style="display:flex;align-items:center;justify-content:center;gap:8px;'
-        'min-height:48px;border-radius:10px;text-decoration:none;font-weight:700;'
+        'min-height:52px;border-radius:12px;text-decoration:none;font-weight:700;'
         'font-size:14px;border:1px solid var(--orange-border);'
         'background:var(--orange-dim);color:var(--orange);">'
         '&#8681;&nbsp;Export CSV</a></div>'
@@ -41392,7 +41455,7 @@ def garbage_dispatch_view():
   @keyframes ambient-rise { 0% { transform: translateY(0); opacity: 0; }
     12% { opacity: .8; } 80% { opacity: .25; } 100% { transform: translateY(-105vh); opacity: 0; } }
   /* Lift page content above the ambient background */
-  body > :not(.ambient-bg):not(nav):not(svg):not(script) { position: relative; z-index: 1; }
+  body > :not(.ambient-bg):not(nav):not(svg):not(script):not(.haul-more-sheet):not(.bottom-bar):not(.haul-ptr):not(.haul-tabbar) { position: relative; z-index: 1; }
 
   .toast { position: fixed; left: 50%; bottom: 190px; transform: translateX(-50%);
     background: var(--bg-2); border: 1px solid var(--green); color: var(--green);
