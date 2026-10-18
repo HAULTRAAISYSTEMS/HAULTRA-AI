@@ -10983,7 +10983,7 @@ def dashboard():
             if _r["status"] in ("open", "in_progress"):
                 _active_n += 1
             _stops = conn.execute("""
-                SELECT stop_order, action, customer_name, address, city, status
+                SELECT id, stop_order, action, customer_name, address, city, status
                 FROM stops WHERE route_id=? AND cancelled_at IS NULL
                 ORDER BY stop_order, id
             """, (_r["id"],)).fetchall()
@@ -11017,7 +11017,9 @@ def dashboard():
                 _where = (_s["address"] or "").strip()
                 _sub = (" — " + _where) if _where and _where != _who else ""
                 _act = (_s["action"] or "").strip().upper()
-                # 2026-10-17: cancel button on upcoming stops (not done, not current)
+                # 2026-10-17: cancel button on every open stop (not done). The
+                # current stop is included on purpose — the mid-day "boss
+                # texted: cancel this one, go do another" flow.
                 _cancel_btn = ""
                 _row_cls = "drv-stop"
                 if not _s_done and _cur_marked:
@@ -12024,12 +12026,29 @@ def boss_notifications_page():
     show = (request.args.get("show") or "open").strip().lower()
     if show not in ("open", "all"):
         show = "open"
+    # 2026-10-17: paginate the Everything view — after a few months this
+    # list gets long. 50 per page, newest first.
+    try:
+        page = max(1, int(request.args.get("page") or 1))
+    except (TypeError, ValueError):
+        page = 1
+    per_page = 50
 
     conn = get_db()
     where = "a.company_id=?"
     params = [cid()]
     if show == "open":
         where += " AND a.resolved_at IS NULL"
+    # Count for pagination (only needed on "all")
+    total_pages = 1
+    if show == "all":
+        _cnt = conn.execute(
+            f"SELECT COUNT(*) n FROM alerts a WHERE {where}", params
+        ).fetchone()["n"]
+        total_pages = max(1, (_cnt + per_page - 1) // per_page)
+        page = min(page, total_pages)
+    _offset = (page - 1) * per_page
+    _limit = per_page if show == "all" else 200
     rows = conn.execute(
         f"""SELECT a.*, COALESCE(NULLIF(TRIM(u.full_name),''), u.username) AS actor_name
               FROM alerts a
@@ -12038,7 +12057,7 @@ def boss_notifications_page():
              ORDER BY (a.resolved_at IS NULL) DESC,
                       CASE a.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
                       a.created_at DESC, a.id DESC
-             LIMIT 200""",
+             LIMIT {_limit} OFFSET {_offset}""",
         params,
     ).fetchall()
     open_n = alert_open_count(conn, cid())
@@ -12235,8 +12254,18 @@ def boss_notifications_page():
             Needs you{f' &middot; {open_n}' if open_n else ''}</a>
         <a class="alert-filter{' on' if show == 'all' else ''}" href="{url_for('boss_notifications_page', show='all')}">
             Everything</a>
+        {f'''<form method="POST" action="{url_for('alerts_resolve_all')}" style="margin:0;margin-left:auto;"
+              onsubmit="return confirm('Mark all {open_n} open alerts as handled?');">
+            <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+            <button type="submit" class="alert-filter" style="cursor:pointer;">&#10003; Mark all handled</button>
+        </form>''' if open_n and show == 'open' else ''}
     </div>
     {cards or _empty}
+    {f'''<div class="alert-filters" style="justify-content:center;margin-top:16px;">
+        {f'<a class="alert-filter" href="{url_for("boss_notifications_page", show="all", page=page-1)}">&larr; Newer</a>' if page > 1 else ''}
+        <span class="alert-filter on" style="cursor:default;">Page {page} of {total_pages}</span>
+        {f'<a class="alert-filter" href="{url_for("boss_notifications_page", show="all", page=page+1)}">Older &rarr;</a>' if page < total_pages else ''}
+    </div>''' if show == 'all' and total_pages > 1 else ''}
     """
     return render_template_string(shell_page("Alerts", body))
 
@@ -12252,6 +12281,21 @@ def alert_resolve(alert_id):
     conn.commit()
     conn.close()
     return redirect(request.referrer or url_for("boss_notifications_page"))
+
+
+@app.route("/alerts/resolve-all", methods=["POST"])
+@boss_required
+def alerts_resolve_all():
+    """Mark every open alert as handled (2026-10-17). One tap for the
+    Monday-morning inbox clear — the boss has seen them all."""
+    conn = get_db()
+    conn.execute(
+        "UPDATE alerts SET resolved_at=?, resolved_by=? WHERE company_id=? AND resolved_at IS NULL",
+        (now_ts(), session["user_id"], cid()),
+    )
+    conn.commit()
+    conn.close()
+    return redirect(url_for("boss_notifications_page"))
 
 
 @app.route("/alert/<int:alert_id>/open")
@@ -20885,21 +20929,35 @@ def route_messages(route_id):
         conn.close()
         return jsonify({"success": True, "id": msg_id})
 
-    # GET — mark the other party's messages read, then return the full thread.
+    # GET — mark the other party's messages read, then return the thread.
+    # 2026-10-17: paginate — after months of back-and-forth a thread gets
+    # long. Default to the latest 100; ?before=<id> loads the 100 before it.
     conn.execute(
         "UPDATE messages SET read_at=? WHERE route_id=? AND sender_user_id != ? AND read_at IS NULL",
         (now_ts(), route_id, session["user_id"])
     )
     conn.commit()
 
-    rows = conn.execute("""
+    try:
+        _before = int(request.args.get("before") or 0)
+    except (TypeError, ValueError):
+        _before = 0
+    _where = "m.route_id=?"
+    _params = [route_id]
+    if _before:
+        _where += " AND m.id < ?"
+        _params.append(_before)
+    rows = conn.execute(f"""
         SELECT m.id, m.sender_user_id, u.username AS sender_username, u.role AS sender_role,
                u.full_name AS sender_full_name, u.avatar_path AS sender_avatar,
                m.body, m.created_at
         FROM messages m JOIN users u ON u.id = m.sender_user_id
-        WHERE m.route_id=?
-        ORDER BY m.id ASC
-    """, (route_id,)).fetchall()
+        WHERE {_where}
+        ORDER BY m.id DESC LIMIT 101
+    """, _params).fetchall()
+    rows = rows[::-1]  # back to chronological
+    has_more = len(rows) > 100
+    rows = rows[-100:]
     typers = _thread_typers(conn, "route:%d" % route_id, session["user_id"])
     conn.close()
 
@@ -20915,7 +20973,7 @@ def route_messages(route_id):
             "sender_color": _avatar_color(r["sender_user_id"]),
         }
         for r in rows
-    ], "typing": typers})
+    ], "typing": typers, "has_more": has_more})
 
 
 @app.route("/dm/<int:driver_id>/messages", methods=["GET", "POST"])
@@ -21035,6 +21093,9 @@ def direct_messages_api(driver_id):
         (now_ts(), me, driver_id, company),
     )
     conn.commit()
+    # 2026-10-17: cap the merged thread at the latest 200 — after months of
+    # daily back-and-forth this keeps the thread snappy. The thread list
+    # stays one row per driver, so this is the only growth point.
     rows = conn.execute("""
         SELECT x.body, x.created_at, x.sender_user_id, x.route_name, x.route_date,
                u.username AS sender_username, u.role AS sender_role,
@@ -21049,8 +21110,9 @@ def direct_messages_api(driver_id):
             SELECT d.body, d.created_at, d.sender_user_id, NULL, NULL
             FROM direct_messages d WHERE d.driver_user_id=?
         ) x JOIN users u ON u.id = x.sender_user_id
-        ORDER BY x.created_at ASC
+        ORDER BY x.created_at DESC LIMIT 200
     """, (driver_id, company, driver_id)).fetchall()
+    rows = rows[::-1]  # back to chronological
     typers = _thread_typers(conn, "dm:%d" % driver_id, me)
     conn.close()
     return jsonify({"messages": [
@@ -21066,7 +21128,7 @@ def direct_messages_api(driver_id):
             "sender_color": _avatar_color(r["sender_user_id"]),
         }
         for i, r in enumerate(rows)
-    ], "typing": typers})
+    ], "typing": typers, "has_more": False})
 
 
 # --- Typing indicators -------------------------------------------------------
