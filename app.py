@@ -7335,6 +7335,31 @@ def shell_page(title, body, extra_head=""):
             sheet.classList.remove('open');
             document.body.style.overflow = '';
         }}
+        // 2026-10-17: swipe down on the panel to dismiss the More sheet
+        (function() {{
+            var sheet = document.getElementById('haul-more-sheet');
+            var panel = sheet ? sheet.querySelector('.haul-more-panel') : null;
+            if (!panel) return;
+            var startY = 0, curY = 0, dragging = false;
+            panel.addEventListener('touchstart', function(e) {{
+                startY = e.touches[0].clientY;
+                dragging = true;
+                panel.style.transition = 'none';
+            }}, {{passive: true}});
+            panel.addEventListener('touchmove', function(e) {{
+                if (!dragging) return;
+                curY = e.touches[0].clientY - startY;
+                if (curY > 0) panel.style.transform = 'translateY(' + curY + 'px)';
+            }}, {{passive: true}});
+            panel.addEventListener('touchend', function() {{
+                if (!dragging) return;
+                dragging = false;
+                panel.style.transition = 'transform .25s ease';
+                if (curY > 90) {{ closeMoreSheet(); }}
+                else {{ panel.style.transform = ''; }}
+                curY = 0;
+            }});
+        }})();
         // 2026-10-13: Pull-to-refresh with HAULTRA logo
         // 2026-10-13: Disabled when More sheet is open (no gesture conflict)
         (function() {{
@@ -41525,6 +41550,19 @@ def garbage_dispatch_view():
     padding-bottom: env(safe-area-inset-bottom, 0px); max-height: 70vh; overflow-y: auto; }
   .haul-more-handle { width: 40px; height: 4px; background: rgba(255,255,255,.2); border-radius: 2px; margin: 12px auto 8px; }
   .haul-more-items .nav-item { display: block; padding: 14px 20px; color: #fff; text-decoration: none; font-size: 16px; border-bottom: 1px solid rgba(255,255,255,.05); }
+  .topnav-more-head {
+    font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase;
+    color: rgba(255,255,255,0.4); padding: 16px 20px 6px;
+  }
+  .haul-more-owner-hero {
+    display: block; margin: 6px 16px 14px; padding: 18px 20px;
+    border-radius: 16px; text-decoration: none; position: relative; overflow: hidden;
+    background: linear-gradient(135deg, rgba(255,107,26,0.18), rgba(255,107,26,0.06));
+    border: 1px solid rgba(255,107,26,0.35);
+    box-shadow: 0 0 32px rgba(255,107,26,0.12), inset 0 1px 0 rgba(255,190,120,0.15);
+  }
+  .haul-more-owner-title { font-size: 18px; font-weight: 800; color: #FFB35C; margin-bottom: 4px; }
+  .haul-more-owner-sub { font-size: 12px; color: rgba(255,255,255,0.6); }
 </style></head><body>
 <div class="ambient-bg" aria-hidden="true">
   <div class="ambient-orb o1"></div>
@@ -41663,13 +41701,28 @@ def garbage_dispatch_view():
 </nav>
 <div class="haul-more-sheet" id="haul-more-sheet">
   <div class="haul-more-backdrop" onclick="closeMoreSheet()"></div>
-  <div class="haul-more-panel">
+  <div class="haul-more-panel" id="haul-more-panel">
     <div class="haul-more-handle"></div>
     <div class="haul-more-items">
+      <a href="/dashboard" class="haul-more-owner-hero">
+        <div class="haul-more-owner-title">Owner</div>
+        <div class="haul-more-owner-sub">Yard overview &middot; pulls &middot; revenue &middot; pay week</div>
+      </a>
+      <div class="topnav-more-head">Money &amp; Ops</div>
       <a class="nav-item" href="/invoices">Invoices</a>
-      <a class="nav-item" href="/bins">Bin Tracker</a>
-      <a class="nav-item" href="/rate-card">Rate Card</a>
-      <a class="nav-item" href="/messages">Messages</a>
+      <a class="nav-item" href="/bin-tracker">Bin Tracker</a>
+      <a class="nav-item" href="/boss/notifications">Alerts</a>
+      <div class="topnav-more-head">Team</div>
+      <a class="nav-item" href="/boss/team-hours">Team Hours</a>
+      <a class="nav-item" href="/team-time-off">Team Time Off</a>
+      <div class="topnav-more-head">Fleet</div>
+      <a class="nav-item" href="/trucks">Trucks</a>
+      <a class="nav-item" href="/vendors">Vendors</a>
+      <a class="nav-item" href="/maintenance">Maintenance</a>
+      <a class="nav-item" href="/team">Team</a>
+      <div class="topnav-more-head">Setup</div>
+      <a class="nav-item" href="/yard-setup">Yard Setup</a>
+      <a class="nav-item" href="/settings">Settings</a>
     </div>
   </div>
 </div>
@@ -41686,8 +41739,40 @@ function toast(msg){
   clearTimeout(t._h);
   t._h = setTimeout(function(){ t.classList.remove('show'); }, 3200);
 }
-function openMoreSheet(){ document.getElementById('haul-more-sheet').classList.add('open'); }
-function closeMoreSheet(){ document.getElementById('haul-more-sheet').classList.remove('open'); }
+function openMoreSheet(){
+  document.getElementById('haul-more-sheet').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+function closeMoreSheet(){
+  var sheet = document.getElementById('haul-more-sheet');
+  var panel = document.getElementById('haul-more-panel');
+  if (panel) { panel.style.transform = ''; panel.style.transition = ''; }
+  sheet.classList.remove('open');
+  document.body.style.overflow = '';
+}
+// Swipe down on the panel to dismiss
+(function() {
+  var panel = document.getElementById('haul-more-panel');
+  if (!panel) return;
+  var startY = 0, curY = 0, dragging = false;
+  panel.addEventListener('touchstart', function(e) {
+    startY = e.touches[0].clientY;
+    dragging = true;
+    panel.style.transition = 'none';
+  }, {passive: true});
+  panel.addEventListener('touchmove', function(e) {
+    if (!dragging) return;
+    curY = e.touches[0].clientY - startY;
+    if (curY > 0) panel.style.transform = 'translateY(' + curY + 'px)';
+  }, {passive: true});
+  panel.addEventListener('touchend', function() {
+    if (!dragging) return;
+    dragging = false;
+    panel.style.transition = 'transform .25s ease';
+    if (curY > 90) { closeMoreSheet(); } else { panel.style.transform = ''; }
+    curY = 0;
+  });
+})();
 
 function parseLine(line){
   var m = line.match(/^(toter|hpu|landfill)\s+(.+)$/i);
