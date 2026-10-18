@@ -15846,18 +15846,27 @@ def routes_page():
     _day_nav = f"""
     <style>
     /* 2026-10-16: board day switcher — flip between today/tomorrow/any day */
-    .board-day-nav {{ display:flex; align-items:center; gap:6px; margin-top:10px; }}
-    .board-day-arrow {{
-        flex:none; width:44px; height:44px; display:inline-flex; align-items:center; justify-content:center;
-        font-size:1.6rem; font-weight:800; color:#FF8C42; text-decoration:none;
-        border:1px solid rgba(255,107,26,.35); border-radius:12px; background:rgba(255,107,26,.08);
+    /* 2026-10-17: compact centered capsule — no full-width stretch on desktop */
+    .board-day-nav {{
+        display:flex; align-items:center; justify-content:center; gap:8px;
+        margin-top:14px;
     }}
-    .board-day-arrow:active {{ background:rgba(255,107,26,.2); }}
+    .board-day-arrow {{
+        flex:none; width:48px; height:48px; display:inline-flex; align-items:center; justify-content:center;
+        font-size:1.6rem; font-weight:800; color:#FF8C42; text-decoration:none;
+        border:1px solid rgba(255,107,26,.35); border-radius:14px; background:rgba(255,107,26,.08);
+        box-shadow: 0 0 16px rgba(255,107,26,0.08);
+        transition: background .15s, box-shadow .15s;
+    }}
+    .board-day-arrow:hover {{ background:rgba(255,107,26,.16); box-shadow: 0 0 24px rgba(255,107,26,0.18); }}
+    .board-day-arrow:active {{ background:rgba(255,107,26,.22); transform:scale(.96); }}
     .board-day-label {{
-        position:relative; flex:1; text-align:center; cursor:pointer;
+        position:relative; text-align:center; cursor:pointer;
         font-size:.95rem; font-weight:800; letter-spacing:.6px; color:#fff;
-        border:1px solid rgba(255,255,255,.12); border-radius:12px; background:rgba(255,255,255,.04);
-        padding:12px 10px; min-height:44px; display:flex; align-items:center; justify-content:center;
+        border:1px solid rgba(255,255,255,.12); border-radius:14px; background:rgba(255,255,255,.04);
+        padding:13px 28px; min-height:48px; display:inline-flex; align-items:center; justify-content:center;
+        min-width: 240px;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,0.06);
     }}
     .board-day-label input[type=date] {{
         position:absolute; inset:0; width:100%; height:100%; opacity:0; cursor:pointer;
