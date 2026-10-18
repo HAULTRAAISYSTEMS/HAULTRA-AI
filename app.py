@@ -8193,8 +8193,9 @@ a:hover {{ color: #FF9D5C; }}
 .haul-ptr-logo img {{
     width: 100%;
     height: 100%;
-    object-fit: contain;
+    object-fit: cover;
     display: block;
+    border-radius: 50%;
     /* Blend mode makes the black JPG background transparent */
     mix-blend-mode: screen;
     filter: drop-shadow(0 0 12px rgba(255, 107, 26, 0.6));
@@ -41374,7 +41375,8 @@ def garbage_dispatch_view():
   }
   .haul-ptr.loading .haul-ptr-logo::before, .haul-ptr.pulling .haul-ptr-logo::before { opacity: 1; }
   .haul-ptr-logo img {
-    width: 100%; height: 100%; object-fit: contain; display: block;
+    width: 100%; height: 100%; object-fit: cover; display: block;
+    border-radius: 50%;
     mix-blend-mode: screen; filter: drop-shadow(0 0 12px rgba(255,107,26,.6));
   }
   @keyframes haul-ring-spin { to { transform: rotate(360deg); } }
