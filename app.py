@@ -37990,6 +37990,7 @@ def maintenance_page():
                 <select id="sd-dispatch-{d['item_id']}" style="width:100%;margin-bottom:10px;min-height:48px;"
                         onchange="onDispatchChange({d['item_id']})">
                     <option value="none">Just log it &mdash; no dispatch</option>
+                    <option value="vendor_first">GO TO VENDOR</option>
                     <option value="now">Go NOW &mdash; skip remaining stops</option>
                     <option value="after_current">After current stop</option>
                     <option value="after_n">After N more stops&hellip;</option>
@@ -38379,7 +38380,7 @@ def _dispatch_driver_to_vendor(conn, defect_row, vendor_id, dispatch, dispatch_n
 
     dispatch: 'now' | 'after_current' | 'after_n' | 'none'
     """
-    if dispatch not in ("now", "after_current", "after_n"):
+    if dispatch not in ("now", "vendor_first", "after_current", "after_n"):
         return {"dispatched": False}
 
     # A dispatch with no vendor would create a nameless "the vendor" stop with no
@@ -38415,7 +38416,11 @@ def _dispatch_driver_to_vendor(conn, defect_row, vendor_id, dispatch, dispatch_n
     truck = defect_row["truck_name"] or "the truck"
     label = defect_row["label"] or "defect"
 
-    if dispatch == "now":
+    if dispatch == "vendor_first":
+        # 2026-10-20: explicit "GO TO VENDOR" — vendor is the driver's next
+        # move, full stop. Works with or without an existing route.
+        timing, after_idx = "GO TO VENDOR", 0
+    elif dispatch == "now":
         timing = "Go NOW — first, before your route" if created_route else "Go NOW — skip remaining stops"
         after_idx = 0
     elif dispatch == "after_current":
@@ -38437,11 +38442,12 @@ def _dispatch_driver_to_vendor(conn, defect_row, vendor_id, dispatch, dispatch_n
     stop_id = _insert_vendor_stop(
         conn, route_id, after_idx, vname, vaddr,
         defect_row["id"], vendor_id, dispatch_note or None)
-    # Go NOW = the truck goes to the shop first: make the vendor stop CURRENT and
-    # park every other incomplete stop (held) so the driver can't work them while
-    # the truck is down. Holds release on Repaired = yes or a manual boss release.
+    # Go NOW / GO TO VENDOR = the truck goes to the shop first: make the vendor
+    # stop CURRENT and park every other incomplete stop (held) so the driver
+    # can't work them while the truck is down. Holds release on Repaired = yes
+    # or a manual boss release.
     held_count = 0
-    if dispatch == "now":
+    if dispatch in ("now", "vendor_first"):
         held_count = _reprioritize_for_vendor(conn, route_id, stop_id)
     try:
         compute_can_flow(conn, route_id)
@@ -38991,7 +38997,7 @@ def resolve_defect(item_id):
             dispatch_n = int(src.get("dispatch_n") or 0)
         except (ValueError, TypeError):
             dispatch_n = 0
-        if dispatch in ("now", "after_current", "after_n"):
+        if dispatch in ("now", "vendor_first", "after_current", "after_n"):
             dispatch_result = _dispatch_driver_to_vendor(
                 conn, row, vendor_id, dispatch, dispatch_n, dispatch_note)
     else:
