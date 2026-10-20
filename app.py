@@ -38393,22 +38393,38 @@ def _dispatch_driver_to_vendor(conn, defect_row, vendor_id, dispatch, dispatch_n
         return {"dispatched": False, "warning": "No driver is linked to this defect."}
 
     route_id = driver_active_route_id(conn, driver_id)
+    created_route = False
     if not route_id:
-        return {"dispatched": False,
-                "warning": "Driver has no active route right now — vendor marked sent, "
-                           "but no dispatch was sent. Assign a route, then re-send."}
+        # 2026-10-20: No route yet — the boss wants the driver at the vendor
+        # FIRST, before any work is dispatched. Create today's route with the
+        # vendor stop as stop #1; the normal /api/dispatch flow appends later
+        # work to this same open route, so the day reads vendor → work.
+        _drv = conn.execute(
+            "SELECT username FROM users WHERE id=?", (driver_id,)).fetchone()
+        _uname = (_drv["username"] if _drv else "driver")
+        _today = today_str()
+        _cur = conn.execute(
+            """INSERT INTO routes (route_date, route_name, raw_text, assigned_to, created_by,
+                                   status, notes, company_id, route_type, created_at)
+               VALUES (?, ?, '', ?, ?, 'open', '', ?, 'rolloff', ?)""",
+            (_today, f"{_uname} — {_today}", driver_id, session["user_id"], cid(), now_ts()))
+        route_id = _cur.lastrowid
+        created_route = True
 
     vname = _vendor_map(conn).get(vendor_id, "the vendor")
     truck = defect_row["truck_name"] or "the truck"
     label = defect_row["label"] or "defect"
 
     if dispatch == "now":
-        timing, after_idx = "Go NOW — skip remaining stops", 0
+        timing = "Go NOW — first, before your route" if created_route else "Go NOW — skip remaining stops"
+        after_idx = 0
     elif dispatch == "after_current":
-        timing, after_idx = "After your current stop", 0
+        timing, after_idx = "After your current stop" if not created_route else "Go NOW — first, before your route", 0
     else:  # after_n
         n = max(1, min(int(dispatch_n or 1), 20))
-        timing, after_idx = ("After %d more stop%s" % (n, "" if n == 1 else "s")), n
+        timing, after_idx = (("Go NOW — first, before your route" if created_route
+                              else "After %d more stop%s" % (n, "" if n == 1 else "s")),
+                             0 if created_route else n)
 
     # Mid-route vendor stop (Go NOW / After N both insert into the route; the
     # boss can reorder with the existing tools). The stop's address is the
@@ -38454,7 +38470,7 @@ def _dispatch_driver_to_vendor(conn, defect_row, vendor_id, dispatch, dispatch_n
                  (defect_row["id"],))
     _recompute_truck_at_vendor(conn, defect_row["truck_id"])
     return {"dispatched": True, "route_id": route_id, "stop_id": stop_id,
-            "timing": timing, "held": held_count}
+            "timing": timing, "held": held_count, "created_route": created_route}
 
 
 # ── Driver-initiated truck breakdown (feat/driver-breakdown) ──────────────────
