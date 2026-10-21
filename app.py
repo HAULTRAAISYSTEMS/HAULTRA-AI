@@ -2645,6 +2645,24 @@ def company_week_start_for(company_settings, d):
     return d - timedelta(days=(d.weekday() - start_wd) % 7)
 
 
+def _wall_clock_in_ms(wall_ts, tz_name):
+    """Convert a company-local wall timestamp 'YYYY-MM-DD HH:MM:SS' to epoch ms.
+
+    2026-10-21: iOS Safari/WKWebView parses timezone-naive ISO datetimes
+    ("2026-10-21T06:30:00") as UTC instead of local time, which inflated the
+    client-side live-hours tick by the UTC offset (4h for EDT — dashboard
+    showed 32.8 instead of 28.8). Epoch milliseconds are unambiguous on every
+    browser, so the live tick embeds this instead of (alongside) the string.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        dt = datetime.strptime(wall_ts[:19], "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=ZoneInfo((tz_name or "America/New_York").strip()))
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return 0
+
+
 def get_driver_week_summary(conn, driver_id, week_start, company_settings, now_local=None):
     """
     Build a 7-day hours summary for one driver and one week.
@@ -2746,7 +2764,7 @@ def _fmt_hours_1(h):
     return ("%.1f" % h) if h is not None else "&mdash;"
 
 
-def render_week_hours_card(summary, nav_base_url, w, extra_qs="", heading="This Week", off_dates=None):
+def render_week_hours_card(summary, nav_base_url, w, extra_qs="", heading="This Week", off_dates=None, tz_name=None):
     """
     Render the shared weekly-hours card (one row per Mon→Sun day + big total,
     with ‹ › week arrows). Used verbatim by the driver clock page and the boss
@@ -2758,6 +2776,7 @@ def render_week_hours_card(summary, nav_base_url, w, extra_qs="", heading="This 
     extra_qs     : extra query-string fragment to preserve on nav (e.g.
                    'driver_id=5&'), already ending in '&' if non-empty.
     heading      : card heading text.
+    tz_name      : IANA timezone for the live-tick epoch (2026-10-21 fix).
     """
     week_start = summary["week_start"]
     week_end   = week_start + timedelta(days=6)
@@ -2808,9 +2827,13 @@ def render_week_hours_card(summary, nav_base_url, w, extra_qs="", heading="This 
                 # phone's clock (data-clock-in), not the server's "now".
                 # The phone's timezone is always right; the server's may not
                 # be (see tzdata saga). Server value is the no-JS fallback.
+                # 2026-10-21: also embed data-clock-in-ms (epoch ms) — iOS
+                # parses timezone-naive ISO strings as UTC, inflating live
+                # hours by the UTC offset. The tick JS prefers the ms value.
                 _ci_iso = (day["start"][:19].replace(" ", "T") if day["start"] else "")
-                hrs_cell = ('<span data-live-hours data-clock-in="%s" style="color:var(--green);font-weight:800;">'
-                            '%.1f</span>' % (e(_ci_iso), day["hours"]))
+                _ci_ms = _wall_clock_in_ms(day["start"], tz_name) if day["start"] else 0
+                hrs_cell = ('<span data-live-hours data-clock-in="%s" data-clock-in-ms="%d" style="color:var(--green);font-weight:800;">'
+                            '%.1f</span>' % (e(_ci_iso), _ci_ms, day["hours"]))
                 detail += ' <span style="color:var(--green);font-weight:700;">&#9679; live</span>'
             else:
                 hrs_cell = '<span style="font-weight:800;">%.1f</span>' % day["hours"]
@@ -2879,19 +2902,28 @@ _WEEK_LIVE_TICK_JS = """
 <script>
 (function(){
   // 2026-10-14: live hours are computed from the PHONE's clock, not the
-  // server's. The server embeds the clock-in time (company-local wall time,
-  // e.g. "2026-10-14T06:30:00"); the phone interprets it in its own local
-  // timezone — which matches, because the driver is where the company is.
-  // This is immune to server timezone misconfiguration.
+  // server's. The server embeds the clock-in time; the phone adds the
+  // elapsed time to the server-rendered base total.
+  // 2026-10-21: prefer data-clock-in-ms (epoch ms, unambiguous). The old
+  // data-clock-in wall-time string is kept as a fallback — but iOS parses
+  // timezone-naive ISO datetimes as UTC, which inflated live hours by the
+  // UTC offset, so the ms value is authoritative when present.
   var liveEl  = document.querySelector('[data-live-hours]');
   var totalEl = document.querySelector('[data-live-total]');
   if(!liveEl && !totalEl) return;
   var clockInMs = 0;
   if (liveEl) {
-    var ci = liveEl.getAttribute('data-clock-in');
-    if (ci) {
-      var t = new Date(ci).getTime();
-      if (!isNaN(t)) clockInMs = t;
+    var ciMs = liveEl.getAttribute('data-clock-in-ms');
+    if (ciMs) {
+      var tm = parseInt(ciMs, 10);
+      if (!isNaN(tm) && tm > 0) clockInMs = tm;
+    }
+    if (!clockInMs) {
+      var ci = liveEl.getAttribute('data-clock-in');
+      if (ci) {
+        var t = new Date(ci).getTime();
+        if (!isNaN(t)) clockInMs = t;
+      }
     }
   }
   // Base total excludes the server's live portion; we add back the
@@ -11106,18 +11138,23 @@ def dashboard():
         _week_hours = _week_summary["total"]
         # 2026-10-14: dashboard live hours also compute client-side from the
         # phone's clock (see _WEEK_LIVE_TICK_JS). Embed clock-in + base total.
+        # 2026-10-21: embed data-clock-in-ms (epoch ms) — iOS parses the
+        # naive wall-time string as UTC, inflating live hours by the offset.
         _dash_live_ci = ""
+        _dash_live_ci_ms = 0
         _dash_live_base = _week_hours
         if _week_summary["has_live"]:
             _dash_live_base = _week_hours - _week_summary["live_hours"]
             for _d in _week_summary["days"]:
                 if _d.get("live") and _d.get("start"):
                     _dash_live_ci = _d["start"][:19].replace(" ", "T")
+                    _dash_live_ci_ms = _wall_clock_in_ms(
+                        _d["start"], (_co_s.get("timezone") if _co_s else None))
                     break
         _dash_hours_attrs = ""
         if _dash_live_ci:
-            _dash_hours_attrs = (' data-live-hours data-clock-in="%s" data-live-base="%.4f"'
-                                 % (e(_dash_live_ci), _dash_live_base))
+            _dash_hours_attrs = (' data-live-hours data-clock-in="%s" data-clock-in-ms="%d" data-live-base="%.4f"'
+                                 % (e(_dash_live_ci), _dash_live_ci_ms, _dash_live_base))
         _forgot_all = _driver_open_clock_entries(conn, company_id, user["id"], _clk_today)
         _forgot = [f for f in _forgot_all
                    if _pp_start <= (f["date"] or "") <= _pp_end]
@@ -11380,11 +11417,21 @@ def dashboard():
     <script>
     // 2026-10-14: dashboard hours tick from the phone's clock (same logic as
     // _WEEK_LIVE_TICK_JS) — immune to server timezone issues.
+    // 2026-10-21: prefer data-clock-in-ms (epoch ms); iOS misparses the naive
+    // wall-time string as UTC.
     (function(){{
         var el = document.querySelector('.drv-hours .n[data-live-hours]');
         if (!el) return;
-        var ci = el.getAttribute('data-clock-in');
-        var t = ci ? new Date(ci).getTime() : NaN;
+        var t = NaN;
+        var ciMs = el.getAttribute('data-clock-in-ms');
+        if (ciMs) {{
+            var tm = parseInt(ciMs, 10);
+            if (!isNaN(tm) && tm > 0) t = tm;
+        }}
+        if (isNaN(t)) {{
+            var ci = el.getAttribute('data-clock-in');
+            t = ci ? new Date(ci).getTime() : NaN;
+        }}
         if (isNaN(t)) return;
         var base = parseFloat(el.getAttribute('data-live-base')) || 0;
         function tick(){{
@@ -31506,7 +31553,8 @@ def team_hours_page():
         card = render_week_hours_card(
             summary, url_for("team_hours_page"), w,
             extra_qs="driver_id=%d&" % selected_driver_id,
-            heading=name + " · Hours")
+            heading=name + " · Hours",
+            tz_name=(co_settings.get("timezone") if co_settings else None))
         tick = _WEEK_LIVE_TICK_JS if (summary["has_live"] and w == 0) else ""
         body = (
             '<div class="hero"><h1>&#128100; ' + e(name) + '</h1>'
@@ -33069,7 +33117,8 @@ def driver_clock():
     _week_off = _time_off_for_range(conn, cid(), driver_id, _week_monday, _week_monday + timedelta(days=6))
     _week_off_dates = {k for k, v in _week_off.items() if v.get("status") == "approved"}
     week_card_html = render_week_hours_card(
-        week_summary, url_for("driver_clock"), _w, heading="This Week", off_dates=_week_off_dates)
+        week_summary, url_for("driver_clock"), _w, heading="This Week", off_dates=_week_off_dates,
+        tz_name=(co_settings.get("timezone") if co_settings else None))
     week_tick_js = _WEEK_LIVE_TICK_JS if (week_summary["has_live"] and _w == 0) else ""
 
     # Time Off card (request form + own list + running-late control).
