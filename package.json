@@ -2,7 +2,7 @@
   "name": "haultra-app",
   "version": "1.0.0",
   "private": true,
-  "description": "Capacitor native wrapper (iOS + Android) around the live HAULTRA AI Dispatch web app at https://haultra-systems.com. This is a remote-URL wrapper, not a bundled web build — the app always loads the live site, so web deploys update every installed app instantly with no store resubmission.",
+  "description": "Capacitor native wrapper (iOS + Android) around the live HAULTRA AI Dispatch web app at https://haultra-systems.com. This is a remote-URL wrapper, not a bundled web build \u2014 the app always loads the live site, so web deploys update every installed app instantly with no store resubmission.",
   "engines": {
     "node": ">=22"
   },
@@ -15,7 +15,8 @@
     "@capacitor/app": "^8.0.0",
     "@capacitor/camera": "^8.0.0",
     "@capacitor/core": "^8.0.0",
-    "@capacitor/geolocation": "^8.0.0"
+    "@capacitor/geolocation": "^8.0.0",
+    "@capacitor/push-notifications": "^8.0.0"
   },
   "devDependencies": {
     "@capacitor/assets": "^3.0.0",
