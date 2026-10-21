@@ -21897,9 +21897,11 @@ def _log_box_numbers(stop_id, can_number, can_by_stop, takes_from):
     if can_number:
         box_out = can_number
         _giver = takes_from.get(stop_id)
-        box_in = can_by_stop.get(_giver) if _giver else can_number
-        if not box_in:
-            box_in = can_number
+        if _giver:
+            box_in = can_by_stop.get(_giver) or ""
+        # 2026-10-21: no chain → leave Box In BLANK. The old code duplicated
+        # Box Out into Box In, which is wrong (paper log: Pull has Box In "/").
+        # A swap's Box In (the empty delivered) only comes from a real chain.
     return box_in, box_out
 
 
@@ -25781,14 +25783,17 @@ def route_daily_log(route_id):
     """THE daily log (2026-10-13 unified) — one canonical column set for screen
     and print, matching the paper log. /report redirects here."""
     conn = get_db()
+    # 2026-10-21: self-healing truck_id (stale boss session may predate deploy).
+    _ensure_routes_truck_id(conn)
     route = conn.execute(
         """SELECT r.*, u.username AS driver_name, u.full_name AS driver_full,
                   t.name AS truck_name
            FROM routes r LEFT JOIN users u ON r.assigned_to=u.id
-           LEFT JOIN trucks t ON t.id = (
-               SELECT truck_id FROM inspections
-               WHERE driver_id = r.assigned_to AND company_id = r.company_id
-               ORDER BY id DESC LIMIT 1)
+           LEFT JOIN trucks t ON t.id = COALESCE(
+               r.truck_id,
+               (SELECT truck_id FROM inspections
+                WHERE driver_id = r.assigned_to AND company_id = r.company_id
+                ORDER BY id DESC LIMIT 1))
            WHERE r.id=? AND r.company_id=?""",
         (route_id, cid())
     ).fetchone()
@@ -25864,7 +25869,7 @@ def route_daily_log(route_id):
             <td class="col-addr">{e(s['address'] or '')}</td>
             <td>{e(_city_for_log(s))}</td>
             <td class="col-center">{e(str(s['container_size']) + ' yd') if s['container_size'] else ''}</td>
-            <td class="col-time">{_log_fmt_time(route['started_at'])}</td>
+            <td class="col-time">{_log_fmt_time(s['arrived_at'] or route['started_at'])}</td>
             <td class="col-time">{_log_fmt_time(s['dump_arrival'])}</td>
             <td class="col-time">{_log_fmt_time(s['dump_departure'])}</td>
             <td class="col-time">{_log_fmt_time(s['completed_at'])}</td>
