@@ -4450,6 +4450,10 @@ def init_db():
     # truck move scheduled → en_route → at_vendor. NULL = no vendor badge.
     safe_add_column(conn, "inspection_items", "vendor_status TEXT")
     safe_add_column(conn, "trucks", "vendor_status TEXT")
+    # Truck assignment per route (2026-10-21): the boss assigns a truck at
+    # dispatch; drivers can be moved between trucks day to day (cover for a
+    # missed day). NULL = driver's usual truck (their last inspection truck).
+    safe_add_column(conn, "routes", "truck_id INTEGER")
     # Soft-delete for defects + maintenance events (boss "Delete") and a
     # driver "report mistake" flag on their own defect. Deleted rows are kept
     # (deleted_at + who) but hidden from every view; the DVIR itself is never
@@ -8105,6 +8109,16 @@ a:hover {{ color: #FF9D5C; }}
 .lane-add-tile:active {{
     transform: scale(0.97);
 }}
+/* 2026-10-21: truck bar — the iron the driver is in today (boss-assigned or usual). */
+.cab-truck-bar {{
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    margin: 0 0 12px; padding: 10px 14px; border-radius: 12px;
+    background: rgba(255,107,26,0.10); border: 1px solid rgba(255,107,26,0.35);
+    box-shadow: 0 0 18px rgba(255,107,26,0.10);
+    font-size: 0.92rem; color: #FFD9B8; letter-spacing: .2px;
+}}
+.cab-truck-bar strong {{ color: #fff; }}
+.cab-truck-icon {{ font-size: 1.1rem; }}
 .lane-add-plus {{
     width: 44px;
     height: 44px;
@@ -15361,6 +15375,7 @@ def _build_route_board_html(user, day=None):
     sql = """
         SELECT r.id AS route_id, r.route_name, r.assigned_to,
                COALESCE(r.route_type, 'rolloff') AS route_type,
+               r.truck_id, t.name AS truck_name,
                u.username AS driver_username, u.full_name AS driver_full_name,
                u.avatar_path AS driver_avatar,
                s.id AS stop_id, s.stop_order, s.customer_name, s.address, s.city,
@@ -15374,6 +15389,7 @@ def _build_route_board_html(user, day=None):
                EXISTS(SELECT 1 FROM route_photos rp WHERE rp.stop_id = s.id) AS has_photo
         FROM routes r
         LEFT JOIN users u ON r.assigned_to = u.id
+        LEFT JOIN trucks t ON r.truck_id = t.id
         LEFT JOIN stops s ON s.route_id = r.id
         LEFT JOIN inspection_items ii ON ii.id = s.defect_item_id
         WHERE r.company_id = ? AND r.route_date = ?
@@ -15465,6 +15481,10 @@ def _build_route_board_html(user, day=None):
             "driver_id": row["assigned_to"],
             "driver_full_name": row["driver_full_name"],
             "driver_avatar": row["driver_avatar"],
+            # 2026-10-21: boss-assigned truck per route (first route wins if
+            # a driver has more than one open route today).
+            "truck_id": row["truck_id"],
+            "truck_name": row["truck_name"],
             "route_names": [],
             "route_ids_seen": set(),
             "route_types": set(),
@@ -15474,6 +15494,10 @@ def _build_route_board_html(user, day=None):
             lane["route_ids_seen"].add(row["route_id"])
             lane["route_names"].append(row["route_name"])
             lane["route_types"].add(row["route_type"] or "rolloff")
+            # Keep the first route's truck assignment for the lane header.
+            if lane["truck_id"] is None and row["truck_id"]:
+                lane["truck_id"] = row["truck_id"]
+                lane["truck_name"] = row["truck_name"]
         if row["stop_id"] is not None:
             lane["stops"].append(row)
 
@@ -15748,6 +15772,20 @@ def _build_route_board_html(user, day=None):
                 "id": lane["driver_id"], "full_name": lane.get("driver_full_name"),
                 "username": lane.get("driver_username"), "avatar_path": lane.get("driver_avatar"),
             }, 28)
+        # 2026-10-21: truck chip — shows the boss-assigned truck (or the
+        # driver's usual truck from their last inspection when none assigned).
+        _truck_chip = ""
+        _tname = lane.get("truck_name")
+        if not _tname and lane.get("driver_id"):
+            _utruck = _driver_truck_id(conn, lane["driver_id"])
+            if _utruck:
+                _urow = conn.execute("SELECT name FROM trucks WHERE id=?", (_utruck,)).fetchone()
+                _tname = _urow["name"] if _urow else None
+        if _tname:
+            _truck_chip = (f'<span class="lane-truck-chip" style="display:inline-flex;align-items:center;gap:4px;'
+                           f'margin-left:8px;font-size:10px;font-weight:800;letter-spacing:.4px;padding:3px 9px;'
+                           f'border-radius:999px;background:rgba(255,107,26,0.12);color:#FFB37A;'
+                           f'border:1px solid rgba(255,107,26,0.4);">&#128666; {e(_tname)}</span>')
         _drag_grip = ('<span class="lane-drag-handle" title="Press &amp; hold to reorder">&#x2833;&#x2833;</span>'
                       if user["role"] == "boss" else "")
         lanes_html += f"""
@@ -15758,6 +15796,7 @@ def _build_route_board_html(user, day=None):
                     <span class="lane-status-dot {dot_cls}"></span>
                     {_lane_avatar}
                     <span class="lane-name">{e(display_name)}</span>
+                    {_truck_chip}
                     {timeoff_chip}
                     <!-- 2026-10-13: Icon buttons on the right -->
                     <span class="lane-header-actions">{message_html}{_report_html}</span>
@@ -17485,6 +17524,20 @@ def driver_route_detail(route_id):
             _recompute_truck_at_vendor(conn, _dv["truck_id"])
             conn.commit()
 
+    # 2026-10-21: truck bar — the boss-assigned truck for this route, else the
+    # driver's usual. Computed before conn.close().
+    _truck_bar_html = ""
+    try:
+        _trow = _route_truck(conn, route_id)
+    except Exception:
+        _trow = None
+    if _trow:
+        _truck_bar_html = (
+            '<div class="cab-truck-bar">'
+            '<span class="cab-truck-icon">&#128666;</span>'
+            '<span class="cab-truck-text">You&rsquo;re in <strong>' + e(_trow["name"]) + '</strong> today</span>'
+            '</div>')
+
     conn.close()
 
     # Pinned urgent (vendor-dispatch) banner — shown until the driver taps
@@ -17853,6 +17906,7 @@ def driver_route_detail(route_id):
     {nav_pref_modal_html}
     {urgent_banner_html}
     {_handoff_banner_html}
+    {_truck_bar_html}
     <div class="cab-progress-label">{e(route['route_name'])} &middot; {e(route['route_date'])}</div>
     <div class="cab-progress-track"><div class="cab-progress-fill" style="width:100%;"></div></div>
 
@@ -19138,6 +19192,7 @@ def driver_route_detail(route_id):
       box-shadow:none !important; min-height:64px !important; font-weight:800 !important; font-size:1.12rem !important; }}
   .cab-primary-zone button:disabled, .cab-primary-zone .btn:disabled {{ opacity:.5; }}
   .cab-nav-btn.is-disabled, .cab-copy-btn:disabled {{ opacity:.45; pointer-events:none; }}
+  .cab-truck-icon {{ font-size: 1.1rem; }}
 </style>
 <div class="cab-wrap">
     <!-- 2026-10-10: unified top bar — stop counter, controls, and a quiet End link in one row.
@@ -19174,6 +19229,7 @@ def driver_route_detail(route_id):
     {nav_pref_modal_html}
     {urgent_banner_html}
     {_handoff_banner_html}
+    {_truck_bar_html}
 
     <div id="route-updated-banner" class="route-updated-banner" hidden>
         <span id="route-updated-text"></span>
@@ -21944,6 +22000,29 @@ def view_route(route_id):
 
     route_action_buttons = ""
 
+    # 2026-10-21: boss can change the truck mid-day (swap after a breakdown,
+    # cover for a missed day). Driver gets an urgent message on the route thread.
+    if session.get("role") == "boss":
+        _all_trucks = conn.execute(
+            "SELECT id, name FROM trucks WHERE company_id=? AND is_active=1 ORDER BY LOWER(name), id",
+            (cid(),)).fetchall()
+        _cols = [c["name"] for c in conn.execute("PRAGMA table_info(routes)").fetchall()]
+        _cur_truck_id = route["truck_id"] if "truck_id" in _cols else None
+        _truck_opts = "".join(
+            f'<option value="{t["id"]}"{" selected" if t["id"] == _cur_truck_id else ""}>{e(t["name"])}</option>'
+            for t in _all_trucks)
+        route_action_buttons += f"""
+        <form class="inline" method="POST" action="{url_for('change_route_truck', route_id=route_id)}"
+              style="display:inline-flex;align-items:center;gap:6px;margin-left:6px;">
+            <input type="hidden" name="_csrf_token" value="{_csrf}">
+            <span style="font-size:11px;color:#8C8C82;font-weight:700;">&#128666; TRUCK</span>
+            <select name="truck_id" style="min-height:38px;border-radius:8px;">
+                <option value="">Driver's usual</option>{_truck_opts}
+            </select>
+            <button class="btn secondary" type="submit" style="min-height:38px;">Set</button>
+        </form>
+        """
+
     if route["status"] == "open":
         route_action_buttons += f"""
         <form class="inline" method="POST" action="{url_for('mark_route_in_progress', route_id=route_id)}">
@@ -22539,6 +22618,41 @@ def view_route(route_id):
     """
 
     return render_template_string(shell_page("Route", body, extra_head))
+
+@app.route("/route/<int:route_id>/truck", methods=["POST"])
+@login_required
+def change_route_truck(route_id):
+    """Boss changes the truck assigned to a route mid-day (2026-10-21) — e.g.
+    a swap after a breakdown. Empty value clears back to the driver's usual."""
+    if session.get("role") != "boss":
+        flash("Only the boss can change the truck.", "error")
+        return redirect(url_for("view_route", route_id=route_id))
+    conn = get_db()
+    route = conn.execute("SELECT id, assigned_to FROM routes WHERE id=? AND company_id=?",
+                         (route_id, cid())).fetchone()
+    if not route:
+        conn.close()
+        abort(404)
+    truck_raw = (request.form.get("truck_id") or "").strip()
+    truck_id = None
+    truck_name = "driver's usual truck"
+    if truck_raw.isdigit():
+        trow = conn.execute("SELECT id, name FROM trucks WHERE id=? AND company_id=? AND is_active=1",
+                            (int(truck_raw), cid())).fetchone()
+        if trow:
+            truck_id = int(truck_raw)
+            truck_name = trow["name"]
+    conn.execute("UPDATE routes SET truck_id=? WHERE id=?", (truck_id, route_id))
+    conn.commit()
+    # Let the driver know — same thread they'd watch all day.
+    conn.execute(
+        "INSERT INTO messages (route_id, sender_user_id, body, created_at, priority) VALUES (?,?,?,?,'urgent')",
+        (route_id, session["user_id"], f"🚚 Truck change — you're now in {truck_name}.", now_ts()))
+    conn.commit()
+    conn.close()
+    flash(f"Truck changed to {truck_name}. Driver was notified.", "success")
+    return redirect(url_for("view_route", route_id=route_id))
+
 
 @app.route("/route/<int:route_id>/start", methods=["POST"])
 @login_required
@@ -33900,7 +34014,18 @@ def api_dispatch():
         return jsonify({"error": "Select a driver before dispatching."}), 400
     driver_id = int(driver_id_raw)
 
+    # 2026-10-21: truck assignment at dispatch. Boss picks the truck for the
+    # day (covers for a missed day, truck swaps). Empty = driver's usual truck.
+    truck_id_raw = data.get("truck_id")
+    truck_id = None
     conn = get_db()
+    if truck_id_raw and str(truck_id_raw).isdigit():
+        _trow = conn.execute(
+            "SELECT id FROM trucks WHERE id=? AND company_id=? AND is_active=1",
+            (int(truck_id_raw), cid())).fetchone()
+        if _trow:
+            truck_id = int(truck_id_raw)
+
     driver = conn.execute(
         "SELECT id, username FROM users WHERE id=? AND company_id=? AND role='driver' AND is_active=1",
         (driver_id, cid())
@@ -33925,13 +34050,16 @@ def api_dispatch():
     if existing:
         route_id = existing["id"]
         appended_to_existing = True
+        # Boss can change the truck on a later dispatch to the same route.
+        if truck_id is not None:
+            cur.execute("UPDATE routes SET truck_id=? WHERE id=?", (truck_id, route_id))
     else:
         route_name = f"{driver['username']} — {route_date}"
         cur.execute("""
             INSERT INTO routes (route_date, route_name, raw_text, assigned_to, created_by,
-                                 status, notes, company_id, route_type, created_at)
-            VALUES (?, ?, '', ?, ?, 'open', '', ?, ?, ?)
-        """, (route_date, route_name, driver_id, session["user_id"], cid(), route_type, now_ts()))
+                                 status, notes, company_id, route_type, truck_id, created_at)
+            VALUES (?, ?, '', ?, ?, 'open', '', ?, ?, ?, ?)
+        """, (route_date, route_name, driver_id, session["user_id"], cid(), route_type, truck_id, now_ts()))
         route_id = cur.lastrowid
         appended_to_existing = False
 
@@ -37374,6 +37502,15 @@ def inspection_new():
         (session["user_id"], cid()),
     ).fetchone()
     last_truck_id = last["truck_id"] if last else None
+    # 2026-10-21: if the boss assigned a truck at dispatch, that's today's
+    # truck — prefill it, not the last inspection truck.
+    try:
+        _arid = driver_active_route_id(conn, session["user_id"])
+        _rt = _route_truck(conn, _arid) if _arid else None
+        if _rt:
+            last_truck_id = _rt["id"]
+    except Exception:
+        pass
     items = _active_checklist(conn)
     conn.close()
 
@@ -38497,6 +38634,23 @@ def _driver_truck_id(conn, driver_id):
         (driver_id, cid()),
     ).fetchone()
     return row["truck_id"] if row else None
+
+
+def _route_truck(conn, route_id):
+    """Effective truck for a route: the boss-assigned truck (2026-10-21), else
+    the driver's usual truck (their last inspection truck). Returns the truck
+    row or None."""
+    r = conn.execute("SELECT truck_id, assigned_to FROM routes WHERE id=?", (route_id,)).fetchone()
+    if not r:
+        return None
+    cols = conn.execute("PRAGMA table_info(routes)").fetchall()
+    has_truck_col = any(c["name"] == "truck_id" for c in cols)
+    tid = r["truck_id"] if has_truck_col else None
+    if not tid and r["assigned_to"]:
+        tid = _driver_truck_id(conn, r["assigned_to"])
+    if not tid:
+        return None
+    return conn.execute("SELECT id, name FROM trucks WHERE id=?", (tid,)).fetchone()
 
 
 def _driver_active_breakdown(conn, driver_id):
@@ -41273,6 +41427,12 @@ def garbage_dispatch_view():
         "SELECT id, username, full_name FROM users "
         "WHERE company_id=? AND role='driver' AND is_active=1 ORDER BY username",
         (cid(),)).fetchall()
+    # 2026-10-21: truck picker — same as roll-off dispatch.
+    trucks = conn.execute(
+        "SELECT id, name FROM trucks WHERE company_id=? AND is_active=1 ORDER BY LOWER(name), id",
+        (cid(),)).fetchall()
+    truck_opts = "".join(
+        '<option value="%d">%s</option>' % (t["id"], e(t["name"])) for t in trucks)
     route_id_arg = (request.args.get("route_id") or "").strip()
     append_route_id = None
     append_driver_id = None
@@ -41692,6 +41852,8 @@ def garbage_dispatch_view():
   <div class="assign-row">
     <span class="lbl">Assign to</span>
     <select id="gd-driver" class="driver-select"><option value="">Select a driver&hellip;</option>__OPTS__</select>
+    <span class="lbl" style="margin-left:4px;">Truck</span>
+    <select id="gd-truck" class="driver-select"><option value="">Driver&rsquo;s usual&hellip;</option>__TRUCK_OPTS__</select>
     <span class="dispatch-day-label">__DAY_LABEL__</span>
   </div>
   <div class="dispatch-row">
@@ -41891,8 +42053,10 @@ document.getElementById('gd-dispatch').addEventListener('click', function(){
   if(!c.stops.length){ toast('Add at least one stop.'); return; }
   toast('Dispatching…');
   var url = APPEND_RID ? '/api/route/' + APPEND_RID + '/insert-stops' : '/api/dispatch';
+  var trkEl = document.getElementById('gd-truck');
   var payload = APPEND_RID ? {stops: c.stops}
-    : {route_type:'garbage', driver_id: parseInt(drv,10), route_date: GD_DAY, stops: c.stops};
+    : {route_type:'garbage', driver_id: parseInt(drv,10), route_date: GD_DAY,
+       truck_id: trkEl ? trkEl.value : '', stops: c.stops};
   fetchT(url, {method:'POST', credentials:'same-origin',
     headers:{'Content-Type':'application/json','X-CSRF-Token':GD_CSRF},
     body: JSON.stringify(payload)
@@ -42106,7 +42270,7 @@ function fetchT(url, opts, ms){
 }
 </script></body></html>
 """
-    page = page.replace("__OPTS__", opts).replace("__CSRF__", csrf)
+    page = page.replace("__OPTS__", opts).replace("__TRUCK_OPTS__", truck_opts).replace("__CSRF__", csrf)
     page = page.replace("__DAY__", _dispatch_day).replace("__DAY_LABEL__", _dispatch_label)
     page = page.replace("__CMD_META__", _cmd_meta)
     page = page.replace("__MODE__", e(mode_note) if mode_note else "")
@@ -42211,6 +42375,12 @@ def parser_view():
             "SELECT id, username, full_name FROM users WHERE role='driver' AND company_id=? AND is_active=1 ORDER BY username",
             (cid(),)
         ).fetchall()
+        # 2026-10-21: truck picker — boss assigns the truck for the day
+        # (covers for a missed day, truck swaps). Empty = driver's usual truck.
+        trucks = conn.execute(
+            "SELECT id, name FROM trucks WHERE company_id=? AND is_active=1 ORDER BY LOWER(name), id",
+            (cid(),)
+        ).fetchall()
         conn.close()
         _driver_count = len(drivers)
 
@@ -42219,10 +42389,16 @@ def parser_view():
                 f'<option value="{d["id"]}">{e(d["full_name"] or d["username"])}</option>'
                 for d in drivers
             )
+            truck_opts = "".join(
+                f'<option value="{t["id"]}">{e(t["name"])}</option>' for t in trucks
+            )
             assign_html = (
                 '<label for="driver-select">Assign to</label>'
                 '<select id="driver-select" class="driver-select">'
                 f'<option value="">Select a driver&hellip;</option>{options}</select>'
+                '<label for="truck-select" style="margin-left:4px;">Truck</label>'
+                '<select id="truck-select" class="driver-select">'
+                f'<option value="">Driver&rsquo;s usual&hellip;</option>{truck_opts}</select>'
                 # 2026-10-16: no date picker — the board's day switcher owns the
                 # date. Dispatch inherits ?day= (or today for direct visits).
                 f'<span class="dispatch-day-label">{_dispatch_label}</span>'
