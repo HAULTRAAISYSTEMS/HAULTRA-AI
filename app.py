@@ -8019,17 +8019,25 @@ a:hover {{ color: #FF9D5C; }}
     row-gap: 6px;
 }}
 /* ── 2026-10-13: Lane utility strip — quiet text actions, not pills ── */
+/* 2026-10-21: wraps instead of overflowing the 170px driver column into the
+   stops track (iPad landscape). Top divider makes the wrap look deliberate. */
 .lane-util {{
     display: flex;
     align-items: center;
-    margin-top: 7px;
+    flex-wrap: wrap;
+    margin-top: 9px;
+    padding-top: 6px;
+    border-top: 1px solid rgba(255,255,255,0.07);
+    row-gap: 1px;
+    max-width: 100%;
+    overflow: hidden;
 }}
 .lane-util-link {{
     background: none;
     border: none;
-    padding: 9px 11px;
+    padding: 7px 8px;
     color: #FF8C42;
-    font-size: 13.5px;
+    font-size: 13px;
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
@@ -8037,6 +8045,10 @@ a:hover {{ color: #FF9D5C; }}
     white-space: nowrap;
 }}
 .lane-util-link:hover {{ color: #FFA76B; text-decoration: underline; }}
+/* Smart Optimize gets a whisper of glow — it's the AI move. */
+.lane-util-link.opt-link:hover {{
+    text-shadow: 0 0 12px rgba(255,140,66,0.55);
+}}
 .lane-util-sep {{ color: #3d3d38; font-size: 13px; user-select: none; }}
 .lane-icon-btn {{
     width: 34px;
@@ -15613,7 +15625,7 @@ def _build_route_board_html(user, day=None):
                     f'<form class="inline" method="POST" '
                     f'action="{url_for("optimize_route", route_id=_lane_route_id)}?next=board" '
                     f'onsubmit="showOptimizeOverlay(event, {len(stops)})" style="display:inline;">'
-                    f'<button type="submit" class="lane-util-link">&#9883; Optimize</button></form>'
+                    f'<button type="submit" class="lane-util-link opt-link">&#9883; Optimize</button></form>'
                 )
             lane_util_html = (
                 '<div class="lane-util">' +
