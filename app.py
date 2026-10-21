@@ -13731,6 +13731,10 @@ def register():
         if not username or not password or role not in ("boss", "driver"):
             flash("Fill everything correctly.", "error")
             return redirect(url_for("register"))
+        # 2026-10-21: confirm-password check.
+        if password != request.form.get("password_confirm", ""):
+            flash("Passwords do not match — please re-enter them.", "error")
+            return redirect(url_for("register"))
         if policy_error:
             flash(policy_error, "error")
             return redirect(url_for("register"))
@@ -13791,7 +13795,29 @@ def register():
             <label>Username</label>
             <input name="username" required>
             <label>Password</label>
-            <input type="password" name="password" required minlength="12">
+            <input type="password" name="password" id="reg2-password" required minlength="12" autocomplete="new-password">
+            <label>Confirm Password</label>
+            <input type="password" name="password_confirm" id="reg2-password-confirm" required minlength="12" autocomplete="new-password">
+            <div id="pw2-match-msg" class="muted small" style="margin-top:6px;min-height:18px;"></div>
+            <script>
+            (function(){
+                var pw = document.getElementById('reg2-password');
+                var pc = document.getElementById('reg2-password-confirm');
+                var msg = document.getElementById('pw2-match-msg');
+                function check(){
+                    if(!pw.value && !pc.value){ msg.textContent=''; return; }
+                    if(pw.value === pc.value){
+                        msg.textContent = pc.value ? '✓ Passwords match' : '';
+                        msg.style.color = '#3DDC84';
+                    } else {
+                        msg.textContent = '✗ Passwords do not match';
+                        msg.style.color = '#FF7A7A';
+                    }
+                }
+                pw.addEventListener('input', check);
+                pc.addEventListener('input', check);
+            })();
+            </script>
             <label>Full Name</label>
             <input name="full_name">
             <label>Email</label>
@@ -27660,6 +27686,12 @@ def company_register():
         if not company_name or not username or not password:
             flash("Company name, username, and password are required.", "error")
             return redirect(url_for("company_register"))
+        # 2026-10-21: confirm-password — a typo'd password locks the new boss
+        # out of their own company on day one.
+        password_confirm = request.form.get("password_confirm", "")
+        if password != password_confirm:
+            flash("Passwords do not match — please re-enter them.", "error")
+            return redirect(url_for("company_register"))
         policy_error = password_policy_error(password)
         if policy_error:
             flash(policy_error, "error")
@@ -27743,7 +27775,49 @@ def company_register():
                 <label>Your Username (boss login)</label>
                 <input name="username" required>
                 <label>Password</label>
-                <input type="password" name="password" required minlength="12">
+                <input type="password" name="password" id="reg-password" required minlength="12" autocomplete="new-password">
+                <label>Confirm Password</label>
+                <input type="password" name="password_confirm" id="reg-password-confirm" required minlength="12" autocomplete="new-password">
+                <div id="pw-match-msg" class="muted small" style="margin-top:6px;min-height:18px;"></div>
+                <script>
+                (function(){
+                    // 2026-10-21: live password-match feedback + show/hide toggles.
+                    var pw = document.getElementById('reg-password');
+                    var pc = document.getElementById('reg-password-confirm');
+                    var msg = document.getElementById('pw-match-msg');
+                    function check(){
+                        if(!pw.value && !pc.value){ msg.textContent=''; return; }
+                        if(pw.value === pc.value){
+                            msg.textContent = pc.value ? '✓ Passwords match' : '';
+                            msg.style.color = '#3DDC84';
+                        } else {
+                            msg.textContent = '✗ Passwords do not match';
+                            msg.style.color = '#FF7A7A';
+                        }
+                    }
+                    pw.addEventListener('input', check);
+                    pc.addEventListener('input', check);
+                    // show/hide toggles on both fields
+                    [pw, pc].forEach(function(inp){
+                        var wrap = document.createElement('div');
+                        wrap.style.cssText = 'position:relative;';
+                        inp.parentNode.insertBefore(wrap, inp);
+                        wrap.appendChild(inp);
+                        var t = document.createElement('button');
+                        t.type = 'button';
+                        t.textContent = 'Show';
+                        t.style.cssText = 'position:absolute;right:10px;top:50%;transform:translateY(-50%);' +
+                            'background:none;border:none;color:#FF8C42;font-size:12px;font-weight:700;cursor:pointer;padding:6px;';
+                        t.addEventListener('click', function(){
+                            var show = inp.type === 'password';
+                            inp.type = show ? 'text' : 'password';
+                            t.textContent = show ? 'Hide' : 'Show';
+                        });
+                        wrap.appendChild(t);
+                        inp.style.paddingRight = '64px';
+                    });
+                })();
+                </script>
                 <label>Full Name</label>
                 <input name="full_name">
                 <label>Email</label>
