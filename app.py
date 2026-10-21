@@ -15371,11 +15371,19 @@ def _build_route_board_html(user, day=None):
     company_id = cid()
     day = day or today_str()
 
+    # 2026-10-21: self-healing truck_id migration. init_db runs on /login, so
+    # a boss with a persistent session may not have re-logged in since the
+    # deploy that added routes.truck_id. Ensure it here so the SELECT below
+    # never 500s on "no such column".
+    _has_truck_col = _ensure_routes_truck_id(conn)
+    _truck_select = "r.truck_id, t.name AS truck_name," if _has_truck_col else "NULL AS truck_id, NULL AS truck_name,"
+    _truck_join = "LEFT JOIN trucks t ON r.truck_id = t.id" if _has_truck_col else ""
+
     params = [company_id, day]
-    sql = """
+    sql = f"""
         SELECT r.id AS route_id, r.route_name, r.assigned_to,
                COALESCE(r.route_type, 'rolloff') AS route_type,
-               r.truck_id, t.name AS truck_name,
+               {_truck_select}
                u.username AS driver_username, u.full_name AS driver_full_name,
                u.avatar_path AS driver_avatar,
                s.id AS stop_id, s.stop_order, s.customer_name, s.address, s.city,
@@ -15389,7 +15397,7 @@ def _build_route_board_html(user, day=None):
                EXISTS(SELECT 1 FROM route_photos rp WHERE rp.stop_id = s.id) AS has_photo
         FROM routes r
         LEFT JOIN users u ON r.assigned_to = u.id
-        LEFT JOIN trucks t ON r.truck_id = t.id
+        {_truck_join}
         LEFT JOIN stops s ON s.route_id = r.id
         LEFT JOIN inspection_items ii ON ii.id = s.defect_item_id
         WHERE r.company_id = ? AND r.route_date = ?
@@ -15774,18 +15782,23 @@ def _build_route_board_html(user, day=None):
             }, 28)
         # 2026-10-21: truck chip — shows the boss-assigned truck (or the
         # driver's usual truck from their last inspection when none assigned).
+        # Wrapped defensively: a truck lookup must never 500 the board.
         _truck_chip = ""
-        _tname = lane.get("truck_name")
-        if not _tname and lane.get("driver_id"):
-            _utruck = _driver_truck_id(conn, lane["driver_id"])
-            if _utruck:
-                _urow = conn.execute("SELECT name FROM trucks WHERE id=?", (_utruck,)).fetchone()
-                _tname = _urow["name"] if _urow else None
-        if _tname:
-            _truck_chip = (f'<span class="lane-truck-chip" style="display:inline-flex;align-items:center;gap:4px;'
-                           f'margin-left:8px;font-size:10px;font-weight:800;letter-spacing:.4px;padding:3px 9px;'
-                           f'border-radius:999px;background:rgba(255,107,26,0.12);color:#FFB37A;'
-                           f'border:1px solid rgba(255,107,26,0.4);">&#128666; {e(_tname)}</span>')
+        try:
+            _tname = lane.get("truck_name")
+            if not _tname and lane.get("driver_id"):
+                _utruck = _driver_truck_id(conn, lane["driver_id"])
+                if _utruck:
+                    _urow = conn.execute("SELECT name FROM trucks WHERE id=?", (_utruck,)).fetchone()
+                    _tname = _urow["name"] if _urow else None
+            if _tname:
+                _truck_chip = (f'<span class="lane-truck-chip" style="display:inline-flex;align-items:center;gap:4px;'
+                               f'margin-left:8px;font-size:10px;font-weight:800;letter-spacing:.4px;padding:3px 9px;'
+                               f'border-radius:999px;background:rgba(255,107,26,0.12);color:#FFB37A;'
+                               f'border:1px solid rgba(255,107,26,0.4);">&#128666; {e(_tname)}</span>')
+        except Exception:
+            app.logger.warning("truck chip failed for lane %s", lane.get("driver_username"), exc_info=True)
+            _truck_chip = ""
         _drag_grip = ('<span class="lane-drag-handle" title="Press &amp; hold to reorder">&#x2833;&#x2833;</span>'
                       if user["role"] == "boss" else "")
         lanes_html += f"""
@@ -22639,6 +22652,11 @@ def change_route_truck(route_id):
     if not route:
         conn.close()
         abort(404)
+    # Self-healing: persistent session may predate the truck_id deploy.
+    if not _ensure_routes_truck_id(conn):
+        conn.close()
+        flash("Truck feature isn't ready yet — log out and back in, then try again.", "error")
+        return redirect(url_for("view_route", route_id=route_id))
     truck_raw = (request.form.get("truck_id") or "").strip()
     truck_id = None
     truck_name = "driver's usual truck"
@@ -34020,12 +34038,14 @@ def api_dispatch():
         return jsonify({"error": "Select a driver before dispatching."}), 400
     driver_id = int(driver_id_raw)
 
+    conn = get_db()
     # 2026-10-21: truck assignment at dispatch. Boss picks the truck for the
     # day (covers for a missed day, truck swaps). Empty = driver's usual truck.
+    # Self-healing migration: a persistent boss session may predate the deploy.
+    _has_truck_col = _ensure_routes_truck_id(conn)
     truck_id_raw = data.get("truck_id")
     truck_id = None
-    conn = get_db()
-    if truck_id_raw and str(truck_id_raw).isdigit():
+    if _has_truck_col and truck_id_raw and str(truck_id_raw).isdigit():
         _trow = conn.execute(
             "SELECT id FROM trucks WHERE id=? AND company_id=? AND is_active=1",
             (int(truck_id_raw), cid())).fetchone()
@@ -34057,15 +34077,22 @@ def api_dispatch():
         route_id = existing["id"]
         appended_to_existing = True
         # Boss can change the truck on a later dispatch to the same route.
-        if truck_id is not None:
+        if truck_id is not None and _has_truck_col:
             cur.execute("UPDATE routes SET truck_id=? WHERE id=?", (truck_id, route_id))
     else:
         route_name = f"{driver['username']} — {route_date}"
-        cur.execute("""
-            INSERT INTO routes (route_date, route_name, raw_text, assigned_to, created_by,
-                                 status, notes, company_id, route_type, truck_id, created_at)
-            VALUES (?, ?, '', ?, ?, 'open', '', ?, ?, ?, ?)
-        """, (route_date, route_name, driver_id, session["user_id"], cid(), route_type, truck_id, now_ts()))
+        if _has_truck_col:
+            cur.execute("""
+                INSERT INTO routes (route_date, route_name, raw_text, assigned_to, created_by,
+                                     status, notes, company_id, route_type, truck_id, created_at)
+                VALUES (?, ?, '', ?, ?, 'open', '', ?, ?, ?, ?)
+            """, (route_date, route_name, driver_id, session["user_id"], cid(), route_type, truck_id, now_ts()))
+        else:
+            cur.execute("""
+                INSERT INTO routes (route_date, route_name, raw_text, assigned_to, created_by,
+                                     status, notes, company_id, route_type, created_at)
+                VALUES (?, ?, '', ?, ?, 'open', '', ?, ?, ?)
+            """, (route_date, route_name, driver_id, session["user_id"], cid(), route_type, now_ts()))
         route_id = cur.lastrowid
         appended_to_existing = False
 
@@ -38640,6 +38667,21 @@ def _driver_truck_id(conn, driver_id):
         (driver_id, cid()),
     ).fetchone()
     return row["truck_id"] if row else None
+
+
+def _ensure_routes_truck_id(conn):
+    """Self-healing migration for routes.truck_id (2026-10-21). init_db only
+    runs on /login, so a persistent session may predate the deploy. Returns
+    True if the column exists (or was just added)."""
+    try:
+        if any(c["name"] == "truck_id" for c in conn.execute("PRAGMA table_info(routes)").fetchall()):
+            return True
+        conn.execute("ALTER TABLE routes ADD COLUMN truck_id INTEGER")
+        conn.commit()
+        return True
+    except Exception:
+        app.logger.warning("could not ensure routes.truck_id", exc_info=True)
+        return False
 
 
 def _route_truck(conn, route_id):
