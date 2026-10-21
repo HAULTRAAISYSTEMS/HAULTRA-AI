@@ -13,7 +13,7 @@ pywebpush==2.5.0
 # HTTP/2; pyjwt + cryptography to sign the ES256 JWT with the .p8 auth key.
 httpx[http2]==0.28.1
 pyjwt==2.10.1
-cryptography==44.0.1
+cryptography==47.0.0
 # IANA timezone database for zoneinfo. Without this, slim server images
 # (Render) may lack /usr/share/zoneinfo, causing ZoneInfo("America/New_York")
 # to raise and all company-local times to silently fall back to UTC —
