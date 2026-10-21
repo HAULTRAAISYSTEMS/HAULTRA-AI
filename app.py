@@ -21974,6 +21974,30 @@ def view_route(route_id):
                 _route_rev_cents += _stop_overage_cents(_tn_rates, _s["action"], _s["container_size"], _s["weight_tons"])
     except Exception:
         _route_rev_cents = 0
+
+    # 2026-10-21: boss truck-change data — fetched BEFORE conn.close() below.
+    # The form HTML joins route_action_buttons after the close.
+    _truck_form_html = ""
+    if session.get("role") == "boss":
+        _all_trucks = conn.execute(
+            "SELECT id, name FROM trucks WHERE company_id=? AND is_active=1 ORDER BY LOWER(name), id",
+            (cid(),)).fetchall()
+        _cols = [c["name"] for c in conn.execute("PRAGMA table_info(routes)").fetchall()]
+        _cur_truck_id = route["truck_id"] if "truck_id" in _cols else None
+        _truck_opts = "".join(
+            f'<option value="{t["id"]}"{" selected" if t["id"] == _cur_truck_id else ""}>{e(t["name"])}</option>'
+            for t in _all_trucks)
+        _truck_form_html = f"""
+        <form class="inline" method="POST" action="{url_for('change_route_truck', route_id=route_id)}"
+              style="display:inline-flex;align-items:center;gap:6px;margin-left:6px;">
+            <input type="hidden" name="_csrf_token" value="{_csrf}">
+            <span style="font-size:11px;color:#8C8C82;font-weight:700;">&#128666; TRUCK</span>
+            <select name="truck_id" style="min-height:38px;border-radius:8px;">
+                <option value="">Driver's usual</option>{_truck_opts}
+            </select>
+            <button class="btn secondary" type="submit" style="min-height:38px;">Set</button>
+        </form>
+        """
     conn.close()
 
     _route_rev_html = ""
@@ -22002,26 +22026,8 @@ def view_route(route_id):
 
     # 2026-10-21: boss can change the truck mid-day (swap after a breakdown,
     # cover for a missed day). Driver gets an urgent message on the route thread.
-    if session.get("role") == "boss":
-        _all_trucks = conn.execute(
-            "SELECT id, name FROM trucks WHERE company_id=? AND is_active=1 ORDER BY LOWER(name), id",
-            (cid(),)).fetchall()
-        _cols = [c["name"] for c in conn.execute("PRAGMA table_info(routes)").fetchall()]
-        _cur_truck_id = route["truck_id"] if "truck_id" in _cols else None
-        _truck_opts = "".join(
-            f'<option value="{t["id"]}"{" selected" if t["id"] == _cur_truck_id else ""}>{e(t["name"])}</option>'
-            for t in _all_trucks)
-        route_action_buttons += f"""
-        <form class="inline" method="POST" action="{url_for('change_route_truck', route_id=route_id)}"
-              style="display:inline-flex;align-items:center;gap:6px;margin-left:6px;">
-            <input type="hidden" name="_csrf_token" value="{_csrf}">
-            <span style="font-size:11px;color:#8C8C82;font-weight:700;">&#128666; TRUCK</span>
-            <select name="truck_id" style="min-height:38px;border-radius:8px;">
-                <option value="">Driver's usual</option>{_truck_opts}
-            </select>
-            <button class="btn secondary" type="submit" style="min-height:38px;">Set</button>
-        </form>
-        """
+    # Form HTML was built before conn.close() above.
+    route_action_buttons += _truck_form_html
 
     if route["status"] == "open":
         route_action_buttons += f"""
