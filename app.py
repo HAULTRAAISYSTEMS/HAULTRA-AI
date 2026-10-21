@@ -12090,6 +12090,23 @@ VAPID_PUBLIC_KEY  = os.environ.get("VAPID_PUBLIC_KEY", "").strip()
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "").strip()
 VAPID_SUBJECT     = os.environ.get("VAPID_SUBJECT", "mailto:info@haultraai.com").strip()
 
+# 2026-10-21: Apple Push (APNs) for the native iOS app (Capacitor shell).
+# APNS_PRIVATE_KEY is the full contents of the .p8 auth key file from the
+# Apple Developer portal (Keys section). APNS_KEY_ID is that key's Key ID,
+# APNS_TEAM_ID is the Apple Developer Team ID. With any of them missing the
+# app runs normally and APNs sends are skipped — same graceful degradation
+# as the VAPID keys above.
+APNS_KEY_ID      = os.environ.get("APNS_KEY_ID", "").strip()
+APNS_TEAM_ID     = os.environ.get("APNS_TEAM_ID", "").strip()
+APNS_PRIVATE_KEY = os.environ.get("APNS_PRIVATE_KEY", "").strip()
+APNS_BUNDLE_ID   = os.environ.get("APNS_BUNDLE_ID", "com.rockkstaar.haultra").strip()
+APNS_SANDBOX     = os.environ.get("APNS_SANDBOX", "").strip().lower() in ("1", "true", "yes")
+
+
+def apns_configured():
+    """True when the .p8 key triple is present and a send can be attempted."""
+    return bool(APNS_KEY_ID and APNS_TEAM_ID and APNS_PRIVATE_KEY)
+
 
 def push_configured():
     return bool(VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY)
@@ -12182,11 +12199,155 @@ def flush_alert_pushes(company_id=None, limit=20):
                     conn.commit()
                 else:
                     sent += 1
+            # 2026-10-21: same alert to native iOS app devices via APNs.
+            if apns_configured():
+                badge = alert_open_count(conn, row["company_id"])
+                for dev in _apns_recipients(conn, row["company_id"], roles=("boss",)):
+                    if not _apns_send(dev["token"], row["title"], row["body"] or "",
+                                      badge=badge, data={"link": row["link"] or ""}):
+                        conn.execute("UPDATE push_tokens SET failed_at=? WHERE id=?",
+                                     (now_ts(), dev["id"]))
+                        conn.commit()
+                    else:
+                        sent += 1
     except sqlite3.Error as exc:
         app.logger.warning("push: sweep failed (%s)", exc)
     finally:
         conn.close()
     return sent
+
+
+# =========================================================
+# APPLE PUSH (APNs) — native iOS app via the Capacitor shell
+# =========================================================
+_apns_jwt_cache = {"token": None, "expires": 0}
+
+
+def _apns_jwt():
+    """ES256 JWT for APNs auth. Cached; APNs honors it up to 60 minutes."""
+    import time
+    import jwt as _pyjwt
+    now = int(time.time())
+    if _apns_jwt_cache["token"] and _apns_jwt_cache["expires"] > now + 60:
+        return _apns_jwt_cache["token"]
+    key_pem = APNS_PRIVATE_KEY.replace("\\n", "\n")
+    if "-----BEGIN" not in key_pem:
+        key_pem = "-----BEGIN PRIVATE KEY-----\n" + key_pem + "\n-----END PRIVATE KEY-----"
+    token = _pyjwt.encode(
+        {"iss": APNS_TEAM_ID, "iat": now},
+        key_pem,
+        algorithm="ES256",
+        headers={"kid": APNS_KEY_ID},
+    )
+    _apns_jwt_cache["token"] = token
+    _apns_jwt_cache["expires"] = now + 50 * 60
+    return token
+
+
+def _apns_send(device_token, title, body, badge=None, data=None):
+    """Send one push via APNs HTTP/2. Returns True on accept, False on
+    permanent failure (bad/expired token — caller should retire it)."""
+    if not apns_configured():
+        return True
+    import httpx
+    host = "api.sandbox.push.apple.com" if APNS_SANDBOX else "api.push.apple.com"
+    url = f"https://{host}/3/device/{device_token}"
+    payload = {"aps": {"alert": {"title": title, "body": body or ""},
+                       "sound": "default"}}
+    if badge is not None:
+        payload["aps"]["badge"] = badge
+    if data:
+        payload.update(data)
+    headers = {
+        "authorization": f"bearer {_apns_jwt()}",
+        "apns-topic": APNS_BUNDLE_ID,
+        "apns-push-type": "alert",
+        "apns-priority": "10",
+    }
+    try:
+        with httpx.Client(http2=True, timeout=10) as client:
+            r = client.post(url, json=payload, headers=headers)
+        if r.status_code == 200:
+            return True
+        reason = ""
+        try:
+            reason = r.json().get("reason", "")
+        except Exception:
+            pass
+        if r.status_code in (400, 410) and reason in (
+                "BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic"):
+            app.logger.info("apns: retiring dead token (%s)", reason)
+            return False
+        app.logger.warning("apns: send failed %s %s", r.status_code, reason)
+        return True  # transient — don't retire the token
+    except Exception as exc:
+        app.logger.warning("apns: send exception (%s)", exc)
+        return True
+
+
+def _apns_recipients(conn, company_id, roles=("boss",)):
+    """Native-app (APNs) devices for active users in the given roles."""
+    try:
+        q = """SELECT p.id, p.token, p.user_id FROM push_tokens p
+                 JOIN users u ON u.id = p.user_id
+                WHERE p.company_id=? AND p.failed_at IS NULL
+                  AND p.platform='apns' AND u.is_active=1"""
+        params = [company_id]
+        if roles:
+            q += " AND u.role IN (%s)" % ",".join("?" * len(roles))
+            params += list(roles)
+        return conn.execute(q, params).fetchall()
+    except sqlite3.Error:
+        return []
+
+
+def _user_badge_count(conn, user_id, company_id, role):
+    """The number for the app-icon badge: open alerts for bosses,
+    unread messages for drivers."""
+    try:
+        if role == "boss":
+            return alert_open_count(conn, company_id)
+        row = conn.execute(
+            """SELECT COUNT(*) n FROM messages
+                WHERE company_id=? AND to_user_id=? AND read_at IS NULL""",
+            (company_id, user_id),
+        ).fetchone()
+        return (row["n"] if row else 0) or 0
+    except sqlite3.Error:
+        return 0
+
+
+def push_to_user(conn, user_id, title, body="", link="", company_id=None):
+    """Immediate push to one user's native-app devices (driver or boss).
+
+    Never raises — a push is a courtesy, never the work itself."""
+    if not apns_configured():
+        return 0
+    try:
+        u = conn.execute("SELECT id, company_id, role FROM users WHERE id=? AND is_active=1",
+                         (user_id,)).fetchone()
+        if not u:
+            return 0
+        cid = company_id or u["company_id"]
+        badge = _user_badge_count(conn, user_id, cid, u["role"])
+        sent = 0
+        for dev in _apns_recipients(conn, cid, roles=(u["role"],)):
+            if dev["user_id"] != user_id:
+                continue
+            if not _apns_send(dev["token"], title, body, badge=badge,
+                              data={"link": link or ""}):
+                conn.execute("UPDATE push_tokens SET failed_at=? WHERE id=?",
+                             (now_ts(), dev["id"]))
+                try:
+                    conn.commit()
+                except Exception:
+                    pass
+            else:
+                sent += 1
+        return sent
+    except Exception as exc:
+        app.logger.warning("push_to_user failed (%s)", exc)
+        return 0
 
 
 def _alert_email_recipients(conn, company_id):
@@ -12337,6 +12498,55 @@ def api_push_register():
     )
     conn.commit()
     conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/push/apns-register", methods=["POST"])
+def api_push_apns_register():
+    """The native iOS shell hands us its APNs device token after the user
+    grants notification permission. 64-hex-char token; stored per user so
+    dispatches and messages can buzz the right phone.
+
+    2026-10-21: driver + boss both register — the driver gets dispatch and
+    message pushes, the boss gets alert pushes.
+    """
+    if "user_id" not in session:
+        return jsonify({"error": "login required"}), 401
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", token):
+        return jsonify({"error": "bad device token"}), 400
+    conn = get_db()
+    try:
+        u = conn.execute("SELECT company_id FROM users WHERE id=?",
+                         (session["user_id"],)).fetchone()
+        company_id = u["company_id"] if u else cid()
+        conn.execute(
+            """INSERT INTO push_tokens (company_id, user_id, token, platform, created_at, last_seen_at)
+               VALUES (?,?,?,'apns',?,?)
+               ON CONFLICT(token) DO UPDATE SET
+                 user_id=excluded.user_id, company_id=excluded.company_id,
+                 last_seen_at=excluded.last_seen_at, failed_at=NULL""",
+            (company_id, session["user_id"], token, now_ts(), now_ts()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/push/apns-unregister", methods=["POST"])
+def api_push_apns_unregister():
+    """Remove this device's token on logout so a signed-out phone stops buzzing."""
+    if "user_id" not in session:
+        return jsonify({"error": "login required"}), 401
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or "").strip().lower()
+    if token:
+        conn = get_db()
+        conn.execute("DELETE FROM push_tokens WHERE token=? AND platform='apns'", (token,))
+        conn.commit()
+        conn.close()
     return jsonify({"success": True})
 
 
@@ -12512,8 +12722,54 @@ def boss_notifications_page():
         sub.textContent = reason;
       }
       if (isNativeShell) {
-        blocked('Phone alerts don\u2019t work in the installed app yet. ' +
-                'Open haultra-systems.com in Safari or Chrome and add it to your Home Screen to get them.');
+        // 2026-10-21: the installed app gets real pushes now via APNs
+        // (Capacitor PushNotifications plugin). Register the device token.
+        card.hidden = false;
+        sub.textContent = 'Get dispatch alerts and messages on this phone, even with the app closed.';
+        var cap = (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.PushNotifications) || null;
+        if (!cap) {
+          blocked('This app version can\u2019t do phone alerts yet \u2014 update HAULTRA from the App Store.');
+          return;
+        }
+        function apnsRegister(token) {
+          var csrf = document.querySelector('meta[name="csrf-token"]');
+          fetch('/api/push/apns-register', {
+            method: 'POST', credentials: 'same-origin',
+            headers: {'Content-Type': 'application/json',
+                      'X-CSRF-Token': csrf ? csrf.getAttribute('content') : ''},
+            body: JSON.stringify({token: token})
+          }).then(function () {
+            btn.textContent = 'On'; btn.disabled = true;
+            sub.textContent = 'This phone is registered for alerts.';
+          }).catch(function () {
+            sub.textContent = 'Couldn\u2019t register this phone \u2014 try again.';
+          });
+        }
+        cap.checkPermissions().then(function (perm) {
+          if (perm.receive === 'granted') {
+            btn.textContent = 'On'; btn.disabled = true;
+            cap.register();
+          }
+        }).catch(function () {});
+        cap.addListener('registration', function (t) { apnsRegister(t.value); });
+        cap.addListener('registrationError', function () {
+          sub.textContent = 'Couldn\u2019t register this phone \u2014 try again.';
+        });
+        // Tapping a push opens the app; route to the linked page.
+        cap.addListener('pushNotificationActionPerformed', function (n) {
+          var link = n.notification && n.notification.data && n.notification.data.link;
+          if (link) window.location.href = link;
+        });
+        window.haultraEnablePush = function () {
+          btn.disabled = true; btn.textContent = 'Asking\u2026';
+          cap.requestPermissions().then(function (p) {
+            if (p.receive === 'granted') { cap.register(); }
+            else {
+              btn.disabled = false; btn.textContent = 'Turn on';
+              sub.textContent = 'You said no to notifications. Turn them on in iPhone Settings \u2192 HAULTRA.';
+            }
+          });
+        };
         return;
       }
       if (isIOS && !isStandalone) {
@@ -21370,6 +21626,17 @@ def route_messages(route_id):
                 # send can never raise a second alert.
                 dedupe_key=("msg:%s" % client_id) if client_id else None,
             )
+        # 2026-10-21: boss → driver message also buzzes the driver's phone.
+        if session.get("role") == "boss":
+            try:
+                _drv = conn.execute("SELECT assigned_to FROM routes WHERE id=?", (route_id,)).fetchone()
+                if _drv and _drv["assigned_to"]:
+                    push_to_user(conn, _drv["assigned_to"],
+                                 _actor_name(conn) + " sent a message",
+                                 body[:120],
+                                 link=url_for("driver_route_detail", route_id=route_id))
+            except Exception:
+                pass
         conn.commit()
         conn.close()
         return jsonify({"success": True, "id": msg_id})
@@ -21522,6 +21789,15 @@ def direct_messages_api(driver_id):
                 # send can never raise a second alert.
                 dedupe_key=("msg:%s" % client_id) if client_id else None,
             )
+        # 2026-10-21: boss → driver DM also buzzes the driver's phone.
+        if role == "boss":
+            try:
+                push_to_user(conn, driver_id,
+                             _actor_name(conn) + " sent you a message",
+                             (body or "")[:120],
+                             link=url_for("messages_page"))
+            except Exception:
+                pass
         conn.commit()
         conn.close()
         return jsonify({"success": True, "id": msg_id})
@@ -22805,6 +23081,15 @@ def change_route_truck(route_id):
     conn.execute(
         "INSERT INTO messages (route_id, sender_user_id, body, created_at, priority) VALUES (?,?,?,?,'urgent')",
         (route_id, session["user_id"], f"🚚 Truck change — you're now in {truck_name}.", now_ts()))
+    # 2026-10-21: buzz the driver's phone too.
+    try:
+        if route and route["assigned_to"]:
+            push_to_user(conn, route["assigned_to"],
+                         "🚚 Truck change",
+                         "You're now in %s." % truck_name,
+                         link=url_for("driver_route_detail", route_id=route_id))
+    except Exception:
+        pass
     conn.commit()
     conn.close()
     flash(f"Truck changed to {truck_name}. Driver was notified.", "success")
@@ -34351,6 +34636,14 @@ def api_dispatch():
     conn.commit()
     if route_type == "garbage":
         # No containers, no chains on a garbage route — dispatch is done.
+        # 2026-10-21: buzz the driver's phone.
+        try:
+            push_to_user(conn, driver_id,
+                         "🚚 New route dispatched",
+                         "%d stops — %s" % (len(clean_stops), route_date),
+                         link="/driver")
+        except Exception:
+            pass
         conn.close()
         return jsonify({
             "success": True,
@@ -34375,6 +34668,14 @@ def api_dispatch():
     if _blocking:
         conn.close()
         return jsonify({"error": " ".join(dict.fromkeys(e["msg"] for e in _blocking))}), 400
+    # 2026-10-21: buzz the driver's phone about the new route.
+    try:
+        push_to_user(conn, driver_id,
+                     "🚚 New route dispatched",
+                     "%d stops — %s" % (len(clean_stops), route_date),
+                     link="/driver")
+    except Exception:
+        pass
     conn.close()
 
     return jsonify({
