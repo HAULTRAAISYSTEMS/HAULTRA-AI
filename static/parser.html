@@ -1684,10 +1684,12 @@
       var driverId = driverSelect ? driverSelect.value : '';
       if (!driverId) return;
       var dateEl = el('route-date');
+      var truckSelect = el('truck-select');
       url = '/api/dispatch';
       payload = {
         driver_id: driverId,
         route_date: dateEl && dateEl.value ? dateEl.value : '',
+        truck_id: truckSelect ? truckSelect.value : '',
         stops: TraySeq.sortBySeq(currentStops).map(function (s) {
           return {
             action: s.action,
