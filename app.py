@@ -25805,8 +25805,7 @@ def route_daily_log(route_id):
         """SELECT s.*,
                   dt.id AS dump_ticket_id, dt.dump_site,
                   dt.arrival_time AS dump_arrival, dt.departure_time AS dump_departure,
-                  COALESCE(dt.can_number, s.can_number) AS ticket_can_number,
-                  dt.net_tons, dt.material,
+                  dt.can_number AS ticket_can_number, dt.net_tons, dt.material,
                   dt.ticket_number AS dump_ticket_number, dt.photo_path AS dump_photo_path
            FROM stops s
            LEFT JOIN dump_tickets dt ON dt.stop_id = s.id
