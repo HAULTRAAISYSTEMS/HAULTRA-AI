@@ -9,6 +9,11 @@ stripe==15.3.1
 boto3==1.43.51
 # Web Push (VAPID) for boss alerts. Only imported when push is configured.
 pywebpush==2.5.0
+# Apple Push (APNs) for the native iOS app. httpx[http2] because APNs requires
+# HTTP/2; pyjwt + cryptography to sign the ES256 JWT with the .p8 auth key.
+httpx[http2]==0.28.1
+pyjwt==2.10.1
+cryptography==44.0.1
 # IANA timezone database for zoneinfo. Without this, slim server images
 # (Render) may lack /usr/share/zoneinfo, causing ZoneInfo("America/New_York")
 # to raise and all company-local times to silently fall back to UTC —
