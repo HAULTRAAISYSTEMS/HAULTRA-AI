@@ -25864,9 +25864,13 @@ def route_daily_log(route_id):
         else:
             box_in = _prev_box_out
         _prev_box_out = box_out
-        # Start = previous stop's finish (driver rolls job to job). First
-        # stop falls back to its own arrival, then the route start.
-        _start_ts = _prev_finish or s['arrived_at'] or route['started_at']
+        # 2026-10-21: Start = previous stop's finish (driver rolls job to
+        # job). First stop = when the driver hit start on the route.
+        # Stops not yet reached show NO start time (not the route start).
+        if _pos == 1:
+            _start_ts = route['started_at'] or s['arrived_at'] or ""
+        else:
+            _start_ts = _prev_finish
         _prev_finish = s['completed_at'] or ""
         weight_display, tons = _log_weight(
             s["net_tons"],
