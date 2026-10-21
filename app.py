@@ -9924,6 +9924,40 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     opacity: 0.7;
 }}
 .lane-driver {{ width: 170px; flex-shrink: 0; }}
+/* ── 2026-10-21: fleet plate — the iron the driver is in today. A proper
+   assignment plate, not a pill: rivet dots, glowing truck mark, plate sheen. */
+.lane-truck-chip {{
+    display: inline-flex; align-items: center; gap: 7px;
+    margin-left: 10px; padding: 5px 11px 5px 9px;
+    font-size: 11px; font-weight: 800; letter-spacing: 1px;
+    color: #FFE3C4; text-transform: uppercase; white-space: nowrap;
+    background:
+        radial-gradient(120% 140% at 50% 0%, rgba(255,190,120,0.20) 0%, rgba(255,190,120,0) 55%),
+        linear-gradient(135deg, rgba(255,107,26,0.28), rgba(255,107,26,0.08));
+    border: 1px solid rgba(255,140,66,0.60);
+    border-radius: 9px;
+    box-shadow: 0 0 16px rgba(255,107,26,0.30),
+                inset 0 1px 0 rgba(255,255,255,0.16),
+                inset 0 -1px 0 rgba(0,0,0,0.25);
+    vertical-align: middle;
+    position: relative;
+}}
+.lane-truck-chip::before,
+.lane-truck-chip::after {{
+    content: ''; width: 4px; height: 4px; border-radius: 50%;
+    background: rgba(255,200,150,0.55);
+    box-shadow: inset 0 1px 1px rgba(0,0,0,0.5);
+    flex-shrink: 0;
+}}
+.lane-truck-chip::before {{ order: -1; }}
+.lane-truck-chip::after {{ order: 99; }}
+.lane-truck-chip .ltc-icon {{
+    font-size: 14px; line-height: 1;
+    filter: drop-shadow(0 0 5px rgba(255,140,66,0.75));
+}}
+.lane-truck-chip .ltc-name {{
+    text-shadow: 0 0 10px rgba(255,140,66,0.45);
+}}
 .lane-name-row {{ display: flex; align-items: center; gap: 8px; }}
 .lane-status-dot {{ width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: #55554C; }}
 .lane-status-dot.active {{ background: var(--cyan); box-shadow: 0 0 6px var(--cyan); }}
@@ -15851,10 +15885,11 @@ def _build_route_board_html(user, day=None):
                     _urow = conn.execute("SELECT name FROM trucks WHERE id=?", (_utruck,)).fetchone()
                     _tname = _urow["name"] if _urow else None
             if _tname:
-                _truck_chip = (f'<span class="lane-truck-chip" style="display:inline-flex;align-items:center;gap:4px;'
-                               f'margin-left:8px;font-size:10px;font-weight:800;letter-spacing:.4px;padding:3px 9px;'
-                               f'border-radius:999px;background:rgba(255,107,26,0.12);color:#FFB37A;'
-                               f'border:1px solid rgba(255,107,26,0.4);">&#128666; {e(_tname)}</span>')
+                _truck_chip = (
+                    f'<span class="lane-truck-chip">'
+                    f'<span class="ltc-icon">&#128666;</span>'
+                    f'<span class="ltc-name">{e(_tname)}</span>'
+                    f'</span>')
         except Exception:
             app.logger.warning("truck chip failed for lane %s", lane.get("driver_username"), exc_info=True)
             _truck_chip = ""
