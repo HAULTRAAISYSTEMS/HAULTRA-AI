@@ -9926,9 +9926,15 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .lane-driver {{ width: 170px; flex-shrink: 0; }}
 /* ── 2026-10-21: fleet plate — the iron the driver is in today. A proper
    assignment plate, not a pill: rivet dots, glowing truck mark, plate sheen. */
+.lane-truck-row {{
+    margin: 8px 0 2px;
+}}
+.lane-truck-row:empty {{
+    display: none;
+}}
 .lane-truck-chip {{
     display: inline-flex; align-items: center; gap: 7px;
-    margin-left: 10px; padding: 5px 11px 5px 9px;
+    padding: 5px 11px 5px 9px;
     font-size: 11px; font-weight: 800; letter-spacing: 1px;
     color: #FFE3C4; text-transform: uppercase; white-space: nowrap;
     background:
@@ -15877,6 +15883,7 @@ def _build_route_board_html(user, day=None):
         # driver's usual truck from their last inspection when none assigned).
         # Wrapped defensively: a truck lookup must never 500 the board.
         _truck_chip = ""
+        _truck_row = ""
         try:
             _tname = lane.get("truck_name")
             if not _tname and lane.get("driver_id"):
@@ -15890,6 +15897,10 @@ def _build_route_board_html(user, day=None):
                     f'<span class="ltc-icon">&#128666;</span>'
                     f'<span class="ltc-name">{e(_tname)}</span>'
                     f'</span>')
+            # 2026-10-21: plate gets its own row under the driver name — it
+            # was overflowing the 170px name row into the stops track.
+            _truck_row = (f'<div class="lane-truck-row">{_truck_chip}</div>'
+                          if _truck_chip else "")
         except Exception:
             app.logger.warning("truck chip failed for lane %s", lane.get("driver_username"), exc_info=True)
             _truck_chip = ""
@@ -15903,11 +15914,11 @@ def _build_route_board_html(user, day=None):
                     <span class="lane-status-dot {dot_cls}"></span>
                     {_lane_avatar}
                     <span class="lane-name">{e(display_name)}</span>
-                    {_truck_chip}
                     {timeoff_chip}
                     <!-- 2026-10-13: Icon buttons on the right -->
                     <span class="lane-header-actions">{message_html}{_report_html}</span>
                 </div>
+                {_truck_row}
                 <div class="lane-sub">{e(route_label)}{_garbage_badge}<br>{e(progress_label)}</div>
                 {lane_util_html}
             </div>
