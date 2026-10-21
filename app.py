@@ -25805,7 +25805,8 @@ def route_daily_log(route_id):
         """SELECT s.*,
                   dt.id AS dump_ticket_id, dt.dump_site,
                   dt.arrival_time AS dump_arrival, dt.departure_time AS dump_departure,
-                  dt.can_number, dt.net_tons, dt.material,
+                  COALESCE(dt.can_number, s.can_number) AS ticket_can_number,
+                  dt.net_tons, dt.material,
                   dt.ticket_number AS dump_ticket_number, dt.photo_path AS dump_photo_path
            FROM stops s
            LEFT JOIN dump_tickets dt ON dt.stop_id = s.id
@@ -25832,6 +25833,16 @@ def route_daily_log(route_id):
     total_cans = total_bags = 0
     done_count = 0
     ticket_photos = []
+    # 2026-10-21: box numbers chain SEQUENTIALLY through the route, matching
+    # how the driver works in the cab. The driver pulls a bin (Box Out for
+    # that stop), dumps it, and the ticket captures the bin number. At the
+    # next stop, Box In = the bin on the truck (previous stop's Box Out),
+    # Box Out = the bin at this job site. The driver only enters the bin
+    # number at the dump when doing the ticket — never at the pull.
+    _prev_box_out = ""
+    # 2026-10-21: start time for a stop = finish time of the PREVIOUS stop
+    # (the driver rolls straight from one job to the next).
+    _prev_finish = ""
     for _pos, s in enumerate(stops, start=1):
         if s["status"] == "completed":
             done_count += 1
@@ -25842,7 +25853,22 @@ def route_daily_log(route_id):
         elif action == "Hand Pickup":
             total_bags += cnt
         has_ticket = s["dump_ticket_id"] is not None
-        box_in, box_out = _log_box_numbers(s["id"], s["can_number"], can_by_stop, takes_from)
+        # Box Out = the bin hauled from THIS stop (from the dump ticket —
+        # that's where the driver enters it). Box In = what was on the truck
+        # coming in = previous stop's Box Out. An explicit swap chain
+        # (takes_from) overrides the sequential Box In.
+        _ticket_can = (s["ticket_can_number"] or "").strip()
+        box_out = _ticket_can
+        _giver = takes_from.get(s["id"])
+        if _giver and can_by_stop.get(_giver):
+            box_in = can_by_stop.get(_giver)
+        else:
+            box_in = _prev_box_out
+        _prev_box_out = box_out
+        # Start = previous stop's finish (driver rolls job to job). First
+        # stop falls back to its own arrival, then the route start.
+        _start_ts = _prev_finish or s['arrived_at'] or route['started_at']
+        _prev_finish = s['completed_at'] or ""
         weight_display, tons = _log_weight(
             s["net_tons"],
             s["material"] if has_ticket else None,
@@ -25869,7 +25895,7 @@ def route_daily_log(route_id):
             <td class="col-addr">{e(s['address'] or '')}</td>
             <td>{e(_city_for_log(s))}</td>
             <td class="col-center">{e(str(s['container_size']) + ' yd') if s['container_size'] else ''}</td>
-            <td class="col-time">{_log_fmt_time(s['arrived_at'] or route['started_at'])}</td>
+            <td class="col-time">{_log_fmt_time(_start_ts)}</td>
             <td class="col-time">{_log_fmt_time(s['dump_arrival'])}</td>
             <td class="col-time">{_log_fmt_time(s['dump_departure'])}</td>
             <td class="col-time">{_log_fmt_time(s['completed_at'])}</td>
