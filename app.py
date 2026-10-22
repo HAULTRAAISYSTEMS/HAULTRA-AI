@@ -23151,10 +23151,25 @@ def _log_fmt_time(ts):
         return ""
     try:
         import datetime as _dt
-        d = _dt.datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S")
+        ts_s = str(ts).strip()
+        # Full timestamp: "2026-10-22 09:30:00"
+        d = _dt.datetime.strptime(ts_s[:19], "%Y-%m-%d %H:%M:%S")
         return d.strftime("%-I:%M %p").lower()
     except Exception:
-        return ts[11:16] if len(ts) > 16 else ts
+        pass
+    try:
+        import datetime as _dt
+        ts_s = str(ts).strip()
+        # Time-only: "09:30" or "09:30:00" or "14:05"
+        for _fmt in ("%H:%M:%S", "%H:%M"):
+            try:
+                d = _dt.datetime.strptime(ts_s[:8], _fmt)
+                return d.strftime("%-I:%M %p").lower()
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return ts_s[11:16] if len(ts_s) > 16 else ts_s
 
 
 def _log_work_order(action):
