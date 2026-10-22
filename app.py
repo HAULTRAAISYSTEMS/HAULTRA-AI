@@ -8690,6 +8690,9 @@ body {{
     gap: 2px;
     box-shadow: 0 12px 40px rgba(0,0,0,0.55);
     z-index: 250;
+    max-height: 70vh;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
 }}
 .topnav-more-menu .nav-item {{ width: 100%; display: flex; }}
 
@@ -12874,6 +12877,39 @@ def _phone_push_card():
     """
 
 
+def _push_nudge_js():
+    # Dismiss X + per-device memory for dashboard push nudges. Appended AFTER
+    # the push card HTML; the card's own script still controls when it unhides.
+    # A MutationObserver keeps it hidden if the user dismissed it.
+    return """
+    <script>
+    (function(){
+      var KEY='haultra_push_nudge_off';
+      var card=document.getElementById('push-card');
+      if(!card) return;
+      var off=false;
+      try{off=localStorage.getItem(KEY)==='1';}catch(e){}
+      var x=document.createElement('button');
+      x.setAttribute('aria-label','Dismiss');
+      x.style.cssText='position:absolute;top:8px;right:10px;background:none;border:none;'
+        +'color:var(--text-muted);font-size:18px;cursor:pointer;padding:6px;z-index:2;';
+      x.innerHTML='&times;';
+      card.style.position='relative';
+      card.appendChild(x);
+      x.addEventListener('click',function(){
+        try{localStorage.setItem(KEY,'1');}catch(e){}
+        card.hidden=true;
+      });
+      if(off){card.hidden=true;}
+      new MutationObserver(function(){
+        try{if(localStorage.getItem(KEY)==='1')card.hidden=true;}catch(e){}
+      }).observe(card,{attributes:true,attributeFilter:['hidden']});
+    })();
+    </script>
+    """
+
+
+
 @app.route("/boss/notifications")
 @boss_required
 def boss_notifications_page():
@@ -12970,36 +13006,6 @@ def boss_notifications_page():
         </div>
         """
 
-def _push_nudge_js():
-    # Dismiss X + per-device memory for dashboard push nudges. Appended AFTER
-    # the push card HTML; the card's own script still controls when it unhides.
-    # A MutationObserver keeps it hidden if the user dismissed it.
-    return """
-    <script>
-    (function(){
-      var KEY='haultra_push_nudge_off';
-      var card=document.getElementById('push-card');
-      if(!card) return;
-      var off=false;
-      try{off=localStorage.getItem(KEY)==='1';}catch(e){}
-      var x=document.createElement('button');
-      x.setAttribute('aria-label','Dismiss');
-      x.style.cssText='position:absolute;top:8px;right:10px;background:none;border:none;'
-        +'color:var(--text-muted);font-size:18px;cursor:pointer;padding:6px;z-index:2;';
-      x.innerHTML='&times;';
-      card.style.position='relative';
-      card.appendChild(x);
-      x.addEventListener('click',function(){
-        try{localStorage.setItem(KEY,'1');}catch(e){}
-        card.hidden=true;
-      });
-      if(off){card.hidden=true;}
-      new MutationObserver(function(){
-        try{if(localStorage.getItem(KEY)==='1')card.hidden=true;}catch(e){}
-      }).observe(card,{attributes:true,attributeFilter:['hidden']});
-    })();
-    </script>
-    """
 
 
 
@@ -13026,6 +13032,7 @@ def _push_nudge_js():
            truck trouble, cancels and time off.</p>
     </div>
     {push_row}
+    {_push_nudge_js()}
     <div class="alert-filters">
         <a class="alert-filter{' on' if show == 'open' else ''}" href="{url_for('boss_notifications_page')}">
             Needs you{f' &middot; {open_n}' if open_n else ''}</a>
