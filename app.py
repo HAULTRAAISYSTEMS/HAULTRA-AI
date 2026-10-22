@@ -27161,22 +27161,25 @@ def route_daily_log(route_id):
         # (takes_from) overrides the sequential Box In.
         _ticket_can = (s["ticket_can_number"] or "").strip()
         box_out = _ticket_can
-        _giver = takes_from.get(s["id"])
-        if _giver and can_by_stop.get(_giver):
-            box_in = can_by_stop.get(_giver)
-        else:
-            box_in = _prev_box_out
-        # 2026-10-22: For a PR (Pickup and Return) that is NOT a swap, the
-        # empty bin is returned to the customer — truck leaves empty. Don't
-        # carry the bin forward. For a Pull (or PR swap), the bin IS carried.
         _act_lc = (s["action"] or "").lower()
         _is_pr = "pickup and return" in _act_lc
         _is_swap = bool(s["swap_with_previous_empty"]) or (s["id"] in takes_from)
+        _giver = takes_from.get(s["id"])
+        if _giver and can_by_stop.get(_giver):
+            box_in = can_by_stop.get(_giver)
+        elif _is_pr and not _is_swap:
+            # 2026-10-22: PR (non-swap): Box In = Box Out = SAME bin.
+            # Driver pulls the full bin, dumps it, returns the empty to THIS
+            # customer. The bin does NOT come from the previous stop.
+            box_in = box_out
+        else:
+            # Pull or PR swap: Box In = bin carried on truck (prev Box Out)
+            box_in = _prev_box_out
+        # Carry forward: PR (non-swap) returns the bin, so truck leaves empty
+        # for the next stop. Pull/PR-swap carries the (now empty) bin forward.
         if _is_pr and not _is_swap:
-            # PR (not a swap): bin returned, truck empty for next stop
             _prev_box_out = ""
         else:
-            # Pull or PR swap: bin carried forward
             _prev_box_out = box_out
         # 2026-10-21: Start = previous stop's finish (driver rolls job to
         # job). First stop = when the driver hit start on the route.
