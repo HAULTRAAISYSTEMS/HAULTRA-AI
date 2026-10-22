@@ -19016,6 +19016,11 @@ def driver_route_detail(route_id):
     go_to_dump_html = ""
     box_out_html = ""
     _hide_complete_btn = False
+    # 2026-10-22: For PICKUP (pull) stops, hide Complete Stop until the driver
+    # reaches the dump (need_box_in/box_in). Otherwise they can tap Complete
+    # on Leg 1 and skip the dump leg + ticket entry entirely.
+    if is_pull and driver_status not in ("need_box_in", "box_in", "completed"):
+        _hide_complete_btn = True
     if _chained:
         # First on-site step: the head has no incoming empty (just box out its
         # full); every other chain member arrives carrying an empty to set off.
@@ -19069,10 +19074,14 @@ def driver_route_detail(route_id):
             "need_box_in": _empty_step,
         }
     elif is_pull:
+        # 2026-10-22: Added going_to_dump -> need_box_in step. Without this,
+        # the driver taps "Go To Dump" and the workflow dead-ends — the only
+        # button left is "Complete Stop" which skips the dump leg entirely.
         wf_map = {
-            "pending":     ("arrived",       "&#128666; Arrived at Stop",           "btn-driver btn-driver-complete"),
-            "arrived":     ("box_out",       "&#128230; Box Out &mdash; Remove Container", "btn-driver btn-driver-complete"),
-            "box_out":     ("going_to_dump", "&#128465;&#65039; Go To Dump",               "btn-driver btn-driver-dump"),
+            "pending":       ("arrived",       "&#128666; Arrived at Stop",           "btn-driver btn-driver-complete"),
+            "arrived":       ("box_out",       "&#128230; Box Out &mdash; Remove Container", "btn-driver btn-driver-complete"),
+            "box_out":       ("going_to_dump", "&#128465;&#65039; Go To Dump",               "btn-driver btn-driver-dump"),
+            "going_to_dump": ("need_box_in",   "&#9989; Arrived at Dump &mdash; Enter Ticket", "btn-driver btn-driver-complete"),
         }
     else:
         wf_map = {"pending": ("arrived", "&#128666; Arrived at Stop", "btn-driver btn-driver-complete")}
