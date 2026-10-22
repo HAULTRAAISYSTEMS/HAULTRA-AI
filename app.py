@@ -22764,13 +22764,14 @@ def messages_page():
     .msg-team-row::before{content:"";position:absolute;inset:0;border-radius:18px;
         background:radial-gradient(120% 90% at 20% 0%,rgba(120,180,255,.08),transparent 60%);
         pointer-events:none;}
-    .msg-team-avatars{position:relative;width:52px;height:40px;min-width:52px;flex:none;}
-    .msg-team-avatars .ta{position:absolute;width:32px;height:32px;border-radius:50%;
+    .msg-team-avatars{display:flex;align-items:center;flex:none;flex-shrink:0;
+        width:52px;min-width:52px;margin-right:2px;}
+    .msg-team-avatars .ta{width:32px;height:32px;min-width:32px;border-radius:50%;
         display:flex;align-items:center;justify-content:center;
-        font-size:11px;font-weight:800;color:#fff;
+        font-size:11px;font-weight:800;color:#fff;flex:none;
         border:2px solid rgba(20,20,24,.9);box-shadow:0 2px 8px rgba(0,0,0,.4);}
-    .msg-team-avatars .ta1{left:0;top:4px;background:linear-gradient(135deg,#5E8BFF,#8B5CF6);z-index:1;}
-    .msg-team-avatars .ta2{left:18px;top:4px;background:linear-gradient(135deg,#34D399,#10B981);z-index:2;}
+    .msg-team-avatars .ta1{background:linear-gradient(135deg,#5E8BFF,#8B5CF6);}
+    .msg-team-avatars .ta2{background:linear-gradient(135deg,#34D399,#10B981);margin-left:-14px;}
     /* Refined unread badge — soft glow pill, not solid orange. */
     .msg-unread-ai{display:inline-flex;align-items:center;justify-content:center;
         min-width:22px;height:22px;padding:0 7px;border-radius:999px;
