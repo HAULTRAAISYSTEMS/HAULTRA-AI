@@ -22664,10 +22664,31 @@ def message_threads_api():
     # Team thread goes first — but only if the user is in the team chat.
     if _in_team_chat(conn, me, role, company):
         _tb, _ta, _tu = _team_summary()
+        # 2026-10-22: Real member avatars for the Team row — pulls the
+        # photos drivers uploaded on the Team page, so the channel shows
+        # actual faces, not placeholders. Up to 3, boss first.
+        _tav = []
+        try:
+            for _m in conn.execute(
+                """SELECT id, username, full_name, avatar_path FROM users
+                   WHERE company_id=? AND COALESCE(is_active,1)=1
+                   AND (role='boss' OR COALESCE(team_chat,1)=1)
+                   ORDER BY CASE WHEN role='boss' THEN 0 ELSE 1 END,
+                            COALESCE(full_name, username) LIMIT 3""",
+                (company,),
+            ).fetchall():
+                _tav.append({
+                    "src": ("/" + _m["avatar_path"].lstrip("/")) if _m["avatar_path"] else None,
+                    "initials": ((_m["full_name"] or _m["username"] or "?")[:1]).upper(),
+                    "name": _m["full_name"] or _m["username"] or "",
+                })
+        except Exception:
+            pass
         threads.append({
             "kind": "team", "key": "team",
             "title": "Team", "url": "/team/messages",
             "last_body": _tb, "last_at": _ta, "unread": _tu,
+            "avatars": _tav,
         })
     if role == "driver":
         last_body, last_at, unread = _summary(me)
@@ -22769,7 +22790,9 @@ def messages_page():
     .msg-team-avatars .ta{width:32px;height:32px;min-width:32px;border-radius:50%;
         display:flex;align-items:center;justify-content:center;
         font-size:11px;font-weight:800;color:#fff;flex:none;
-        border:2px solid rgba(20,20,24,.9);box-shadow:0 2px 8px rgba(0,0,0,.4);}
+        border:2px solid rgba(20,20,24,.9);box-shadow:0 2px 8px rgba(0,0,0,.4);
+        object-fit:cover;}
+    .msg-team-avatars img.ta{display:block;}
     .msg-team-avatars .ta1{background:linear-gradient(135deg,#5E8BFF,#8B5CF6);}
     .msg-team-avatars .ta2{background:linear-gradient(135deg,#34D399,#10B981);margin-left:-14px;}
     /* Refined unread badge — soft glow pill, not solid orange. */
@@ -22821,13 +22844,28 @@ def messages_page():
                  + '<span class="msg-thread-time">' + esc(t.last_at || '') + '</span></button>';
         }
         function teamRowHtml(t) {
-            // 2026-10-22: Apple Messages 2027 AI — stacked group avatars,
-            // refined glow badge. Stylized avatars signal "group" at a glance.
+            // 2026-10-22: Real member avatars — the photos from the Team page.
+            // Falls back to initials if no photo. Max 2 shown (iMessage-style stack).
             var pill = t.unread ? ' <span class="msg-unread-ai">' + t.unread + '</span>' : '';
+            var avHtml = '';
+            var avs = t.avatars || [];
+            for (var i = 0; i < Math.min(avs.length, 2); i++) {
+                var a = avs[i];
+                var cls = i === 0 ? 'ta1' : 'ta2';
+                if (a.src) {
+                    avHtml += '<img class="ta ' + cls + '" src="' + esc(a.src) + '" alt="' + esc(a.name).replace(/"/g, '&quot;') + '"'
+                          + ' loading="lazy" onerror="this.style.display=\'none\'">';
+                } else {
+                    avHtml += '<span class="ta ' + cls + '">' + esc(a.initials || '?') + '</span>';
+                }
+            }
+            // Fallback if no members: show the generic stack
+            if (!avHtml) {
+                avHtml = '<span class="ta ta1">T</span><span class="ta ta2">+</span>';
+            }
             return '<button type="button" class="msg-team-row" data-key="' + esc(t.key) + '"'
                  + ' data-title="' + esc(t.title).replace(/"/g, '&quot;') + '">'
-                 + '<span class="msg-team-avatars" aria-hidden="true">'
-                 + '<span class="ta ta1">T</span><span class="ta ta2">+</span></span>'
+                 + '<span class="msg-team-avatars" aria-hidden="true">' + avHtml + '</span>'
                  + '<span class="msg-thread-main"><span class="msg-thread-title">' + esc(t.title) + pill + '</span>'
                  + '<span class="msg-thread-preview">' + esc(t.last_body || 'No messages yet \u2014 say hello.') + '</span></span>'
                  + '<span class="msg-thread-time">' + esc(t.last_at || '') + '</span></button>';
