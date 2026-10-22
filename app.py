@@ -13869,6 +13869,7 @@ def account_settings():
             <button type="submit" class="haul-dropdown-item" style="justify-content:center;background:rgba(255,107,26,.16) !important;border-color:rgba(255,107,26,.45) !important;margin-top:8px;"><span class="haul-di-text" style="text-align:center;color:#FF8C42;font-weight:800;">Save</span></button>
         </form>
     </div>
+    {_push_settings_toggle()}
     <div class="card">
         <h2>&#128205; Location</h2>
         <p class="muted small">Used to record where containers are placed when you complete a stop.</p>
