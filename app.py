@@ -27159,12 +27159,16 @@ def route_daily_log(route_id):
         # that's where the driver enters it). Box In = what was on the truck
         # coming in = previous stop's Box Out. An explicit swap chain
         # (takes_from) overrides the sequential Box In.
-        _ticket_can = (s.get("ticket_can_number") or "").strip()
+        _skeys = s.keys()
+        _ticket_can = (s["ticket_can_number"] if "ticket_can_number" in _skeys else None) or ""
+        _ticket_can = _ticket_can.strip()
         box_out = _ticket_can
-        _act_lc = (s.get("action") or "").lower()
+        _act_lc = ((s["action"] if "action" in _skeys else None) or "").lower()
         _is_pr = "pickup and return" in _act_lc
-        _is_swap = bool(s.get("swap_with_previous_empty")) or (s.get("id") in (takes_from or {}))
-        _giver = (takes_from or {}).get(s.get("id"))
+        _swap_flag = s["swap_with_previous_empty"] if "swap_with_previous_empty" in _skeys else None
+        _sid = s["id"] if "id" in _skeys else None
+        _is_swap = bool(_swap_flag) or (_sid in (takes_from or {}))
+        _giver = (takes_from or {}).get(_sid)
         if _giver and can_by_stop.get(_giver):
             box_in = can_by_stop.get(_giver)
         elif _is_pr and not _is_swap:
