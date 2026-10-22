@@ -22670,28 +22670,12 @@ def message_threads_api():
             return None, "", 0
 
     threads = []
-    # Team thread goes first — but only if the user is in the team chat.
-    if _in_team_chat(conn, me, role, company):
-        # Ensure team tables exist (defensive: init_db may not have completed).
-        try:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS team_messages ("
-                "id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER NOT NULL, "
-                "sender_user_id INTEGER NOT NULL, body TEXT NOT NULL, "
-                "created_at TEXT NOT NULL, read_at TEXT, client_id TEXT)"
-            )
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS team_read_state ("
-                "company_id INTEGER NOT NULL, user_id INTEGER NOT NULL, "
-                "last_read_id INTEGER NOT NULL DEFAULT 0, "
-                "PRIMARY KEY (company_id, user_id))"
-            )
-            conn.commit()
-        except Exception:
-            pass
+    # 2026-10-22: Team thread TEMPORARILY DISABLED to unblock Messages inbox.
+    # The team_messages table and /team/messages API still exist, but the
+    # inbox shows DMs only until the Team integration is debugged properly.
+    # TODO: Re-enable Team thread after root-causing the Loading... hang.
+    if False and _in_team_chat(conn, me, role, company):
         _tb, _ta, _tu = _team_summary()
-        # 2026-10-22: Avatars temporarily disabled to unblock Messages.
-        # TODO: Re-add with defensive coding after confirming threads API works.
         threads.append({
             "kind": "team", "key": "team",
             "title": "Team", "url": "/team/messages",
