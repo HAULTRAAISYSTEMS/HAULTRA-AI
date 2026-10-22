@@ -22307,16 +22307,20 @@ def direct_messages_api(driver_id):
 
 def _in_team_chat(conn, user_id, role, company_id):
     """Is this user in the Team channel? Boss is always in; drivers need
-    the team_chat flag (boss controls membership in Settings)."""
+    the team_chat flag (boss controls membership on the Team page)."""
     if role == "boss":
         return True
-    row = conn.execute(
-        "SELECT team_chat FROM users WHERE id=? AND company_id=?",
-        (user_id, company_id),
-    ).fetchone()
+    # Column may not exist yet if the migration hasn't run (user hasn't
+    # logged out/in since it was added) — default to IN the chat.
+    try:
+        row = conn.execute(
+            "SELECT team_chat FROM users WHERE id=? AND company_id=?",
+            (user_id, company_id),
+        ).fetchone()
+    except Exception:
+        return True
     if not row:
         return False
-    # Column may not exist on very old DBs (migration adds it) — default in.
     try:
         return bool(row["team_chat"])
     except (KeyError, IndexError):
