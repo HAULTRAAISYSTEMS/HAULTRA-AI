@@ -12648,118 +12648,11 @@ def api_push_config():
     return jsonify({"enabled": push_configured(), "publicKey": VAPID_PUBLIC_KEY})
 
 
-@app.route("/boss/notifications")
-@boss_required
-def boss_notifications_page():
-    """The alert feed — one inbox for everything a driver sends.
-
-    Open items (still needing a decision) sort to the top regardless of age; a
-    breakdown from this morning outranks a time-off request from a minute ago.
-    Everything else is history, newest first.
-    """
-    show = (request.args.get("show") or "open").strip().lower()
-    if show not in ("open", "all"):
-        show = "open"
-    # 2026-10-17: paginate the Everything view — after a few months this
-    # list gets long. 50 per page, newest first.
-    try:
-        page = max(1, int(request.args.get("page") or 1))
-    except (TypeError, ValueError):
-        page = 1
-    per_page = 50
-
-    conn = get_db()
-    where = "a.company_id=?"
-    params = [cid()]
-    if show == "open":
-        where += " AND a.resolved_at IS NULL"
-    # Count for pagination (only needed on "all")
-    total_pages = 1
-    if show == "all":
-        _cnt = conn.execute(
-            f"SELECT COUNT(*) n FROM alerts a WHERE {where}", params
-        ).fetchone()["n"]
-        total_pages = max(1, (_cnt + per_page - 1) // per_page)
-        page = min(page, total_pages)
-    _offset = (page - 1) * per_page
-    _limit = per_page if show == "all" else 200
-    rows = conn.execute(
-        f"""SELECT a.*, COALESCE(NULLIF(TRIM(u.full_name),''), u.username) AS actor_name
-              FROM alerts a
-              LEFT JOIN users u ON u.id = a.actor_user_id
-             WHERE {where}
-             ORDER BY (a.resolved_at IS NULL) DESC,
-                      CASE a.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
-                      a.created_at DESC, a.id DESC
-             LIMIT {_limit} OFFSET {_offset}""",
-        params,
-    ).fetchall()
-    open_n = alert_open_count(conn, cid())
-    total_n = conn.execute(
-        "SELECT COUNT(*) n FROM alerts WHERE company_id=?", (cid(),)
-    ).fetchone()["n"]
-    # Opening the page is what marks things READ. Read is "I have seen this";
-    # resolved is "I have dealt with it" — two different questions, and the
-    # badge only ever counts the second.
-    conn.execute(
-        "UPDATE alerts SET read_at=COALESCE(read_at,?) WHERE company_id=? AND read_at IS NULL",
-        (now_ts(), cid()),
-    )
-    conn.commit()
-    conn.close()
-
-    _sev_style = {
-        "critical": ("#FF5252", "rgba(255,82,82,0.09)", "rgba(255,82,82,0.45)"),
-        "warning":  ("#F5B43C", "rgba(245,180,60,0.08)", "rgba(245,180,60,0.40)"),
-        "info":     ("#8CA0B3", "rgba(140,160,179,0.07)", "rgba(140,160,179,0.30)"),
-    }
-
-    cards = ""
-    for r in rows:
-        icon_name, _dsev, label = ALERT_KINDS.get(r["kind"], ("bell", "info", r["kind"]))
-        col, bg, bd = _sev_style.get(r["severity"], _sev_style["info"])
-        done = bool(r["resolved_at"])
-        # 2026-10-14: opening a driver-message alert marks it handled in the
-        # same tap (alert_open) and deep-links into the thread.
-        _open_href = (
-            url_for("alert_open", alert_id=r["id"])
-            if (r["kind"] == "DRIVER_MESSAGE" and not done)
-            else r["link"]
-        )
-        cards += f"""
-        <div class="alert-card{' is-done' if done else ''}"
-             style="border-left-color:{col};background:{'transparent' if done else bg};border-color:{bd};">
-            <div class="alert-head">
-                <span class="alert-kind" style="color:{col};">{icon(icon_name)}{e(label)}</span>
-                <span class="alert-when">{e(_ago(r['created_at']))}</span>
-            </div>
-            <div class="alert-title">{e(r['title'])}</div>
-            {f'<div class="alert-body">{e(r["body"])}</div>' if r["body"] else ''}
-            <div class="alert-actions">
-                {f'<a class="alert-link" href="{_open_href}">Open{icon("board")}</a>' if _open_href else ''}
-                {'<span class="alert-done-tag">Handled</span>' if done else
-                 f'''<form method="POST" action="{url_for('alert_resolve', alert_id=r['id'])}" style="margin:0;">
-                     <button type="submit" class="alert-resolve">{icon('check')}Mark handled</button></form>'''}
-            </div>
-        </div>
-        """
-
-    if total_n == 0:
-        _empty = ('<div class="card muted">No alerts yet. When a driver reports running late, '
-                  'cancels a stop, sends a message or breaks down, it lands here.</div>')
-    elif show == "open":
-        _empty = ('<div class="card muted">Nothing needs you right now &mdash; '
-                  + str(total_n) + ' alert' + ('' if total_n == 1 else 's')
-                  + ' handled. <a href="' + url_for("boss_notifications_page", show="all")
-                  + '">See everything</a>.</div>')
-    else:
-        _empty = '<div class="card muted">No alerts yet.</div>' 
-
-    # Phone alerts. The permission prompt has to come from a real tap — browsers
-    # reject one fired on page load, and ambushing someone with it is rude
-    # anyway. The row hides itself when push isn't configured server-side, so
-    # nobody is offered a button that cannot work.
-    push_row = """
+def _phone_push_card():
+    # Shared phone-alerts card: boss Alerts page AND boss Settings.
+    # Native-shell (installed app) -> APNs via Capacitor; browsers -> Web Push.
+    # The card hides itself when push is not configured server-side.
+    return """
     <div class="card" id="push-card" hidden style="margin-bottom:14px;">
       <div class="row between" style="gap:12px;flex-wrap:wrap;">
         <div>
@@ -12922,6 +12815,120 @@ def boss_notifications_page():
     })();
     </script>
     """
+
+
+@app.route("/boss/notifications")
+@boss_required
+def boss_notifications_page():
+    """The alert feed — one inbox for everything a driver sends.
+
+    Open items (still needing a decision) sort to the top regardless of age; a
+    breakdown from this morning outranks a time-off request from a minute ago.
+    Everything else is history, newest first.
+    """
+    show = (request.args.get("show") or "open").strip().lower()
+    if show not in ("open", "all"):
+        show = "open"
+    # 2026-10-17: paginate the Everything view — after a few months this
+    # list gets long. 50 per page, newest first.
+    try:
+        page = max(1, int(request.args.get("page") or 1))
+    except (TypeError, ValueError):
+        page = 1
+    per_page = 50
+
+    conn = get_db()
+    where = "a.company_id=?"
+    params = [cid()]
+    if show == "open":
+        where += " AND a.resolved_at IS NULL"
+    # Count for pagination (only needed on "all")
+    total_pages = 1
+    if show == "all":
+        _cnt = conn.execute(
+            f"SELECT COUNT(*) n FROM alerts a WHERE {where}", params
+        ).fetchone()["n"]
+        total_pages = max(1, (_cnt + per_page - 1) // per_page)
+        page = min(page, total_pages)
+    _offset = (page - 1) * per_page
+    _limit = per_page if show == "all" else 200
+    rows = conn.execute(
+        f"""SELECT a.*, COALESCE(NULLIF(TRIM(u.full_name),''), u.username) AS actor_name
+              FROM alerts a
+              LEFT JOIN users u ON u.id = a.actor_user_id
+             WHERE {where}
+             ORDER BY (a.resolved_at IS NULL) DESC,
+                      CASE a.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
+                      a.created_at DESC, a.id DESC
+             LIMIT {_limit} OFFSET {_offset}""",
+        params,
+    ).fetchall()
+    open_n = alert_open_count(conn, cid())
+    total_n = conn.execute(
+        "SELECT COUNT(*) n FROM alerts WHERE company_id=?", (cid(),)
+    ).fetchone()["n"]
+    # Opening the page is what marks things READ. Read is "I have seen this";
+    # resolved is "I have dealt with it" — two different questions, and the
+    # badge only ever counts the second.
+    conn.execute(
+        "UPDATE alerts SET read_at=COALESCE(read_at,?) WHERE company_id=? AND read_at IS NULL",
+        (now_ts(), cid()),
+    )
+    conn.commit()
+    conn.close()
+
+    _sev_style = {
+        "critical": ("#FF5252", "rgba(255,82,82,0.09)", "rgba(255,82,82,0.45)"),
+        "warning":  ("#F5B43C", "rgba(245,180,60,0.08)", "rgba(245,180,60,0.40)"),
+        "info":     ("#8CA0B3", "rgba(140,160,179,0.07)", "rgba(140,160,179,0.30)"),
+    }
+
+    cards = ""
+    for r in rows:
+        icon_name, _dsev, label = ALERT_KINDS.get(r["kind"], ("bell", "info", r["kind"]))
+        col, bg, bd = _sev_style.get(r["severity"], _sev_style["info"])
+        done = bool(r["resolved_at"])
+        # 2026-10-14: opening a driver-message alert marks it handled in the
+        # same tap (alert_open) and deep-links into the thread.
+        _open_href = (
+            url_for("alert_open", alert_id=r["id"])
+            if (r["kind"] == "DRIVER_MESSAGE" and not done)
+            else r["link"]
+        )
+        cards += f"""
+        <div class="alert-card{' is-done' if done else ''}"
+             style="border-left-color:{col};background:{'transparent' if done else bg};border-color:{bd};">
+            <div class="alert-head">
+                <span class="alert-kind" style="color:{col};">{icon(icon_name)}{e(label)}</span>
+                <span class="alert-when">{e(_ago(r['created_at']))}</span>
+            </div>
+            <div class="alert-title">{e(r['title'])}</div>
+            {f'<div class="alert-body">{e(r["body"])}</div>' if r["body"] else ''}
+            <div class="alert-actions">
+                {f'<a class="alert-link" href="{_open_href}">Open{icon("board")}</a>' if _open_href else ''}
+                {'<span class="alert-done-tag">Handled</span>' if done else
+                 f'''<form method="POST" action="{url_for('alert_resolve', alert_id=r['id'])}" style="margin:0;">
+                     <button type="submit" class="alert-resolve">{icon('check')}Mark handled</button></form>'''}
+            </div>
+        </div>
+        """
+
+    if total_n == 0:
+        _empty = ('<div class="card muted">No alerts yet. When a driver reports running late, '
+                  'cancels a stop, sends a message or breaks down, it lands here.</div>')
+    elif show == "open":
+        _empty = ('<div class="card muted">Nothing needs you right now &mdash; '
+                  + str(total_n) + ' alert' + ('' if total_n == 1 else 's')
+                  + ' handled. <a href="' + url_for("boss_notifications_page", show="all")
+                  + '">See everything</a>.</div>')
+    else:
+        _empty = '<div class="card muted">No alerts yet.</div>' 
+
+    # Phone alerts. The permission prompt has to come from a real tap — browsers
+    # reject one fired on page load, and ambushing someone with it is rude
+    # anyway. The row hides itself when push isn't configured server-side, so
+    # nobody is offered a button that cannot work.
+    push_row = _phone_push_card()
     body = f"""
     <div class="hero">
         <h1>Alerts</h1>
@@ -28889,12 +28896,23 @@ def settings_page():
         </div>
         """
 
+    # 2026-10-21: phone alerts live in Settings too (boss asked) — same shared
+    # card as the Alerts page. Plain string section; the card unhides itself
+    # when push is configured and this is the native app or a capable browser.
+    _phone_section = (
+        '<div style="margin-top:20px;">'
+        '<h2>\U0001F514 Phone Alerts</h2>'
+        + _phone_push_card()
+        + '</div>'
+    )
+
     body = f"""
     <div class="hero">
         <h1>Settings</h1>
         <p>Company profile, yard location, work hours, and subscription — all in one place.</p>
     </div>
     {settings_body}
+    {_phone_section}
     {subscription_body}
     {delete_account_body}
     """
