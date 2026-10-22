@@ -27166,7 +27166,18 @@ def route_daily_log(route_id):
             box_in = can_by_stop.get(_giver)
         else:
             box_in = _prev_box_out
-        _prev_box_out = box_out
+        # 2026-10-22: For a PR (Pickup and Return) that is NOT a swap, the
+        # empty bin is returned to the customer — truck leaves empty. Don't
+        # carry the bin forward. For a Pull (or PR swap), the bin IS carried.
+        _act_lc = (s["action"] or "").lower()
+        _is_pr = "pickup and return" in _act_lc
+        _is_swap = bool(s["swap_with_previous_empty"]) or (s["id"] in takes_from)
+        if _is_pr and not _is_swap:
+            # PR (not a swap): bin returned, truck empty for next stop
+            _prev_box_out = ""
+        else:
+            # Pull or PR swap: bin carried forward
+            _prev_box_out = box_out
         # 2026-10-21: Start = previous stop's finish (driver rolls job to
         # job). First stop = when the driver hit start on the route.
         # Stops not yet reached show NO start time (not the route start).
