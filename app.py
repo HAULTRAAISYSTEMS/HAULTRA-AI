@@ -22873,9 +22873,20 @@ def messages_page():
                  + '<span class="msg-thread-time">' + esc(t.last_at || '') + '</span></button>';
         }
         function loadThreads() {
+            var _loadEl = document.getElementById('msg-inbox-loading');
+            // 2026-10-22: Diagnostic — show exactly what fails.
+            function _showErr(msg) {
+                _loadEl.style.display = '';
+                _loadEl.textContent = 'Error: ' + msg;
+                _loadEl.style.color = '#f87171';
+            }
             fetch('/api/messages/threads', { credentials: 'same-origin' })
-                .then(function(r) { return r.json(); })
+                .then(function(r) {
+                    if (!r.ok) { throw new Error('HTTP ' + r.status); }
+                    return r.json();
+                })
                 .then(function(d) {
+                    if (d.error) { _showErr('API: ' + d.error); return; }
                     document.getElementById('msg-inbox-loading').style.display = 'none';
                     var threads = d.threads || [];
                     var team = threads.filter(function(t) { return t.kind === 'team'; });
@@ -22914,8 +22925,8 @@ def messages_page():
                         if (hit) window.openMessageThread(hit.key, hit.title);
                     }
                 })
-                .catch(function() {
-                    document.getElementById('msg-inbox-loading').textContent = 'Could not load messages \u2014 check your connection.';
+                .catch(function(err) {
+                    _showErr((err && err.message) || 'fetch failed');
                 });
         }
         document.addEventListener('click', function(ev) {
