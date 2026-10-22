@@ -22606,7 +22606,18 @@ def message_typing_heartbeat():
 @login_required
 def message_threads_api():
     """Inbox: ONE thread per driver (direct + route messages merged). The boss
-    sees one row per driver; the driver sees their single "Boss" thread."""
+    sees one row per driver; the driver sees their single "Boss" thread.
+    2026-10-22: Wrapped in try/except — a 500 here leaves inbox on "Loading..."."""
+    try:
+        return _message_threads_api_inner()
+    except Exception as ex:
+        import traceback
+        traceback.print_exc()
+        from flask import jsonify as _jf
+        return _jf({"threads": [], "error": str(ex)[:200]})
+
+
+def _message_threads_api_inner():
     conn = get_db()
     me = session["user_id"]
     role = session.get("role")
