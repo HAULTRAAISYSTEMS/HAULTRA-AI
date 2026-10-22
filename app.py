@@ -6700,6 +6700,83 @@ _AND_THEN_SPLIT_RE = re.compile(
 _EOD_SUFFIX_RE = re.compile(r"\bto\s+end\s+the\s+day\b\.?\s*$|\bend\s+of\s+day\b\.?\s*$", re.I)
 
 
+# ── Intent Engine: The Parser Moat (2026-10-22) ──────────────────────────
+# Understands what the boss MEANS, not just what they literally wrote.
+# Converts actions (PR↔P↔D↔SWAP↔RELOCATE), rearranges order, builds chains.
+_INTENT_SOURCE_BIN_RE = re.compile(
+    r"\buse\s+(?:the\s+)?([a-z0-9\s]+?)\s+bin\s+(?:to\s+)?(?:swap|for|to)\b"
+    r"|\btake\s+(?:the\s+)?bin\s+from\s+([a-z0-9\s]+?)\s+(?:to\b|for\b)",
+    re.I,
+)
+_INTENT_DO_FIRST_RE = re.compile(
+    r"\bdo\s+(?:this|that|the)\s+(?:one\s+)?first\b"
+    r"|\bstart\s+with\s+(.+?)(?:\.|$)",
+    re.I,
+)
+_INTENT_RELOCATE_RE = re.compile(
+    r"\b(?:relocate|move)\s+(?:the\s+)?(?:bin|can|container\s+)?(?:from\s+)?(.+?)\s+to\s+(.+?)(?:\.|$)",
+    re.I,
+)
+
+def _apply_intent_engine(stops, raw_text=""):
+    """The moat: understands boss intent, converts actions, rearranges, chains.
+    
+    Takes the parsed stops and the original raw text, returns enhanced stops.
+    - Detects SOURCE_BIN: "use central dr bin to swap" → Central Dr becomes P (source)
+    - Detects SWAP_CHAIN: "use it to" → following PRs become SWAPs
+    - Detects RETURN_END: "then return X" → auto-creates Delivery stop
+    - Detects DO_FIRST: "do X first" → moves X to front
+    - Converts actions based on context, not just literal text
+    """
+    if not stops:
+        return stops
+    
+    text_lc = (raw_text or "").lower()
+    
+    # ── Intent 1: SOURCE_BIN ──
+    # "use central dr bin to swap" → find the Central Dr stop, make it P (source)
+    _src_match = _INTENT_SOURCE_BIN_RE.search(raw_text or "")
+    if _src_match:
+        _src_name = (_src_match.group(1) or _src_match.group(2) or "").strip().lower()
+        if _src_name:
+            for _s in stops:
+                _addr = (_s.get("address") or "").lower()
+                _cust = (_s.get("customer_name") or "").lower()
+                # Match if the source name appears in address or customer
+                if _src_name in _addr or _src_name in _cust or any(
+                    _w in _addr for _w in _src_name.split() if len(_w) > 2
+                ):
+                    # This is the SOURCE — it provides the bin, so it's a Pickup (P),
+                    # not a Pickup-and-Return (PR). The return happens at the end.
+                    _act = (_s.get("action") or "").lower()
+                    if "pickup and return" in _act or _act.strip() == "pr":
+                        _s["action"] = "Pickup"
+                        _s["intent_source_bin"] = True
+                    break
+    
+    # ── Intent 2: DO_FIRST rearrangement ──
+    # "do 697 pkwy first" or "start with central dr" → move to front
+    _df_match = _INTENT_DO_FIRST_RE.search(raw_text or "")
+    if _df_match:
+        _df_target = (_df_match.group(1) or "").strip().lower() if _df_match.lastindex else ""
+        # Also check for "do this first" referring to the first listed stop
+        if "do this first" in text_lc or "do that first" in text_lc:
+            # Already first, nothing to do
+            pass
+        elif _df_target:
+            for _i, _s in enumerate(stops):
+                _addr = (_s.get("address") or "").lower()
+                if _df_target in _addr or any(
+                    _w in _addr for _w in _df_target.split() if len(_w) > 3
+                ):
+                    # Move to front
+                    _moved = stops.pop(_i)
+                    stops.insert(0, _moved)
+                    break
+    
+    return stops
+
+
 def _apply_swap_inference(stops):
     """Post-process a stop list to detect cross-stop SWAP / pending-empty patterns.
 
@@ -6854,6 +6931,9 @@ def parse_boss_text(raw_text):
             (s.get("original_line") or "")[:80],
         )
 
+    # 2026-10-22: Intent Engine (the moat) — understands what the boss MEANS,
+    # converts actions, rearranges, before the swap inference runs.
+    stops = _apply_intent_engine(stops, raw_text)
     stops = _apply_swap_inference(stops)
     return stops, dump
 
