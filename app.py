@@ -7036,7 +7036,7 @@ def _msg_nav_badge(n):
 
 
 # 2026-10-14: Keeps every .msg-nav-badge fresh on the page — polls the unread
-# count every 30s and on tab refocus. Exposes window.refreshMsgBadge() so the
+# count every 10s and on tab refocus. Exposes window.refreshMsgBadge() so the
 # inbox can clear badges the moment a thread is read.
 _MSG_BADGE_POLL_JS = """
 <script>
@@ -7057,7 +7057,7 @@ _MSG_BADGE_POLL_JS = """
             .catch(function() {});
     };
     window.refreshMsgBadge();
-    setInterval(window.refreshMsgBadge, 30000);
+    setInterval(window.refreshMsgBadge, 10000);
     document.addEventListener('visibilitychange', function() {
         if (!document.hidden) window.refreshMsgBadge();
     });
@@ -22484,7 +22484,7 @@ def messages_page():
         // refresh. Poll every 5s; skip when tab is backgrounded to save battery.
         setInterval(function() {
             if (!document.hidden) loadThreads();
-        }, 5000);
+        }, 3000);
         document.addEventListener('visibilitychange', function() {
             if (!document.hidden) loadThreads();
         });
