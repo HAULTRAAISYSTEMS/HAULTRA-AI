@@ -13445,6 +13445,23 @@ def team_page():
                                                    include_js=False, compact=True)
         else:
             _av_cell = avatar_html(u, 40)
+        # Team chat toggle: boss controls who's in the Team channel.
+        # Boss always in (disabled toggle); drivers get a clickable toggle.
+        try:
+            _in_chat = bool(u["team_chat"])
+        except (KeyError, IndexError):
+            _in_chat = True
+        if u["role"] == "boss":
+            _chat_cell = '<span class="muted small" title="Boss is always in team chat">—</span>'
+        elif is_deleted:
+            _chat_cell = '<span class="muted small">—</span>'
+        else:
+            _chk = "checked" if _in_chat else ""
+            _chat_cell = (
+                f'<label class="team-chat-toggle" title="Team chat membership">'
+                f'<input type="checkbox" {_chk} data-uid="{u["id"]}" aria-label="Team chat">'
+                f'<span class="slider"></span></label>'
+            )
         rows += f"""
         <tr>
             <td>{_av_cell}</td>
@@ -13454,6 +13471,7 @@ def team_page():
             <td>{role_badge}</td>
             <td class="muted small">{stats_cell}</td>
             <td>{nav_cell}</td>
+            <td>{_chat_cell}</td>
             <td>{e(u['created_at'])}</td>
             <td {_del_td_style}>{hours_cell}{delete_cell}</td>
         </tr>
@@ -13476,14 +13494,46 @@ def team_page():
                     <tr>
                         <th style="width:56px;"></th>
                         <th>Username</th><th>Full Name</th><th>Phone</th><th>Role</th>
-                        <th>Driver Activity</th><th>Nav App</th><th>Created</th><th style="width:170px;"></th>
+                        <th>Driver Activity</th><th>Nav App</th><th>Team Chat</th><th>Created</th><th style="width:170px;"></th>
                     </tr>
                 </thead>
-                <tbody>{rows or '<tr><td colspan="9" class="muted">No team members found.</td></tr>'}</tbody>
+                <tbody>{rows or '<tr><td colspan="10" class="muted">No team members found.</td></tr>'}</tbody>
             </table>
         </div>
     </div>
     {_AVATAR_UPLOAD_JS}
+    <style>
+    .team-chat-toggle{{position:relative;display:inline-block;width:44px;height:26px;cursor:pointer;}}
+    .team-chat-toggle input{{opacity:0;width:0;height:0;}}
+    .team-chat-toggle .slider{{position:absolute;inset:0;border-radius:999px;
+        background:rgba(255,255,255,.14);transition:.2s;}}
+    .team-chat-toggle .slider:before{{content:"";position:absolute;width:20px;height:20px;
+        left:3px;top:3px;border-radius:50%;background:#fff;transition:.2s;}}
+    .team-chat-toggle input:checked + .slider{{background:#34C759;}}
+    .team-chat-toggle input:checked + .slider:before{{transform:translateX(18px);}}
+    </style>
+    <script>
+    (function(){{
+        var CSRF=document.querySelector('meta[name="csrf-token"]');
+        CSRF=CSRF?CSRF.content:'';
+        document.querySelectorAll('.team-chat-toggle input[data-uid]').forEach(function(inp){{
+            inp.addEventListener('change',function(){{
+                var uid=inp.getAttribute('data-uid'), want=inp.checked;
+                inp.disabled=true;
+                fetch('/api/team/members',{{method:'POST',
+                    headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},
+                    credentials:'same-origin',
+                    body:JSON.stringify({{user_id:parseInt(uid,10),in_team:want}})}})
+                .then(function(r){{return r.json().then(function(j){{return{{ok:r.ok,j:j}};}});}})
+                .then(function(res){{
+                    inp.disabled=false;
+                    if(!res.ok){{inp.checked=!want;alert((res.j&&res.j.error)||'Could not update.');}}
+                }})
+                .catch(function(){{inp.disabled=false;inp.checked=!want;alert('Network error.');}});
+            }});
+        }});
+    }})();
+    </script>
     """
     return render_template_string(shell_page("Team", body))
 
@@ -22701,22 +22751,41 @@ def messages_page():
     .msg-thread-row{display:flex;align-items:center;gap:10px;width:100%;text-align:left;
         background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);
         border-radius:14px;padding:12px 14px;margin-bottom:8px;cursor:pointer;color:inherit;font:inherit;}
-    /* 2026-10-22: Team channel gets a distinct look — group identity, not a DM. */
+    /* 2026-10-22: Team channel — Apple Messages 2027 AI aesthetic.
+       Frosted glass, stacked group avatars (iMessage-style), subtle
+       intelligent glow. No orange wash — the group identity speaks. */
     .msg-team-row{display:flex;align-items:center;gap:12px;width:100%;text-align:left;
-        background:linear-gradient(135deg,rgba(255,107,26,.12),rgba(255,107,26,.04));
-        border:1px solid rgba(255,107,26,.35);
-        border-radius:14px;padding:14px;margin-bottom:8px;cursor:pointer;color:inherit;font:inherit;}
+        background:rgba(255,255,255,.045);
+        -webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px);
+        border:1px solid rgba(255,255,255,.10);
+        border-radius:18px;padding:14px;margin-bottom:8px;cursor:pointer;
+        color:inherit;font:inherit;position:relative;overflow:hidden;}
     .msg-team-row:active{transform:scale(.99);}
-    .msg-team-icon{width:40px;height:40px;min-width:40px;border-radius:50%;
-        background:linear-gradient(135deg,#FF6B1A,#FF9A3D);
-        display:flex;align-items:center;justify-content:center;font-size:20px;}
+    .msg-team-row::before{content:"";position:absolute;inset:0;border-radius:18px;
+        background:radial-gradient(120% 90% at 20% 0%,rgba(120,180,255,.08),transparent 60%);
+        pointer-events:none;}
+    .msg-team-avatars{position:relative;width:52px;height:40px;min-width:52px;flex:none;}
+    .msg-team-avatars .ta{position:absolute;width:32px;height:32px;border-radius:50%;
+        display:flex;align-items:center;justify-content:center;
+        font-size:11px;font-weight:800;color:#fff;
+        border:2px solid rgba(20,20,24,.9);box-shadow:0 2px 8px rgba(0,0,0,.4);}
+    .msg-team-avatars .ta1{left:0;top:4px;background:linear-gradient(135deg,#5E8BFF,#8B5CF6);z-index:1;}
+    .msg-team-avatars .ta2{left:18px;top:4px;background:linear-gradient(135deg,#34D399,#10B981);z-index:2;}
+    /* Refined unread badge — soft glow pill, not solid orange. */
+    .msg-unread-ai{display:inline-flex;align-items:center;justify-content:center;
+        min-width:22px;height:22px;padding:0 7px;border-radius:999px;
+        font-size:11px;font-weight:700;color:#fff;
+        background:rgba(255,107,26,.18);
+        border:1px solid rgba(255,107,26,.45);
+        box-shadow:0 0 12px rgba(255,107,26,.25),inset 0 0 8px rgba(255,107,26,.12);
+        -webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);}
     .msg-thread-row:active{transform:scale(.99);}
     .msg-thread-main{flex:1;min-width:0;}
     .msg-thread-title{font-weight:700;font-size:15px;display:flex;align-items:center;gap:8px;}
     .msg-thread-preview{display:block;font-size:13px;color:var(--text-dim,#8b8b8b);
         white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;}
     .msg-thread-time{font-size:11px;color:var(--text-dim,#8b8b8b);flex:none;}
-    .msg-unread-pill{min-width:20px;height:20px;padding:0 6px;border-radius:999px;
+    .msg-unread-ai{min-width:20px;height:20px;padding:0 6px;border-radius:999px;
         background:var(--cyan);color:#121212;font-size:11px;font-weight:800;
         display:inline-flex;align-items:center;justify-content:center;}
     .msg-inbox-empty{text-align:center;color:var(--text-dim,#8b8b8b);padding:40px 20px;font-size:14px;}
@@ -22743,7 +22812,7 @@ def messages_page():
             return d.innerHTML;
         }
         function rowHtml(t) {
-            var pill = t.unread ? ' <span class="msg-unread-pill">' + t.unread + '</span>' : '';
+            var pill = t.unread ? ' <span class="msg-unread-ai">' + t.unread + '</span>' : '';
             return '<button type="button" class="msg-thread-row" data-key="' + esc(t.key) + '"'
                  + ' data-title="' + esc(t.title).replace(/"/g, '&quot;') + '">'
                  + '<span class="msg-thread-main"><span class="msg-thread-title">' + esc(t.title) + pill + '</span>'
@@ -22751,10 +22820,13 @@ def messages_page():
                  + '<span class="msg-thread-time">' + esc(t.last_at || '') + '</span></button>';
         }
         function teamRowHtml(t) {
-            var pill = t.unread ? ' <span class="msg-unread-pill">' + t.unread + '</span>' : '';
+            // 2026-10-22: Apple Messages 2027 AI — stacked group avatars,
+            // refined glow badge. Stylized avatars signal "group" at a glance.
+            var pill = t.unread ? ' <span class="msg-unread-ai">' + t.unread + '</span>' : '';
             return '<button type="button" class="msg-team-row" data-key="' + esc(t.key) + '"'
                  + ' data-title="' + esc(t.title).replace(/"/g, '&quot;') + '">'
-                 + '<span class="msg-team-icon">👥</span>'
+                 + '<span class="msg-team-avatars" aria-hidden="true">'
+                 + '<span class="ta ta1">T</span><span class="ta ta2">+</span></span>'
                  + '<span class="msg-thread-main"><span class="msg-thread-title">' + esc(t.title) + pill + '</span>'
                  + '<span class="msg-thread-preview">' + esc(t.last_body || 'No messages yet \u2014 say hello.') + '</span></span>'
                  + '<span class="msg-thread-time">' + esc(t.last_at || '') + '</span></button>';
@@ -29528,87 +29600,6 @@ def settings_page():
         + _push_settings_toggle()
         + '</div>'
     )
-
-    # 2026-10-22: Team Chat membership — boss controls who's in the Team
-    # channel. Drivers come and go; the boss adds/removes them here.
-    _team_section = """
-    <div style="margin-top:20px;">
-        <h2>\U0001F465 Team Chat</h2>
-        <p style="color:var(--text-dim);font-size:13px;margin:4px 0 12px;">
-            Who can see and post in the <strong>Team</strong> channel in Messages.
-            You're always in.
-        </p>
-        <div id="team-members-list">
-            <div style="color:var(--text-dim);font-size:13px;">Loading...</div>
-        </div>
-    </div>
-    <style>
-    .team-member-row{display:flex;align-items:center;gap:12px;padding:10px 4px;
-        border-bottom:1px solid rgba(255,255,255,.06);}
-    .team-member-row:last-child{border-bottom:none;}
-    .team-member-name{flex:1;font-size:15px;font-weight:600;}
-    .team-member-role{font-size:11px;color:var(--text-dim);text-transform:uppercase;
-        letter-spacing:.08em;}
-    .team-toggle{position:relative;width:48px;height:28px;flex:none;cursor:pointer;}
-    .team-toggle input{opacity:0;width:0;height:0;}
-    .team-toggle .slider{position:absolute;inset:0;border-radius:999px;
-        background:rgba(255,255,255,.12);transition:.2s;}
-    .team-toggle .slider:before{content:"";position:absolute;width:22px;height:22px;
-        left:3px;top:3px;border-radius:50%;background:#fff;transition:.2s;}
-    .team-toggle input:checked + .slider{background:#34C759;}
-    .team-toggle input:checked + .slider:before{transform:translateX(20px);}
-    .team-toggle input:disabled + .slider{opacity:.4;cursor:default;}
-    </style>
-    <script>
-    (function(){
-        var CSRF = (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
-        function esc(s){var d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML;}
-        function load(){
-            fetch('/api/team/members',{credentials:'same-origin'})
-                .then(function(r){return r.json();})
-                .then(function(d){
-                    var list=document.getElementById('team-members-list');
-                    if(!list)return;
-                    var ms=d.members||[];
-                    if(!ms.length){list.innerHTML='<div style="color:var(--text-dim);">No team members.</div>';return;}
-                    list.innerHTML=ms.map(function(m){
-                        var dis=m.is_boss?'disabled':'';
-                        var chk=m.in_team?'checked':'';
-                        var badge=m.is_boss?'<span class="team-member-role">boss - always in</span>':'<span class="team-member-role">'+esc(m.role)+'</span>';
-                        return '<div class="team-member-row">'
-                            +'<span class="team-member-name">'+esc(m.name)+'<br>'+badge+'</span>'
-                            +'<label class="team-toggle"><input type="checkbox" '+chk+' '+dis
-                            +' data-uid="'+m.id+'" aria-label="Team chat for '+esc(m.name)+'">'
-                            +'<span class="slider"></span></label></div>';
-                    }).join('');
-                    list.querySelectorAll('input[data-uid]').forEach(function(inp){
-                        inp.addEventListener('change',function(){
-                            var uid=inp.getAttribute('data-uid');
-                            var want=inp.checked;
-                            inp.disabled=true;
-                            fetch('/api/team/members',{method:'POST',
-                                headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
-                                credentials:'same-origin',
-                                body:JSON.stringify({user_id:parseInt(uid,10),in_team:want})})
-                            .then(function(r){return r.json().then(function(j){return{ok:r.ok,j:j};});})
-                            .then(function(res){
-                                inp.disabled=false;
-                                if(!res.ok){inp.checked=!want;alert((res.j&&res.j.error)||'Could not update.');}
-                            })
-                            .catch(function(){inp.disabled=false;inp.checked=!want;alert('Network error.');});
-                        });
-                    });
-                })
-                .catch(function(){
-                    var list=document.getElementById('team-members-list');
-                    if(list)list.innerHTML='<div style="color:var(--text-dim);">Could not load team members.</div>';
-                });
-        }
-        load();
-    })();
-    </script>
-    """
-
     body = f"""
     <div class="hero">
         <h1>Settings</h1>
@@ -29616,7 +29607,6 @@ def settings_page():
     </div>
     {settings_body}
     {_phone_section}
-    {_team_section}
     {subscription_body}
     {delete_account_body}
     """
