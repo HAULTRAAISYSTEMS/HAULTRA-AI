@@ -19034,14 +19034,9 @@ def driver_route_detail(route_id):
     go_to_dump_html = ""
     box_out_html = ""
     _hide_complete_btn = False
-    # 2026-10-22: For PICKUP (pull) stops, hide Complete Stop until the driver
-    # reaches the dump (need_box_in/box_in). Otherwise they can tap Complete
-    # on Leg 1 and skip the dump leg + ticket entry entirely.
-    # EXCEPTION: empty pickups ("pickup empty" / "from landfill") have no dump
-    # leg — show Complete Stop right after Box Out.
-    _is_empty_pickup = bool(_s.get("is_empty_pickup"))
-    if is_pull and not _is_empty_pickup and driver_status not in ("need_box_in", "box_in", "completed"):
-        _hide_complete_btn = True
+    # 2026-10-22: Complete Stop stays visible as a driver override
+    # (user's call) — the workflow buttons are the normal path, but the
+    # driver can always complete manually if needed.
     if _chained:
         # First on-site step: the head has no incoming empty (just box out its
         # full); every other chain member arrives carrying an empty to set off.
