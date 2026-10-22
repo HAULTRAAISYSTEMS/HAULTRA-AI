@@ -746,11 +746,17 @@ def parse_route_text(text, conn, company_id):
             notes_lc  = notes.lower()
             is_pr     = "pickup and return" in action_lc
 
-            # Apply pending swap from a previous stop to this PR stop
+            # Apply pending swap from a previous stop to this PR stop.
+            # 2026-10-22: For swap CHAINS, keep use_for_next active so ALL
+            # consecutive PR stops become swaps (not just the first one).
+            # The chain breaks when a non-PR stop appears.
             if use_for_next and is_pr:
                 parsed["pr_mode"]                  = "swap"
                 parsed["swap_with_prev_pull"]      = 1
                 parsed["swap_with_previous_empty"] = True
+                # Do NOT set use_for_next=False — chain continues.
+            elif not is_pr:
+                # Non-PR stop breaks the chain.
                 use_for_next = False
 
             # Detect swap trigger phrase in this stop's notes
@@ -6716,11 +6722,14 @@ def _apply_swap_inference(stops):
         # Check for trigger phrase before applying swap (order matters for chaining)
         this_triggers = bool(_PENDING_EMPTY_RE.search(notes_lc))
 
-        # Apply pending swap to the next PR stop
+        # Apply pending swap to PR stops (chain: keeps applying until
+        # a non-PR stop breaks it).
         if is_pr and pending_swap:
             stop["swap_with_previous_empty"] = True
             stop["pr_mode"]                  = "swap"
             stop["swap_with_prev_pull"]      = 1
+            # Do NOT clear pending_swap — chain continues for consecutive PRs.
+        elif not is_pr:
             pending_swap = False
 
         # Set pending if this stop has a trigger phrase
