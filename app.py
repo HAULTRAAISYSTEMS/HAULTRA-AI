@@ -22668,31 +22668,12 @@ def message_threads_api():
     # Team thread goes first — but only if the user is in the team chat.
     if _in_team_chat(conn, me, role, company):
         _tb, _ta, _tu = _team_summary()
-        # 2026-10-22: Real member avatars for the Team row — pulls the
-        # photos drivers uploaded on the Team page, so the channel shows
-        # actual faces, not placeholders. Up to 3, boss first.
-        _tav = []
-        try:
-            for _m in conn.execute(
-                """SELECT id, username, full_name, avatar_path FROM users
-                   WHERE company_id=? AND COALESCE(is_active,1)=1
-                   AND (role='boss' OR COALESCE(team_chat,1)=1)
-                   ORDER BY CASE WHEN role='boss' THEN 0 ELSE 1 END,
-                            COALESCE(full_name, username) LIMIT 3""",
-                (company,),
-            ).fetchall():
-                _tav.append({
-                    "src": ("/" + _m["avatar_path"].lstrip("/")) if _m["avatar_path"] else None,
-                    "initials": ((_m["full_name"] or _m["username"] or "?")[:1]).upper(),
-                    "name": _m["full_name"] or _m["username"] or "",
-                })
-        except Exception:
-            pass
+        # 2026-10-22: Avatars temporarily disabled to unblock Messages.
+        # TODO: Re-add with defensive coding after confirming threads API works.
         threads.append({
             "kind": "team", "key": "team",
             "title": "Team", "url": "/team/messages",
             "last_body": _tb, "last_at": _ta, "unread": _tu,
-            "avatars": _tav,
         })
     if role == "driver":
         last_body, last_at, unread = _summary(me)
