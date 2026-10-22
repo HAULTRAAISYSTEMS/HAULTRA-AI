@@ -11360,7 +11360,7 @@ def dashboard():
           <div class="muted small" id="push-sub" style="margin-top:3px;">
             New routes, boss messages and truck changes buzz you even with the app closed.</div>
         </div>
-        <button type="button" class="btn" id="push-btn" onclick="haultraEnablePush()">Turn on</button>
+        <button type="button" class="btn" id="push-btn" onclick="haultraEnablePush()">Turn on</button> <button type="button" class="btn secondary" id="push-test-btn" onclick="haultraTestPush()" style="margin-left:8px;" title="Send yourself a test push">Test</button>
       </div>
     </div>
     <script>
@@ -11416,6 +11416,22 @@ def dashboard():
             btn.disabled = false; btn.textContent = 'Turn on';
             sub.textContent = 'You said no to notifications. Turn them on in iPhone Settings \u2192 HAULTRA.';
           }
+        });
+      };
+      window.haultraTestPush = function () {
+        var csrf = document.querySelector('meta[name="csrf-token"]');
+        sub.textContent = 'Sending test push\\u2026';
+        fetch('/api/push/test', {
+          method: 'POST', credentials: 'same-origin',
+          headers: {'Content-Type': 'application/json',
+                    'X-CSRF-Token': csrf ? csrf.getAttribute('content') : ''},
+          body: '{}'
+        }).then(function (r) { return r.json(); }).then(function (d) {
+          if (d.error) { sub.textContent = 'Test failed: ' + d.error; return; }
+          sub.textContent = 'Test: ' + d.sent + ' sent to ' + d.my_tokens +
+            ' device(s). Server ' + (d.apns_configured ? 'is configured.' : 'is NOT configured');
+        }).catch(function () {
+          sub.textContent = 'Test request failed \\u2014 try again.';
         });
       };
     })();
@@ -11518,6 +11534,7 @@ def dashboard():
         <p>{e(today)} &mdash; your board, your routes, your stops.</p>
     </div>
     {_drv_push_card}
+    {_push_nudge_js()}
     {_clock_strip}
     {_forgot_html}
     <div class="drv-stats">
@@ -12002,6 +12019,8 @@ def dashboard():
             &#8615; Export Day
         </a>
     </div>
+    {_phone_push_card()}
+    {_push_nudge_js()}
 
     <div class="grid" style="margin-bottom:20px;">
         <div class="gauge-stat">
@@ -12624,6 +12643,27 @@ def api_push_apns_unregister():
         conn.close()
     return jsonify({"success": True})
 
+@app.route("/api/push/test", methods=["POST"])
+def api_push_test():
+    """One-tap end-to-end check: sends a real push to this user's own devices
+    and reports what the server saw. Never raises."""
+    if "user_id" not in session:
+        return jsonify({"error": "login required"}), 401
+    conn = get_db()
+    try:
+        toks = _apns_recipients(conn, cid(), roles=None)
+        mine = [t for t in toks if t["user_id"] == session["user_id"]]
+        sent = push_to_user(conn, session["user_id"],
+                            "HAULTRA test push",
+                            "If you see this, pushes work end to end.",
+                            link="/driver")
+        conn.commit()
+        return jsonify({"apns_configured": apns_configured(),
+                        "my_tokens": len(mine), "sent": sent})
+    finally:
+        conn.close()
+
+
 
 @app.after_request
 def _push_after_request(response):
@@ -12660,7 +12700,7 @@ def _phone_push_card():
           <div class="muted small" id="push-sub" style="margin-top:3px;">
             Breakdowns, cancels and messages buzz you even when the app is closed.</div>
         </div>
-        <button type="button" class="btn" id="push-btn" onclick="haultraEnablePush()">Turn on</button>
+        <button type="button" class="btn" id="push-btn" onclick="haultraEnablePush()">Turn on</button> <button type="button" class="btn secondary" id="push-test-btn" onclick="haultraTestPush()" style="margin-left:8px;" title="Send yourself a test push">Test</button>
       </div>
     </div>
     <script>
@@ -12738,6 +12778,23 @@ def _phone_push_card():
             }
           });
         };
+        window.haultraTestPush = function () {
+        var csrf = document.querySelector('meta[name="csrf-token"]');
+        sub.textContent = 'Sending test push\\u2026';
+        fetch('/api/push/test', {
+          method: 'POST', credentials: 'same-origin',
+          headers: {'Content-Type': 'application/json',
+                    'X-CSRF-Token': csrf ? csrf.getAttribute('content') : ''},
+          body: '{}'
+        }).then(function (r) { return r.json(); }).then(function (d) {
+          if (d.error) { sub.textContent = 'Test failed: ' + d.error; return; }
+          sub.textContent = 'Test: ' + d.sent + ' sent to ' + d.my_tokens +
+            ' device(s). Server ' + (d.apns_configured ? 'is configured.' : 'is NOT configured');
+        }).catch(function () {
+          sub.textContent = 'Test request failed \\u2014 try again.';
+        });
+      };
+
         return;
       }
       if (isIOS && !isStandalone) {
@@ -12912,6 +12969,39 @@ def boss_notifications_page():
             </div>
         </div>
         """
+
+def _push_nudge_js():
+    # Dismiss X + per-device memory for dashboard push nudges. Appended AFTER
+    # the push card HTML; the card's own script still controls when it unhides.
+    # A MutationObserver keeps it hidden if the user dismissed it.
+    return """
+    <script>
+    (function(){
+      var KEY='haultra_push_nudge_off';
+      var card=document.getElementById('push-card');
+      if(!card) return;
+      var off=false;
+      try{off=localStorage.getItem(KEY)==='1';}catch(e){}
+      var x=document.createElement('button');
+      x.setAttribute('aria-label','Dismiss');
+      x.style.cssText='position:absolute;top:8px;right:10px;background:none;border:none;'
+        +'color:var(--text-muted);font-size:18px;cursor:pointer;padding:6px;z-index:2;';
+      x.innerHTML='&times;';
+      card.style.position='relative';
+      card.appendChild(x);
+      x.addEventListener('click',function(){
+        try{localStorage.setItem(KEY,'1');}catch(e){}
+        card.hidden=true;
+      });
+      if(off){card.hidden=true;}
+      new MutationObserver(function(){
+        try{if(localStorage.getItem(KEY)==='1')card.hidden=true;}catch(e){}
+      }).observe(card,{attributes:true,attributeFilter:['hidden']});
+    })();
+    </script>
+    """
+
+
 
     if total_n == 0:
         _empty = ('<div class="card muted">No alerts yet. When a driver reports running late, '
