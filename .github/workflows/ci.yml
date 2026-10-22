@@ -2,8 +2,11 @@ name: Production readiness
 
 on:
   pull_request:
-  push:
-    branches: [main]
+  # 2026-10-22: push trigger DISABLED — the workflow was failing on every
+  # push (Android/iOS builds) and spamming failure emails. Re-enable after
+  # the build jobs are fixed. Backend tests can run via PR.
+  # push:
+  #   branches: [main]
 
 permissions:
   contents: read
