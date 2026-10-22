@@ -6717,6 +6717,15 @@ _INTENT_RELOCATE_RE = re.compile(
     r"\b(?:relocate|move)\s+(?:the\s+)?(?:bin|can|container\s+)?(?:from\s+)?(.+?)\s+to\s+(.+?)(?:\.|$)",
     re.I,
 )
+# 2026-10-22: Empty pickup detection. "pickup empty" or "pickup from landfill/dump"
+# means the can is already empty — no dump leg needed. Otherwise a pickup is
+# assumed FULL and must go to the dump before the empty goes to the next stop.
+_INTENT_EMPTY_PICKUP_RE = re.compile(
+    r"\b(?:pickup|pull|pr)\s+(?:an?\s+)?empty\b"
+    r"|\bempty\s+(?:pickup|pull|can|bin|container)\b"
+    r"|\b(?:pickup|pull)\s+from\s+(?:the\s+)?(?:landfill|dump)\b",
+    re.I,
+)
 
 def _apply_intent_engine(stops, raw_text=""):
     """The moat: understands boss intent, converts actions, rearranges, chains.
@@ -6754,6 +6763,15 @@ def _apply_intent_engine(stops, raw_text=""):
                         _s["intent_source_bin"] = True
                     break
     
+    # ── Intent 1b: EMPTY_PICKUP ──
+    # "pickup empty" / "pull empty" / "pickup from landfill" → the can is empty,
+    # skip the dump leg. Otherwise a pickup is FULL and goes to the dump.
+    for _s in stops:
+        _ol = (_s.get("original_line") or "") + " " + (_s.get("notes") or "")
+        _act = (_s.get("action") or "").lower()
+        if ("pickup" in _act or "pull" in _act) and _INTENT_EMPTY_PICKUP_RE.search(_ol):
+            _s["is_empty_pickup"] = True
+
     # ── Intent 2: DO_FIRST rearrangement ──
     # "do 697 pkwy first" or "start with central dr" → move to front
     _df_match = _INTENT_DO_FIRST_RE.search(raw_text or "")
@@ -19019,7 +19037,10 @@ def driver_route_detail(route_id):
     # 2026-10-22: For PICKUP (pull) stops, hide Complete Stop until the driver
     # reaches the dump (need_box_in/box_in). Otherwise they can tap Complete
     # on Leg 1 and skip the dump leg + ticket entry entirely.
-    if is_pull and driver_status not in ("need_box_in", "box_in", "completed"):
+    # EXCEPTION: empty pickups ("pickup empty" / "from landfill") have no dump
+    # leg — show Complete Stop right after Box Out.
+    _is_empty_pickup = bool(_s.get("is_empty_pickup"))
+    if is_pull and not _is_empty_pickup and driver_status not in ("need_box_in", "box_in", "completed"):
         _hide_complete_btn = True
     if _chained:
         # First on-site step: the head has no incoming empty (just box out its
@@ -19074,15 +19095,25 @@ def driver_route_detail(route_id):
             "need_box_in": _empty_step,
         }
     elif is_pull:
-        # 2026-10-22: Added going_to_dump -> need_box_in step. Without this,
-        # the driver taps "Go To Dump" and the workflow dead-ends — the only
-        # button left is "Complete Stop" which skips the dump leg entirely.
-        wf_map = {
-            "pending":       ("arrived",       "&#128666; Arrived at Stop",           "btn-driver btn-driver-complete"),
-            "arrived":       ("box_out",       "&#128230; Box Out &mdash; Remove Container", "btn-driver btn-driver-complete"),
-            "box_out":       ("going_to_dump", "&#128465;&#65039; Go To Dump",               "btn-driver btn-driver-dump"),
-            "going_to_dump": ("need_box_in",   "&#9989; Arrived at Dump &mdash; Enter Ticket", "btn-driver btn-driver-complete"),
-        }
+        # 2026-10-22: Empty pickup check. If the boss said "pickup empty" or
+        # "pickup from landfill", the can is already empty — no dump leg.
+        # Otherwise the can is FULL and must go to the dump.
+        _is_empty = bool(_s.get("is_empty_pickup"))
+        if _is_empty:
+            # Empty pickup: just grab the can, no dump needed.
+            wf_map = {
+                "pending": ("arrived", "&#128666; Arrived at Stop",           "btn-driver btn-driver-complete"),
+                "arrived": ("box_out", "&#128230; Box Out &mdash; Remove Container", "btn-driver btn-driver-complete"),
+            }
+        else:
+            # Full pickup: must go to dump. Added going_to_dump -> need_box_in
+            # step so the driver doesn't dead-end after "Go To Dump".
+            wf_map = {
+                "pending":       ("arrived",       "&#128666; Arrived at Stop",           "btn-driver btn-driver-complete"),
+                "arrived":       ("box_out",       "&#128230; Box Out &mdash; Remove Container", "btn-driver btn-driver-complete"),
+                "box_out":       ("going_to_dump", "&#128465;&#65039; Go To Dump",               "btn-driver btn-driver-dump"),
+                "going_to_dump": ("need_box_in",   "&#9989; Arrived at Dump &mdash; Enter Ticket", "btn-driver btn-driver-complete"),
+            }
     else:
         wf_map = {"pending": ("arrived", "&#128666; Arrived at Stop", "btn-driver btn-driver-complete")}
 
