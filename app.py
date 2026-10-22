@@ -2524,11 +2524,16 @@ def _driver_clock_in_now(conn, company_id, driver_id, note="", ts=None, today=No
             "UPDATE driver_clock_entries SET clock_in_at=?, notes=? WHERE id=?",
             (ts, notes, row["id"]))
     else:
-        conn.execute(
-            "INSERT INTO driver_clock_entries "
-            "(company_id, driver_id, date, clock_in_at, notes, created_at) "
-            "VALUES (?,?,?,?,?,?)",
-            (company_id, driver_id, today, ts, notes, ts))
+        try:
+            conn.execute(
+                "INSERT INTO driver_clock_entries "
+                "(company_id, driver_id, date, clock_in_at, notes, created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (company_id, driver_id, today, ts, notes, ts))
+        except sqlite3.IntegrityError:
+            # Lost a race with a concurrent clock-in (double-tap / retry).
+            # The other request won; fall through and return its row.
+            conn.rollback()
     conn.commit()
     return _driver_clock_entry(conn, company_id, driver_id, today)
 
@@ -3182,6 +3187,19 @@ def init_db():
         FOREIGN KEY (created_by) REFERENCES users(id)
     )
     """)
+
+    # Prevent duplicate open routes from concurrent dispatch (double-tap / retry).
+    # Partial index: only one open/in_progress route per driver per day per type.
+    try:
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_routes_driver_day_open "
+            "ON routes(company_id, assigned_to, route_date, route_type) "
+            "WHERE status IN ('open','in_progress')"
+        )
+    except sqlite3.OperationalError:
+        # route_type column may not exist yet on very old DBs; the migration
+        # at line ~4540 adds it, and this index will be created on next run.
+        pass
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS stops (
@@ -4060,6 +4078,12 @@ def init_db():
         FOREIGN KEY (driver_id) REFERENCES users(id)
     )
     """)
+
+    # Prevent double clock-in rows from concurrent requests (double-tap / retry).
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_clock_entries_driver_day "
+        "ON driver_clock_entries(company_id, driver_id, date)"
+    )
 
     # ── Time off system (feat/time-off) ───────────────────────────────────────
     # One-time day/range off requests. status: pending|approved|denied.
@@ -10829,7 +10853,12 @@ def init_route():
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    init_db()
+    try:
+        init_db()
+    except Exception:
+        # A failed migration must never lock out all users. Log loudly and
+        # continue — the DB is usually already usable from a prior run.
+        app.logger.error("init_db() failed on /login", exc_info=True)
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "").strip()
@@ -34898,20 +34927,38 @@ def api_dispatch():
             cur.execute("UPDATE routes SET truck_id=? WHERE id=?", (truck_id, route_id))
     else:
         route_name = f"{driver['username']} — {route_date}"
-        if _has_truck_col:
-            cur.execute("""
-                INSERT INTO routes (route_date, route_name, raw_text, assigned_to, created_by,
-                                     status, notes, company_id, route_type, truck_id, created_at)
-                VALUES (?, ?, '', ?, ?, 'open', '', ?, ?, ?, ?)
-            """, (route_date, route_name, driver_id, session["user_id"], cid(), route_type, truck_id, now_ts()))
+        try:
+            if _has_truck_col:
+                cur.execute("""
+                    INSERT INTO routes (route_date, route_name, raw_text, assigned_to, created_by,
+                                         status, notes, company_id, route_type, truck_id, created_at)
+                    VALUES (?, ?, '', ?, ?, 'open', '', ?, ?, ?, ?)
+                """, (route_date, route_name, driver_id, session["user_id"], cid(), route_type, truck_id, now_ts()))
+            else:
+                cur.execute("""
+                    INSERT INTO routes (route_date, route_name, raw_text, assigned_to, created_by,
+                                         status, notes, company_id, route_type, created_at)
+                    VALUES (?, ?, '', ?, ?, 'open', '', ?, ?, ?)
+                """, (route_date, route_name, driver_id, session["user_id"], cid(), route_type, now_ts()))
+        except sqlite3.IntegrityError:
+            # Lost a race with a concurrent dispatch (double-tap / retry).
+            # The partial unique index blocked the duplicate; use the winner.
+            conn.rollback()
+            existing = conn.execute(
+                """SELECT id FROM routes
+                    WHERE company_id=? AND assigned_to=? AND route_date=?
+                      AND status IN ('open','in_progress')
+                      AND COALESCE(route_type,'rolloff')=?
+                    ORDER BY id LIMIT 1""",
+                (cid(), driver_id, route_date, route_type)
+            ).fetchone()
+            if not existing:
+                raise
+            route_id = existing["id"]
+            appended_to_existing = True
         else:
-            cur.execute("""
-                INSERT INTO routes (route_date, route_name, raw_text, assigned_to, created_by,
-                                     status, notes, company_id, route_type, created_at)
-                VALUES (?, ?, '', ?, ?, 'open', '', ?, ?, ?)
-            """, (route_date, route_name, driver_id, session["user_id"], cid(), route_type, now_ts()))
-        route_id = cur.lastrowid
-        appended_to_existing = False
+            route_id = cur.lastrowid
+            appended_to_existing = False
 
     next_order = conn.execute(
         "SELECT COALESCE(MAX(stop_order), 0) AS m FROM stops WHERE route_id=?", (route_id,)
@@ -42035,6 +42082,7 @@ def debug_db():
 # DISPATCH ROUTES — Firebase live dispatch feature
 # =========================================================
 @app.route('/dispatch')
+@login_required
 def dispatch_view():
     return send_from_directory('static', 'dispatch.html')
 
@@ -43160,6 +43208,7 @@ function fetchT(url, opts, ms){
 
 
 @app.route('/route')
+@login_required
 def route_view():
     return send_from_directory('static', 'route.html')
 
