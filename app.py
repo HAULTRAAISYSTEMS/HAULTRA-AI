@@ -6755,11 +6755,11 @@ def _apply_intent_engine(stops, raw_text=""):
                 if _src_name in _addr or _src_name in _cust or any(
                     _w in _addr for _w in _src_name.split() if len(_w) > 2
                 ):
-                    # This is the SOURCE — it provides the bin, so it's a Pickup (P),
+                    # This is the SOURCE — it provides the bin, so it's a Pull,
                     # not a Pickup-and-Return (PR). The return happens at the end.
                     _act = (_s.get("action") or "").lower()
                     if "pickup and return" in _act or _act.strip() == "pr":
-                        _s["action"] = "Pickup"
+                        _s["action"] = "Pull"
                         _s["intent_source_bin"] = True
                     break
     
