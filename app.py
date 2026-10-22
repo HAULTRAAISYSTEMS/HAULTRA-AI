@@ -11359,7 +11359,7 @@ def dashboard():
     <div class="card" id="push-card" hidden style="margin-bottom:14px;">
       <div class="row between" style="gap:12px;flex-wrap:wrap;">
         <div>
-          <strong>Get dispatch alerts on this phone</strong>
+          <strong>Get notifications and alerts</strong>
           <div class="muted small" id="push-sub" style="margin-top:3px;">
             New routes, boss messages and truck changes buzz you even with the app closed.</div>
         </div>
@@ -12699,7 +12699,7 @@ def _phone_push_card():
     <div class="card" id="push-card" hidden style="margin-bottom:14px;">
       <div class="row between" style="gap:12px;flex-wrap:wrap;">
         <div>
-          <strong id="push-title">Get these on your phone</strong>
+          <strong id="push-title">Get notifications and alerts</strong>
           <div class="muted small" id="push-sub" style="margin-top:3px;">
             Breakdowns, cancels and messages buzz you even when the app is closed.</div>
         </div>
@@ -12908,6 +12908,115 @@ def _push_nudge_js():
     </script>
     """
 
+def _push_settings_toggle():
+    # iOS-style toggle for Settings > Notifications and Alerts.
+    # Truthful: the switch only flips ON after the server confirms the token.
+    return """
+    <style>
+      .push-toggle { width:56px; height:32px; border-radius:16px; background:rgba(255,255,255,0.14);
+        border:1px solid rgba(255,255,255,0.12); position:relative; cursor:pointer;
+        transition:background 0.2s; flex:none; padding:0; }
+      .push-toggle.on { background:#3DDC84; border-color:#3DDC84; }
+      .push-toggle-knob { position:absolute; top:2px; left:2px; width:26px; height:26px;
+        border-radius:50%; background:#fff; transition:left 0.2s; box-shadow:0 2px 6px rgba(0,0,0,0.3); }
+      .push-toggle.on .push-toggle-knob { left:26px; }
+      .push-toggle:disabled { opacity:0.6; cursor:default; }
+    </style>
+    <div class="card" id="push-card" hidden style="margin-bottom:14px;">
+      <div class="row between" style="gap:12px;align-items:center;">
+        <div style="flex:1;">
+          <strong>Notifications and Alerts</strong>
+          <div class="muted small" id="push-sub" style="margin-top:3px;">
+            Dispatch alerts, messages and critical updates on this phone, even with the app closed.</div>
+        </div>
+        <button type="button" class="push-toggle" id="push-toggle" onclick="haultraTogglePush()" aria-label="Turn notifications on">
+          <span class="push-toggle-knob"></span>
+        </button>
+      </div>
+      <div style="margin-top:10px;display:flex;gap:8px;align-items:center;">
+        <button type="button" class="btn secondary" id="push-test-btn" onclick="haultraTestPush()" style="font-size:13px;padding:8px 16px;" title="Send yourself a test push">Test</button>
+        <span class="muted small" id="push-test-sub"></span>
+      </div>
+    </div>
+    <script>
+    (function () {
+      var card = document.getElementById('push-card');
+      var tgl  = document.getElementById('push-toggle');
+      var sub  = document.getElementById('push-sub');
+      var tsub = document.getElementById('push-test-sub');
+      var ua = navigator.userAgent || '';
+      var isNativeShell = ua.indexOf('HaultraNativeApp') !== -1;
+      if (!isNativeShell) return;
+      var cap = (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.PushNotifications) || null;
+      card.hidden = false;
+      if (!cap) {
+        tgl.disabled = true;
+        sub.textContent = 'This app version can\u2019t do phone alerts yet \u2014 update HAULTRA from the App Store.';
+        return;
+      }
+      function setOn(on) {
+        if (on) { tgl.classList.add('on'); tgl.setAttribute('aria-label', 'Notifications on'); }
+        else { tgl.classList.remove('on'); tgl.setAttribute('aria-label', 'Turn notifications on'); }
+      }
+      function apnsRegister(token) {
+        var csrf = document.querySelector('meta[name="csrf-token"]');
+        fetch('/api/push/apns-register', {
+          method: 'POST', credentials: 'same-origin',
+          headers: {'Content-Type': 'application/json',
+                    'X-CSRF-Token': csrf ? csrf.getAttribute('content') : ''},
+          body: JSON.stringify({token: token})
+        }).then(function (r) { return r.json().then(function (d) { return {ok: r.ok, d: d}; }); })
+        .then(function (res) {
+          if (res.ok && res.d.success) {
+            setOn(true); tgl.disabled = true;
+            sub.textContent = 'This phone is registered for notifications and alerts.';
+          } else {
+            setOn(false); tgl.disabled = false;
+            sub.textContent = 'Couldn\u2019t register this phone (' + (res.d.error || r.status) + ') \u2014 try again.';
+          }
+        }).catch(function () {
+          setOn(false); tgl.disabled = false;
+          sub.textContent = 'Couldn\u2019t reach the server \u2014 try again.';
+        });
+      }
+      cap.checkPermissions().then(function (perm) {
+        if (perm.receive === 'granted') { cap.register(); }
+      }).catch(function () {});
+      cap.addListener('registration', function (t) { apnsRegister(t.value); });
+      cap.addListener('registrationError', function () {
+        sub.textContent = 'Couldn\u2019t register this phone \u2014 try again.';
+      });
+      cap.addListener('pushNotificationActionPerformed', function (n) {
+        var link = n.notification && n.notification.data && n.notification.data.link;
+        if (link) window.location.href = link;
+      });
+      window.haultraTogglePush = function () {
+        tgl.disabled = true;
+        cap.requestPermissions().then(function (p) {
+          if (p.receive === 'granted') { cap.register(); }
+          else {
+            tgl.disabled = false;
+            sub.textContent = 'You said no to notifications. Turn them on in iPhone Settings \u2192 HAULTRA.';
+          }
+        }).catch(function () { tgl.disabled = false; });
+      };
+      window.haultraTestPush = function () {
+        tsub.textContent = 'Sending\u2026';
+        var csrf = document.querySelector('meta[name="csrf-token"]');
+        fetch('/api/push/test', {
+          method: 'POST', credentials: 'same-origin',
+          headers: {'Content-Type': 'application/json',
+                    'X-CSRF-Token': csrf ? csrf.getAttribute('content') : ''},
+          body: '{}'
+        }).then(function (r) { return r.json(); }).then(function (d) {
+          tsub.textContent = d.error ? ('Failed: ' + d.error)
+            : (d.sent + ' sent to ' + d.my_tokens + ' device(s).' + (d.apns_configured ? '' : ' Server NOT configured.'));
+        }).catch(function () { tsub.textContent = 'Test failed \u2014 try again.'; });
+      };
+    })();
+    </script>
+    """
+
 
 
 @app.route("/boss/notifications")
@@ -13024,15 +13133,12 @@ def boss_notifications_page():
     # reject one fired on page load, and ambushing someone with it is rude
     # anyway. The row hides itself when push isn't configured server-side, so
     # nobody is offered a button that cannot work.
-    push_row = _phone_push_card()
     body = f"""
     <div class="hero">
         <h1>Alerts</h1>
         <p>Everything your drivers send, in one place &mdash; running late, messages,
            truck trouble, cancels and time off.</p>
     </div>
-    {push_row}
-    {_push_nudge_js()}
     <div class="alert-filters">
         <a class="alert-filter{' on' if show == 'open' else ''}" href="{url_for('boss_notifications_page')}">
             Needs you{f' &middot; {open_n}' if open_n else ''}</a>
@@ -28998,8 +29104,8 @@ def settings_page():
     # when push is configured and this is the native app or a capable browser.
     _phone_section = (
         '<div style="margin-top:20px;">'
-        '<h2>\U0001F514 Phone Alerts</h2>'
-        + _phone_push_card()
+        '<h2>\U0001F514 Notifications and Alerts</h2>'
+        + _push_settings_toggle()
         + '</div>'
     )
 
