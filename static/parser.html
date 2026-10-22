@@ -1023,7 +1023,10 @@
   <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
     <div class="sheet-head">
       <div id="sheet-title" class="sheet-title">Confirm Stop</div>
-      <button type="button" id="sheet-close" class="sheet-close" aria-label="Cancel">&times;</button>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button type="button" id="sheet-add-top" class="btn btn-orange-solid" style="min-height:44px;padding:0 20px;">Add Stop</button>
+        <button type="button" id="sheet-close" class="sheet-close" aria-label="Cancel">&times;</button>
+      </div>
     </div>
     <div class="sheet-body">
       <div class="sheet-field">
@@ -1867,6 +1870,8 @@
     sheetSize = (CONTAINER_SIZES.indexOf(prefill.container_size) !== -1) ? prefill.container_size : '';
     el('sheet-title').textContent = editId ? 'Edit Stop' : 'Confirm Stop';
     el('sheet-add').textContent = editId ? 'Save' : 'Add Stop';
+    var addTop = el('sheet-add-top');
+    if (addTop) addTop.textContent = editId ? 'Save' : 'Add Stop';
     el('sheet-customer').value = prefill.customer || '';
     var addrEl = el('sheet-address');
     addrEl.value = prefill.address || '';
@@ -1954,6 +1959,8 @@
     fillDatalist('sheet-return-list', RETURN_SITES);
     var addBtn = el('sheet-add');
     if (addBtn) addBtn.addEventListener('click', commitSheet);
+    var addBtnTop = el('sheet-add-top');
+    if (addBtnTop) addBtnTop.addEventListener('click', commitSheet);
     var cancelBtn = el('sheet-cancel');
     if (cancelBtn) cancelBtn.addEventListener('click', function () { closeStopSheet(sheetMode === 'add'); });
     var closeBtn = el('sheet-close');
