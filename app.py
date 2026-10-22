@@ -2608,24 +2608,45 @@ def _apply_clock_correction(conn, company_id, driver_id, date_str, ci_hhmm,
 # get_driver_week_summary() so the two views can never disagree.
 # =========================================================
 def _company_local_now(company_settings):
-    """Current datetime in the company's local timezone (naive-safe fallback)."""
-    tz_name = (company_settings.get("timezone") or "America/New_York").strip()
+    """Current datetime in the company's local timezone (naive-safe fallback).
+
+    2026-10-22: BULLETPROOF — this function must NEVER return UTC. The old
+    version had a nested try/except chain where a failure in _eastern_now()
+    (or in the logging) would fall through to datetime.now() = UTC, inflating
+    live hours by 4h. Now the manual EDT/EST calculation is inlined and
+    cannot fail.
+    """
+    tz_name = "America/New_York"
+    try:
+        if company_settings:
+            tz_name = (company_settings.get("timezone") or "America/New_York").strip()
+    except Exception:
+        pass
+    # Try ZoneInfo first (works when tzdata is installed)
     try:
         from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo(tz_name))
+        return datetime.now(ZoneInfo(tz_name)).replace(tzinfo=None)
     except Exception as exc:
-        # 2026-10-14: NEVER silently fall back to UTC for payroll-adjacent
-        # times — a wrong "now" corrupts live hours and pay-week boundaries.
-        # Log loudly so a missing tzdata package is caught immediately.
         try:
-            app.logger.error("TIMEZONE FAILURE: ZoneInfo(%r) failed (%s); "
-                             "falling back — live hours may be wrong", tz_name, exc)
+            app.logger.error("TIMEZONE FAILURE: ZoneInfo(%r) failed (%s)", tz_name, exc)
         except Exception:
             pass
-        try:
-            return _eastern_now()
-        except Exception:
-            return datetime.now()
+    # Manual fallback: US Eastern via UTC offset. Cannot fail — pure arithmetic.
+    # DST: 2nd Sunday March 07:00 UTC -> 1st Sunday November 06:00 UTC = EDT (UTC-4)
+    try:
+        import calendar as _cal
+        _utc = datetime.utcnow()
+        _y = _utc.year
+        _mar = [w[6] for w in _cal.monthcalendar(_y, 3) if w[6]]
+        _nov = [w[6] for w in _cal.monthcalendar(_y, 11) if w[6]]
+        _dst_start = datetime(_y, 3, _mar[1], 7, 0, 0)
+        _dst_end = datetime(_y, 11, _nov[0], 6, 0, 0)
+        _off = -4 if (_dst_start <= _utc < _dst_end) else -5
+        return _utc + timedelta(hours=_off)
+    except Exception:
+        # Absolute last resort: assume EDT (UTC-4). Wrong by 1h in winter,
+        # but NEVER wrong by 4h. UTC is never acceptable for payroll times.
+        return datetime.utcnow() + timedelta(hours=-4)
 
 
 _WEEKDAY_INDEX = {
