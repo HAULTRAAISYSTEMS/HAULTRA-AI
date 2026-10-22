@@ -2653,12 +2653,32 @@ def _wall_clock_in_ms(wall_ts, tz_name):
     client-side live-hours tick by the UTC offset (4h for EDT — dashboard
     showed 32.8 instead of 28.8). Epoch milliseconds are unambiguous on every
     browser, so the live tick embeds this instead of (alongside) the string.
+    2026-10-22: NEVER return 0 on ZoneInfo failure — the JS falls back to the
+    naive string (UTC parse = 4h inflation). Use the manual EDT/EST offset.
     """
     try:
         from zoneinfo import ZoneInfo
         dt = datetime.strptime(wall_ts[:19], "%Y-%m-%d %H:%M:%S").replace(
             tzinfo=ZoneInfo((tz_name or "America/New_York").strip()))
         return int(dt.timestamp() * 1000)
+    except Exception:
+        pass
+    # Manual fallback: treat wall_ts as America/New_York via UTC offset.
+    try:
+        import calendar
+        dt_naive = datetime.strptime(wall_ts[:19], "%Y-%m-%d %H:%M:%S")
+        # Determine if EDT (UTC-4) or EST (UTC-5) for this date
+        y, m, d = dt_naive.year, dt_naive.month, dt_naive.day
+        mar_sundays = [w[6] for w in calendar.monthcalendar(y, 3) if w[6]]
+        nov_sundays = [w[6] for w in calendar.monthcalendar(y, 11) if w[6]]
+        dst_start = datetime(y, 3, mar_sundays[1], 2, 0, 0)  # 2AM local
+        dst_end = datetime(y, 11, nov_sundays[0], 2, 0, 0)
+        is_edt = dst_start <= dt_naive < dst_end
+        offset_hours = -4 if is_edt else -5
+        # wall_ts is local; convert to UTC then to epoch
+        dt_utc = dt_naive - timedelta(hours=offset_hours)
+        epoch = datetime(1970, 1, 1)
+        return int((dt_utc - epoch).total_seconds() * 1000)
     except Exception:
         return 0
 
