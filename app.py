@@ -3921,6 +3921,39 @@ def init_db():
     )
     """)
 
+    # --- Team channel: company-wide thread for all drivers + boss.
+    # 2026-10-22: drivers needed a way to ask each other things (e.g. bin
+    # locations) without leaving the app. One thread per company; everyone
+    # sees everything (it's a work tool, not private chat).
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS team_messages (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id     INTEGER NOT NULL,
+        sender_user_id INTEGER NOT NULL,
+        body           TEXT NOT NULL,
+        created_at     TEXT NOT NULL,
+        read_at        TEXT,
+        client_id      TEXT,
+        FOREIGN KEY (sender_user_id) REFERENCES users(id)
+    )
+    """)
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_team_messages_company "
+        "ON team_messages(company_id, created_at)"
+    )
+    # Per-user read position for the team channel. One row per (company, user);
+    # last_read_id = highest team_messages.id the user has seen.
+    # (A single read_at column can't work for group threads — one reader
+    # would mark messages read for everyone.)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS team_read_state (
+        company_id   INTEGER NOT NULL,
+        user_id      INTEGER NOT NULL,
+        last_read_id INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (company_id, user_id)
+    )
+    """)
+
     # --- Typing indicators: ephemeral "X is typing..." heartbeats, one row per
     # (thread, user). The client heartbeats while typing; rows older than a few
     # seconds are treated as stopped. SQLite (not memory) so both gunicorn
@@ -15614,10 +15647,12 @@ def _message_thread_js():
 
     function el(id) { return document.getElementById(id); }
 
-    // Thread keys: legacy numeric route ids ("45"), "route:45", or "dm:7" for
-    // the direct boss<->driver channel. One modal serves all three.
+    // Thread keys: legacy numeric route ids ("45"), "route:45", "dm:7" for
+    // the direct boss<->driver channel, or "team" for the company-wide
+    // team channel. One modal serves all four.
     function threadUrl(key) {
         var s = String(key == null ? '' : key);
+        if (s === 'team') return '/team/messages';
         if (s.indexOf('dm:') === 0) return '/dm/' + s.slice(3) + '/messages';
         if (s.indexOf('route:') === 0) return '/route/' + s.slice(6) + '/messages';
         return '/route/' + s + '/messages';
@@ -22210,6 +22245,107 @@ def direct_messages_api(driver_id):
     ], "typing": typers, "has_more": False})
 
 
+# --- Team channel ------------------------------------------------------------
+# 2026-10-22: company-wide thread for all drivers + boss. Drivers needed a
+# way to ask each other things (e.g. bin locations) without leaving the app.
+# Everyone sees everything — it's a work tool, not private chat.
+
+
+@app.route("/team/messages", methods=["GET", "POST"])
+@login_required
+def team_messages_api():
+    """Company-wide team thread. GET returns messages oldest-first (marks
+    others' messages read). POST accepts {body, client_id}."""
+    conn = get_db()
+    me = session["user_id"]
+    role = session.get("role")
+    company = cid()
+
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        body = (data.get("body") or "").strip()[:500]
+        if not body:
+            conn.close()
+            return jsonify({"error": "Message can't be empty."}), 400
+        client_id = (str(data.get("client_id") or "").strip() or None)
+        if client_id:
+            dup = conn.execute(
+                "SELECT id FROM team_messages WHERE company_id=? AND sender_user_id=? AND client_id=?",
+                (company, me, client_id),
+            ).fetchone()
+            if dup:
+                conn.close()
+                return jsonify({"success": True, "id": dup["id"], "duplicate": True})
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO team_messages (company_id, sender_user_id, body, created_at, client_id)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (company, me, body, now_ts(), client_id),
+        )
+        msg_id = cur.lastrowid
+        # Notify everyone else in the company: all active drivers + boss(es).
+        # (The sender doesn't need a notification about their own message.)
+        try:
+            _sender_name = _actor_name(conn)
+            for _u in conn.execute(
+                "SELECT id FROM users WHERE company_id=? AND COALESCE(is_active,1)=1 AND id != ?",
+                (company, me),
+            ).fetchall():
+                try:
+                    push_to_user(conn, _u["id"],
+                                 _sender_name + " in Team",
+                                 (body or "")[:120],
+                                 link=url_for("messages_page"))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        conn.commit()
+        conn.close()
+        return jsonify({"success": True, "id": msg_id})
+
+    # GET — advance this user's read position to the latest message,
+    # return thread oldest-first. (Per-user: one reader doesn't clear
+    # unreads for everyone else.)
+    _max_id = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM team_messages WHERE company_id=?",
+        (company,),
+    ).fetchone()[0] or 0
+    conn.execute(
+        "INSERT INTO team_read_state (company_id, user_id, last_read_id)"
+        " VALUES (?, ?, ?)"
+        " ON CONFLICT(company_id, user_id) DO UPDATE SET last_read_id=excluded.last_read_id",
+        (company, me, _max_id),
+    )
+    conn.commit()
+    rows = conn.execute(
+        """SELECT t.body, t.created_at, t.sender_user_id,
+                  u.username AS sender_username, u.role AS sender_role,
+                  u.full_name AS sender_full_name, u.avatar_path AS sender_avatar
+           FROM team_messages t JOIN users u ON u.id = t.sender_user_id
+           WHERE t.company_id=?
+           ORDER BY t.created_at DESC LIMIT 200""",
+        (company,),
+    ).fetchall()
+    rows = rows[::-1]  # back to chronological
+    typers = _thread_typers(conn, "team", me)
+    conn.close()
+    return jsonify({"messages": [
+        {
+            "id": i, "sender_username": r["sender_username"], "sender_role": r["sender_role"],
+            "body": r["body"], "created_at": r["created_at"],
+            "is_me": r["sender_user_id"] == me,
+            "route_label": None,
+            "sender_avatar": ("/" + r["sender_avatar"]) if (r["sender_avatar"] or "").strip() else None,
+            "sender_initial": _avatar_initials(r["sender_full_name"], r["sender_username"]),
+            "sender_color": _avatar_color(r["sender_user_id"]),
+            # Show who said it: "Mike" or "Boss" for the boss.
+            "sender_display": (r["sender_full_name"] or r["sender_username"] or "?").strip(),
+        }
+        for i, r in enumerate(rows)
+    ], "typing": typers, "has_more": False})
+
+
 # --- Typing indicators -------------------------------------------------------
 # 2026-10-16: "X is typing..." for message threads. The client heartbeats
 # while the user types; the server treats rows older than a few seconds as
@@ -22219,9 +22355,11 @@ _TYPING_TTL_SEC = 6
 
 
 def _normalize_thread_key(key):
-    """Modal thread keys: 'dm:<driver_id>' or 'route:<id>' (legacy callers may
-    pass a bare numeric route id)."""
+    """Modal thread keys: 'dm:<driver_id>', 'route:<id>', or 'team'
+    (legacy callers may pass a bare numeric route id)."""
     s = (key or "").strip()
+    if s == "team":
+        return s
     if s.startswith("route:"):
         return s
     if s.isdigit():
@@ -22252,6 +22390,9 @@ def _thread_access_ok(conn, thread_key, user_id, role, company_id):
         if not route:
             return False
         return role == "boss" or route["assigned_to"] == user_id
+    if thread_key == "team":
+        # Everyone in the company can see/type in the team channel.
+        return True
     return False
 
 
@@ -22338,7 +22479,35 @@ def message_threads_api():
             return row["body"], _fmt_ts(row["created_at"]), unread
         return None, "", unread
 
+    # 2026-10-22: Team channel — one company-wide thread for all drivers + boss.
+    def _team_summary():
+        row = conn.execute(
+            "SELECT body, created_at FROM team_messages "
+            "WHERE company_id=? ORDER BY created_at DESC LIMIT 1",
+            (company,),
+        ).fetchone()
+        _lr = conn.execute(
+            "SELECT last_read_id FROM team_read_state WHERE company_id=? AND user_id=?",
+            (company, me),
+        ).fetchone()
+        _lr_id = _lr["last_read_id"] if _lr else 0
+        unread = conn.execute(
+            "SELECT COUNT(*) FROM team_messages "
+            "WHERE company_id=? AND id > ? AND sender_user_id != ?",
+            (company, _lr_id, me),
+        ).fetchone()[0] or 0
+        if row:
+            return row["body"], _fmt_ts(row["created_at"]), unread
+        return None, "", unread
+
     threads = []
+    # Team thread goes first for everyone.
+    _tb, _ta, _tu = _team_summary()
+    threads.append({
+        "kind": "team", "key": "team",
+        "title": "Team", "url": "/team/messages",
+        "last_body": _tb, "last_at": _ta, "unread": _tu,
+    })
     if role == "driver":
         last_body, last_at, unread = _summary(me)
         threads.append({
@@ -22361,8 +22530,11 @@ def message_threads_api():
                 "last_body": last_body, "last_at": last_at, "unread": unread,
             })
         # Most-recent conversation first; never-contacted drivers sink
-        # ("" sorts below every real timestamp).
-        threads.sort(key=lambda t: t["last_at"], reverse=True)
+        # ("" sorts below every real timestamp). Team stays pinned at top.
+        _team = [t for t in threads if t.get("kind") == "team"]
+        _rest = [t for t in threads if t.get("kind") != "team"]
+        _rest.sort(key=lambda t: t["last_at"], reverse=True)
+        threads = _team + _rest
     conn.close()
     return jsonify({"threads": threads})
 
@@ -22375,20 +22547,31 @@ def message_unread_count():
     me = session["user_id"]
     role = session.get("role")
     company = cid()
+    # 2026-10-22: include team channel unreads in the badge count.
     if role == "driver":
         n = conn.execute("""
             SELECT (SELECT COUNT(*) FROM messages m JOIN routes r ON r.id=m.route_id
                      WHERE r.company_id=? AND r.assigned_to=? AND m.sender_user_id != ? AND m.read_at IS NULL)
                  + (SELECT COUNT(*) FROM direct_messages
                      WHERE driver_user_id=? AND sender_user_id != ? AND read_at IS NULL)
-        """, (company, me, me, me, me)).fetchone()[0]
+                 + (SELECT COUNT(*) FROM team_messages t
+                     WHERE t.company_id=? AND t.sender_user_id != ?
+                       AND t.id > COALESCE(
+                           (SELECT last_read_id FROM team_read_state
+                            WHERE company_id=? AND user_id=?), 0))
+        """, (company, me, me, me, me, company, me, company, me)).fetchone()[0]
     else:
         n = conn.execute("""
             SELECT (SELECT COUNT(*) FROM messages m JOIN routes r ON r.id=m.route_id
                      WHERE r.company_id=? AND m.sender_user_id != ? AND m.read_at IS NULL)
                  + (SELECT COUNT(*) FROM direct_messages
                      WHERE company_id=? AND sender_user_id != ? AND read_at IS NULL)
-        """, (company, me, company, me)).fetchone()[0]
+                 + (SELECT COUNT(*) FROM team_messages t
+                     WHERE t.company_id=? AND t.sender_user_id != ?
+                       AND t.id > COALESCE(
+                           (SELECT last_read_id FROM team_read_state
+                            WHERE company_id=? AND user_id=?), 0))
+        """, (company, me, company, me, company, me, company, me)).fetchone()[0]
     conn.close()
     return jsonify({"count": n or 0})
 
