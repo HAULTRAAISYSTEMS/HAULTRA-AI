@@ -2681,10 +2681,13 @@ def _wall_clock_in_ms(wall_ts, tz_name):
     2026-10-22: NEVER return 0 on ZoneInfo failure — the JS falls back to the
     naive string (UTC parse = 4h inflation). Use the manual EDT/EST offset.
     """
+    # 2026-10-22 08:22: Hardcode America/New_York. The tz_name from DB
+    # might be "UTC" (or wrong) — ZoneInfo("UTC") succeeds and would
+    # misinterpret the Eastern wall time as UTC, causing 4h inflation.
     try:
         from zoneinfo import ZoneInfo
         dt = datetime.strptime(wall_ts[:19], "%Y-%m-%d %H:%M:%S").replace(
-            tzinfo=ZoneInfo((tz_name or "America/New_York").strip()))
+            tzinfo=ZoneInfo("America/New_York"))
         return int(dt.timestamp() * 1000)
     except Exception:
         pass
