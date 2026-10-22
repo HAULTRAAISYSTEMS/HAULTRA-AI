@@ -3953,6 +3953,10 @@ def init_db():
         PRIMARY KEY (company_id, user_id)
     )
     """)
+    # 2026-10-22: team chat membership — boss controls who's in the Team
+    # channel (drivers come and go). 1 = in team chat, 0 = excluded.
+    # Defaults to 1 so existing users keep access; boss is always in.
+    _add_column_if_missing(conn, "users", "team_chat", "team_chat INTEGER NOT NULL DEFAULT 1")
 
     # --- Typing indicators: ephemeral "X is typing..." heartbeats, one row per
     # (thread, user). The client heartbeats while typing; rows older than a few
@@ -22251,6 +22255,24 @@ def direct_messages_api(driver_id):
 # Everyone sees everything — it's a work tool, not private chat.
 
 
+def _in_team_chat(conn, user_id, role, company_id):
+    """Is this user in the Team channel? Boss is always in; drivers need
+    the team_chat flag (boss controls membership in Settings)."""
+    if role == "boss":
+        return True
+    row = conn.execute(
+        "SELECT team_chat FROM users WHERE id=? AND company_id=?",
+        (user_id, company_id),
+    ).fetchone()
+    if not row:
+        return False
+    # Column may not exist on very old DBs (migration adds it) — default in.
+    try:
+        return bool(row["team_chat"])
+    except (KeyError, IndexError):
+        return True
+
+
 @app.route("/team/messages", methods=["GET", "POST"])
 @login_required
 def team_messages_api():
@@ -22260,6 +22282,9 @@ def team_messages_api():
     me = session["user_id"]
     role = session.get("role")
     company = cid()
+    if not _in_team_chat(conn, me, role, company):
+        conn.close()
+        return jsonify({"error": "Not in team chat."}), 403
 
     if request.method == "POST":
         data = request.get_json(silent=True) or {}
@@ -22288,9 +22313,17 @@ def team_messages_api():
         try:
             _sender_name = _actor_name(conn)
             for _u in conn.execute(
-                "SELECT id FROM users WHERE company_id=? AND COALESCE(is_active,1)=1 AND id != ?",
+                "SELECT id, role, team_chat FROM users "
+                "WHERE company_id=? AND COALESCE(is_active,1)=1 AND id != ?",
                 (company, me),
             ).fetchall():
+                # Only notify team members (boss always in).
+                try:
+                    _in_team = (_u["role"] == "boss") or bool(_u["team_chat"])
+                except (KeyError, IndexError):
+                    _in_team = True
+                if not _in_team:
+                    continue
                 try:
                     push_to_user(conn, _u["id"],
                                  _sender_name + " in Team",
@@ -22344,6 +22377,83 @@ def team_messages_api():
         }
         for i, r in enumerate(rows)
     ], "typing": typers, "has_more": False})
+
+
+# --- Team chat membership management -------------------------------------------
+# 2026-10-22: boss controls who's in the Team channel (drivers come and go).
+# Boss only. Drivers can't change membership.
+
+
+@app.route("/api/team/members", methods=["GET"])
+@boss_required
+def team_members_api():
+    """List all users in the company with their team chat membership."""
+    conn = get_db()
+    company = cid()
+    # Ensure column exists (defensive for old DBs)
+    try:
+        users = conn.execute(
+            """SELECT id, username, full_name, role, team_chat
+               FROM users WHERE company_id=? AND COALESCE(is_active,1)=1
+               ORDER BY CASE WHEN role='boss' THEN 0 ELSE 1 END,
+                        COALESCE(full_name, username)""",
+            (company,),
+        ).fetchall()
+    except Exception:
+        # team_chat column doesn't exist yet — treat everyone as in.
+        users = conn.execute(
+            """SELECT id, username, full_name, role, 1 AS team_chat
+               FROM users WHERE company_id=? AND COALESCE(is_active,1)=1
+               ORDER BY CASE WHEN role='boss' THEN 0 ELSE 1 END,
+                        COALESCE(full_name, username)""",
+            (company,),
+        ).fetchall()
+    conn.close()
+    return jsonify({"members": [
+        {
+            "id": u["id"],
+            "name": (u["full_name"] or u["username"] or "?").strip(),
+            "role": u["role"],
+            "in_team": True if u["role"] == "boss" else bool(u["team_chat"]),
+            "is_boss": u["role"] == "boss",
+        }
+        for u in users
+    ]})
+
+
+@app.route("/api/team/members", methods=["POST"])
+@boss_required
+def team_members_update_api():
+    """Toggle a driver's team chat membership. Boss only. Boss can't remove self."""
+    data = request.get_json(silent=True) or {}
+    try:
+        user_id = int(data.get("user_id"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "user_id required."}), 400
+    in_team = bool(data.get("in_team"))
+    conn = get_db()
+    company = cid()
+    me = session["user_id"]
+    if user_id == me:
+        conn.close()
+        return jsonify({"error": "You can't remove yourself."}), 400
+    target = conn.execute(
+        "SELECT id, role FROM users WHERE id=? AND company_id=?",
+        (user_id, company),
+    ).fetchone()
+    if not target:
+        conn.close()
+        return jsonify({"error": "User not found."}), 404
+    if target["role"] == "boss":
+        conn.close()
+        return jsonify({"error": "Boss is always in team chat."}), 400
+    conn.execute(
+        "UPDATE users SET team_chat=? WHERE id=? AND company_id=?",
+        (1 if in_team else 0, user_id, company),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "in_team": in_team})
 
 
 # --- Typing indicators -------------------------------------------------------
@@ -22501,13 +22611,14 @@ def message_threads_api():
         return None, "", unread
 
     threads = []
-    # Team thread goes first for everyone.
-    _tb, _ta, _tu = _team_summary()
-    threads.append({
-        "kind": "team", "key": "team",
-        "title": "Team", "url": "/team/messages",
-        "last_body": _tb, "last_at": _ta, "unread": _tu,
-    })
+    # Team thread goes first — but only if the user is in the team chat.
+    if _in_team_chat(conn, me, role, company):
+        _tb, _ta, _tu = _team_summary()
+        threads.append({
+            "kind": "team", "key": "team",
+            "title": "Team", "url": "/team/messages",
+            "last_body": _tb, "last_at": _ta, "unread": _tu,
+        })
     if role == "driver":
         last_body, last_at, unread = _summary(me)
         threads.append({
@@ -22590,6 +22701,15 @@ def messages_page():
     .msg-thread-row{display:flex;align-items:center;gap:10px;width:100%;text-align:left;
         background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);
         border-radius:14px;padding:12px 14px;margin-bottom:8px;cursor:pointer;color:inherit;font:inherit;}
+    /* 2026-10-22: Team channel gets a distinct look — group identity, not a DM. */
+    .msg-team-row{display:flex;align-items:center;gap:12px;width:100%;text-align:left;
+        background:linear-gradient(135deg,rgba(255,107,26,.12),rgba(255,107,26,.04));
+        border:1px solid rgba(255,107,26,.35);
+        border-radius:14px;padding:14px;margin-bottom:8px;cursor:pointer;color:inherit;font:inherit;}
+    .msg-team-row:active{transform:scale(.99);}
+    .msg-team-icon{width:40px;height:40px;min-width:40px;border-radius:50%;
+        background:linear-gradient(135deg,#FF6B1A,#FF9A3D);
+        display:flex;align-items:center;justify-content:center;font-size:20px;}
     .msg-thread-row:active{transform:scale(.99);}
     .msg-thread-main{flex:1;min-width:0;}
     .msg-thread-title{font-weight:700;font-size:15px;display:flex;align-items:center;gap:8px;}
@@ -22603,9 +22723,15 @@ def messages_page():
     </style>
     <div class="msg-inbox">
         """ + _cmd_header("Messages") + """
-        <div class="msg-sec-label">Conversations</div>
-        <div id="msg-thread-list"></div>
         <div id="msg-inbox-loading" class="msg-inbox-empty">Loading…</div>
+        <div id="msg-team-section" style="display:none;">
+            <div class="msg-sec-label">👥 Team</div>
+            <div id="msg-team-list"></div>
+        </div>
+        <div id="msg-dm-section" style="display:none;">
+            <div class="msg-sec-label">💬 Direct Messages</div>
+            <div id="msg-thread-list"></div>
+        </div>
     </div>
     """ + _message_thread_modal_html(show_quick_taps=False) + """
     <script>{thread_js}</script>
@@ -22624,15 +22750,45 @@ def messages_page():
                  + '<span class="msg-thread-preview">' + esc(t.last_body || 'No messages yet \u2014 say hello.') + '</span></span>'
                  + '<span class="msg-thread-time">' + esc(t.last_at || '') + '</span></button>';
         }
+        function teamRowHtml(t) {
+            var pill = t.unread ? ' <span class="msg-unread-pill">' + t.unread + '</span>' : '';
+            return '<button type="button" class="msg-team-row" data-key="' + esc(t.key) + '"'
+                 + ' data-title="' + esc(t.title).replace(/"/g, '&quot;') + '">'
+                 + '<span class="msg-team-icon">👥</span>'
+                 + '<span class="msg-thread-main"><span class="msg-thread-title">' + esc(t.title) + pill + '</span>'
+                 + '<span class="msg-thread-preview">' + esc(t.last_body || 'No messages yet \u2014 say hello.') + '</span></span>'
+                 + '<span class="msg-thread-time">' + esc(t.last_at || '') + '</span></button>';
+        }
         function loadThreads() {
             fetch('/api/messages/threads', { credentials: 'same-origin' })
                 .then(function(r) { return r.json(); })
                 .then(function(d) {
-                    var list = document.getElementById('msg-thread-list');
                     document.getElementById('msg-inbox-loading').style.display = 'none';
                     var threads = d.threads || [];
-                    list.innerHTML = threads.map(rowHtml).join('')
-                        || '<div class="msg-inbox-empty">No conversations yet.</div>';
+                    var team = threads.filter(function(t) { return t.kind === 'team'; });
+                    var dms = threads.filter(function(t) { return t.kind !== 'team'; });
+                    // Team section
+                    var teamSec = document.getElementById('msg-team-section');
+                    var teamList = document.getElementById('msg-team-list');
+                    if (team.length) {
+                        teamSec.style.display = '';
+                        teamList.innerHTML = team.map(teamRowHtml).join('');
+                    } else {
+                        teamSec.style.display = 'none';
+                    }
+                    // DM section
+                    var dmSec = document.getElementById('msg-dm-section');
+                    var dmList = document.getElementById('msg-thread-list');
+                    if (dms.length) {
+                        dmSec.style.display = '';
+                        dmList.innerHTML = dms.map(rowHtml).join('');
+                    } else {
+                        dmSec.style.display = 'none';
+                    }
+                    if (!team.length && !dms.length) {
+                        document.getElementById('msg-inbox-loading').style.display = '';
+                        document.getElementById('msg-inbox-loading').textContent = 'No conversations yet.';
+                    }
                     // 2026-10-14: deep-link (?thread=dm:<id>) — e.g. from an
                     // alert's Open button — opens the thread straight away.
                     var want = null;
@@ -22650,7 +22806,7 @@ def messages_page():
                 });
         }
         document.addEventListener('click', function(ev) {
-            var b = ev.target.closest('.msg-thread-row');
+            var b = ev.target.closest('.msg-thread-row, .msg-team-row');
             if (!b || typeof window.openMessageThread !== 'function') return;
             window.openMessageThread(b.dataset.key, b.dataset.title);
         });
@@ -29373,6 +29529,86 @@ def settings_page():
         + '</div>'
     )
 
+    # 2026-10-22: Team Chat membership — boss controls who's in the Team
+    # channel. Drivers come and go; the boss adds/removes them here.
+    _team_section = """
+    <div style="margin-top:20px;">
+        <h2>\U0001F465 Team Chat</h2>
+        <p style="color:var(--text-dim);font-size:13px;margin:4px 0 12px;">
+            Who can see and post in the <strong>Team</strong> channel in Messages.
+            You're always in.
+        </p>
+        <div id="team-members-list">
+            <div style="color:var(--text-dim);font-size:13px;">Loading...</div>
+        </div>
+    </div>
+    <style>
+    .team-member-row{display:flex;align-items:center;gap:12px;padding:10px 4px;
+        border-bottom:1px solid rgba(255,255,255,.06);}
+    .team-member-row:last-child{border-bottom:none;}
+    .team-member-name{flex:1;font-size:15px;font-weight:600;}
+    .team-member-role{font-size:11px;color:var(--text-dim);text-transform:uppercase;
+        letter-spacing:.08em;}
+    .team-toggle{position:relative;width:48px;height:28px;flex:none;cursor:pointer;}
+    .team-toggle input{opacity:0;width:0;height:0;}
+    .team-toggle .slider{position:absolute;inset:0;border-radius:999px;
+        background:rgba(255,255,255,.12);transition:.2s;}
+    .team-toggle .slider:before{content:"";position:absolute;width:22px;height:22px;
+        left:3px;top:3px;border-radius:50%;background:#fff;transition:.2s;}
+    .team-toggle input:checked + .slider{background:#34C759;}
+    .team-toggle input:checked + .slider:before{transform:translateX(20px);}
+    .team-toggle input:disabled + .slider{opacity:.4;cursor:default;}
+    </style>
+    <script>
+    (function(){
+        var CSRF = (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
+        function esc(s){var d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML;}
+        function load(){
+            fetch('/api/team/members',{credentials:'same-origin'})
+                .then(function(r){return r.json();})
+                .then(function(d){
+                    var list=document.getElementById('team-members-list');
+                    if(!list)return;
+                    var ms=d.members||[];
+                    if(!ms.length){list.innerHTML='<div style="color:var(--text-dim);">No team members.</div>';return;}
+                    list.innerHTML=ms.map(function(m){
+                        var dis=m.is_boss?'disabled':'';
+                        var chk=m.in_team?'checked':'';
+                        var badge=m.is_boss?'<span class="team-member-role">boss - always in</span>':'<span class="team-member-role">'+esc(m.role)+'</span>';
+                        return '<div class="team-member-row">'
+                            +'<span class="team-member-name">'+esc(m.name)+'<br>'+badge+'</span>'
+                            +'<label class="team-toggle"><input type="checkbox" '+chk+' '+dis
+                            +' data-uid="'+m.id+'" aria-label="Team chat for '+esc(m.name)+'">'
+                            +'<span class="slider"></span></label></div>';
+                    }).join('');
+                    list.querySelectorAll('input[data-uid]').forEach(function(inp){
+                        inp.addEventListener('change',function(){
+                            var uid=inp.getAttribute('data-uid');
+                            var want=inp.checked;
+                            inp.disabled=true;
+                            fetch('/api/team/members',{method:'POST',
+                                headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},
+                                credentials:'same-origin',
+                                body:JSON.stringify({user_id:parseInt(uid,10),in_team:want})})
+                            .then(function(r){return r.json().then(function(j){return{ok:r.ok,j:j};});})
+                            .then(function(res){
+                                inp.disabled=false;
+                                if(!res.ok){inp.checked=!want;alert((res.j&&res.j.error)||'Could not update.');}
+                            })
+                            .catch(function(){inp.disabled=false;inp.checked=!want;alert('Network error.');});
+                        });
+                    });
+                })
+                .catch(function(){
+                    var list=document.getElementById('team-members-list');
+                    if(list)list.innerHTML='<div style="color:var(--text-dim);">Could not load team members.</div>';
+                });
+        }
+        load();
+    })();
+    </script>
+    """
+
     body = f"""
     <div class="hero">
         <h1>Settings</h1>
@@ -29380,6 +29616,7 @@ def settings_page():
     </div>
     {settings_body}
     {_phone_section}
+    {_team_section}
     {subscription_body}
     {delete_account_body}
     """
