@@ -1800,7 +1800,7 @@ def _can_flow_valid(action_lower, can_state):
       Dump/unknown — always valid (no can-state constraint)
     """
     is_delivery = "delivery" in action_lower
-    is_pull     = "pull" in action_lower and "return" not in action_lower
+    is_pull     = ("pull" in action_lower or "pickup" in action_lower) and "return" not in action_lower
     if is_delivery:
         return can_state == "empty_can"
     if is_pull:
@@ -1829,7 +1829,7 @@ def _next_can_state(action_lower, can_state):
         or ("swap" in action_lower and "pull" not in action_lower)
     )
     is_delivery = "delivery" in action_lower
-    is_pull     = "pull" in action_lower and "return" not in action_lower
+    is_pull     = ("pull" in action_lower or "pickup" in action_lower) and "return" not in action_lower
 
     if is_delivery:
         return "no_can"   # left the can at the site; truck is empty
@@ -2219,7 +2219,7 @@ def compute_containers_out(conn, company_id, asof_date=None):
         action_lower = (s["action"] or "").lower()
         is_pr       = "pickup and return" in action_lower or ("swap" in action_lower and "pull" not in action_lower)
         is_delivery = "delivery" in action_lower or "drop" in action_lower
-        is_pull     = "pull" in action_lower and "return" not in action_lower
+        is_pull     = ("pull" in action_lower or "pickup" in action_lower) and "return" not in action_lower
 
         if is_delivery or is_pr:
             has_gps = s["gps_lat"] is not None and s["gps_lng"] is not None
@@ -2242,7 +2242,7 @@ def is_pull_job(action):
     """True for any action that pulls a full container (plain Pull, or PR/swap)."""
     action_lower = (action or "").lower()
     is_pr   = "pickup and return" in action_lower or ("swap" in action_lower and "pull" not in action_lower)
-    is_pull = "pull" in action_lower and "return" not in action_lower
+    is_pull = ("pull" in action_lower or "pickup" in action_lower) and "return" not in action_lower
     return is_pr or is_pull
 
 
@@ -18986,7 +18986,7 @@ def driver_route_detail(route_id):
     # its own completion flow ("Truck repaired?"), no container workflow.
     is_vendor = action_lower == "vendor"
     is_pr    = "pickup and return" in action_lower or ("swap" in action_lower and "pull" not in action_lower)
-    is_pull  = "pull" in action_lower and "return" not in action_lower
+    is_pull  = ("pull" in action_lower or "pickup" in action_lower) and "return" not in action_lower
     is_swap_pr = is_pr and bool(_s.get("swap_with_prev_pull"))
     badge_group = "pickup" if (is_pull or "pickup" in action_lower or is_pr) else "dropswap"
     # Delivery/Drop/Service/Relocate read as dropswap; explicit pull-family reads as pickup
@@ -19101,13 +19101,13 @@ def driver_route_detail(route_id):
                 "arrived": ("box_out", "&#128230; Box Out &mdash; Remove Container", "btn-driver btn-driver-complete"),
             }
         else:
-            # Full pickup: must go to dump. Added going_to_dump -> need_box_in
-            # step so the driver doesn't dead-end after "Go To Dump".
+            # Full pickup: must go to dump. After "Go To Dump", the driver is
+            # at the dump — the Complete Stop button (with the scale ticket
+            # weight field) is the action. No box_in step for a pure pull.
             wf_map = {
-                "pending":       ("arrived",       "&#128666; Arrived at Stop",           "btn-driver btn-driver-complete"),
-                "arrived":       ("box_out",       "&#128230; Box Out &mdash; Remove Container", "btn-driver btn-driver-complete"),
-                "box_out":       ("going_to_dump", "&#128465;&#65039; Go To Dump",               "btn-driver btn-driver-dump"),
-                "going_to_dump": ("need_box_in",   "&#9989; Arrived at Dump &mdash; Enter Ticket", "btn-driver btn-driver-complete"),
+                "pending":   ("arrived",       "&#128666; Arrived at Stop",           "btn-driver btn-driver-complete"),
+                "arrived":   ("box_out",       "&#128230; Box Out &mdash; Remove Container", "btn-driver btn-driver-complete"),
+                "box_out":   ("going_to_dump", "&#128465;&#65039; Go To Dump",               "btn-driver btn-driver-dump"),
             }
     else:
         wf_map = {"pending": ("arrived", "&#128666; Arrived at Stop", "btn-driver btn-driver-complete")}
