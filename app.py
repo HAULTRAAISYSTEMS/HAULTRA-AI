@@ -10155,6 +10155,9 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .stop-mini-badge.pickup   {{ background: var(--cyan-dim); color: var(--cyan); border: 1px solid rgba(255,107,26,.4); }}
 .stop-mini-badge.dropswap {{ background: rgba(140,160,179,0.16); color: #8CA0B3; border: 1px solid rgba(140,160,179,0.4); }}
 .stop-mini-badge.neutral  {{ background: rgba(255,255,255,0.06); color: #A6A69E; border: 1px solid rgba(255,255,255,0.1); }}
+/* 2026-10-22: D (Delivery/Drop) gets its own green — distinct from P (Pickup blue).
+   Green = go, you're dropping it off. */
+.stop-mini-badge.badge-d {{ background: rgba(52,199,89,.16); color: #34C759; border: 1px solid rgba(52,199,89,.45); }}
 .stop-mini-urgent {{ font-size: 9px; font-weight: 800; color: var(--red); letter-spacing: .3px; white-space: nowrap; }}
 .stop-mini-addr {{ font-size: 12px; color: #D8D8D0; line-height: 1.35; margin-bottom: 6px; min-height: 32px; }}
 .stop-mini-addr.done {{ text-decoration: line-through; color: #6B6B62; }}
