@@ -6737,6 +6737,37 @@ def _apply_swap_inference(stops):
             stop["pending_empty_can_for_next_pr"] = True
             pending_swap = True
 
+    # 2026-10-22: Auto-create Return stop. If the last stop says
+    # "then return [X] to end the day", the boss wants a Delivery stop
+    # for [X] appended at the end. This makes the parser understand
+    # natural language like Alix's texts without manual fixing.
+    if stops:
+        _last = stops[-1]
+        _rd = (_last.get("return_destination") or "").strip()
+        # Only auto-create for end-of-day returns (not mid-route returns)
+        if _rd and ("end the day" in _rd.lower() or "end of day" in _rd.lower()):
+            # Extract just the destination: "central dr to end the day" -> "central dr"
+            _dest = re.sub(r"\s+to\s+end\s+(?:the\s+)?day\.?$", "", _rd, flags=re.I).strip()
+            _dest = re.sub(r"\.$", "", _dest).strip()
+            if _dest:
+                # Don't duplicate if a Delivery to this dest is already last
+                _already = False
+                for _s in stops:
+                    _a = (_s.get("action") or "").lower()
+                    _addr = (_s.get("address") or "").lower()
+                    if ("delivery" in _a or "drop" in _a) and _dest.lower() in _addr:
+                        _already = True
+                        break
+                if not _already:
+                    stops.append({
+                        "action": "Delivery",
+                        "address": _dest,
+                        "customer_name": "",
+                        "notes": f"Auto-created return: {_rd}",
+                        "size": _last.get("size") or "30yd",
+                        "dump_location": "",
+                    })
+
     return stops
 
 
