@@ -11348,6 +11348,80 @@ def dashboard():
             _lanes = '<div class="drv-empty">No routes assigned yet.</div>'
         conn.close()
 
+        # 2026-10-21: driver push registration. The push card lives on the
+        # boss Alerts page, but drivers had no way to register their phone —
+        # without this, dispatch/message/truck-change pushes can never reach
+        # a driver. Plain string (not f-string): single braces are fine.
+        _drv_push_card = """
+    <div class="card" id="push-card" hidden style="margin-bottom:14px;">
+      <div class="row between" style="gap:12px;flex-wrap:wrap;">
+        <div>
+          <strong>Get dispatch alerts on this phone</strong>
+          <div class="muted small" id="push-sub" style="margin-top:3px;">
+            New routes, boss messages and truck changes buzz you even with the app closed.</div>
+        </div>
+        <button type="button" class="btn" id="push-btn" onclick="haultraEnablePush()">Turn on</button>
+      </div>
+    </div>
+    <script>
+    (function () {
+      var card = document.getElementById('push-card');
+      var btn  = document.getElementById('push-btn');
+      var sub  = document.getElementById('push-sub');
+      var ua = navigator.userAgent || '';
+      var isNativeShell = ua.indexOf('HaultraNativeApp') !== -1;
+      // Drivers register through the installed app only; the web-push path
+      // lives on the boss Alerts page.
+      if (!isNativeShell) return;
+      var cap = (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.PushNotifications) || null;
+      card.hidden = false;
+      if (!cap) {
+        btn.hidden = true;
+        sub.textContent = 'This app version can\u2019t do phone alerts yet \u2014 update HAULTRA from the App Store.';
+        return;
+      }
+      function apnsRegister(token) {
+        var csrf = document.querySelector('meta[name="csrf-token"]');
+        fetch('/api/push/apns-register', {
+          method: 'POST', credentials: 'same-origin',
+          headers: {'Content-Type': 'application/json',
+                    'X-CSRF-Token': csrf ? csrf.getAttribute('content') : ''},
+          body: JSON.stringify({token: token})
+        }).then(function () {
+          btn.textContent = 'On'; btn.disabled = true;
+          sub.textContent = 'This phone is registered for dispatch alerts.';
+        }).catch(function () {
+          sub.textContent = 'Couldn\u2019t register this phone \u2014 try again.';
+        });
+      }
+      cap.checkPermissions().then(function (perm) {
+        if (perm.receive === 'granted') {
+          btn.textContent = 'On'; btn.disabled = true;
+          cap.register();
+        }
+      }).catch(function () {});
+      cap.addListener('registration', function (t) { apnsRegister(t.value); });
+      cap.addListener('registrationError', function () {
+        sub.textContent = 'Couldn\u2019t register this phone \u2014 try again.';
+      });
+      cap.addListener('pushNotificationActionPerformed', function (n) {
+        var link = n.notification && n.notification.data && n.notification.data.link;
+        if (link) window.location.href = link;
+      });
+      window.haultraEnablePush = function () {
+        btn.disabled = true; btn.textContent = 'Asking\u2026';
+        cap.requestPermissions().then(function (p) {
+          if (p.receive === 'granted') { cap.register(); }
+          else {
+            btn.disabled = false; btn.textContent = 'Turn on';
+            sub.textContent = 'You said no to notifications. Turn them on in iPhone Settings \u2192 HAULTRA.';
+          }
+        });
+      };
+    })();
+    </script>
+        """
+
         body = f"""
     <style>
       .drv-clock {{ display:flex; align-items:center; gap:10px; border-radius:14px;
@@ -11443,6 +11517,7 @@ def dashboard():
         <h1>Driver Dashboard</h1>
         <p>{e(today)} &mdash; your board, your routes, your stops.</p>
     </div>
+    {_drv_push_card}
     {_clock_strip}
     {_forgot_html}
     <div class="drv-stats">
