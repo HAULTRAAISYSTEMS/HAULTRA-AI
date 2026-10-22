@@ -2616,12 +2616,11 @@ def _company_local_now(company_settings):
     live hours by 4h. Now the manual EDT/EST calculation is inlined and
     cannot fail.
     """
+    # 2026-10-22 08:22: Hardcode America/New_York. The company_settings
+    # timezone was suspect (possibly "UTC" in the DB) — ZoneInfo("UTC")
+    # succeeds and silently returns UTC, causing the 4h inflation.
+    # The user is in Virginia Beach, VA — always US Eastern.
     tz_name = "America/New_York"
-    try:
-        if company_settings:
-            tz_name = (company_settings.get("timezone") or "America/New_York").strip()
-    except Exception:
-        pass
     # Try ZoneInfo first (works when tzdata is installed)
     try:
         from zoneinfo import ZoneInfo
