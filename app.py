@@ -22932,7 +22932,12 @@ def messages_page():
     })();
     </script>
     """.replace("{thread_js}", _message_thread_js())
-    return render_template_string(shell_page("Messages", body))
+    resp = render_template_string(shell_page("Messages", body))
+    from flask import make_response
+    resp = make_response(resp)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
 
 
 def _city_for_log(s):
