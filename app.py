@@ -22480,6 +22480,14 @@ def messages_page():
             if (typeof window.refreshMsgBadge === 'function') window.refreshMsgBadge();
         };
         loadThreads();
+        // 2026-10-22: live inbox — new messages appear without a manual
+        // refresh. Poll every 5s; skip when tab is backgrounded to save battery.
+        setInterval(function() {
+            if (!document.hidden) loadThreads();
+        }, 5000);
+        document.addEventListener('visibilitychange', function() {
+            if (!document.hidden) loadThreads();
+        });
     })();
     </script>
     """.replace("{thread_js}", _message_thread_js())
