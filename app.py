@@ -22645,28 +22645,50 @@ def message_threads_api():
 
     # 2026-10-22: Team channel — one company-wide thread for all drivers + boss.
     def _team_summary():
-        row = conn.execute(
-            "SELECT body, created_at FROM team_messages "
-            "WHERE company_id=? ORDER BY created_at DESC LIMIT 1",
-            (company,),
-        ).fetchone()
-        _lr = conn.execute(
-            "SELECT last_read_id FROM team_read_state WHERE company_id=? AND user_id=?",
-            (company, me),
-        ).fetchone()
-        _lr_id = _lr["last_read_id"] if _lr else 0
-        unread = conn.execute(
-            "SELECT COUNT(*) FROM team_messages "
-            "WHERE company_id=? AND id > ? AND sender_user_id != ?",
-            (company, _lr_id, me),
-        ).fetchone()[0] or 0
-        if row:
-            return row["body"], _fmt_ts(row["created_at"]), unread
-        return None, "", unread
+        # Defensive: team tables might not exist if init_db() didn't complete.
+        try:
+            row = conn.execute(
+                "SELECT body, created_at FROM team_messages "
+                "WHERE company_id=? ORDER BY created_at DESC LIMIT 1",
+                (company,),
+            ).fetchone()
+            _lr = conn.execute(
+                "SELECT last_read_id FROM team_read_state WHERE company_id=? AND user_id=?",
+                (company, me),
+            ).fetchone()
+            _lr_id = _lr["last_read_id"] if _lr else 0
+            unread = conn.execute(
+                "SELECT COUNT(*) FROM team_messages "
+                "WHERE company_id=? AND id > ? AND sender_user_id != ?",
+                (company, _lr_id, me),
+            ).fetchone()[0] or 0
+            if row:
+                return row["body"], _fmt_ts(row["created_at"]), unread
+            return None, "", unread
+        except Exception:
+            # Tables don't exist yet — no team messages.
+            return None, "", 0
 
     threads = []
     # Team thread goes first — but only if the user is in the team chat.
     if _in_team_chat(conn, me, role, company):
+        # Ensure team tables exist (defensive: init_db may not have completed).
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS team_messages ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER NOT NULL, "
+                "sender_user_id INTEGER NOT NULL, body TEXT NOT NULL, "
+                "created_at TEXT NOT NULL, read_at TEXT, client_id TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS team_read_state ("
+                "company_id INTEGER NOT NULL, user_id INTEGER NOT NULL, "
+                "last_read_id INTEGER NOT NULL DEFAULT 0, "
+                "PRIMARY KEY (company_id, user_id))"
+            )
+            conn.commit()
+        except Exception:
+            pass
         _tb, _ta, _tu = _team_summary()
         # 2026-10-22: Avatars temporarily disabled to unblock Messages.
         # TODO: Re-add with defensive coding after confirming threads API works.
