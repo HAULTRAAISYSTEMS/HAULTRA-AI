@@ -11654,8 +11654,11 @@ def dashboard():
         }
       }).catch(function () {});
       cap.addListener('registration', function (t) { apnsRegister(t.value); });
-      cap.addListener('registrationError', function () {
-        sub.textContent = 'Couldn\u2019t register this phone \u2014 try again.';
+      cap.addListener('registrationError', function (err) {
+        var emsg = err && (err.error || err.errorMessage || err.message || err.code) || '';
+        if (!emsg && err) { try { emsg = JSON.stringify(err); } catch (e) { emsg = ''; } }
+        btn.disabled = false; btn.textContent = 'Turn on';
+        sub.textContent = 'Apple refused to register this phone' + (emsg ? (': ' + emsg) : '.');
       });
       cap.addListener('pushNotificationActionPerformed', function (n) {
         var link = n.notification && n.notification.data && n.notification.data.link;
@@ -11663,12 +11666,31 @@ def dashboard():
       });
       window.haultraEnablePush = function () {
         btn.disabled = true; btn.textContent = 'Asking\u2026';
+        sub.textContent = 'Asking iPhone for permission\u2026';
         cap.requestPermissions().then(function (p) {
-          if (p.receive === 'granted') { cap.register(); }
+          if (p.receive === 'granted') {
+            sub.textContent = 'Permission granted \u2014 registering with Apple\u2026';
+            var regP = null;
+            try { regP = cap.register(); }
+            catch (e) {
+              btn.disabled = false; btn.textContent = 'Turn on';
+              sub.textContent = 'Register call threw: ' + (e && (e.message || e.error) || e) + '.';
+              return;
+            }
+            if (regP && regP.catch) { regP.catch(function (e) {
+              btn.disabled = false; btn.textContent = 'Turn on';
+              sub.textContent = 'Register call failed: ' + (e && (e.message || e.error) || e) + '.';
+            }); }
+          }
           else {
             btn.disabled = false; btn.textContent = 'Turn on';
             sub.textContent = 'You said no to notifications. Turn them on in iPhone Settings \u2192 HAULTRA.';
           }
+        }).catch(function (e) {
+          btn.disabled = false; btn.textContent = 'Turn on';
+          var emsg = e && (e.message || e.error) || '';
+          if (!emsg && e) { try { emsg = JSON.stringify(e); } catch (x) { emsg = ''; } }
+          sub.textContent = 'Permission request failed' + (emsg ? (': ' + emsg) : '.');
         });
       };
       window.haultraTestPush = function () {
@@ -13013,8 +13035,11 @@ def _phone_push_card():
           }
         }).catch(function () {});
         cap.addListener('registration', function (t) { apnsRegister(t.value); });
-        cap.addListener('registrationError', function () {
-          sub.textContent = 'Couldn\u2019t register this phone \u2014 try again.';
+        cap.addListener('registrationError', function (err) {
+          var emsg = err && (err.error || err.errorMessage || err.message || err.code) || '';
+          if (!emsg && err) { try { emsg = JSON.stringify(err); } catch (e) { emsg = ''; } }
+          btn.disabled = false; btn.textContent = 'Turn on';
+          sub.textContent = 'Apple refused to register this phone' + (emsg ? (': ' + emsg) : '.');
         });
         // Tapping a push opens the app; route to the linked page.
         cap.addListener('pushNotificationActionPerformed', function (n) {
@@ -13023,12 +13048,31 @@ def _phone_push_card():
         });
         window.haultraEnablePush = function () {
           btn.disabled = true; btn.textContent = 'Asking\u2026';
+          sub.textContent = 'Asking iPhone for permission\u2026';
           cap.requestPermissions().then(function (p) {
-            if (p.receive === 'granted') { cap.register(); }
+            if (p.receive === 'granted') {
+              sub.textContent = 'Permission granted \u2014 registering with Apple\u2026';
+              var regP = null;
+              try { regP = cap.register(); }
+              catch (e) {
+                btn.disabled = false; btn.textContent = 'Turn on';
+                sub.textContent = 'Register call threw: ' + (e && (e.message || e.error) || e) + '.';
+                return;
+              }
+              if (regP && regP.catch) { regP.catch(function (e) {
+                btn.disabled = false; btn.textContent = 'Turn on';
+                sub.textContent = 'Register call failed: ' + (e && (e.message || e.error) || e) + '.';
+              }); }
+            }
             else {
               btn.disabled = false; btn.textContent = 'Turn on';
               sub.textContent = 'You said no to notifications. Turn them on in iPhone Settings \u2192 HAULTRA.';
             }
+          }).catch(function (e) {
+            btn.disabled = false; btn.textContent = 'Turn on';
+            var emsg = e && (e.message || e.error) || '';
+            if (!emsg && e) { try { emsg = JSON.stringify(e); } catch (x) { emsg = ''; } }
+            sub.textContent = 'Permission request failed' + (emsg ? (': ' + emsg) : '.');
           });
         };
         window.haultraTestPush = function () {
@@ -13233,8 +13277,11 @@ def _push_settings_toggle():
         if (perm.receive === 'granted') { cap.register(); }
       }).catch(function () {});
       cap.addListener('registration', function (t) { apnsRegister(t.value); });
-      cap.addListener('registrationError', function () {
-        sub.textContent = 'Couldn\u2019t register this phone \u2014 try again.';
+      cap.addListener('registrationError', function (err) {
+        var emsg = err && (err.error || err.errorMessage || err.message || err.code) || '';
+        if (!emsg && err) { try { emsg = JSON.stringify(err); } catch (e) { emsg = ''; } }
+        tgl.disabled = false;
+        sub.textContent = 'Apple refused to register this phone' + (emsg ? (': ' + emsg) : '.');
       });
       cap.addListener('pushNotificationActionPerformed', function (n) {
         var link = n.notification && n.notification.data && n.notification.data.link;
@@ -13242,13 +13289,32 @@ def _push_settings_toggle():
       });
       window.haultraTogglePush = function () {
         tgl.disabled = true;
+        sub.textContent = 'Asking iPhone for permission\u2026';
         cap.requestPermissions().then(function (p) {
-          if (p.receive === 'granted') { cap.register(); }
+          if (p.receive === 'granted') {
+            sub.textContent = 'Permission granted \u2014 registering with Apple\u2026';
+            var regP = null;
+            try { regP = cap.register(); }
+            catch (e) {
+              tgl.disabled = false;
+              sub.textContent = 'Register call threw: ' + (e && (e.message || e.error) || e) + '.';
+              return;
+            }
+            if (regP && regP.catch) { regP.catch(function (e) {
+              tgl.disabled = false;
+              sub.textContent = 'Register call failed: ' + (e && (e.message || e.error) || e) + '.';
+            }); }
+          }
           else {
             tgl.disabled = false;
             sub.textContent = 'You said no to notifications. Turn them on in iPhone Settings \u2192 HAULTRA.';
           }
-        }).catch(function () { tgl.disabled = false; });
+        }).catch(function (e) {
+          tgl.disabled = false;
+          var emsg = e && (e.message || e.error) || '';
+          if (!emsg && e) { try { emsg = JSON.stringify(e); } catch (x) { emsg = ''; } }
+          sub.textContent = 'Permission request failed' + (emsg ? (': ' + emsg) : '.');
+        });
       };
       window.haultraTestPush = function () {
         tsub.textContent = 'Sending\u2026';
