@@ -12686,9 +12686,13 @@ def _apns_send(device_token, title, body, badge=None, data=None):
             reason = r.json().get("reason", "")
         except Exception:
             pass
-        if r.status_code in (400, 410) and reason in (
-                "BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic"):
-            app.logger.info("apns: retiring dead token (%s)", reason)
+        # 2026-10-22: retire on any client-side token failure. Provider-token
+        # issues (our JWT) are server-side — don't blame the device for those.
+        _provider_issues = ("InvalidProviderToken", "ExpiredProviderToken",
+                            "MissingProviderToken")
+        if r.status_code in (400, 403, 410) and reason not in _provider_issues:
+            app.logger.info("apns: retiring dead token (%s %s)",
+                            r.status_code, reason)
             return False, r.status_code, reason
         app.logger.warning("apns: send failed %s %s", r.status_code, reason)
         return True, r.status_code, reason  # transient — don't retire the token
