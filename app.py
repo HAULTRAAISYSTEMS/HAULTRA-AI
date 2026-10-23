@@ -27138,9 +27138,9 @@ def dump_ticket(stop_id):
                                 if (fld.material) {{ setAiField('f-surcharge-material', fld.material, c.material); any = true; }}
                                 if (fld.ticket_number) {{ setAiField('f-surcharge-ticketno', fld.ticket_number, c.ticket_number); any = true; }}
                                 if (fld.total_usd != null) {{ setAiField('f-surcharge-total', fld.total_usd, c.total_usd); any = true; }}
-                                scStatus.textContent = any ? 'Read from the photo — check it below.' : 'Could not read it — fill in by hand.';
+                                scStatus.textContent = any ? 'Read from the photo — check it below.' : 'AI could not read it (unreadable) — fill in by hand.';
                             }} else {{
-                                scStatus.textContent = 'Could not read it — fill in by hand (photo is saved).';
+                                scStatus.textContent = 'Could not read it (' + (d.reason || 'unknown') + ') — fill in by hand (photo is saved).';
                             }}
                             try {{ scInput.value = ''; }} catch (e) {{}}
                         }})
