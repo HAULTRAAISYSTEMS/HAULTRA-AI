@@ -12672,16 +12672,25 @@ def _apns_recipients(conn, company_id, roles=("boss",)):
 
 def _user_badge_count(conn, user_id, company_id, role):
     """The number for the app-icon badge: open alerts for bosses,
-    unread messages for drivers."""
+    unread messages for drivers. Mirrors /api/messages/unread-count."""
     try:
         if role == "boss":
             return alert_open_count(conn, company_id)
         row = conn.execute(
-            """SELECT COUNT(*) n FROM messages
-                WHERE company_id=? AND to_user_id=? AND read_at IS NULL""",
-            (company_id, user_id),
+            """SELECT
+                (SELECT COUNT(*) FROM messages m JOIN routes r ON r.id=m.route_id
+                  WHERE r.company_id=? AND r.assigned_to=? AND m.sender_user_id != ? AND m.read_at IS NULL)
+              + (SELECT COUNT(*) FROM direct_messages
+                  WHERE driver_user_id=? AND sender_user_id != ? AND read_at IS NULL)
+              + (SELECT COUNT(*) FROM team_messages t
+                  WHERE t.company_id=? AND t.sender_user_id != ?
+                    AND t.id > COALESCE(
+                        (SELECT last_read_id FROM team_read_state
+                         WHERE company_id=? AND user_id=?), 0))""",
+            (company_id, user_id, user_id, user_id, user_id,
+             company_id, user_id, company_id, user_id),
         ).fetchone()
-        return (row["n"] if row else 0) or 0
+        return (row[0] if row else 0) or 0
     except sqlite3.Error:
         return 0
 
@@ -23166,6 +23175,14 @@ def messages_page():
             loadThreads();
             if (typeof window.refreshMsgBadge === 'function') window.refreshMsgBadge();
         };
+        // 2026-10-22: user is looking at their messages — clear the iOS
+        // app-icon badge. No-op on web / if push isn't registered.
+        try {
+            var _pcap = (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.PushNotifications) || null;
+            if (_pcap && _pcap.removeAllDeliveredNotifications) {
+                _pcap.removeAllDeliveredNotifications().catch(function(){});
+            }
+        } catch (e) {}
         loadThreads();
         // 2026-10-22: live inbox — new messages appear without a manual
         // refresh. Poll every 5s; skip when tab is backgrounded to save battery.
