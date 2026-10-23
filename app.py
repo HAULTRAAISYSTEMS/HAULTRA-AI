@@ -11660,6 +11660,45 @@ def dashboard():
         btn.disabled = false; btn.textContent = 'Turn on';
         sub.textContent = 'Apple refused to register this phone' + (emsg ? (': ' + emsg) : '.');
       });
+
+      // 2026-10-22: Foreground pushes — iOS suppresses the system banner
+      // when the app is open, so show our own HAULTRA-styled banner.
+      function _haultraPushBanner(title, body, link) {
+        try {
+          var old = document.getElementById('haultra-push-banner');
+          if (old && old.parentNode) old.parentNode.removeChild(old);
+          var b = document.createElement('div');
+          b.id = 'haultra-push-banner';
+          var t = document.createElement('div');
+          t.textContent = title || 'HAULTRA';
+          t.style.cssText = 'font-weight:800;font-size:14px;';
+          var m = document.createElement('div');
+          m.textContent = body || '';
+          m.style.cssText = 'font-size:13px;opacity:.85;margin-top:2px;';
+          b.appendChild(t); b.appendChild(m);
+          b.style.cssText = 'position:fixed;top:calc(10px + env(safe-area-inset-top));left:12px;right:12px;z-index:99999;'
+            + 'background:rgba(24,20,16,.96);border:1px solid rgba(255,107,26,.45);border-radius:16px;'
+            + 'padding:14px 16px;color:#fff;box-shadow:0 8px 32px rgba(0,0,0,.5);'
+            + 'backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);cursor:pointer;'
+            + 'transform:translateY(-120%);transition:transform .35s ease;';
+          b.onclick = function() {
+            if (b.parentNode) b.parentNode.removeChild(b);
+            if (link) window.location.href = link;
+          };
+          document.body.appendChild(b);
+          setTimeout(function() { b.style.transform = 'translateY(0)'; }, 50);
+          setTimeout(function() {
+            b.style.transform = 'translateY(-120%);';
+            setTimeout(function() { if (b.parentNode) b.parentNode.removeChild(b); }, 400);
+          }, 5000);
+        } catch (e) {}
+      }
+      
+
+      cap.addListener('pushNotificationReceived', function (n) {
+        var nt = n.notification || {};
+        _haultraPushBanner(nt.title, nt.body, nt.data && nt.data.link);
+      });
       cap.addListener('pushNotificationActionPerformed', function (n) {
         var link = n.notification && n.notification.data && n.notification.data.link;
         if (link) window.location.href = link;
@@ -13051,6 +13090,45 @@ def _phone_push_card():
           sub.textContent = 'Apple refused to register this phone' + (emsg ? (': ' + emsg) : '.');
         });
         // Tapping a push opens the app; route to the linked page.
+
+        // 2026-10-22: Foreground pushes — iOS suppresses the system banner
+        // when the app is open, so show our own HAULTRA-styled banner.
+        function _haultraPushBanner(title, body, link) {
+          try {
+            var old = document.getElementById('haultra-push-banner');
+            if (old && old.parentNode) old.parentNode.removeChild(old);
+            var b = document.createElement('div');
+            b.id = 'haultra-push-banner';
+            var t = document.createElement('div');
+            t.textContent = title || 'HAULTRA';
+            t.style.cssText = 'font-weight:800;font-size:14px;';
+            var m = document.createElement('div');
+            m.textContent = body || '';
+            m.style.cssText = 'font-size:13px;opacity:.85;margin-top:2px;';
+            b.appendChild(t); b.appendChild(m);
+            b.style.cssText = 'position:fixed;top:calc(10px + env(safe-area-inset-top));left:12px;right:12px;z-index:99999;'
+              + 'background:rgba(24,20,16,.96);border:1px solid rgba(255,107,26,.45);border-radius:16px;'
+              + 'padding:14px 16px;color:#fff;box-shadow:0 8px 32px rgba(0,0,0,.5);'
+              + 'backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);cursor:pointer;'
+              + 'transform:translateY(-120%);transition:transform .35s ease;';
+            b.onclick = function() {
+              if (b.parentNode) b.parentNode.removeChild(b);
+              if (link) window.location.href = link;
+            };
+            document.body.appendChild(b);
+            setTimeout(function() { b.style.transform = 'translateY(0)'; }, 50);
+            setTimeout(function() {
+              b.style.transform = 'translateY(-120%);';
+              setTimeout(function() { if (b.parentNode) b.parentNode.removeChild(b); }, 400);
+            }, 5000);
+          } catch (e) {}
+        }
+        
+
+        cap.addListener('pushNotificationReceived', function (n) {
+          var nt = n.notification || {};
+          _haultraPushBanner(nt.title, nt.body, nt.data && nt.data.link);
+        });
         cap.addListener('pushNotificationActionPerformed', function (n) {
           var link = n.notification && n.notification.data && n.notification.data.link;
           if (link) window.location.href = link;
@@ -13291,6 +13369,45 @@ def _push_settings_toggle():
         if (!emsg && err) { try { emsg = JSON.stringify(err); } catch (e) { emsg = ''; } }
         tgl.disabled = false;
         sub.textContent = 'Apple refused to register this phone' + (emsg ? (': ' + emsg) : '.');
+      });
+
+      // 2026-10-22: Foreground pushes — iOS suppresses the system banner
+      // when the app is open, so show our own HAULTRA-styled banner.
+      function _haultraPushBanner(title, body, link) {
+        try {
+          var old = document.getElementById('haultra-push-banner');
+          if (old && old.parentNode) old.parentNode.removeChild(old);
+          var b = document.createElement('div');
+          b.id = 'haultra-push-banner';
+          var t = document.createElement('div');
+          t.textContent = title || 'HAULTRA';
+          t.style.cssText = 'font-weight:800;font-size:14px;';
+          var m = document.createElement('div');
+          m.textContent = body || '';
+          m.style.cssText = 'font-size:13px;opacity:.85;margin-top:2px;';
+          b.appendChild(t); b.appendChild(m);
+          b.style.cssText = 'position:fixed;top:calc(10px + env(safe-area-inset-top));left:12px;right:12px;z-index:99999;'
+            + 'background:rgba(24,20,16,.96);border:1px solid rgba(255,107,26,.45);border-radius:16px;'
+            + 'padding:14px 16px;color:#fff;box-shadow:0 8px 32px rgba(0,0,0,.5);'
+            + 'backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);cursor:pointer;'
+            + 'transform:translateY(-120%);transition:transform .35s ease;';
+          b.onclick = function() {
+            if (b.parentNode) b.parentNode.removeChild(b);
+            if (link) window.location.href = link;
+          };
+          document.body.appendChild(b);
+          setTimeout(function() { b.style.transform = 'translateY(0)'; }, 50);
+          setTimeout(function() {
+            b.style.transform = 'translateY(-120%);';
+            setTimeout(function() { if (b.parentNode) b.parentNode.removeChild(b); }, 400);
+          }, 5000);
+        } catch (e) {}
+      }
+      
+
+      cap.addListener('pushNotificationReceived', function (n) {
+        var nt = n.notification || {};
+        _haultraPushBanner(nt.title, nt.body, nt.data && nt.data.link);
       });
       cap.addListener('pushNotificationActionPerformed', function (n) {
         var link = n.notification && n.notification.data && n.notification.data.link;
