@@ -8234,7 +8234,7 @@ a:hover {{ color: #FF9D5C; }}
     border-bottom: 1px solid var(--border);
     position: sticky;
     top: 0;
-    z-index: 200;
+    z-index: 1000;
     /* Own the status-bar strip in CSS. iOS drops the WebView's native top inset
        when a system modal (e.g. the location prompt) returns focus, which used
        to leave this bar drawn under the status bar until the next page load. */
@@ -8923,6 +8923,7 @@ body {{
     top: calc(100% + 8px);
     right: 0;
     min-width: 220px;
+    max-width: calc(100vw - 24px);
     background: var(--bg-card);
     border: 1px solid rgba(255,107,26,0.18);
     border-radius: var(--radius);
@@ -8931,7 +8932,7 @@ body {{
     flex-direction: column;
     gap: 2px;
     box-shadow: 0 12px 40px rgba(0,0,0,0.55);
-    z-index: 250;
+    z-index: 1001;
     max-height: 70vh;
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
