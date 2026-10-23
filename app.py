@@ -17001,6 +17001,11 @@ def routes_page():
                     <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
                     <button class="hist-ghost-btn danger" type="submit">Delete</button>
                 </form>''' if user['role'] == 'boss' else '')
+            # 2026-10-23: one-tap invoice from the route card — no more digging
+            # for the button inside the route detail page.
+            _inv_btn = (f'''
+                <a class="hist-ghost-btn" style="color:#FF9D5C;border-color:rgba(255,157,92,.4);" href="{url_for('invoice_new', route_id=r['id'])}">&#x1F9FE; Invoice</a>'''
+                if user['role'] == 'boss' and _done > 0 else '')
             return f"""
             <div class="drv-lane hist-lane">
                 <div class="drv-lane-head">
@@ -17017,6 +17022,7 @@ def routes_page():
                     <span class="hist-ghost-actions">
                         <a class="hist-ghost-btn" href="{url_for('view_route', route_id=r['id'])}">Open</a>
                         <a class="hist-ghost-btn" href="{url_for('export_route_csv', route_id=r['id'])}">CSV</a>
+                        {_inv_btn}
                         {_del}
                     </span>
                     <a class="drv-lane-foot-link" href="{url_for('view_route', route_id=r['id'])}">Open Route &#8250;</a>
