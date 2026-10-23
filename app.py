@@ -4618,6 +4618,13 @@ def init_db():
     # dispatch; drivers can be moved between trucks day to day (cover for a
     # missed day). NULL = driver's usual truck (their last inspection truck).
     safe_add_column(conn, "routes", "truck_id INTEGER")
+    # 2026-10-23: end-of-day bin disposition — where the last bin ended up.
+    # final_bin_number: the bin on the truck after the last stop.
+    # final_bin_disposition: 'yard' | 'landfill' | 'customer' | NULL (not set).
+    # final_bin_note: customer name/address if left at customer, else ''.
+    safe_add_column(conn, "routes", "final_bin_number TEXT")
+    safe_add_column(conn, "routes", "final_bin_disposition TEXT")
+    safe_add_column(conn, "routes", "final_bin_note TEXT")
     # Soft-delete for defects + maintenance events (boss "Delete") and a
     # driver "report mistake" flag on their own defect. Deleted rows are kept
     # (deleted_at + who) but hidden from every view; the DVIR itself is never
@@ -18735,6 +18742,63 @@ def driver_route_detail(route_id):
             {_PHONE_TS_JS}
             <p class="muted small" style="margin-top:8px;">Back at the yard? Clock out to end your day.</p>
             """
+        # 2026-10-23: end-of-day bin disposition — if there's a bin on the
+        # truck and it hasn't been logged, ask where it went. Smart default:
+        # Pull/swap → Yard (most common); driver one-taps to confirm/change.
+        _disp_html = ""
+        try:
+            _dconn = get_db()
+            _final_bin = _route_final_bin_on_truck(_dconn, route_id)
+            _rd = _dconn.execute("SELECT final_bin_disposition FROM routes WHERE id=?",
+                                 (route_id,)).fetchone()
+            _dconn.close()
+            _already = (_rd["final_bin_disposition"] if _rd and "final_bin_disposition" in _rd.keys() else None)
+        except Exception:
+            _final_bin, _already = "", None
+        if _final_bin and not _already:
+            _disp_html = f"""
+        <div id="cab-bin-disp" style="margin:18px 0;padding:16px;border:1px solid rgba(255,107,26,.4);border-radius:14px;background:rgba(255,107,26,.06);text-align:center;">
+            <div style="font-size:15px;font-weight:800;margin-bottom:4px;">&#x1F4E6; Bin {_final_bin} — where'd it go?</div>
+            <div class="muted small" style="margin-bottom:12px;">Last bin on the truck. One tap.</div>
+            <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
+                <button type="button" class="btn gold" data-disp="yard" data-bin="{_final_bin}" style="min-height:48px;flex:1;min-width:90px;">&#x1F3E0; Yard</button>
+                <button type="button" class="btn secondary" data-disp="landfill" data-bin="{_final_bin}" style="min-height:48px;flex:1;min-width:90px;">&#x1F3ED; Landfill</button>
+                <button type="button" class="btn secondary" data-disp="customer" data-bin="{_final_bin}" style="min-height:48px;flex:1;min-width:90px;">&#x1F464; Customer</button>
+            </div>
+            <div id="cab-bin-disp-msg" class="muted small" style="margin-top:8px;min-height:16px;"></div>
+        </div>
+        <script>
+        (function(){{
+            var box = document.getElementById('cab-bin-disp');
+            if (!box) return;
+            var msg = document.getElementById('cab-bin-disp-msg');
+            box.querySelectorAll('[data-disp]').forEach(function(b){{
+                b.addEventListener('click', function(){{
+                    var disp = b.getAttribute('data-disp');
+                    var bin = b.getAttribute('data-bin');
+                    var note = '';
+                    if (disp === 'customer') {{
+                        note = prompt('Which customer did it stay with?', '') || '';
+                        if (note === null) return;
+                    }}
+                    msg.textContent = 'Saving…';
+                    fetch('/api/route/{route_id}/bin-disposition', {{
+                        method: 'POST',
+                        headers: {{'Content-Type': 'application/json', 'X-CSRF-Token': '{_csrf}'}},
+                        body: JSON.stringify({{disposition: disp, bin_number: bin, note: note}})
+                    }}).then(function(r){{ return r.json(); }}).then(function(d){{
+                        if (d.ok) {{
+                            box.innerHTML = '<div style="color:#3DDC84;font-weight:700;">&#10003; Bin ' + bin +
+                                ' → ' + disp.charAt(0).toUpperCase() + disp.slice(1) +
+                                (note ? ' (' + note.replace(/</g,'&lt;') + ')' : '') + '</div>';
+                        }} else {{
+                            msg.textContent = 'Could not save — try again.';
+                        }}
+                    }}).catch(function(){{ msg.textContent = 'No signal — try again.'; }});
+                }});
+            }});
+        }})();
+        </script>"""
         body = f"""
 <div class="cab-wrap">
     <div class="cab-header">
@@ -18754,6 +18818,7 @@ def driver_route_detail(route_id):
         <div class="cab-all-done-icon"></div>
         <h2>All Stops Done</h2>
         <p style="color:var(--text-muted);margin-top:8px;">{total_count} of {total_count} stops completed.</p>
+        {_disp_html}
         <div style="margin-top:22px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
             {route_action_buttons}
             {f'''
@@ -24009,6 +24074,76 @@ def mark_route_in_progress(route_id):
 
 @app.route("/route/<int:route_id>/complete", methods=["POST"])
 @login_required
+def _route_final_bin_on_truck(conn, route_id):
+    """Bin number on the truck after the last stop ('' if none).
+    Replays the box chain: Pull carries forward, PR-return empties the truck,
+    PR field-swap carries the pulled bin. Used for end-of-day disposition."""
+    prev = ""
+    try:
+        stops = conn.execute(
+            """SELECT s.id, s.action, s.swap_with_previous_empty,
+                      dt.can_number AS ticket_can
+               FROM stops s LEFT JOIN dump_tickets dt ON dt.stop_id = s.id
+               WHERE s.route_id=? AND s.status='completed' AND s.cancelled_at IS NULL
+               ORDER BY s.stop_order, s.id""",
+            (route_id,)).fetchall()
+        for s in stops:
+            sd = dict(s)
+            ticket_can = (sd.get("ticket_can") or "").strip()
+            act = (sd.get("action") or "").lower()
+            is_pr = "pickup and return" in act
+            is_swap = bool(sd.get("swap_with_previous_empty"))
+            if not is_pr:
+                # Pull (or other): truck carries the pulled bin forward.
+                if ticket_can:
+                    prev = ticket_can
+            elif is_swap:
+                if ticket_can:
+                    prev = ticket_can
+            else:
+                # PR: field swap if incoming differs from ticket.
+                if ticket_can and prev and prev != ticket_can:
+                    prev = ticket_can  # swapped — now carrying the pulled bin
+                elif ticket_can:
+                    prev = ""  # true PR — bin returned to customer
+                # incomplete PR: prev stays (still carrying incoming)
+    except Exception:
+        pass
+    return prev
+
+
+@app.route("/api/route/<int:route_id>/bin-disposition", methods=["POST"])
+@login_required
+def api_bin_disposition(route_id):
+    """Driver sets where the final bin ended up: yard | landfill | customer."""
+    data = request.get_json(silent=True) or {}
+    disp = (data.get("disposition") or "").strip().lower()
+    if disp not in ("yard", "landfill", "customer"):
+        return jsonify({"ok": False, "error": "bad disposition"}), 400
+    note = (data.get("note") or "").strip()[:120]
+    bin_no = (data.get("bin_number") or "").strip()[:20]
+
+    conn = get_db()
+    route = conn.execute("SELECT * FROM routes WHERE id=? AND company_id=?",
+                         (route_id, cid())).fetchone()
+    if not route:
+        conn.close()
+        return jsonify({"ok": False}), 404
+    if session.get("role") != "boss" and route["assigned_to"] != session["user_id"]:
+        conn.close()
+        return jsonify({"ok": False}), 403
+    # Safe columns (migration may not have run yet on very old DBs).
+    try:
+        conn.execute("""UPDATE routes SET final_bin_number=?, final_bin_disposition=?,
+                        final_bin_note=? WHERE id=?""",
+                     (bin_no, disp, note, route_id))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    conn.close()
+    return jsonify({"ok": True})
+
+
 def mark_route_completed(route_id):
     conn = get_db()
     route = conn.execute(
@@ -27432,6 +27567,24 @@ def route_daily_log(route_id):
     if (route["route_type"] or "rolloff").lower() != "rolloff":
         _tot_extra = f"Cans: {total_cans} &nbsp;&middot;&nbsp; Bags: {total_bags} &nbsp;|&nbsp; "
 
+    # 2026-10-23: end-of-day bin disposition row.
+    _disp_row = ""
+    try:
+        _rkeys = route.keys()
+        _dbin = (route["final_bin_number"] if "final_bin_number" in _rkeys else "") or ""
+        _ddisp = (route["final_bin_disposition"] if "final_bin_disposition" in _rkeys else "") or ""
+        _dnote = (route["final_bin_note"] if "final_bin_note" in _rkeys else "") or ""
+    except Exception:
+        _dbin, _ddisp, _dnote = "", "", ""
+    if _dbin and _ddisp:
+        _dlabel = {"yard": "🏠 Yard", "landfill": "🏭 Landfill",
+                   "customer": "👤 Customer"}.get(_ddisp, _ddisp)
+        _dtext = f"End of day: Bin {_dbin} → {_dlabel}"
+        if _dnote:
+            _dtext += f" ({_dnote})"
+        _disp_row = (f'<tr><td colspan="15" style="text-align:center;padding:10px;'
+                     f'color:#FF9D5C;font-weight:700;">{e(_dtext)}</td></tr>')
+
     gallery = ""
     if ticket_photos:
         thumbs = ""
@@ -27546,6 +27699,7 @@ def route_daily_log(route_id):
                     <td class="col-num">{total_tons:.2f}</td>
                     <td colspan="2"></td>
                 </tr>
+                {_disp_row}
             </tbody>
         </table>
     </div>
