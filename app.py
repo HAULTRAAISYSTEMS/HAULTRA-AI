@@ -11156,6 +11156,23 @@ def login():
                 session["company_plan"] = _co_row["subscription_plan"]
             flash("Logged in.", "success")
 
+            # 2026-10-23: brand-new boss with nothing set up → onboarding.
+            # A company with no customers, no dump sites, and no yard address
+            # hasn't been through setup yet.
+            if user["role"] == "boss":
+                try:
+                    _ob = get_db()
+                    _ob_cid = user["company_id"]
+                    _ob_nc = _ob.execute("SELECT COUNT(*) FROM saved_addresses WHERE company_id=? AND kind='customer'", (_ob_cid,)).fetchone()[0] or 0
+                    _ob_nd = _ob.execute("SELECT COUNT(*) FROM dump_locations WHERE company_id=?", (_ob_cid,)).fetchone()[0] or 0
+                    _ob_co = _ob.execute("SELECT yard_address FROM companies WHERE id=?", (_ob_cid,)).fetchone()
+                    _ob_base = bool(_ob_co and (_ob_co["yard_address"] or "").strip())
+                    _ob.close()
+                    if _ob_nc == 0 and _ob_nd == 0 and not _ob_base:
+                        return redirect(url_for("onboarding_setup"))
+                except Exception:
+                    pass
+
             if user["role"] == "driver":
                 # 2026-10-14 ~9:20 AM: drivers land on the new Driver Dashboard
                 # (clock + lanes), not the My Routes history page.
@@ -32419,6 +32436,278 @@ def _containers_section_html():
         </div>
     </div>
     """
+
+
+def _onboarding_steps(conn, company_id, user_id):
+    """Compute onboarding checklist state from real data. Returns list of
+    dicts: key, title, desc, done, url, essential. No extra state to manage —
+    completion is derived from what the company has actually set up."""
+    def _count(q, *a):
+        try:
+            return conn.execute(q, a).fetchone()[0] or 0
+        except Exception:
+            return 0
+    # Company base: yard address set?
+    try:
+        _co = conn.execute("SELECT yard_address FROM companies WHERE id=?", (company_id,)).fetchone()
+        _base_done = bool(_co and (_co["yard_address"] or "").strip())
+    except Exception:
+        _base_done = False
+    # Push: boss has a registered device?
+    _push_done = _count("SELECT COUNT(*) FROM push_tokens WHERE company_id=?", company_id) > 0
+    steps = [
+        {"key": "base", "title": "Company base",
+         "desc": "Yard address — unlocks route optimize and navigate-to-yard.",
+         "done": _base_done, "url": url_for("settings_page") + "#company",
+         "essential": True},
+        {"key": "customers", "title": "Import customers",
+         "desc": "Photo, spreadsheet, or paste dispatch texts — the parser learns them.",
+         "done": _count("SELECT COUNT(*) FROM saved_addresses WHERE company_id=? AND kind='customer'", company_id) > 0,
+         "url": url_for("onboarding_import_customers"),
+         "essential": True},
+        {"key": "dumps", "title": "Dump locations",
+         "desc": "Confirm sites, add addresses, set the ticket toggle per site.",
+         "done": _count("SELECT COUNT(*) FROM dump_locations WHERE company_id=?", company_id) > 0,
+         "url": url_for("yard_setup_page") + "#dump-locations",
+         "essential": True},
+        {"key": "drivers", "title": "Add drivers",
+         "desc": "Name + phone — they get a text invite to download the app.",
+         "done": _count("SELECT COUNT(*) FROM users WHERE company_id=? AND role='driver'", company_id) > 0,
+         "url": url_for("team_page"),
+         "essential": True},
+        {"key": "push", "title": "Turn on notifications",
+         "desc": "Dispatch alerts and route pushes to your phone.",
+         "done": _push_done, "url": url_for("settings_page") + "#notifications",
+         "essential": False},
+        {"key": "ratecard", "title": "Rate card",
+         "desc": "Per-size pricing, fees, and surcharge markup for invoices.",
+         "done": _count("SELECT COUNT(*) FROM rate_cards WHERE company_id=?", company_id) > 0,
+         "url": url_for("settings_page") + "#rate-card",
+         "essential": False},
+        {"key": "fleet", "title": "Container fleet",
+         "desc": "Track your cans — what's out, what's at the yard.",
+         "done": _count("SELECT COUNT(*) FROM containers WHERE company_id=?", company_id) > 0,
+         "url": url_for("yard_setup_page") + "#containers",
+         "essential": False},
+        {"key": "payroll", "title": "Work hours & pay cycle",
+         "desc": "Clock-in rules and pay periods for the team.",
+         "done": False,  # TODO: wire to company settings when payroll ships
+         "url": url_for("settings_page") + "#payroll",
+         "essential": False},
+    ]
+    return steps
+
+
+@app.route("/onboarding/setup")
+@login_required
+def onboarding_setup():
+    """Guided setup checklist for new companies. Essentials first (first route
+    in 5 minutes), polish later. Progress is computed from real data."""
+    if session.get("role") != "boss":
+        return redirect(url_for("dashboard"))
+    conn = get_db()
+    steps = _onboarding_steps(conn, cid(), session["user_id"])
+    conn.close()
+    essential = [s for s in steps if s["essential"]]
+    later = [s for s in steps if not s["essential"]]
+    done_n = sum(1 for s in steps if s["done"])
+    total_n = len(steps)
+    pct = int(done_n / total_n * 100) if total_n else 0
+
+    def _card(s):
+        _icon = "✅" if s["done"] else "⭕"
+        _btn = ("<span class='ob-done'>Done</span>" if s["done"]
+                else f"<a class='btn' href='{s['url']}'>Set up →</a>")
+        return f"""
+        <div class="ob-step{' done' if s['done'] else ''}">
+            <div class="ob-step-icon">{_icon}</div>
+            <div class="ob-step-body">
+                <div class="ob-step-title">{e(s['title'])}</div>
+                <div class="ob-step-desc">{e(s['desc'])}</div>
+            </div>
+            <div class="ob-step-act">{_btn}</div>
+        </div>"""
+
+    body = f"""
+    <div class="hero">
+        <h1>🚀 Get Set Up</h1>
+        <p>Essentials first — your first route in 5 minutes. Polish the rest over the week.</p>
+    </div>
+    <div class="card">
+        <div class="ob-progress-wrap">
+            <div class="ob-progress-lbl">{done_n} of {total_n} complete</div>
+            <div class="ob-progress"><div style="width:{pct}%;"></div></div>
+        </div>
+        <h2 style="margin:18px 0 10px;">⚡ Essentials</h2>
+        {"".join(_card(s) for s in essential)}
+        <h2 style="margin:22px 0 10px;">✨ Finish later</h2>
+        {"".join(_card(s) for s in later)}
+        <div style="margin-top:18px;text-align:center;">
+            <a class="btn secondary" href="{url_for('dashboard')}">← Back to dashboard</a>
+        </div>
+    </div>
+    <style>
+    .ob-progress-wrap {{ margin-bottom:6px; }}
+    .ob-progress-lbl {{ font-size:.85rem; color:var(--text-muted); margin-bottom:6px; }}
+    .ob-progress {{ height:10px; border-radius:5px; background:rgba(255,255,255,.08); overflow:hidden; }}
+    .ob-progress div {{ height:100%; border-radius:5px; background:linear-gradient(90deg,#FF6B1A,#FF9D5C); transition:width .4s; }}
+    .ob-step {{ display:flex; align-items:center; gap:14px; padding:14px; border:1px solid rgba(255,255,255,.08);
+        border-radius:12px; margin-bottom:10px; background:rgba(255,255,255,.02); }}
+    .ob-step.done {{ opacity:.75; border-color:rgba(61,220,132,.25); }}
+    .ob-step-icon {{ font-size:1.4rem; flex:none; }}
+    .ob-step-body {{ flex:1; min-width:0; }}
+    .ob-step-title {{ font-weight:800; font-size:1rem; }}
+    .ob-step-desc {{ color:var(--text-muted); font-size:.85rem; margin-top:2px; }}
+    .ob-step-act {{ flex:none; }}
+    .ob-done {{ color:#3DDC84; font-weight:700; font-size:.9rem; }}
+    </style>
+    """
+    return render_template_string(shell_page("Get Set Up", body))
+
+
+@app.route("/onboarding/import-customers", methods=["GET", "POST"])
+@login_required
+def onboarding_import_customers():
+    """Three ways to fill the address book: manual add, CSV upload, or paste
+    dispatch texts and let the parser extract customers + dump sites."""
+    if session.get("role") != "boss":
+        return redirect(url_for("dashboard"))
+    _csrf = get_csrf_token()
+    msg = ""
+
+    if request.method == "POST":
+        mode = request.form.get("mode", "")
+        conn = get_db()
+        try:
+            if mode == "manual":
+                nm = request.form.get("customer_name", "").strip()
+                ad = request.form.get("address", "").strip()
+                ct = request.form.get("city", "").strip()
+                if nm or ad:
+                    learn_location(conn, cid(), ad, city=ct, customer_name=nm)
+                    conn.commit()
+                    msg = f"<p class='ob-ok'>✅ Added {e(nm or ad)}</p>"
+                else:
+                    msg = "<p class='ob-err'>Enter a name or address.</p>"
+            elif mode == "csv":
+                f = request.files.get("csv_file")
+                if f and f.filename:
+                    import csv as _csv, io as _io
+                    text = f.read().decode("utf-8-sig", errors="replace")
+                    reader = _csv.DictReader(_io.StringIO(text))
+                    n = 0
+                    for row in reader:
+                        # Flexible headers: name/customer, address/street, city
+                        rl = {k.lower().strip(): (v or "").strip() for k, v in row.items() if k}
+                        nm = rl.get("customer_name") or rl.get("name") or rl.get("customer") or ""
+                        ad = rl.get("address") or rl.get("street") or ""
+                        ct = rl.get("city") or ""
+                        st = rl.get("state") or ""
+                        zp = rl.get("zip") or rl.get("zip_code") or ""
+                        if nm or ad:
+                            learn_location(conn, cid(), ad, city=ct, state=st,
+                                           zip_code=zp, customer_name=nm)
+                            n += 1
+                    conn.commit()
+                    msg = f"<p class='ob-ok'>✅ Imported {n} customers from CSV</p>"
+                else:
+                    msg = "<p class='ob-err'>Choose a CSV file.</p>"
+            elif mode == "dispatch":
+                raw = request.form.get("dispatch_text", "").strip()
+                if raw:
+                    # Run the rule-based parser to extract stops, then learn
+                    # each customer/address/dump site into the address book.
+                    # parse_boss_text returns (stops_list, dump_site_str).
+                    try:
+                        _parsed = parse_boss_text(raw)
+                        stops = _parsed[0] if isinstance(_parsed, (list, tuple)) else []
+                    except Exception:
+                        stops = []
+                    n_cust, n_dump = 0, 0
+                    for st in stops:
+                        sd = dict(st) if not isinstance(st, dict) else st
+                        cn = (sd.get("customer_name") or "").strip()
+                        ad = (sd.get("address") or "").strip()
+                        ct = (sd.get("city") or "").strip()
+                        dl = (sd.get("dump_location") or "").strip()
+                        if cn or ad:
+                            learn_location(conn, cid(), ad, city=ct, customer_name=cn,
+                                           action=sd.get("action", ""),
+                                           container_size=sd.get("container_size", ""),
+                                           dump_location=dl)
+                            n_cust += 1
+                        if dl:
+                            try:
+                                _resolve_site(conn, cid(), dl, "dump")
+                                n_dump += 1
+                            except Exception:
+                                pass
+                    conn.commit()
+                    msg = (f"<p class='ob-ok'>✅ Learned {n_cust} customers"
+                           f"{f' and {n_dump} dump sites' if n_dump else ''} from your dispatch text</p>")
+                else:
+                    msg = "<p class='ob-err'>Paste some dispatch text first.</p>"
+        except Exception as ex:
+            conn.rollback()
+            msg = f"<p class='ob-err'>Import failed: {e(str(ex)[:120])}</p>"
+        finally:
+            conn.close()
+
+    # Current count for the header
+    conn = get_db()
+    try:
+        _nc = conn.execute("SELECT COUNT(*) FROM saved_addresses WHERE company_id=? AND kind='customer'",
+                           (cid(),)).fetchone()[0] or 0
+    except Exception:
+        _nc = 0
+    conn.close()
+
+    body = f"""
+    <div class="hero">
+        <h1>📇 Import Customers</h1>
+        <p>{_nc} customers in your address book. Three ways to add more.</p>
+    </div>
+    {msg}
+    <div class="card">
+        <h2 style="margin-top:0;">✏️ Add one manually</h2>
+        <form method="POST" style="display:flex;gap:8px;flex-wrap:wrap;">
+            <input type="hidden" name="_csrf_token" value="{_csrf}">
+            <input type="hidden" name="mode" value="manual">
+            <input name="customer_name" placeholder="Customer name" style="flex:1;min-width:160px;min-height:48px;padding:8px 12px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);">
+            <input name="address" placeholder="Street address" style="flex:1;min-width:160px;min-height:48px;padding:8px 12px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);">
+            <input name="city" placeholder="City" style="width:130px;min-height:48px;padding:8px 12px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);">
+            <button class="btn" type="submit" style="min-height:48px;">+ Add</button>
+        </form>
+    </div>
+    <div class="card">
+        <h2 style="margin-top:0;">📊 Upload a spreadsheet</h2>
+        <p class="muted small">CSV with headers like <code>customer_name, address, city, state, zip</code>.</p>
+        <form method="POST" enctype="multipart/form-data" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <input type="hidden" name="_csrf_token" value="{_csrf}">
+            <input type="hidden" name="mode" value="csv">
+            <input type="file" name="csv_file" accept=".csv" style="color:var(--text);">
+            <button class="btn" type="submit" style="min-height:48px;">Upload & Import</button>
+        </form>
+    </div>
+    <div class="card">
+        <h2 style="margin-top:0;">📋 Paste dispatch texts</h2>
+        <p class="muted small">Paste 5–10 old dispatch texts. The parser pulls out every customer, address, and dump site — and learns your shorthand too.</p>
+        <form method="POST">
+            <input type="hidden" name="_csrf_token" value="{_csrf}">
+            <input type="hidden" name="mode" value="dispatch">
+            <textarea name="dispatch_text" rows="8" placeholder="Pr 697 independence pkwy, ches, Marlyn 30yd dump dominion&#10;Pull 4512 elm st 30yd&#10;..." style="width:100%;padding:10px 12px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);font-family:monospace;"></textarea>
+            <div style="margin-top:10px;display:flex;gap:8px;">
+                <button class="btn" type="submit" style="min-height:48px;">🧠 Learn from these texts</button>
+                <a class="btn secondary" href="{url_for('onboarding_setup')}" style="min-height:48px;display:inline-flex;align-items:center;">← Checklist</a>
+            </div>
+        </form>
+    </div>
+    <style>
+    .ob-ok {{ color:#3DDC84; font-weight:700; }}
+    .ob-err {{ color:#FF6B6B; font-weight:700; }}
+    </style>
+    """
+    return render_template_string(shell_page("Import Customers", body))
 
 
 @app.route("/yard-setup")
