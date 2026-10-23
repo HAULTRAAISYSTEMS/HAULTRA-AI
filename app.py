@@ -3462,6 +3462,28 @@ def init_db():
         FOREIGN KEY (route_id) REFERENCES routes(id)
     )
     """)
+    # 2026-10-23: landfill surcharge tickets — the extra paper ticket the
+    # landfill hands the driver when the load had mattresses, tires, etc.
+    # Driver snaps it, AI reads material/ticket#/total, boss confirms. Linked
+    # to the stop's dump ticket; flows onto the invoice as a pass-through
+    # line item (+ optional boss-configured markup). billed=1 once invoiced.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS ticket_surcharges (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id INTEGER NOT NULL,
+        stop_id INTEGER NOT NULL,
+        dump_ticket_id INTEGER,
+        material TEXT NOT NULL DEFAULT '',
+        ticket_number TEXT NOT NULL DEFAULT '',
+        amount_cents INTEGER NOT NULL DEFAULT 0,
+        photo_path TEXT,
+        billed INTEGER NOT NULL DEFAULT 0,
+        created_by INTEGER,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (stop_id) REFERENCES stops(id),
+        FOREIGN KEY (dump_ticket_id) REFERENCES dump_tickets(id)
+    )
+    """)
     # --- Phase 5A: container fleet tracking ---
     cur.execute("""
     CREATE TABLE IF NOT EXISTS containers (
@@ -19219,12 +19241,152 @@ def driver_route_detail(route_id):
         document.getElementById('cab-fee-desc').focus();
     }}
     </script>"""
+    # 2026-10-23: landfill surcharge tickets — driver snaps the extra paper
+    # ticket, AI reads material/ticket#/total, driver confirms. Photo-first so
+    # the old guys never type unless the scan fails.
+    _cab_surcharge_block = f"""
+    <div class="cab-surcharge-block" id="cab-surcharge-block" style="margin-bottom:12px;padding:12px;border:1px solid rgba(255,255,255,0.12);border-radius:10px;background:rgba(255,255,255,0.03);">
+        <div style="font-size:13px;font-weight:700;margin-bottom:8px;">&#x1F9FE; Extra charges on this ticket? <span class="muted" style="font-weight:400;">(optional)</span></div>
+        <div id="cab-surcharge-list" style="margin-bottom:8px;"></div>
+        <button type="button" class="btn secondary" id="cab-surcharge-scan" style="width:100%;min-height:48px;">&#x1F4F8; Scan surcharge ticket</button>
+        <input type="file" id="cab-surcharge-photo" accept="image/*" capture="environment" hidden>
+        <div id="cab-surcharge-form" hidden style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);">
+            <div id="cab-surcharge-scan-status" class="muted small" style="margin-bottom:8px;"></div>
+            <div class="grid" style="grid-template-columns:1fr 1fr;gap:8px;">
+                <input id="cab-surcharge-material" placeholder="Material (e.g. mattress)" style="font-size:15px;padding:10px;" list="cab-surcharge-materials">
+                <datalist id="cab-surcharge-materials"></datalist>
+                <input id="cab-surcharge-ticketno" placeholder="Ticket #" style="font-size:15px;padding:10px;">
+            </div>
+            <div style="margin-top:8px;">
+                <input id="cab-surcharge-total" type="number" min="0" step="0.01" inputmode="decimal" placeholder="Total $" style="font-size:15px;padding:10px;width:100%;">
+            </div>
+            <div class="row" style="gap:8px;margin-top:8px;">
+                <button type="button" class="btn gold" id="cab-surcharge-confirm" style="flex:1;min-height:48px;">Add Surcharge</button>
+                <button type="button" class="btn secondary" id="cab-surcharge-cancel">Cancel</button>
+            </div>
+        </div>
+    </div>
+    <script>
+    (function(){{
+        var stopId = {int(stop_id)};
+        var csrf = "{_csrf}";
+        var scanBtn = document.getElementById('cab-surcharge-scan');
+        var photoInput = document.getElementById('cab-surcharge-photo');
+        var form = document.getElementById('cab-surcharge-form');
+        var status = document.getElementById('cab-surcharge-scan-status');
+        var matInput = document.getElementById('cab-surcharge-material');
+        var tickInput = document.getElementById('cab-surcharge-ticketno');
+        var totInput = document.getElementById('cab-surcharge-total');
+        var list = document.getElementById('cab-surcharge-list');
+        var scannedPhotoPath = "";
+        if (!scanBtn) return;
+
+        function money(cents){{
+            var d = cents/100;
+            return '$' + (d % 1 === 0 ? d.toFixed(0) : d.toFixed(2));
+        }}
+        function refreshList(){{
+            fetch('/api/surcharges/for-stop/' + stopId).then(function(r){{ return r.json(); }}).then(function(d){{
+                var items = (d && d.surcharges) || [];
+                // Learn materials for autocomplete.
+                var seen = {{}};
+                var dl = document.getElementById('cab-surcharge-materials');
+                dl.innerHTML = '';
+                items.forEach(function(s){{
+                    var m = (s.material || '').trim();
+                    if (m && !seen[m.toLowerCase()]) {{
+                        seen[m.toLowerCase()] = 1;
+                        var o = document.createElement('option');
+                        o.value = m;
+                        dl.appendChild(o);
+                    }}
+                }});
+                if (!items.length) {{ list.innerHTML = ''; return; }}
+                list.innerHTML = items.map(function(s){{
+                    return '<div style="display:flex;align-items:center;gap:8px;padding:8px;border:1px solid rgba(255,255,255,0.1);border-radius:8px;margin-bottom:6px;background:rgba(255,255,255,0.02);">'
+                        + '<div style="flex:1;"><strong>' + s.material.replace(/</g,'&lt;') + '</strong>'
+                        + (s.ticket_number ? ' <span class="muted small">#' + s.ticket_number.replace(/</g,'&lt;') + '</span>' : '')
+                        + '<div style="color:#3DDC84;font-weight:700;">' + money(s.amount_cents) + '</div></div>'
+                        + (s.billed ? '<span class="muted small">invoiced</span>'
+                           : '<button type="button" data-sc-del="' + s.id + '" style="background:transparent;color:#f87171;border:1px solid rgba(248,113,113,0.4);border-radius:6px;padding:4px 10px;font-size:12px;">Remove</button>')
+                        + '</div>';
+                }}).join('');
+                list.querySelectorAll('[data-sc-del]').forEach(function(b){{
+                    b.addEventListener('click', function(){{
+                        fetch('/api/surcharges/' + b.getAttribute('data-sc-del') + '/delete', {{
+                            method: 'POST', headers: {{'X-CSRF-Token': csrf}}
+                        }}).then(function(){{ refreshList(); }});
+                    }});
+                }});
+            }});
+        }}
+        scanBtn.addEventListener('click', function(){{ photoInput.click(); }});
+        photoInput.addEventListener('change', function(){{
+            var f = photoInput.files[0];
+            if (!f) return;
+            form.hidden = false;
+            status.textContent = 'Reading ticket…';
+            matInput.value = ''; tickInput.value = ''; totInput.value = '';
+            scannedPhotoPath = '';
+            var fd = new FormData();
+            fd.append('photo', f);
+            fd.append('stop_id', stopId);
+            fetch('/api/surcharge-ticket/ocr', {{method: 'POST', body: fd, headers: {{'X-CSRF-Token': csrf}}}})
+            .then(function(r){{ return r.json(); }})
+            .then(function(d){{
+                scannedPhotoPath = d.photo_path || '';
+                if (d.ok && d.fields) {{
+                    matInput.value = d.fields.material || '';
+                    tickInput.value = d.fields.ticket_number || '';
+                    totInput.value = d.fields.total_usd != null ? d.fields.total_usd : '';
+                    status.textContent = d.unreadable ? 'Could not read it — fill in by hand.' : 'Check it, then tap Add Surcharge.';
+                }} else {{
+                    status.textContent = 'Could not read it — fill in by hand.';
+                }}
+                photoInput.value = '';
+            }})
+            .catch(function(){{
+                status.textContent = 'Scan failed — fill in by hand.';
+                photoInput.value = '';
+            }});
+        }});
+        document.getElementById('cab-surcharge-cancel').addEventListener('click', function(){{
+            form.hidden = true;
+        }});
+        document.getElementById('cab-surcharge-confirm').addEventListener('click', function(){{
+            var payload = {{
+                stop_id: stopId,
+                material: matInput.value.trim(),
+                ticket_number: tickInput.value.trim(),
+                total_usd: parseFloat(totInput.value) || 0,
+                photo_path: scannedPhotoPath
+            }};
+            if (!payload.material || !(payload.total_usd > 0)) {{
+                status.textContent = 'Material and total are required.';
+                return;
+            }}
+            fetch('/api/surcharges/add', {{
+                method: 'POST', headers: {{'Content-Type': 'application/json', 'X-CSRF-Token': csrf}},
+                body: JSON.stringify(payload)
+            }}).then(function(r){{ return r.json(); }}).then(function(d){{
+                if (d.ok) {{
+                    form.hidden = true;
+                    refreshList();
+                }} else {{
+                    status.textContent = (d.error || 'Could not save.') ;
+                }}
+            }});
+        }});
+        refreshList();
+    }})();
+    </script>"""
     complete_section = f"""
     <form method="POST" action="{url_for('toggle_stop_complete', stop_id=stop_id)}" id="cab-complete-form"
           data-has-photo="{'1' if has_photo else '0'}" data-photo-mode="{e(photo_proof_mode)}">
         <input type="hidden" name="_csrf_token" value="{_csrf}">
         <input type="hidden" name="intent" value="complete">
         {_cab_weight_block}
+        {_cab_surcharge_block}
         <button class="cab-complete-btn" type="submit" {"disabled" if required_locked else ""}>&#9989; Complete Stop</button>
     </form>
     {'<div class="cab-photo-status">Take at least one photo to unlock Complete Stop</div>' if required_locked else ''}
@@ -24855,6 +25017,16 @@ def invoice_list():
     rows = conn.execute(
         """SELECT * FROM invoices WHERE company_id=? ORDER BY id DESC""",
         (cid(),)).fetchall()
+    # 2026-10-23: unbilled landfill surcharges — money the drivers logged that
+    # hasn't hit an invoice yet. Boss-visible so nothing slips through.
+    try:
+        _unbilled = conn.execute(
+            """SELECT COUNT(*), COALESCE(SUM(amount_cents),0) FROM ticket_surcharges
+               WHERE company_id=? AND billed=0""",
+            (cid(),)).fetchone()
+        _unbilled_n, _unbilled_cents = (_unbilled[0] or 0), (_unbilled[1] or 0)
+    except Exception:
+        _unbilled_n, _unbilled_cents = 0, 0
     conn.close()
     _status_badge = {"draft": "", "sent": "in_progress", "paid": "completed", "void": "cancelled"}
     # 2026-10-17: command header meta — open count + outstanding.
@@ -24863,6 +25035,10 @@ def invoice_list():
     _inv_meta = (f"<span>{len(_open)} open</span><span class=\"cmd-sep\"></span>"
                  f"<span>{_fmt_money(_owed_cents)} outstanding</span>" if _open
                  else "<span>All paid up</span>")
+    if _unbilled_n:
+        _inv_meta += (f"<span class=\"cmd-sep\"></span>"
+                      f"<span style=\"color:#FF9D5C;font-weight:700;\">&#x1F9FE; {_unbilled_n} unbilled surcharge"
+                      f"{'s' if _unbilled_n != 1 else ''} ({_fmt_money(_unbilled_cents)})</span>")
     cards = ""
     for inv in rows:
         d = dict(inv)
@@ -24986,6 +25162,10 @@ def invoice_create():
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (inv_id, ln["kind"], ln["description"], ln["qty"], ln["unit_cents"],
                  ln["amount_cents"], ln["stop_id"], i))
+            # 2026-10-23: surcharge billed — mark it so it never double-invoices.
+            if ln.get("kind") == "surcharge" and ln.get("surcharge_id"):
+                conn.execute("UPDATE ticket_surcharges SET billed=1 WHERE id=?",
+                             (ln["surcharge_id"],))
     _invoice_recalc_totals(conn, inv_id)
     conn.commit()
     conn.close()
@@ -25917,6 +26097,33 @@ Rules:
 """
 
 
+# 2026-10-23: surcharge ticket OCR — the EXTRA paper ticket for special
+# materials (mattresses, tires, appliances...). Same assist pattern as scale
+# tickets: photo saved first, AI prefills, driver confirms. Never auto-saves.
+_SURCHARGE_TICKET_OCR_PROMPT = """You read landfill / transfer-station SURCHARGE TICKETS from a photo and return ONLY a JSON object — no prose, no markdown fences.
+
+This is a surcharge ticket: an extra charge on top of the base dump fee because the load contained special materials (mattresses, tires, appliances, electronics, etc.). It is NOT the scale/weight ticket.
+
+This is billing data. NEVER guess. If a field is not clearly legible, return null for it. It is far better to leave a field null than to invent a value.
+
+Return exactly this shape:
+{
+  "material": string|null,
+  "ticket_number": string|null,
+  "total_usd": number|null,
+  "confidence": { "<field>": "high"|"medium"|"low" },
+  "unreadable": boolean
+}
+
+Rules:
+- material is WHAT was surcharged: e.g. "MATTRESS DISPOSAL", "TIRE", "APPLIANCE". Use the ticket's own words.
+- ticket_number is the ticket/receipt number printed on THIS surcharge ticket.
+- total_usd is the total amount due on this ticket, a plain number (no $).
+- Include a confidence entry for every non-null field.
+- Set "unreadable": true only when the image is not a surcharge ticket or no field could be read at all.
+"""
+
+
 def _dump_ticket_ocr_cap(conn, company_id):
     row = conn.execute("SELECT ocr_daily_cap FROM companies WHERE id=?", (company_id,)).fetchone()
     cap = row["ocr_daily_cap"] if row else None
@@ -26106,6 +26313,239 @@ def _normalize_ocr_ticket(parsed):
             if fields["net_tons"] is not None:
                 conf["net_tons"] = "low"
     return fields, conf
+
+
+# --- Landfill surcharge tickets (2026-10-23) ---------------------------------
+# The extra paper ticket for special materials. Driver snaps it at the dump,
+# AI reads material/ticket#/total, driver confirms. Saved linked to the stop
+# (and its dump ticket); flows onto the invoice as a pass-through line item
+# plus the boss's configured markup.
+def _save_surcharge_photo(conn, company_id, raw, ext):
+    """Persist a surcharge ticket photo. Returns the db path."""
+    uid = secrets.token_hex(8)
+    fname = f"sc_{uid}.{ext}"
+    with open(os.path.join(app.config["UPLOAD_FOLDER"], fname), "wb") as fh:
+        fh.write(raw)
+    return os.path.join("static", "uploads", fname)
+
+
+def _get_surcharge_markup_cents(conn, company_id):
+    """Boss's per-surcharge handling markup in cents. 0 = pure pass-through."""
+    try:
+        row = conn.execute(
+            "SELECT cents FROM rate_cards WHERE company_id=? AND service='surcharge_markup' LIMIT 1",
+            (company_id,)).fetchone()
+        return max(0, int(row["cents"] or 0)) if row else 0
+    except Exception:
+        return 0
+
+
+@app.route("/api/surcharge-ticket/ocr", methods=["POST"])
+@login_required
+def api_surcharge_ticket_ocr():
+    """ASSIST — read a photographed SURCHARGE ticket and return prefill values
+    for the driver to CONFIRM. Same pattern as scale-ticket OCR: photo saved
+    first, best-effort AI, HTTP 200 with ok:false on any failure so the client
+    falls back to the blank form — never a red error at a landfill."""
+    import base64 as _b64
+
+    stop_id_raw = (request.form.get("stop_id") or "").strip()
+    if not stop_id_raw.isdigit():
+        return jsonify({"ok": False, "reason": "bad_request"}), 400
+    stop_id = int(stop_id_raw)
+
+    conn = get_db()
+    stop = conn.execute(
+        """SELECT s.id, r.assigned_to, r.id AS rid FROM stops s JOIN routes r ON s.route_id=r.id
+            WHERE s.id=? AND r.company_id=?""",
+        (stop_id, cid())
+    ).fetchone()
+    if not stop:
+        conn.close()
+        return jsonify({"ok": False, "reason": "not_found"}), 404
+    if session.get("role") != "boss" and stop["assigned_to"] != session["user_id"]:
+        conn.close()
+        return jsonify({"ok": False, "reason": "forbidden"}), 403
+
+    photo = request.files.get("photo")
+    if not photo or not photo.filename:
+        conn.close()
+        return jsonify({"ok": False, "reason": "no_photo"}), 400
+    raw = photo.read()
+    if not raw:
+        conn.close()
+        return jsonify({"ok": False, "reason": "empty"}), 400
+    if len(raw) > _DUMP_TICKET_OCR_MAX_BYTES:
+        conn.close()
+        return jsonify({"ok": False, "reason": "too_large"}), 413
+    media_type = (photo.mimetype or "").lower()
+    if media_type not in _DUMP_TICKET_OCR_TYPES:
+        conn.close()
+        return jsonify({"ok": False, "reason": "bad_type"}), 415
+    ext = _DUMP_TICKET_OCR_TYPES[media_type]
+
+    photo_path = _save_surcharge_photo(conn, cid(), raw, ext)
+
+    def _fallback(reason):
+        conn.close()
+        return jsonify({"ok": False, "reason": reason, "photo_path": photo_path})
+
+    cap = _dump_ticket_ocr_cap(conn, cid())
+    allowed, _retry = rate_limit_allow("surcharge_ticket_ocr", str(cid()), cap, 86400)
+    if not allowed:
+        return _fallback("cap")
+    try:
+        import anthropic
+    except ImportError:
+        return _fallback("no_ai")
+    api_key = _os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return _fallback("no_ai")
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key, timeout=25.0)
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            system=_SURCHARGE_TICKET_OCR_PROMPT,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media_type,
+                                             "data": _b64.b64encode(raw).decode("ascii")}},
+                {"type": "text", "text": "Read this surcharge ticket. Return only the JSON."},
+            ]}],
+        )
+        raw_reply = "".join(
+            b.text for b in resp.content if getattr(b, "type", None) == "text"
+        ).strip()
+    except Exception as ex:
+        app.logger.warning("surcharge_ticket_ocr: model error: %s", ex)
+        return _fallback("error")
+
+    cleaned = raw_reply.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\\s*", "", cleaned)
+        cleaned = re.sub(r"\\s*```\\s*$", "", cleaned)
+    try:
+        parsed = json.loads(cleaned)
+    except (json.JSONDecodeError, ValueError):
+        return _fallback("parse")
+    if not isinstance(parsed, dict):
+        return _fallback("parse")
+
+    def _str(v):
+        v = (v or "")
+        return str(v).strip()[:120] if isinstance(v, (str, int, float)) else ""
+    def _usd(v):
+        try:
+            return round(float(v), 2) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+    raw_conf = parsed.get("confidence") or {}
+    conf = {}
+    for k in ("material", "ticket_number", "total_usd"):
+        c = str(raw_conf.get(k, "medium")).lower()
+        conf[k] = c if c in ("high", "medium", "low") else "medium"
+
+    fields = {
+        "material": _str(parsed.get("material")) or None,
+        "ticket_number": _str(parsed.get("ticket_number")) or None,
+        "total_usd": _usd(parsed.get("total_usd")),
+    }
+    unreadable = bool(parsed.get("unreadable")) or not any(v is not None for v in fields.values())
+    conn.close()
+    return jsonify({"ok": True, "unreadable": unreadable, "fields": fields,
+                    "confidence": conf, "photo_path": photo_path})
+
+
+@app.route("/api/surcharges/add", methods=["POST"])
+@login_required
+def api_surcharge_add():
+    """Save a driver-confirmed surcharge. Photo already uploaded via OCR (or
+    blank form); this just records the confirmed values."""
+    data = request.get_json(silent=True) or {}
+    stop_id = data.get("stop_id")
+    try:
+        stop_id = int(stop_id)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "bad stop"}), 400
+    material = (data.get("material") or "").strip()[:120]
+    ticket_number = (data.get("ticket_number") or "").strip()[:60]
+    photo_path = (data.get("photo_path") or "").strip()[:255]
+    try:
+        amount_cents = int(round(float(data.get("total_usd") or 0) * 100))
+    except (TypeError, ValueError):
+        amount_cents = 0
+    if not material or amount_cents <= 0:
+        return jsonify({"ok": False, "error": "material and total required"}), 400
+    # Basic path guard: photo must be one of ours.
+    if photo_path and (not photo_path.startswith("static/uploads/") or ".." in photo_path):
+        photo_path = ""
+
+    conn = get_db()
+    stop = conn.execute(
+        """SELECT s.id, r.id AS rid FROM stops s JOIN routes r ON s.route_id=r.id
+            WHERE s.id=? AND r.company_id=?""",
+        (stop_id, cid())).fetchone()
+    if not stop:
+        conn.close()
+        return jsonify({"ok": False, "error": "not found"}), 404
+    if session.get("role") != "boss" and conn.execute(
+            "SELECT assigned_to FROM routes WHERE id=?", (stop["rid"],)).fetchone()["assigned_to"] != session["user_id"]:
+        conn.close()
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    # Link to the stop's dump ticket if one exists.
+    dt = conn.execute("SELECT id FROM dump_tickets WHERE stop_id=? ORDER BY id DESC LIMIT 1",
+                      (stop_id,)).fetchone()
+    cur = conn.execute(
+        """INSERT INTO ticket_surcharges
+           (company_id, stop_id, dump_ticket_id, material, ticket_number,
+            amount_cents, photo_path, billed, created_by, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (cid(), stop_id, dt["id"] if dt else None, material, ticket_number,
+         amount_cents, photo_path or None, 0, session["user_id"], now_ts()))
+    conn.commit()
+    sid = cur.lastrowid
+    conn.close()
+    return jsonify({"ok": True, "id": sid})
+
+
+@app.route("/api/surcharges/for-stop/<int:stop_id>")
+@login_required
+def api_surcharges_for_stop(stop_id):
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT ts.id, ts.material, ts.ticket_number, ts.amount_cents, ts.photo_path,
+                  ts.billed, ts.created_at
+           FROM ticket_surcharges ts JOIN stops s ON ts.stop_id=s.id
+           JOIN routes r ON s.route_id=r.id
+           WHERE ts.stop_id=? AND r.company_id=? ORDER BY ts.id""",
+        (stop_id, cid())).fetchall()
+    conn.close()
+    return jsonify({"surcharges": [dict(r) for r in rows]})
+
+
+@app.route("/api/surcharges/<int:sid>/delete", methods=["POST"])
+@login_required
+def api_surcharge_delete(sid):
+    conn = get_db()
+    row = conn.execute(
+        """SELECT ts.id, ts.billed, r.assigned_to FROM ticket_surcharges ts
+           JOIN stops s ON ts.stop_id=s.id JOIN routes r ON s.route_id=r.id
+           WHERE ts.id=? AND ts.company_id=?""",
+        (sid, cid())).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"ok": False}), 404
+    if row["billed"]:
+        conn.close()
+        return jsonify({"ok": False, "error": "already invoiced"}), 400
+    if session.get("role") != "boss" and row["assigned_to"] != session["user_id"]:
+        conn.close()
+        return jsonify({"ok": False}), 403
+    conn.execute("DELETE FROM ticket_surcharges WHERE id=?", (sid,))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
 
 
 def _site_issues_tickets(conn, company_id, stop):
@@ -29130,6 +29570,12 @@ def settings_page():
                     _rc_errors.append(f"fee_{kind}")
                 elif fc is not None:
                     _rc_rows.append((cid(), f"fee_{kind}", "*", fc, None))
+            # 2026-10-23: landfill surcharge handling markup ($ per surcharge).
+            _sm_cents = _dollars_to_cents(request.form.get("surcharge_markup"))
+            if _sm_cents == "invalid":
+                _rc_errors.append("surcharge_markup")
+            elif _sm_cents is not None:
+                _rc_rows.append((cid(), "surcharge_markup", "*", _sm_cents, None))
             if _rc_errors:
                 flash("Rate card not saved — check the dollar amounts.", "error")
             else:
@@ -29143,7 +29589,8 @@ def settings_page():
                 _want = {(svc, tier) for svc in ("delivery", "pull", "swap")
                          for tier in ("standard", "40yd")} | {("extra_day", "*")} | \
                         {("tonnage_allow", "standard"), ("tonnage_allow", "40yd"), ("tonnage_overage", "*")} | \
-                        {(f"fee_{k}", "*") for k, _, _ in _FEE_KINDS if k != "custom"}
+                        {(f"fee_{k}", "*") for k, _, _ in _FEE_KINDS if k != "custom"} | \
+                        {("surcharge_markup", "*")}
                 _have = {(r[1], r[2]) for r in _rc_rows}
                 for svc, tier in _want - _have:
                     conn.execute(
@@ -29234,6 +29681,9 @@ def settings_page():
                     <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">{label}</label>
                     <input name="fee_{kind}" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_fee_dollars(kind)}" style="width:100%;">
                 </div>"""
+    # 2026-10-23: surcharge handling markup.
+    _sc_markup = _get_surcharge_markup_cents(conn, cid())
+    _sc_markup_val = "" if not _sc_markup else (_fmt_money(_sc_markup).lstrip("$"))
     _yard_status = (
         f'<span style="color:#00e87d;font-size:12px;">&#10003; Set — {e(yard_addr)}, {e(yard_city)}, {e(yard_state)} {e(yard_zip)}</span>'
         if _yard_set else
@@ -29461,6 +29911,17 @@ def settings_page():
             </p>
             <div class="grid" style="grid-template-columns:1fr 1fr;gap:12px;max-width:560px;">
                 {_fee_inputs}
+            </div>
+            <h3 style="margin:20px 0 8px;font-size:14px;">&#x1F9FE; Landfill Surcharges</h3>
+            <p style="color:#B8B8AE;font-size:13px;margin-bottom:12px;">
+                When the landfill charges extra (mattresses, tires…), the driver scans the ticket
+                and it lands on the invoice. Handling fee added per surcharge — $0 = pure pass-through.
+            </p>
+            <div class="grid" style="grid-template-columns:1fr 1fr;gap:12px;max-width:560px;">
+                <div>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Handling fee per surcharge ($)</label>
+                    <input name="surcharge_markup" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_sc_markup_val}" style="width:100%;">
+                </div>
             </div>
             <div style="margin-top:16px;">
                 <button type="submit" class="btn gold">Save Rate Card</button>
@@ -31230,6 +31691,7 @@ def _build_invoice_lines_for_route(conn, company_id, route_id):
     try:
         rate_card = _get_rate_card(conn, company_id)
         tn_rates = _get_tonnage_rates(conn, company_id)
+        _surcharge_markup = _get_surcharge_markup_cents(conn, company_id)
         stops = conn.execute(
             """SELECT id, action, container_size, weight_tons, address,
                       customer_name
@@ -31264,6 +31726,21 @@ def _build_invoice_lines_for_route(conn, company_id, route_id):
                               "qty": 1, "unit_cents": fd["amount_cents"],
                               "amount_cents": fd["amount_cents"],
                               "stop_id": sd["id"]})
+            # 2026-10-23: landfill surcharge tickets — pass-through + boss markup.
+            for sc in conn.execute(
+                    """SELECT id, material, ticket_number, amount_cents
+                       FROM ticket_surcharges WHERE stop_id=? AND billed=0 ORDER BY id""",
+                    (sd["id"],)).fetchall():
+                scd = dict(sc)
+                amt = int(scd["amount_cents"] or 0) + _surcharge_markup
+                desc = f"Landfill surcharge — {scd['material'] or 'surcharge'}"
+                if scd.get("ticket_number"):
+                    desc += f" (Ticket #{scd['ticket_number']})"
+                if _surcharge_markup > 0:
+                    desc += f" incl. {_fmt_money(_surcharge_markup)} handling"
+                lines.append({"kind": "surcharge", "description": desc,
+                              "qty": 1, "unit_cents": amt, "amount_cents": amt,
+                              "stop_id": sd["id"], "surcharge_id": scd["id"]})
     except Exception:
         pass
     return lines
