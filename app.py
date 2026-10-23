@@ -3345,6 +3345,10 @@ def init_db():
         created_at TEXT NOT NULL
     )
     """)
+    # 2026-10-23: per-site ticket policy on dump_locations (mirrors
+    # saved_addresses.issues_tickets). 1 = site issues scale tickets (driver
+    # must enter # or photo); 0 = no ticket, photo + auto internal ref.
+    safe_add_column(conn, "dump_locations", "issues_tickets INTEGER NOT NULL DEFAULT 1")
 
     # Seed dump locations if table is empty
     if cur.execute("SELECT COUNT(*) FROM dump_locations").fetchone()[0] == 0:
@@ -31246,6 +31250,7 @@ def _dump_locations_section_html():
         (cid(),)
     ).fetchall()
     conn.close()
+    _csrf = get_csrf_token()
 
     # 2026-10-13: Cards instead of table — cleaner, more HAULTRA
     rows = ""
@@ -31261,6 +31266,21 @@ def _dump_locations_section_html():
         _dlid   = dl["id"]
         _dlname = e(dl["name"])
         _notes = e(dl['notes'] or '')
+        # 2026-10-23: per-site ticket policy toggle. Syncs to the matching
+        # saved_addresses entry so the driver-side check keeps working.
+        _dl_keys = dl.keys()
+        _dl_it = int(dl["issues_tickets"]) if "issues_tickets" in _dl_keys and dl["issues_tickets"] is not None else 1
+        _dl_tt_style = ("background:rgba(140,160,179,0.18);color:#8CA0B3;border:1px solid rgba(140,160,179,0.4);"
+                        if _dl_it else
+                        "background:rgba(245,180,60,0.16);color:#F5B43C;border:1px solid rgba(245,180,60,0.45);")
+        _dl_tt_label = "🎟️ Issues tickets" if _dl_it else "⚠️ No ticket — photo + ref"
+        _dl_ticket_toggle = (
+            f'<form method="POST" action="{url_for("toggle_dump_location_tickets", loc_id=_dlid)}" style="margin:8px 0 0;">'
+            f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
+            f'<button type="submit" title="Toggle whether this dump site issues its own scale ticket" '
+            f'style="{_dl_tt_style}border-radius:20px;padding:6px 14px;font-size:12px;font-weight:700;cursor:pointer;">'
+            f'{_dl_tt_label}</button></form>'
+        )
         rows += f"""
         <div class="dl-card">
             <div class="dl-card-head">
@@ -31271,6 +31291,7 @@ def _dump_locations_section_html():
                 </div>
                 {active_badge}
             </div>
+            {_dl_ticket_toggle}
             <div class="dl-card-actions">
                 <a href="{url_for('edit_dump_location', loc_id=_dlid)}" class="dl-action">Edit</a>
                 <form method="POST" action="{url_for('toggle_dump_location', loc_id=_dlid)}" style="display:inline;">
@@ -31452,6 +31473,51 @@ def toggle_dump_location(loc_id):
     conn.close()
     status_word = "activated" if new_active else "deactivated"
     flash(f"'{dl['name']}' {status_word}.", "success")
+    return redirect(url_for("yard_setup_page"))
+
+
+@app.route("/dump-locations/<int:loc_id>/toggle-tickets", methods=["POST"])
+@boss_required
+def toggle_dump_location_tickets(loc_id):
+    """Toggle whether a dump site issues scale tickets. Syncs to the matching
+    saved_addresses entry so the driver-side ticket check keeps working."""
+    conn = get_db()
+    try:
+        dl = conn.execute(
+            "SELECT name, issues_tickets FROM dump_locations WHERE id=? AND company_id=?",
+            (loc_id, cid())).fetchone()
+    except Exception:
+        dl = None
+    if not dl:
+        conn.close()
+        flash("Location not found.", "error")
+        return redirect(url_for("yard_setup_page"))
+    try:
+        cur_it = int(dl["issues_tickets"]) if dl["issues_tickets"] is not None else 1
+    except Exception:
+        cur_it = 1
+    new_it = 0 if cur_it else 1
+    try:
+        conn.execute("UPDATE dump_locations SET issues_tickets=? WHERE id=? AND company_id=?",
+                     (new_it, loc_id, cid()))
+    except Exception:
+        pass
+    # Sync to saved_addresses (what the driver-side check reads).
+    try:
+        nm = (dl["name"] or "").strip().lower()
+        for r in conn.execute(
+            "SELECT id, customer_name, label FROM saved_addresses "
+            "WHERE company_id=? AND kind IN ('dump','yard')", (cid(),)).fetchall():
+            cand = ((r["label"] or "").strip() or (r["customer_name"] or "").strip()).lower()
+            if cand and (cand == nm or nm in cand or cand in nm):
+                conn.execute("UPDATE saved_addresses SET issues_tickets=? WHERE id=?",
+                             (new_it, r["id"]))
+    except Exception:
+        pass
+    conn.commit()
+    conn.close()
+    word = "issues tickets" if new_it else "no ticket — photo + ref"
+    flash(f"'{dl['name']}': {word}.", "success")
     return redirect(url_for("yard_setup_page"))
 
 
@@ -32358,7 +32424,6 @@ def yard_setup_page():
         <p>Dump locations and your container fleet, in one place.</p>
     </div>
     {_dump_locations_section_html()}
-    {_site_locations_section_html()}
     {_parse_vocab_section_html()}
     {_address_book_section_html()}
     {_containers_section_html()}
