@@ -11742,8 +11742,10 @@ def dashboard():
           body: '{}'
         }).then(function (r) { return r.json(); }).then(function (d) {
           if (d.error) { sub.textContent = 'Test failed: ' + d.error; return; }
-          sub.textContent = 'Test: ' + d.sent + ' sent to ' + d.my_tokens +
-            ' device(s). Server ' + (d.apns_configured ? 'is configured.' : 'is NOT configured');
+          var det = (d.detail && d.detail[0]) || {};
+          sub.textContent = 'Test: ' + d.sent + '/' + d.my_tokens +
+            ' | Apple: ' + (det.apns_status || '?') + ' ' + (det.apns_reason || '') +
+            ' | ' + (d.apns_host || '');
         }).catch(function () {
           sub.textContent = 'Test request failed \\u2014 try again.';
         });
@@ -12611,8 +12613,9 @@ def flush_alert_pushes(company_id=None, limit=20):
             if apns_configured():
                 badge = alert_open_count(conn, row["company_id"])
                 for dev in _apns_recipients(conn, row["company_id"], roles=("boss",)):
-                    if not _apns_send(dev["token"], row["title"], row["body"] or "",
-                                      badge=badge, data={"link": row["link"] or ""}):
+                    _ok = _apns_send(dev["token"], row["title"], row["body"] or "",
+                                      badge=badge, data={"link": row["link"] or ""})[0]
+                    if not _ok:
                         conn.execute("UPDATE push_tokens SET failed_at=? WHERE id=?",
                                      (now_ts(), dev["id"]))
                         conn.commit()
@@ -12653,10 +12656,11 @@ def _apns_jwt():
 
 
 def _apns_send(device_token, title, body, badge=None, data=None):
-    """Send one push via APNs HTTP/2. Returns True on accept, False on
-    permanent failure (bad/expired token — caller should retire it)."""
+    """Send one push via APNs HTTP/2. Returns (accepted, status_code, reason).
+    accepted=False means a permanent failure (bad/expired token — caller
+    should retire it)."""
     if not apns_configured():
-        return True
+        return True, 0, "apns-not-configured"
     import httpx
     host = "api.sandbox.push.apple.com" if APNS_SANDBOX else "api.push.apple.com"
     url = f"https://{host}/3/device/{device_token}"
@@ -12676,7 +12680,7 @@ def _apns_send(device_token, title, body, badge=None, data=None):
         with httpx.Client(http2=True, timeout=10) as client:
             r = client.post(url, json=payload, headers=headers)
         if r.status_code == 200:
-            return True
+            return True, 200, ""
         reason = ""
         try:
             reason = r.json().get("reason", "")
@@ -12685,12 +12689,12 @@ def _apns_send(device_token, title, body, badge=None, data=None):
         if r.status_code in (400, 410) and reason in (
                 "BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic"):
             app.logger.info("apns: retiring dead token (%s)", reason)
-            return False
+            return False, r.status_code, reason
         app.logger.warning("apns: send failed %s %s", r.status_code, reason)
-        return True  # transient — don't retire the token
+        return True, r.status_code, reason  # transient — don't retire the token
     except Exception as exc:
         app.logger.warning("apns: send exception (%s)", exc)
-        return True
+        return True, 0, "exception: %s" % str(exc)[:100]
 
 
 def _apns_recipients(conn, company_id, roles=("boss",)):
@@ -12751,8 +12755,9 @@ def push_to_user(conn, user_id, title, body="", link="", company_id=None):
         for dev in _apns_recipients(conn, cid, roles=(u["role"],)):
             if dev["user_id"] != user_id:
                 continue
-            if not _apns_send(dev["token"], title, body, badge=badge,
-                              data={"link": link or ""}):
+            _ok = _apns_send(dev["token"], title, body, badge=badge,
+                              data={"link": link or ""})[0]
+            if not _ok:
                 conn.execute("UPDATE push_tokens SET failed_at=? WHERE id=?",
                              (now_ts(), dev["id"]))
                 try:
@@ -12976,13 +12981,27 @@ def api_push_test():
     try:
         toks = _apns_recipients(conn, cid(), roles=None)
         mine = [t for t in toks if t["user_id"] == session["user_id"]]
-        sent = push_to_user(conn, session["user_id"],
-                            "HAULTRA test push",
-                            "If you see this, pushes work end to end.",
-                            link="/driver")
+        # 2026-10-22: send directly so we can report Apple's real response.
+        results = []
+        for t in mine:
+            ok, status, reason = _apns_send(
+                t["token"], "HAULTRA test push",
+                "If you see this, pushes work end to end.",
+                badge=_user_badge_count(conn, session["user_id"], cid(),
+                                        session.get("role")),
+                data={"link": "/driver"})
+            results.append({"token_tail": t["token"][-8:], "accepted": ok,
+                            "apns_status": status, "apns_reason": reason})
+            if not ok:
+                conn.execute("UPDATE push_tokens SET failed_at=? WHERE id=?",
+                             (now_ts(), t["id"]))
         conn.commit()
+        sent = sum(1 for r in results if r["accepted"])
         return jsonify({"apns_configured": apns_configured(),
-                        "my_tokens": len(mine), "sent": sent})
+                        "my_tokens": len(mine), "sent": sent,
+                        "detail": results,
+                        "apns_host": "api.sandbox.push.apple.com"
+                                     if APNS_SANDBOX else "api.push.apple.com"})
     finally:
         conn.close()
 
@@ -13172,8 +13191,10 @@ def _phone_push_card():
           body: '{}'
         }).then(function (r) { return r.json(); }).then(function (d) {
           if (d.error) { sub.textContent = 'Test failed: ' + d.error; return; }
-          sub.textContent = 'Test: ' + d.sent + ' sent to ' + d.my_tokens +
-            ' device(s). Server ' + (d.apns_configured ? 'is configured.' : 'is NOT configured');
+          var det = (d.detail && d.detail[0]) || {};
+          sub.textContent = 'Test: ' + d.sent + '/' + d.my_tokens +
+            ' | Apple: ' + (det.apns_status || '?') + ' ' + (det.apns_reason || '') +
+            ' | ' + (d.apns_host || '');
         }).catch(function () {
           sub.textContent = 'Test request failed \\u2014 try again.';
         });
@@ -13451,8 +13472,9 @@ def _push_settings_toggle():
                     'X-CSRF-Token': csrf ? csrf.getAttribute('content') : ''},
           body: '{}'
         }).then(function (r) { return r.json(); }).then(function (d) {
+          var det3 = (d.detail && d.detail[0]) || {};
           tsub.textContent = d.error ? ('Failed: ' + d.error)
-            : (d.sent + ' sent to ' + d.my_tokens + ' device(s).' + (d.apns_configured ? '' : ' Server NOT configured.'));
+            : (d.sent + '/' + d.my_tokens + ' | Apple: ' + (det3.apns_status || '?') + ' ' + (det3.apns_reason || ''));
         }).catch(function () { tsub.textContent = 'Test failed \u2014 try again.'; });
       };
     })();
