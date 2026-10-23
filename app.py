@@ -26171,6 +26171,58 @@ Rules:
 """
 
 
+_CUSTOMER_LIST_OCR_PROMPT = """You read a CUSTOMER LIST for a roll-off dumpster hauling company from a photo and return ONLY a JSON object — no prose, no markdown fences.
+
+This could be a handwritten list, a printed sheet, a spreadsheet printout, or a notebook page. Each entry is a customer with some combination of: name, street address, city, state, zip, phone.
+
+This is business data. NEVER guess. If a field is not clearly legible, return null for it. It is far better to leave a field null than to invent a value. Do not merge two entries into one. Do not split one entry into two.
+
+Return exactly this shape:
+{
+  "customers": [
+    {"customer_name": string|null, "address": string|null, "city": string|null,
+     "state": string|null, "zip_code": string|null, "phone": string|null,
+     "confidence": "high"|"medium"|"low"}
+  ],
+  "unreadable": boolean
+}
+
+Rules:
+- customer_name is the business or person name. Use the list's own spelling.
+- address is the street address only (no city/state/zip mixed in).
+- confidence is your overall confidence in THIS entry (high = all fields clear, medium = most fields clear, low = partial).
+- Skip headers, titles, page numbers, and totals — only real customer entries.
+- Set "unreadable": true only when the image has no customer list at all.
+"""
+
+
+_RATE_SHEET_OCR_PROMPT = """You read a RATE / PRICE SHEET for a roll-off dumpster hauling company from a photo and return ONLY a JSON object — no prose, no markdown fences.
+
+This could be a printed price list, a handwritten sheet, or a quote document. It lists container sizes (10yd, 20yd, 30yd, 40yd, etc.) with prices, and possibly extra fees (delivery, overweight, extra days, etc.).
+
+This is billing data. NEVER guess. If a price is not clearly legible, return null for it. It is far better to leave a price null than to invent one.
+
+Return exactly this shape:
+{
+  "rates": [
+    {"size": string|null, "price_usd": number|null, "confidence": "high"|"medium"|"low"}
+  ],
+  "fees": [
+    {"name": string|null, "price_usd": number|null, "confidence": "high"|"medium"|"low"}
+  ],
+  "unreadable": boolean
+}
+
+Rules:
+- size is the container size as written: e.g. "10yd", "20yd", "30yd", "40yd". Normalize "yard"/"yd"/"CY" to "yd".
+- price_usd is the price as a plain number (no $). If a range is shown, use the first/base price.
+- fees are extras: delivery fee, haul fee, overweight per ton, extra day, etc. Use the sheet's own words for name.
+- confidence is per-entry (high = clear, medium = mostly clear, low = partial).
+- Skip headers, disclaimers, and fine print — only real prices.
+- Set "unreadable": true only when the image has no rate sheet at all.
+"""
+
+
 def _dump_ticket_ocr_cap(conn, company_id):
     row = conn.execute("SELECT ocr_daily_cap FROM companies WHERE id=?", (company_id,)).fetchone()
     cap = row["ocr_daily_cap"] if row else None
@@ -26503,6 +26555,240 @@ def api_surcharge_ticket_ocr():
     conn.close()
     return jsonify({"ok": True, "unreadable": unreadable, "fields": fields,
                     "confidence": conf, "photo_path": photo_path})
+
+
+    unreadable = bool(parsed.get("unreadable")) or not any(v is not None for v in fields.values())
+    conn.close()
+    return jsonify({"ok": True, "unreadable": unreadable, "fields": fields,
+                    "confidence": conf, "photo_path": photo_path})
+
+
+def _onboarding_ocr_photo(kind):
+    """Shared photo-OCR for onboarding scans. kind: 'customers' | 'rates'.
+    Returns (ok, payload_dict). Boss-only. Photo is validated; AI is
+    best-effort — caller handles ok:false with a manual fallback."""
+    import os as _os
+    import base64 as _b64
+    conn = get_db()
+    photo = request.files.get("photo")
+    if not photo or not photo.filename:
+        conn.close()
+        return False, {"reason": "no_photo"}
+    raw = photo.read()
+    if not raw:
+        conn.close()
+        return False, {"reason": "empty"}
+    if len(raw) > _DUMP_TICKET_OCR_MAX_BYTES:
+        conn.close()
+        return False, {"reason": "too_large"}
+    media_type = (photo.mimetype or "").lower()
+    if media_type not in _DUMP_TICKET_OCR_TYPES:
+        conn.close()
+        return False, {"reason": "bad_type"}
+    cap = _dump_ticket_ocr_cap(conn, cid())
+    allowed, _retry = rate_limit_allow("onboarding_ocr_" + kind, str(cid()), cap, 86400)
+    if not allowed:
+        conn.close()
+        return False, {"reason": "cap"}
+    try:
+        import anthropic
+    except ImportError:
+        conn.close()
+        return False, {"reason": "no_ai"}
+    api_key = _os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        conn.close()
+        return False, {"reason": "no_ai"}
+    prompt = _CUSTOMER_LIST_OCR_PROMPT if kind == "customers" else _RATE_SHEET_OCR_PROMPT
+    ask = ("Read this customer list. Return only the JSON." if kind == "customers"
+           else "Read this rate sheet. Return only the JSON.")
+    try:
+        client = anthropic.Anthropic(api_key=api_key, timeout=30.0)
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
+            system=prompt,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media_type,
+                                             "data": _b64.b64encode(raw).decode("ascii")}},
+                {"type": "text", "text": ask},
+            ]}],
+        )
+        raw_reply = "".join(
+            b.text for b in resp.content if getattr(b, "type", None) == "text"
+        ).strip()
+    except Exception as ex:
+        app.logger.warning("onboarding_ocr_%s: model error: %s", kind, ex)
+        conn.close()
+        return False, {"reason": "error"}
+    conn.close()
+    cleaned = raw_reply.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\\s*", "", cleaned)
+        cleaned = re.sub(r"\\s*```\\s*$", "", cleaned)
+    try:
+        parsed = json.loads(cleaned)
+    except (json.JSONDecodeError, ValueError):
+        return False, {"reason": "parse"}
+    if not isinstance(parsed, dict):
+        return False, {"reason": "parse"}
+    return True, parsed
+
+
+@app.route("/api/onboarding/scan-customers", methods=["POST"])
+@login_required
+def api_scan_customers():
+    """Boss photographs a customer list → AI extracts entries for review."""
+    if session.get("role") != "boss":
+        return jsonify({"ok": False, "reason": "forbidden"}), 403
+    ok, payload = _onboarding_ocr_photo("customers")
+    if not ok:
+        return jsonify({"ok": False, **payload})
+    if payload.get("unreadable") or not payload.get("customers"):
+        return jsonify({"ok": False, "reason": "unreadable"})
+    out = []
+    for c in payload["customers"][:100]:
+        if not isinstance(c, dict):
+            continue
+        def _s(v, n=120):
+            v = v or ""
+            return str(v).strip()[:n] if isinstance(v, (str, int, float)) else ""
+        conf = str(c.get("confidence", "medium")).lower()
+        out.append({
+            "customer_name": _s(c.get("customer_name")) or None,
+            "address": _s(c.get("address")) or None,
+            "city": _s(c.get("city")) or None,
+            "state": _s(c.get("state"), 20) or None,
+            "zip_code": _s(c.get("zip_code"), 20) or None,
+            "phone": _s(c.get("phone"), 40) or None,
+            "confidence": conf if conf in ("high", "medium", "low") else "medium",
+        })
+    out = [c for c in out if c["customer_name"] or c["address"]]
+    if not out:
+        return jsonify({"ok": False, "reason": "unreadable"})
+    return jsonify({"ok": True, "customers": out})
+
+
+@app.route("/api/onboarding/scan-rates", methods=["POST"])
+@login_required
+def api_scan_rates():
+    """Boss photographs a rate sheet → AI extracts sizes/prices/fees."""
+    if session.get("role") != "boss":
+        return jsonify({"ok": False, "reason": "forbidden"}), 403
+    ok, payload = _onboarding_ocr_photo("rates")
+    if not ok:
+        return jsonify({"ok": False, **payload})
+    if payload.get("unreadable"):
+        return jsonify({"ok": False, "reason": "unreadable"})
+    def _usd(v):
+        try:
+            return round(float(v), 2) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+    def _conf(c):
+        c = str(c or "medium").lower()
+        return c if c in ("high", "medium", "low") else "medium"
+    rates, fees = [], []
+    for r in (payload.get("rates") or [])[:30]:
+        if not isinstance(r, dict):
+            continue
+        sz = str(r.get("size") or "").strip()[:20]
+        px = _usd(r.get("price_usd"))
+        if sz or px:
+            rates.append({"size": sz or None, "price_usd": px, "confidence": _conf(r.get("confidence"))})
+    for f in (payload.get("fees") or [])[:30]:
+        if not isinstance(f, dict):
+            continue
+        nm = str(f.get("name") or "").strip()[:80]
+        px = _usd(f.get("price_usd"))
+        if nm or px:
+            fees.append({"name": nm or None, "price_usd": px, "confidence": _conf(f.get("confidence"))})
+    if not rates and not fees:
+        return jsonify({"ok": False, "reason": "unreadable"})
+    return jsonify({"ok": True, "rates": rates, "fees": fees})
+
+
+@app.route("/api/onboarding/confirm-customers", methods=["POST"])
+@login_required
+def api_confirm_customers():
+    """Bulk-import reviewed customer entries into the address book."""
+    if session.get("role") != "boss":
+        return jsonify({"ok": False}), 403
+    data = request.get_json(silent=True) or {}
+    items = data.get("customers") or []
+    conn = get_db()
+    n = 0
+    for it in items[:200]:
+        if not isinstance(it, dict):
+            continue
+        nm = str(it.get("customer_name") or "").strip()[:120]
+        ad = str(it.get("address") or "").strip()[:200]
+        if not (nm or ad):
+            continue
+        try:
+            learn_location(conn, cid(), ad,
+                           city=str(it.get("city") or "").strip()[:80],
+                           state=str(it.get("state") or "").strip()[:20],
+                           zip_code=str(it.get("zip_code") or "").strip()[:20],
+                           customer_name=nm)
+            n += 1
+        except Exception:
+            pass
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "imported": n})
+
+
+@app.route("/api/onboarding/confirm-rates", methods=["POST"])
+@login_required
+def api_confirm_rates():
+    """Bulk-import reviewed rate entries into the rate card."""
+    if session.get("role") != "boss":
+        return jsonify({"ok": False}), 403
+    data = request.get_json(silent=True) or {}
+    conn = get_db()
+    n = 0
+    try:
+        for r in (data.get("rates") or [])[:30]:
+            if not isinstance(r, dict):
+                continue
+            sz = str(r.get("size") or "").strip()[:20]
+            try:
+                px = float(r.get("price_usd")) if r.get("price_usd") is not None else None
+            except (TypeError, ValueError):
+                px = None
+            if sz and px and px > 0:
+                cents = int(round(px * 100))
+                conn.execute(
+                    """INSERT INTO rate_cards (company_id, service, tier, cents)
+                       VALUES (?, ?, 'standard', ?)
+                       ON CONFLICT(company_id, service, tier)
+                       DO UPDATE SET cents=excluded.cents""",
+                    (cid(), f"size_{sz}", cents))
+                n += 1
+        for f in (data.get("fees") or [])[:30]:
+            if not isinstance(f, dict):
+                continue
+            nm = str(f.get("name") or "").strip()[:80]
+            try:
+                px = float(f.get("price_usd")) if f.get("price_usd") is not None else None
+            except (TypeError, ValueError):
+                px = None
+            if nm and px and px > 0:
+                cents = int(round(px * 100))
+                key = "fee_" + re.sub(r"[^a-z0-9]+", "_", nm.lower()).strip("_")[:40]
+                conn.execute(
+                    """INSERT INTO rate_cards (company_id, service, tier, cents)
+                       VALUES (?, ?, 'standard', ?)
+                       ON CONFLICT(company_id, service, tier)
+                       DO UPDATE SET cents=excluded.cents""",
+                    (cid(), key, cents))
+                n += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    conn.close()
+    return jsonify({"ok": True, "imported": n})
 
 
 def _site_issues_tickets(conn, company_id, stop):
@@ -32665,9 +32951,33 @@ def onboarding_import_customers():
     body = f"""
     <div class="hero">
         <h1>📇 Import Customers</h1>
-        <p>{_nc} customers in your address book. Three ways to add more.</p>
+        <p>{_nc} customers in your address book. Four ways to add more.</p>
     </div>
     {msg}
+    <div class="card ob-scan-card">
+        <h2 style="margin-top:0;">📷 Scan a customer list</h2>
+        <p class="muted small">Snap a photo of your paper list, notebook, or spreadsheet printout. AI reads every name and address — you review and confirm.</p>
+        <div class="ob-scan-row">
+            <label class="btn gold ob-scan-btn">
+                📷 Scan customer list
+                <input type="file" id="ob-cust-scan" accept="image/*" capture="environment" hidden>
+            </label>
+            <span id="ob-cust-status" class="muted small"></span>
+        </div>
+        <div id="ob-cust-results"></div>
+    </div>
+    <div class="card ob-scan-card">
+        <h2 style="margin-top:0;">💲 Scan your rate sheet</h2>
+        <p class="muted small">Photo of your paper price list → AI pulls every size and price straight into your rate card.</p>
+        <div class="ob-scan-row">
+            <label class="btn gold ob-scan-btn">
+                📷 Scan rate sheet
+                <input type="file" id="ob-rate-scan" accept="image/*" capture="environment" hidden>
+            </label>
+            <span id="ob-rate-status" class="muted small"></span>
+        </div>
+        <div id="ob-rate-results"></div>
+    </div>
     <div class="card">
         <h2 style="margin-top:0;">✏️ Add one manually</h2>
         <form method="POST" style="display:flex;gap:8px;flex-wrap:wrap;">
@@ -32705,7 +33015,139 @@ def onboarding_import_customers():
     <style>
     .ob-ok {{ color:#3DDC84; font-weight:700; }}
     .ob-err {{ color:#FF6B6B; font-weight:700; }}
+    .ob-scan-card {{ border:1px solid rgba(255,107,26,.25); background:linear-gradient(135deg, rgba(255,107,26,.05), rgba(255,107,26,.01)); }}
+    .ob-scan-row {{ display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin:10px 0; }}
+    .ob-scan-btn {{ min-height:52px; font-size:1rem; cursor:pointer; }}
+    .ob-result {{ border:1px solid rgba(255,255,255,.1); border-radius:12px; padding:12px; margin:8px 0; background:rgba(255,255,255,.02); }}
+    .ob-result-head {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }}
+    .ob-conf {{ font-size:.72rem; font-weight:800; padding:4px 10px; border-radius:999px; }}
+    .ob-conf.high {{ background:rgba(61,220,132,.15); color:#3DDC84; }}
+    .ob-conf.medium {{ background:rgba(245,180,60,.15); color:#F5B43C; }}
+    .ob-conf.low {{ background:rgba(255,82,82,.15); color:#FF5252; }}
+    .ob-fields {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; }}
+    .ob-fields input {{ min-height:44px; padding:8px 10px; background:var(--bg-0); border:1px solid rgba(255,255,255,.12); border-radius:8px; color:var(--text); font-size:.9rem; }}
+    .ob-fields input.low-conf {{ border-color:rgba(245,180,60,.5); }}
+    .ob-import-bar {{ position:sticky; bottom:0; padding:12px; background:rgba(20,20,20,.95); border-top:1px solid rgba(255,107,26,.3); display:flex; gap:10px; justify-content:center; margin:16px -16px -16px; border-radius:0 0 12px 12px; }}
+    @keyframes ob-pulse {{ 0%,100% {{ opacity:1; }} 50% {{ opacity:.4; }} }}
+    .ob-reading {{ animation:ob-pulse 1.2s infinite; color:#FF9D5C; font-weight:700; }}
     </style>
+    <script>
+    (function(){{
+        var csrf = '{_csrf}';
+        function esc(s){{ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }}
+        var custInput = document.getElementById('ob-cust-scan');
+        var custStatus = document.getElementById('ob-cust-status');
+        var custResults = document.getElementById('ob-cust-results');
+        var custData = [];
+        if (custInput) custInput.addEventListener('change', function(){{
+            var f = custInput.files[0];
+            if (!f) return;
+            custStatus.innerHTML = '<span class="ob-reading">Reading your list...</span>';
+            custResults.innerHTML = '';
+            var fd = new FormData();
+            fd.append('photo', f);
+            fetch('/api/onboarding/scan-customers', {{
+                method:'POST', headers:{{'X-CSRF-Token': csrf}}, body:fd
+            }}).then(function(r){{ return r.json(); }}).then(function(d){{
+                if (!d.ok) {{
+                    custStatus.textContent = d.reason==='unreadable' ? 'Could not read it - try a clearer photo.'
+                        : d.reason==='cap' ? 'Daily scan limit reached.'
+                        : 'Scan failed - try again or add manually.';
+                    return;
+                }}
+                custData = d.customers;
+                custStatus.textContent = 'Found ' + custData.length + ' customers - review and tap Import.';
+                var h = '';
+                custData.forEach(function(c, i){{
+                    h += '<div class="ob-result"><div class="ob-result-head">'
+                        + '<strong>#' + (i+1) + '</strong>'
+                        + '<span class="ob-conf ' + c.confidence + '">' + c.confidence + '</span></div>'
+                        + '<div class="ob-fields">'
+                        + '<input data-i="'+i+'" data-f="customer_name" value="'+esc(c.customer_name)+'" placeholder="Customer name" class="'+(c.confidence==='low'?'low-conf':'')+'">'
+                        + '<input data-i="'+i+'" data-f="phone" value="'+esc(c.phone)+'" placeholder="Phone">'
+                        + '<input data-i="'+i+'" data-f="address" value="'+esc(c.address)+'" placeholder="Street address" style="grid-column:1/-1;" class="'+(c.confidence==='low'?'low-conf':'')+'">'
+                        + '<input data-i="'+i+'" data-f="city" value="'+esc(c.city)+'" placeholder="City">'
+                        + '<input data-i="'+i+'" data-f="state" value="'+esc(c.state)+'" placeholder="ST">'
+                        + '<input data-i="'+i+'" data-f="zip_code" value="'+esc(c.zip_code)+'" placeholder="ZIP">'
+                        + '</div></div>';
+                }});
+                h += '<div class="ob-import-bar"><button class="btn gold" id="ob-cust-import" style="min-height:52px;flex:1;max-width:320px;">Import '+custData.length+' customers</button></div>';
+                custResults.innerHTML = h;
+                document.getElementById('ob-cust-import').addEventListener('click', function(){{
+                    custResults.querySelectorAll('input[data-i]').forEach(function(inp){{
+                        var i = +inp.getAttribute('data-i'), f = inp.getAttribute('data-f');
+                        custData[i][f] = inp.value.trim() || null;
+                    }});
+                    custStatus.innerHTML = '<span class="ob-reading">Importing...</span>';
+                    fetch('/api/onboarding/confirm-customers', {{
+                        method:'POST', headers:{{'Content-Type':'application/json','X-CSRF-Token': csrf}},
+                        body: JSON.stringify({{customers: custData}})
+                    }}).then(function(r){{ return r.json(); }}).then(function(d){{
+                        if (d.ok) {{
+                            custResults.innerHTML = '<p class="ob-ok" style="font-size:1.1rem;">'+d.imported+' customers added to your address book!</p>';
+                            custStatus.textContent = '';
+                        }} else custStatus.textContent = 'Import failed - try again.';
+                    }});
+                }});
+            }}).catch(function(){{ custStatus.textContent = 'No signal - try again.'; }});
+        }});
+        var rateInput = document.getElementById('ob-rate-scan');
+        var rateStatus = document.getElementById('ob-rate-status');
+        var rateResults = document.getElementById('ob-rate-results');
+        var rateData = {{rates:[], fees:[]}};
+        if (rateInput) rateInput.addEventListener('change', function(){{
+            var f = rateInput.files[0];
+            if (!f) return;
+            rateStatus.innerHTML = '<span class="ob-reading">Reading your prices...</span>';
+            rateResults.innerHTML = '';
+            var fd = new FormData();
+            fd.append('photo', f);
+            fetch('/api/onboarding/scan-rates', {{
+                method:'POST', headers:{{'X-CSRF-Token': csrf}}, body:fd
+            }}).then(function(r){{ return r.json(); }}).then(function(d){{
+                if (!d.ok) {{
+                    rateStatus.textContent = d.reason==='unreadable' ? 'Could not read it - try a clearer photo.' : 'Scan failed - try again.';
+                    return;
+                }}
+                rateData = d;
+                var n = d.rates.length + d.fees.length;
+                rateStatus.textContent = 'Found ' + n + ' prices - review and tap Import.';
+                var h = '';
+                d.rates.forEach(function(r, i){{
+                    h += '<div class="ob-result"><div class="ob-result-head">'
+                        + '<strong>'+esc(r.size||'Size')+'</strong>'
+                        + '<span style="display:flex;gap:8px;align-items:center;"><span class="ob-conf '+r.confidence+'">'+r.confidence+'</span>'
+                        + '$<input data-k="rates" data-i="'+i+'" data-f="price_usd" value="'+(r.price_usd==null?'':r.price_usd)+'" inputmode="decimal" style="width:100px;min-height:40px;padding:6px 10px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);"></span></div></div>';
+                }});
+                d.fees.forEach(function(fe, i){{
+                    h += '<div class="ob-result"><div class="ob-result-head">'
+                        + '<strong>'+esc(fe.name||'Fee')+'</strong>'
+                        + '<span style="display:flex;gap:8px;align-items:center;"><span class="ob-conf '+fe.confidence+'">'+fe.confidence+'</span>'
+                        + '$<input data-k="fees" data-i="'+i+'" data-f="price_usd" value="'+(fe.price_usd==null?'':fe.price_usd)+'" inputmode="decimal" style="width:100px;min-height:40px;padding:6px 10px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);"></span></div></div>';
+                }});
+                h += '<div class="ob-import-bar"><button class="btn gold" id="ob-rate-import" style="min-height:52px;flex:1;max-width:320px;">Import '+n+' prices to rate card</button></div>';
+                rateResults.innerHTML = h;
+                document.getElementById('ob-rate-import').addEventListener('click', function(){{
+                    rateResults.querySelectorAll('input[data-k]').forEach(function(inp){{
+                        var k = inp.getAttribute('data-k'), i = +inp.getAttribute('data-i'), f = inp.getAttribute('data-f');
+                        var v = inp.value.trim();
+                        rateData[k][i][f] = (f==='price_usd') ? (parseFloat(v)||null) : (v||null);
+                    }});
+                    rateStatus.innerHTML = '<span class="ob-reading">Importing...</span>';
+                    fetch('/api/onboarding/confirm-rates', {{
+                        method:'POST', headers:{{'Content-Type':'application/json','X-CSRF-Token': csrf}},
+                        body: JSON.stringify(rateData)
+                    }}).then(function(r){{ return r.json(); }}).then(function(d){{
+                        if (d.ok) {{
+                            rateResults.innerHTML = '<p class="ob-ok" style="font-size:1.1rem;">'+d.imported+' prices added to your rate card!</p>';
+                            rateStatus.textContent = '';
+                        }} else rateStatus.textContent = 'Import failed - try again.';
+                    }});
+                }});
+            }}).catch(function(){{ rateStatus.textContent = 'No signal - try again.'; }});
+        }});
+    }})();
+    </script>
     """
     return render_template_string(shell_page("Import Customers", body))
 
