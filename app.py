@@ -27354,15 +27354,25 @@ def route_daily_log(route_id):
             # customer. The bin does NOT come from the previous stop.
             # 2026-10-23: if not completed yet (no ticket), show the incoming
             # bin — the driver is carrying it there now.
-            box_in = box_out if box_out else _prev_box_out
+            # 2026-10-23: field swap — incoming bin differs from ticket bin
+            # (e.g. brought 3001, pulled 3117, boss said take it to the yard).
+            # Show them separately; the pulled bin is now on the truck.
+            if box_out and _prev_box_out and _prev_box_out != box_out:
+                box_in = _prev_box_out
+            else:
+                box_in = box_out if box_out else _prev_box_out
         else:
             # Pull or PR swap: Box In = bin carried on truck (prev Box Out)
             box_in = _prev_box_out
         # Carry forward: PR (non-swap) returns the bin, so truck leaves empty
         # for the next stop. Pull/PR-swap carries the (now empty) bin forward.
         # 2026-10-23: incomplete stop — truck still has the incoming bin.
+        # 2026-10-23: field swap — truck now carries the pulled bin.
         if _is_pr and not _is_swap:
-            _prev_box_out = "" if box_out else _prev_box_out
+            if box_out and _prev_box_out and _prev_box_out != box_out:
+                _prev_box_out = box_out
+            else:
+                _prev_box_out = "" if box_out else _prev_box_out
         else:
             _prev_box_out = box_out
         # 2026-10-21: Start = previous stop's finish (driver rolls job to
