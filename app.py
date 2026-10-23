@@ -23080,7 +23080,7 @@ def messages_page():
                 var cls = i === 0 ? 'ta1' : 'ta2';
                 if (a.src) {
                     avHtml += '<img class="ta ' + cls + '" src="' + esc(a.src) + '" alt="' + esc(a.name).replace(/"/g, '&quot;') + '"'
-                          + ' loading="lazy" onerror="this.style.display=\'none\'">';
+                          + ' loading="lazy" onerror="this.style.display=\\'none\\'">';
                 } else {
                     avHtml += '<span class="ta ' + cls + '">' + esc(a.initials || '?') + '</span>';
                 }
