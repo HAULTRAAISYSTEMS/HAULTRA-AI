@@ -11523,7 +11523,9 @@ def dashboard():
             </form>
         </div>"""
 
-        # Route lanes — active first, then by date
+        # Route lanes — active first, then by date.
+        # 2026-10-23: a route with all stops done sorts as DONE even if the
+        # driver never hit "Finish Route" — old days stop floating to the top.
         _routes = conn.execute("""
             SELECT r.*,
                 (SELECT COUNT(*) FROM stops s
@@ -11533,8 +11535,14 @@ def dashboard():
                    AND s.cancelled_at IS NULL) AS done_stops
             FROM routes r
             WHERE r.assigned_to=? AND r.company_id=?
-            ORDER BY CASE r.status WHEN 'in_progress' THEN 0
-                                   WHEN 'open' THEN 1 ELSE 2 END,
+            ORDER BY CASE WHEN r.status='in_progress' AND
+                               (SELECT COUNT(*) FROM stops s
+                                WHERE s.route_id=r.id AND s.cancelled_at IS NULL) >
+                               (SELECT COUNT(*) FROM stops s
+                                WHERE s.route_id=r.id AND s.status='completed'
+                                  AND s.cancelled_at IS NULL)
+                          THEN 0
+                          WHEN r.status='open' THEN 1 ELSE 2 END,
                      r.route_date DESC, r.id DESC
             LIMIT 8
         """, (user["id"], company_id)).fetchall()
@@ -11545,7 +11553,10 @@ def dashboard():
         _stop_total = 0
         for _r in _routes:
             _rc_total += 1
-            if _r["status"] in ("open", "in_progress"):
+            _r_total = _r["total_stops"] or 0
+            _r_done = _r["done_stops"] or 0
+            _r_all_done = _r_total > 0 and _r_done >= _r_total
+            if _r["status"] in ("open", "in_progress") and not _r_all_done:
                 _active_n += 1
             _stops = conn.execute("""
                 SELECT id, stop_order, action, customer_name, address, city, status
@@ -11556,11 +11567,15 @@ def dashboard():
             _done = _r["done_stops"] or 0
             _stop_total += _total
             _pct = int(100 * _done / _total) if _total else 0
+            # 2026-10-23: all stops done = DONE, even if route still in_progress.
+            _effective_status = _r["status"]
+            if _effective_status == "in_progress" and _total > 0 and _done >= _total:
+                _effective_status = "completed"
             _status_cls = {"open": "open", "in_progress": "progress",
-                           "completed": "done"}.get(_r["status"], "")
+                           "completed": "done"}.get(_effective_status, "")
             _status_lbl = {"open": "NOT STARTED", "in_progress": "IN PROGRESS",
-                           "completed": "DONE"}.get(_r["status"],
-                                                   (_r["status"] or "").upper())
+                           "completed": "DONE"}.get(_effective_status,
+                                                   (_effective_status or "").upper())
             # Garbage lanes get their own tag so the driver can tell them
             # apart from roll-off at a glance — same board, one product.
             _type_tag = ""
