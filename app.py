@@ -19241,152 +19241,12 @@ def driver_route_detail(route_id):
         document.getElementById('cab-fee-desc').focus();
     }}
     </script>"""
-    # 2026-10-23: landfill surcharge tickets — driver snaps the extra paper
-    # ticket, AI reads material/ticket#/total, driver confirms. Photo-first so
-    # the old guys never type unless the scan fails.
-    _cab_surcharge_block = f"""
-    <div class="cab-surcharge-block" id="cab-surcharge-block" style="margin-bottom:12px;padding:12px;border:1px solid rgba(255,255,255,0.12);border-radius:10px;background:rgba(255,255,255,0.03);">
-        <div style="font-size:13px;font-weight:700;margin-bottom:8px;">&#x1F9FE; Extra charges on this ticket? <span class="muted" style="font-weight:400;">(optional)</span></div>
-        <div id="cab-surcharge-list" style="margin-bottom:8px;"></div>
-        <button type="button" class="btn secondary" id="cab-surcharge-scan" style="width:100%;min-height:48px;">&#x1F4F8; Scan surcharge ticket</button>
-        <input type="file" id="cab-surcharge-photo" accept="image/*" capture="environment" hidden>
-        <div id="cab-surcharge-form" hidden style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);">
-            <div id="cab-surcharge-scan-status" class="muted small" style="margin-bottom:8px;"></div>
-            <div class="grid" style="grid-template-columns:1fr 1fr;gap:8px;">
-                <input id="cab-surcharge-material" placeholder="Material (e.g. mattress)" style="font-size:15px;padding:10px;" list="cab-surcharge-materials">
-                <datalist id="cab-surcharge-materials"></datalist>
-                <input id="cab-surcharge-ticketno" placeholder="Ticket #" style="font-size:15px;padding:10px;">
-            </div>
-            <div style="margin-top:8px;">
-                <input id="cab-surcharge-total" type="number" min="0" step="0.01" inputmode="decimal" placeholder="Total $" style="font-size:15px;padding:10px;width:100%;">
-            </div>
-            <div class="row" style="gap:8px;margin-top:8px;">
-                <button type="button" class="btn gold" id="cab-surcharge-confirm" style="flex:1;min-height:48px;">Add Surcharge</button>
-                <button type="button" class="btn secondary" id="cab-surcharge-cancel">Cancel</button>
-            </div>
-        </div>
-    </div>
-    <script>
-    (function(){{
-        var stopId = {int(stop_id)};
-        var csrf = "{_csrf}";
-        var scanBtn = document.getElementById('cab-surcharge-scan');
-        var photoInput = document.getElementById('cab-surcharge-photo');
-        var form = document.getElementById('cab-surcharge-form');
-        var status = document.getElementById('cab-surcharge-scan-status');
-        var matInput = document.getElementById('cab-surcharge-material');
-        var tickInput = document.getElementById('cab-surcharge-ticketno');
-        var totInput = document.getElementById('cab-surcharge-total');
-        var list = document.getElementById('cab-surcharge-list');
-        var scannedPhotoPath = "";
-        if (!scanBtn) return;
-
-        function money(cents){{
-            var d = cents/100;
-            return '$' + (d % 1 === 0 ? d.toFixed(0) : d.toFixed(2));
-        }}
-        function refreshList(){{
-            fetch('/api/surcharges/for-stop/' + stopId).then(function(r){{ return r.json(); }}).then(function(d){{
-                var items = (d && d.surcharges) || [];
-                // Learn materials for autocomplete.
-                var seen = {{}};
-                var dl = document.getElementById('cab-surcharge-materials');
-                dl.innerHTML = '';
-                items.forEach(function(s){{
-                    var m = (s.material || '').trim();
-                    if (m && !seen[m.toLowerCase()]) {{
-                        seen[m.toLowerCase()] = 1;
-                        var o = document.createElement('option');
-                        o.value = m;
-                        dl.appendChild(o);
-                    }}
-                }});
-                if (!items.length) {{ list.innerHTML = ''; return; }}
-                list.innerHTML = items.map(function(s){{
-                    return '<div style="display:flex;align-items:center;gap:8px;padding:8px;border:1px solid rgba(255,255,255,0.1);border-radius:8px;margin-bottom:6px;background:rgba(255,255,255,0.02);">'
-                        + '<div style="flex:1;"><strong>' + s.material.replace(/</g,'&lt;') + '</strong>'
-                        + (s.ticket_number ? ' <span class="muted small">#' + s.ticket_number.replace(/</g,'&lt;') + '</span>' : '')
-                        + '<div style="color:#3DDC84;font-weight:700;">' + money(s.amount_cents) + '</div></div>'
-                        + (s.billed ? '<span class="muted small">invoiced</span>'
-                           : '<button type="button" data-sc-del="' + s.id + '" style="background:transparent;color:#f87171;border:1px solid rgba(248,113,113,0.4);border-radius:6px;padding:4px 10px;font-size:12px;">Remove</button>')
-                        + '</div>';
-                }}).join('');
-                list.querySelectorAll('[data-sc-del]').forEach(function(b){{
-                    b.addEventListener('click', function(){{
-                        fetch('/api/surcharges/' + b.getAttribute('data-sc-del') + '/delete', {{
-                            method: 'POST', headers: {{'X-CSRF-Token': csrf}}
-                        }}).then(function(){{ refreshList(); }});
-                    }});
-                }});
-            }});
-        }}
-        scanBtn.addEventListener('click', function(){{ photoInput.click(); }});
-        photoInput.addEventListener('change', function(){{
-            var f = photoInput.files[0];
-            if (!f) return;
-            form.hidden = false;
-            status.textContent = 'Reading ticket…';
-            matInput.value = ''; tickInput.value = ''; totInput.value = '';
-            scannedPhotoPath = '';
-            var fd = new FormData();
-            fd.append('photo', f);
-            fd.append('stop_id', stopId);
-            fetch('/api/surcharge-ticket/ocr', {{method: 'POST', body: fd, headers: {{'X-CSRF-Token': csrf}}}})
-            .then(function(r){{ return r.json(); }})
-            .then(function(d){{
-                scannedPhotoPath = d.photo_path || '';
-                if (d.ok && d.fields) {{
-                    matInput.value = d.fields.material || '';
-                    tickInput.value = d.fields.ticket_number || '';
-                    totInput.value = d.fields.total_usd != null ? d.fields.total_usd : '';
-                    status.textContent = d.unreadable ? 'Could not read it — fill in by hand.' : 'Check it, then tap Add Surcharge.';
-                }} else {{
-                    status.textContent = 'Could not read it — fill in by hand.';
-                }}
-                photoInput.value = '';
-            }})
-            .catch(function(){{
-                status.textContent = 'Scan failed — fill in by hand.';
-                photoInput.value = '';
-            }});
-        }});
-        document.getElementById('cab-surcharge-cancel').addEventListener('click', function(){{
-            form.hidden = true;
-        }});
-        document.getElementById('cab-surcharge-confirm').addEventListener('click', function(){{
-            var payload = {{
-                stop_id: stopId,
-                material: matInput.value.trim(),
-                ticket_number: tickInput.value.trim(),
-                total_usd: parseFloat(totInput.value) || 0,
-                photo_path: scannedPhotoPath
-            }};
-            if (!payload.material || !(payload.total_usd > 0)) {{
-                status.textContent = 'Material and total are required.';
-                return;
-            }}
-            fetch('/api/surcharges/add', {{
-                method: 'POST', headers: {{'Content-Type': 'application/json', 'X-CSRF-Token': csrf}},
-                body: JSON.stringify(payload)
-            }}).then(function(r){{ return r.json(); }}).then(function(d){{
-                if (d.ok) {{
-                    form.hidden = true;
-                    refreshList();
-                }} else {{
-                    status.textContent = (d.error || 'Could not save.') ;
-                }}
-            }});
-        }});
-        refreshList();
-    }})();
-    </script>"""
     complete_section = f"""
     <form method="POST" action="{url_for('toggle_stop_complete', stop_id=stop_id)}" id="cab-complete-form"
           data-has-photo="{'1' if has_photo else '0'}" data-photo-mode="{e(photo_proof_mode)}">
         <input type="hidden" name="_csrf_token" value="{_csrf}">
         <input type="hidden" name="intent" value="complete">
         {_cab_weight_block}
-        {_cab_surcharge_block}
         <button class="cab-complete-btn" type="submit" {"disabled" if required_locked else ""}>&#9989; Complete Stop</button>
     </form>
     {'<div class="cab-photo-status">Take at least one photo to unlock Complete Stop</div>' if required_locked else ''}
@@ -23212,8 +23072,8 @@ def _log_weight(net_tons, material, fallback_tons):
     return ("", 0.0)
 
 
-def _log_ticket_cell(ticket_no, ticket_photo, ticket_id, notes, material, has_ticket):
-    """Dark-theme ticket cell with photo link (unified)."""
+def _log_ticket_cell(ticket_no, ticket_photo, ticket_id, notes, material, has_ticket, surcharges=None):
+    """Dark-theme ticket cell with photo link (unified). Surcharges shown below."""
     if ticket_no:
         if ticket_photo and ticket_id:
             cell = (f'<a href="/ticket-photo/{ticket_id}" target="_blank" style="color:#7FB8FF;">'
@@ -23227,6 +23087,16 @@ def _log_ticket_cell(ticket_no, ticket_photo, ticket_id, notes, material, has_ti
         cell = e(material or "No tkt")
     else:
         cell = '<span style="color:#777;">\u2014</span>'
+    # 2026-10-23: surcharge tickets listed under the main ticket.
+    for sc in (surcharges or []):
+        scd = dict(sc)
+        sc_label = f"Surch #{e(sc['ticket_number'])}" if sc['ticket_number'] else "Surcharge"
+        sc_amt = f" ({_fmt_money(sc['amount_cents'])})" if sc.get('amount_cents') else ""
+        if sc.get('photo_path'):
+            cell += (f'<br><a href="/{e(sc["photo_path"])}" target="_blank" '
+                     f'style="color:#FF9D5C;font-size:12px;">{sc_label}{sc_amt} \U0001F4F7</a>')
+        else:
+            cell += f'<br><span style="color:#FF9D5C;font-size:12px;">{sc_label}{sc_amt}</span>'
     if notes:
         cell += f"<br><small>{e(notes)}</small>"
     return cell
@@ -26347,6 +26217,7 @@ def api_surcharge_ticket_ocr():
     for the driver to CONFIRM. Same pattern as scale-ticket OCR: photo saved
     first, best-effort AI, HTTP 200 with ok:false on any failure so the client
     falls back to the blank form — never a red error at a landfill."""
+    import os as _os
     import base64 as _b64
 
     stop_id_raw = (request.form.get("stop_id") or "").strip()
@@ -26455,97 +26326,6 @@ def api_surcharge_ticket_ocr():
     conn.close()
     return jsonify({"ok": True, "unreadable": unreadable, "fields": fields,
                     "confidence": conf, "photo_path": photo_path})
-
-
-@app.route("/api/surcharges/add", methods=["POST"])
-@login_required
-def api_surcharge_add():
-    """Save a driver-confirmed surcharge. Photo already uploaded via OCR (or
-    blank form); this just records the confirmed values."""
-    data = request.get_json(silent=True) or {}
-    stop_id = data.get("stop_id")
-    try:
-        stop_id = int(stop_id)
-    except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "bad stop"}), 400
-    material = (data.get("material") or "").strip()[:120]
-    ticket_number = (data.get("ticket_number") or "").strip()[:60]
-    photo_path = (data.get("photo_path") or "").strip()[:255]
-    try:
-        amount_cents = int(round(float(data.get("total_usd") or 0) * 100))
-    except (TypeError, ValueError):
-        amount_cents = 0
-    if not material or amount_cents <= 0:
-        return jsonify({"ok": False, "error": "material and total required"}), 400
-    # Basic path guard: photo must be one of ours.
-    if photo_path and (not photo_path.startswith("static/uploads/") or ".." in photo_path):
-        photo_path = ""
-
-    conn = get_db()
-    stop = conn.execute(
-        """SELECT s.id, r.id AS rid FROM stops s JOIN routes r ON s.route_id=r.id
-            WHERE s.id=? AND r.company_id=?""",
-        (stop_id, cid())).fetchone()
-    if not stop:
-        conn.close()
-        return jsonify({"ok": False, "error": "not found"}), 404
-    if session.get("role") != "boss" and conn.execute(
-            "SELECT assigned_to FROM routes WHERE id=?", (stop["rid"],)).fetchone()["assigned_to"] != session["user_id"]:
-        conn.close()
-        return jsonify({"ok": False, "error": "forbidden"}), 403
-    # Link to the stop's dump ticket if one exists.
-    dt = conn.execute("SELECT id FROM dump_tickets WHERE stop_id=? ORDER BY id DESC LIMIT 1",
-                      (stop_id,)).fetchone()
-    cur = conn.execute(
-        """INSERT INTO ticket_surcharges
-           (company_id, stop_id, dump_ticket_id, material, ticket_number,
-            amount_cents, photo_path, billed, created_by, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
-        (cid(), stop_id, dt["id"] if dt else None, material, ticket_number,
-         amount_cents, photo_path or None, 0, session["user_id"], now_ts()))
-    conn.commit()
-    sid = cur.lastrowid
-    conn.close()
-    return jsonify({"ok": True, "id": sid})
-
-
-@app.route("/api/surcharges/for-stop/<int:stop_id>")
-@login_required
-def api_surcharges_for_stop(stop_id):
-    conn = get_db()
-    rows = conn.execute(
-        """SELECT ts.id, ts.material, ts.ticket_number, ts.amount_cents, ts.photo_path,
-                  ts.billed, ts.created_at
-           FROM ticket_surcharges ts JOIN stops s ON ts.stop_id=s.id
-           JOIN routes r ON s.route_id=r.id
-           WHERE ts.stop_id=? AND r.company_id=? ORDER BY ts.id""",
-        (stop_id, cid())).fetchall()
-    conn.close()
-    return jsonify({"surcharges": [dict(r) for r in rows]})
-
-
-@app.route("/api/surcharges/<int:sid>/delete", methods=["POST"])
-@login_required
-def api_surcharge_delete(sid):
-    conn = get_db()
-    row = conn.execute(
-        """SELECT ts.id, ts.billed, r.assigned_to FROM ticket_surcharges ts
-           JOIN stops s ON ts.stop_id=s.id JOIN routes r ON s.route_id=r.id
-           WHERE ts.id=? AND ts.company_id=?""",
-        (sid, cid())).fetchone()
-    if not row:
-        conn.close()
-        return jsonify({"ok": False}), 404
-    if row["billed"]:
-        conn.close()
-        return jsonify({"ok": False, "error": "already invoiced"}), 400
-    if session.get("role") != "boss" and row["assigned_to"] != session["user_id"]:
-        conn.close()
-        return jsonify({"ok": False}), 403
-    conn.execute("DELETE FROM ticket_surcharges WHERE id=?", (sid,))
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True})
 
 
 def _site_issues_tickets(conn, company_id, stop):
@@ -26786,6 +26566,35 @@ def dump_ticket(stop_id):
         # Customer Request System: keep a linked request in sync if this dump
         # step just completed the stop (no-op for normal stops).
         cascade_request_from_stop(conn, stop_id)
+
+        # 2026-10-23: surcharge ticket — saved alongside the dump ticket.
+        # Only insert if the driver filled in material + total (photo optional).
+        _sc_mat = request.form.get("surcharge_material", "").strip()[:120]
+        _sc_tick = request.form.get("surcharge_ticket_number", "").strip()[:60]
+        _sc_photo = request.form.get("surcharge_photo_path", "").strip()[:255]
+        if _sc_photo and (not _sc_photo.startswith("static/uploads/") or ".." in _sc_photo):
+            _sc_photo = ""
+        try:
+            _sc_total = round(float(request.form.get("surcharge_total") or 0), 2)
+            _sc_cents = int(round(_sc_total * 100))
+        except (TypeError, ValueError):
+            _sc_cents = 0
+        if _sc_mat and _sc_cents > 0:
+            _dt_row = conn.execute("SELECT id FROM dump_tickets WHERE stop_id=? ORDER BY id DESC LIMIT 1",
+                                   (stop_id,)).fetchone()
+            # Don't double-save on re-submit: skip if same ticket # already logged.
+            _exists = conn.execute(
+                "SELECT id FROM ticket_surcharges WHERE stop_id=? AND ticket_number=? AND billed=0",
+                (stop_id, _sc_tick)).fetchone() if _sc_tick else None
+            if not _exists:
+                conn.execute(
+                    """INSERT INTO ticket_surcharges
+                       (company_id, stop_id, dump_ticket_id, material, ticket_number,
+                        amount_cents, photo_path, billed, created_by, created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (cid(), stop_id, _dt_row["id"] if _dt_row else None, _sc_mat, _sc_tick,
+                     _sc_cents, _sc_photo or None, 0, session["user_id"], now_ts()))
+
         conn.commit()
         conn.close()
         flash("Dump ticket saved.", "success")
@@ -26951,6 +26760,27 @@ def dump_ticket(stop_id):
                 <input type="file" name="ticket_photo" id="f-photo" accept=".png,.jpg,.jpeg,.webp,.pdf"
                        style="margin-bottom:6px;">
                 <div id="dt-photo-note" class="muted" style="font-size:12px;margin-bottom:16px;min-height:16px;"></div>
+            </div>
+            <!-- 2026-10-23: surcharge ticket — the extra paper ticket for special
+                 materials (mattresses, tires…). Snap it, AI reads material/ticket#/
+                 total, driver confirms. Saved with this dump ticket; flows to invoice. -->
+            <div id="dt-surcharge-section" style="margin:16px 0;padding:14px;border:1px solid rgba(255,255,255,0.12);border-radius:12px;background:rgba(255,255,255,0.02);">
+                <div style="font-size:13px;font-weight:700;margin-bottom:4px;">&#x1F9FE; Surcharge ticket <span class="muted" style="font-weight:400;">(optional)</span></div>
+                <div class="muted" style="font-size:12px;margin-bottom:10px;">Extra charges on this load? Snap that ticket too.</div>
+                <input type="file" id="f-surcharge-photo" accept="image/*" capture="environment" style="display:none;">
+                <button type="button" class="btn" id="dt-surcharge-ocr-btn"
+                        style="width:100%;min-height:48px;margin-bottom:8px;background:var(--teal-dim,rgba(0,229,204,0.12));
+                               border:1px solid var(--teal-border,rgba(0,229,204,0.45));color:var(--teal,#00E5CC);font-weight:700;">
+                    &#128247; Photo of surcharge ticket &mdash; auto-fill
+                </button>
+                <div id="dt-surcharge-ocr-status" class="muted" style="font-size:13px;margin-bottom:8px;min-height:16px;"></div>
+                <div class="grid" style="grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px;">
+                    <input name="surcharge_material" id="f-surcharge-material" placeholder="Material (e.g. mattress)" style="font-size:15px;padding:10px;" list="dt-surcharge-materials">
+                    <datalist id="dt-surcharge-materials"></datalist>
+                    <input name="surcharge_ticket_number" id="f-surcharge-ticketno" placeholder="Ticket #" style="font-size:15px;padding:10px;">
+                </div>
+                <input name="surcharge_total" id="f-surcharge-total" type="number" min="0" step="0.01" inputmode="decimal" placeholder="Total $" style="font-size:15px;padding:10px;width:100%;">
+                <input type="hidden" name="surcharge_photo_path" id="f-surcharge-photo-path" value="">
             </div>
             <div id="dt-error" role="alert" style="display:none;margin-bottom:12px;padding:12px 14px;
                  border-radius:10px;background:var(--red-dim);border:1px solid rgba(255,82,82,0.40);
@@ -27279,6 +27109,49 @@ def dump_ticket(stop_id):
             flushOcr();     // process anything queued while offline last time
         }}
 
+        // 2026-10-23: surcharge ticket scan — same photo-first pattern. Snap the
+        // extra ticket, AI reads material/ticket#/total into the fields below.
+        // The photo path is stashed in a hidden field and saved with the form.
+        var scBtn    = document.getElementById('dt-surcharge-ocr-btn');
+        var scInput  = document.getElementById('f-surcharge-photo');
+        var scStatus = document.getElementById('dt-surcharge-ocr-status');
+        var scPath   = document.getElementById('f-surcharge-photo-path');
+        if (scBtn && scInput) {{
+            scBtn.addEventListener('click', function() {{ scInput.click(); }});
+            scInput.addEventListener('change', function() {{
+                var f = scInput.files && scInput.files[0];
+                if (!f) return;
+                if (scStatus) scStatus.textContent = 'Reading surcharge ticket...';
+                scBtn.disabled = true;
+                downscaleForOcr(f).then(function(small) {{
+                    var ctrl = new AbortController();
+                    var to = setTimeout(function() {{ ctrl.abort(); }}, 25000);
+                    var fd = new FormData();
+                    fd.append('_csrf_token', CSRF); fd.append('stop_id', STOP_ID); fd.append('photo', small, 'surcharge.jpg');
+                    fetch('/api/surcharge-ticket/ocr', {{ method: 'POST', credentials: 'same-origin', body: fd, signal: ctrl.signal }})
+                        .then(function(r) {{ return r.json().catch(function() {{ return null; }}); }})
+                        .then(function(d) {{
+                            clearTimeout(to); scBtn.disabled = false;
+                            if (d && d.photo_path && scPath) scPath.value = d.photo_path;
+                            if (d && d.ok && !d.unreadable && d.fields) {{
+                                var fld = d.fields, c = d.confidence || {{}}, any = false;
+                                if (fld.material) {{ setAiField('f-surcharge-material', fld.material, c.material); any = true; }}
+                                if (fld.ticket_number) {{ setAiField('f-surcharge-ticketno', fld.ticket_number, c.ticket_number); any = true; }}
+                                if (fld.total_usd != null) {{ setAiField('f-surcharge-total', fld.total_usd, c.total_usd); any = true; }}
+                                scStatus.textContent = any ? 'Read from the photo — check it below.' : 'Could not read it — fill in by hand.';
+                            }} else {{
+                                scStatus.textContent = 'Could not read it — fill in by hand (photo is saved).';
+                            }}
+                            try {{ scInput.value = ''; }} catch (e) {{}}
+                        }})
+                        .catch(function() {{
+                            clearTimeout(to); scBtn.disabled = false;
+                            scStatus.textContent = 'No signal — fill in by hand for now.';
+                        }});
+                }});
+            }});
+        }}
+
         var submitting = false;
         form.addEventListener('submit', async function(ev) {{
             ev.preventDefault();
@@ -27394,6 +27267,17 @@ def route_daily_log(route_id):
            ORDER BY s.stop_order ASC, s.id ASC""",
         (route_id,)
     ).fetchall()
+    # 2026-10-23: surcharges per stop for the ticket column + photo section.
+    _surch_by_stop = {}
+    try:
+        for _sc in conn.execute(
+                """SELECT ts.* FROM ticket_surcharges ts
+                   JOIN stops s ON ts.stop_id = s.id
+                   WHERE s.route_id=? ORDER BY ts.id""",
+                (route_id,)).fetchall():
+            _surch_by_stop.setdefault(_sc["stop_id"], []).append(_sc)
+    except Exception:
+        pass
     conn.close()
 
     # One row per stop (a stop can carry several tickets; the paper shows one line)
@@ -27478,9 +27362,11 @@ def route_daily_log(route_id):
         )
         total_tons += tons
         ticket_no = s["dump_ticket_number"] or ""
+        _stop_surcharges = _surch_by_stop.get(s["id"], [])
         ticket_cell = _log_ticket_cell(
             ticket_no, s["dump_photo_path"], s["dump_ticket_id"],
             s["notes"], s["material"] if has_ticket else None, has_ticket,
+            _stop_surcharges,
         )
         if s["dump_photo_path"]:
             ticket_photos.append({
@@ -27488,6 +27374,12 @@ def route_daily_log(route_id):
                 "ticket": ticket_no,
                 "photo": s["dump_photo_path"],
                 "ticket_id": s["dump_ticket_id"],
+                # 2026-10-23: surcharge photos ride with the main ticket photo.
+                "surcharges": [
+                    {"ticket": sc["ticket_number"], "photo": sc["photo_path"],
+                     "material": sc["material"], "amount_cents": sc["amount_cents"]}
+                    for sc in _stop_surcharges if sc["photo_path"]
+                ],
             })
         rows += f"""
         <tr class="{'row-done' if s['status'] == 'completed' else ''}">
@@ -27517,15 +27409,33 @@ def route_daily_log(route_id):
         thumbs = ""
         for tp in ticket_photos:
             _href = f"/ticket-photo/{tp['ticket_id']}" if tp.get("ticket_id") else f"/{e(tp['photo'])}"
+            _surch = tp.get("surcharges") or []
+            # 2026-10-23: "+N" badge when surcharge photos ride along; each
+            # surcharge photo gets its own thumbnail in the same section.
+            _badge = (f'<div style="position:absolute;top:4px;right:4px;background:#FF6B1A;color:#fff;'
+                      f'font-size:11px;font-weight:800;border-radius:10px;padding:2px 8px;">+{len(_surch)}</div>'
+                      if _surch else "")
             thumbs += (
                 f'<a href="{_href}" target="_blank" style="text-decoration:none;">'
-                f'<div style="display:inline-block;margin:8px;text-align:center;">'
+                f'<div style="display:inline-block;margin:8px;text-align:center;position:relative;">'
                 f'<img src="/{e(tp["photo"])}" style="width:120px;height:120px;object-fit:cover;'
                 f'border-radius:8px;border:1px solid #444;">'
+                f'{_badge}'
                 f'<div style="font-size:11px;margin-top:4px;color:#C9C9C0;">'
                 f'{e(tp["ticket"] or "Ticket")}<br>{e(tp["stop"][:25])}</div>'
                 f'</div></a>'
             )
+            for _sc in _surch:
+                _sc_label = f"Surch #{_sc['ticket']}" if _sc.get("ticket") else "Surcharge"
+                thumbs += (
+                    f'<a href="/{e(_sc["photo"])}" target="_blank" style="text-decoration:none;">'
+                    f'<div style="display:inline-block;margin:8px;text-align:center;">'
+                    f'<img src="/{e(_sc["photo"])}" style="width:120px;height:120px;object-fit:cover;'
+                    f'border-radius:8px;border:1px solid rgba(255,157,92,.5);">'
+                    f'<div style="font-size:11px;margin-top:4px;color:#FF9D5C;">'
+                    f'{e(_sc_label)}<br>{e((_sc.get("material") or "")[:25])}</div>'
+                    f'</div></a>'
+                )
         gallery = (
             f'<div class="no-print" style="margin-top:20px;">'
             f'<h3 style="font-size:1rem;">Ticket Photos ({len(ticket_photos)})</h3>'
