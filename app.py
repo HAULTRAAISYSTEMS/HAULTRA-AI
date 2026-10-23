@@ -27337,14 +27337,17 @@ def route_daily_log(route_id):
             # 2026-10-22: PR (non-swap): Box In = Box Out = SAME bin.
             # Driver pulls the full bin, dumps it, returns the empty to THIS
             # customer. The bin does NOT come from the previous stop.
-            box_in = box_out
+            # 2026-10-23: if not completed yet (no ticket), show the incoming
+            # bin — the driver is carrying it there now.
+            box_in = box_out if box_out else _prev_box_out
         else:
             # Pull or PR swap: Box In = bin carried on truck (prev Box Out)
             box_in = _prev_box_out
         # Carry forward: PR (non-swap) returns the bin, so truck leaves empty
         # for the next stop. Pull/PR-swap carries the (now empty) bin forward.
+        # 2026-10-23: incomplete stop — truck still has the incoming bin.
         if _is_pr and not _is_swap:
-            _prev_box_out = ""
+            _prev_box_out = "" if box_out else _prev_box_out
         else:
             _prev_box_out = box_out
         # 2026-10-21: Start = previous stop's finish (driver rolls job to
