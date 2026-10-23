@@ -23088,8 +23088,8 @@ def _log_ticket_cell(ticket_no, ticket_photo, ticket_id, notes, material, has_ti
     else:
         cell = '<span style="color:#777;">\u2014</span>'
     # 2026-10-23: surcharge tickets listed under the main ticket.
-    for sc in (surcharges or []):
-        scd = dict(sc)
+    for _sc in (surcharges or []):
+        sc = dict(_sc)
         sc_label = f"Surch #{e(sc['ticket_number'])}" if sc['ticket_number'] else "Surcharge"
         sc_amt = f" ({_fmt_money(sc['amount_cents'])})" if sc.get('amount_cents') else ""
         if sc.get('photo_path'):
