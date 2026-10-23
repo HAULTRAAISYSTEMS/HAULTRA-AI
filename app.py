@@ -5002,6 +5002,10 @@ def init_db():
     # Usage/recency so re-learning a mapping bumps instead of piling up.
     safe_add_column(conn, "parse_vocab", "times_used INTEGER NOT NULL DEFAULT 1")
     safe_add_column(conn, "parse_vocab", "last_used_at TEXT")
+    # 2026-10-23: intent phrases — kind='intent' rows teach the parser what the
+    # boss's own phrases MEAN (swap_chain, source_bin, return_end_day,
+    # empty_pickup). The machine-readable intent lives here; term=phrase.
+    safe_add_column(conn, "parse_vocab", "intent TEXT NOT NULL DEFAULT ''")
     # parse_vocab is deliberately NOT stamped alongside the tables above: it is
     # the one table carrying a unique index over company_id, so it needs
     # dedupe-before-stamp ordering. See _migrate_parse_vocab for why.
@@ -28281,13 +28285,34 @@ def _parse_vocab_context(conn, company_id):
     try:
         vocab = conn.execute(
             """SELECT term, expansion FROM parse_vocab
-                WHERE company_id IS NULL OR company_id=?
+                WHERE kind='shorthand' AND (company_id IS NULL OR company_id=?)
                 ORDER BY term""",
             (company_id,)
         ).fetchall()
         if vocab:
             lines.append("SHORTHAND (expand these): " + ", ".join(
                 (v["term"] + " = " + v["expansion"]) for v in vocab))
+    except Exception:
+        pass
+    # 2026-10-23: the boss's own intent phrases — "when I write X, I mean Y".
+    # Taught on the Teach page; honored here so dispatch language like "use it
+    # to" / "grab the can from" builds the right chains without code changes.
+    try:
+        intents = conn.execute(
+            """SELECT term, intent FROM parse_vocab
+                WHERE kind='intent' AND (company_id IS NULL OR company_id=?)
+                ORDER BY term""",
+            (company_id,)
+        ).fetchall()
+        if intents:
+            _intent_desc = {
+                "swap_chain":    "the stops that follow form a SWAP CHAIN sharing one empty bin",
+                "source_bin":    "the named location provides the SOURCE BIN (empty) used for the following swaps",
+                "return_end_day":"after these stops, add a final D stop returning the empty to the named location to end the day",
+                "empty_pickup":  "this is an EMPTY pickup — pull the empty container, no dump leg needed",
+            }
+            lines.append("CUSTOM INTENT PHRASES (this boss's own dispatch language — honor exactly): " + "; ".join(
+                '"' + r["term"] + '" → ' + _intent_desc.get(r["intent"], r["intent"]) for r in intents))
     except Exception:
         pass
     # Self-building address book: the company's most-used saved locations, so
@@ -28700,6 +28725,10 @@ def onboarding_parser_page():
         </div>
         <div id="ob-done" class="muted" style="margin-top:12px;color:#3DDC84;font-weight:700;" hidden></div>
     </div>
+    <div style="max-width:760px;margin-top:8px;">
+        {_parse_vocab_section_html(back="/onboarding/parser#parse-vocab")}
+        {_parse_intent_section_html()}
+    </div>
     <script>
     (function() {{
       var CSRF = "{csrf_tok}";
@@ -28742,21 +28771,26 @@ def onboarding_parser_page():
         }});
       }});
 
+      var ACTS = ['PR','P','D','S','R','LL','YARD'];
+      function actOptions(cur) {{
+        return ACTS.map(function(a){{ return '<option value="'+a+'"'+(a===cur?' selected':'')+'>'+a+'</option>'; }}).join('');
+      }}
       function renderPreview() {{
         var rows = parsed.map(function(s, i) {{
           var flag = (s.confidence === 'low') ? ' <span style="color:#fbbf24;">&#9888; review</span>' : '';
           var legs = [];
           if (s.dump_leg) legs.push('dump ' + esc(s.dump_leg));
           if (s.return_leg) legs.push('return ' + esc(s.return_leg));
-          return '<tr>'
-            + '<td><b>' + esc(s.action||'?') + '</b>' + flag + '</td>'
-            + '<td>' + esc(s.address||'') + (s.customer ? '<div class="muted small">' + esc(s.customer) + '</div>' : '') + '</td>'
-            + '<td class="muted small">' + esc(s.container_size||'') + '</td>'
+          return '<tr data-i="'+i+'">'
+            + '<td><select class="ob-act" style="min-height:44px;background:var(--bg-0);color:var(--text);border:1px solid rgba(255,255,255,0.14);border-radius:8px;padding:6px;">' + actOptions(s.action||'PR') + '</select>' + flag + '</td>'
+            + '<td><input class="ob-addr" value="'+esc(s.address||'').replace(/"/g,'&quot;')+'" placeholder="address" style="width:100%;min-height:44px;background:var(--bg-0);color:var(--text);border:1px solid rgba(255,255,255,0.14);border-radius:8px;padding:6px 8px;margin-bottom:4px;">'
+            + '<input class="ob-cust" value="'+esc(s.customer||'').replace(/"/g,'&quot;')+'" placeholder="customer (optional)" style="width:100%;min-height:44px;background:var(--bg-0);color:var(--text);border:1px solid rgba(255,255,255,0.14);border-radius:8px;padding:6px 8px;"></td>'
+            + '<td><input class="ob-size" value="'+esc(s.container_size||'').replace(/"/g,'&quot;')+'" placeholder="size" style="width:72px;min-height:44px;background:var(--bg-0);color:var(--text);border:1px solid rgba(255,255,255,0.14);border-radius:8px;padding:6px 8px;"></td>'
             + '<td class="muted small">' + esc(legs.join(' \\u2192 ')) + '</td>'
             + '</tr>';
         }}).join('');
         results.innerHTML = '<div class="muted small" style="margin-bottom:6px;">' + parsed.length
-          + ' stop(s) parsed. Review, then confirm to teach the parser.</div>'
+          + ' stop(s) parsed. <b>Tap any field to correct it</b> — every fix teaches the parser.</div>'
           + '<div class="table-wrap"><table><thead><tr><th>Action</th><th>Address / customer</th><th>Size</th><th>Legs</th></tr></thead><tbody>'
           + rows + '</tbody></table></div>';
         confirmWrap.hidden = false;
@@ -28764,9 +28798,26 @@ def onboarding_parser_page():
 
       confirmBtn.addEventListener('click', function() {{
         confirmBtn.disabled = true; confirmBtn.textContent = 'Teaching…';
+        var stops = [];
+        results.querySelectorAll('tr[data-i]').forEach(function(tr) {{
+          var i = parseInt(tr.getAttribute('data-i'), 10);
+          var s = parsed[i] || {{}};
+          var actEl = tr.querySelector('.ob-act');
+          var addrEl = tr.querySelector('.ob-addr');
+          var custEl = tr.querySelector('.ob-cust');
+          var sizeEl = tr.querySelector('.ob-size');
+          stops.push({{
+            action: actEl ? actEl.value : (s.action || 'PR'),
+            address: addrEl ? addrEl.value.trim() : (s.address || ''),
+            customer: custEl ? custEl.value.trim() : (s.customer || ''),
+            container_size: sizeEl ? sizeEl.value.trim() : (s.container_size || ''),
+            dump_leg: s.dump_leg || '',
+            return_leg: s.return_leg || ''
+          }});
+        }});
         fetch("{url_for('onboarding_parser_seed')}", {{
           method:'POST', headers:{{'Content-Type':'application/json','X-CSRF-Token':CSRF}},
-          body: JSON.stringify({{stops: parsed}})
+          body: JSON.stringify({{stops: stops}})
         }}).then(function(r){{ return r.json(); }}).then(function(d) {{
           confirmBtn.disabled = false; confirmBtn.textContent = '\\u2705 Confirm all & teach the parser';
           if (d && typeof d.seeded === 'number') {{
@@ -31746,16 +31797,18 @@ def yard_setup_page():
     return render_template_string(shell_page("Yard Setup", body))
 
 
-def _parse_vocab_section_html():
+def _parse_vocab_section_html(back=None):
     """Boss-editable parser shorthand — the terms fed to the AI parser so it
-    resolves local abbreviations (e.g. newpt → Newport News)."""
+    resolves local abbreviations (e.g. newpt → Newport News). `back` is an
+    optional path to return to after add/remove (used by the Teach page)."""
     conn = get_db()
     rows_db = conn.execute(
-        "SELECT id, term, expansion, company_id FROM parse_vocab WHERE company_id IS NULL OR company_id=? ORDER BY term",
+        "SELECT id, term, expansion, company_id FROM parse_vocab WHERE kind='shorthand' AND (company_id IS NULL OR company_id=?) ORDER BY term",
         (cid(),)
     ).fetchall()
     conn.close()
     _csrf = get_csrf_token()
+    _next_field = f'<input type="hidden" name="next" value="{e(back)}">' if back else ""
     rows = ""
     for v in rows_db:
         is_global = v["company_id"] is None
@@ -31763,6 +31816,7 @@ def _parse_vocab_section_html():
         del_cell = "" if is_global else (
             f'<form method="POST" action="{url_for("delete_parse_vocab", vocab_id=v["id"])}" style="display:inline;" '
             f'onsubmit="return confirm(\'Remove this shorthand?\');">'
+            f'<input type="hidden" name="_csrf_token" value="{_csrf}">{_next_field}'
             f'<button type="submit" style="background:transparent;color:#f87171;border:1px solid rgba(248,113,113,0.4);'
             f'border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;">Remove</button></form>'
         )
@@ -31776,7 +31830,7 @@ def _parse_vocab_section_html():
         <p class="muted small" style="margin-bottom:14px;">Abbreviations the AI parser expands when reading your dispatch text
         (e.g. <code>newpt</code> &rarr; Newport News). Defaults apply to everyone; add your own below.</p>
         <form method="POST" action="{url_for('add_parse_vocab')}" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;">
-            <input type="hidden" name="_csrf_token" value="{_csrf}">
+            <input type="hidden" name="_csrf_token" value="{_csrf}">{_next_field}
             <input name="term" placeholder="shorthand (e.g. wburg)" required
                    style="flex:1;min-width:140px;min-height:48px;padding:8px 12px;background:var(--bg-0);
                           border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);">
@@ -31800,9 +31854,12 @@ def _parse_vocab_section_html():
 def add_parse_vocab():
     term = (request.form.get("term") or "").strip().lower()[:40]
     expansion = (request.form.get("expansion") or "").strip()[:120]
+    # Optional redirect back to the page that hosted the form (Teach page).
+    _next = (request.form.get("next") or "").strip()[:80]
+    _back = _next if _next.startswith("/") else url_for("yard_setup_page") + "#parse-vocab"
     if not term or not expansion:
         flash("Both the shorthand and what it means are required.", "error")
-        return redirect(url_for("yard_setup_page") + "#parse-vocab")
+        return redirect(_back)
     conn = get_db()
     ts = now_ts()
     # Upsert: the same mapping bumps usage/recency instead of adding a row; a
@@ -31827,7 +31884,7 @@ def add_parse_vocab():
     conn.commit()
     conn.close()
     flash("Shorthand added.", "success")
-    return redirect(url_for("yard_setup_page") + "#parse-vocab")
+    return redirect(_back)
 
 
 @app.route("/parse-vocab/<int:vocab_id>/delete", methods=["POST"])
@@ -31839,7 +31896,114 @@ def delete_parse_vocab(vocab_id):
     conn.commit()
     conn.close()
     flash("Shorthand removed.", "success")
-    return redirect(url_for("yard_setup_page") + "#parse-vocab")
+    _next = (request.form.get("next") or "").strip()[:80]
+    _back = _next if _next.startswith("/") else url_for("yard_setup_page") + "#parse-vocab"
+    return redirect(_back)
+
+
+# --- Intent phrases: "when I write X, I mean Y" (2026-10-23) -----------------
+# The boss's own dispatch language, taught on the Teach page and injected into
+# the AI parser prompt via _parse_vocab_context. Stored as parse_vocab rows
+# with kind='intent'; the machine-readable intent lives in the intent column.
+_INTENT_TYPES = {
+    "swap_chain":     "Swap chain — following PR stops share one empty bin",
+    "source_bin":     "Source bin — named location provides the empty for swaps",
+    "return_end_day": "Return to end day — auto-create final drop at named location",
+    "empty_pickup":   "Empty pickup — pull the empty, no dump needed",
+}
+
+
+def _parse_intent_section_html():
+    """Boss-editable intent phrases for the Teach page."""
+    conn = get_db()
+    rows_db = conn.execute(
+        "SELECT id, term, intent FROM parse_vocab WHERE kind='intent' AND (company_id IS NULL OR company_id=?) ORDER BY term",
+        (cid(),)
+    ).fetchall()
+    conn.close()
+    _csrf = get_csrf_token()
+    rows = ""
+    for v in rows_db:
+        label = _INTENT_TYPES.get(v["intent"], v["intent"])
+        rows += (f'<tr><td><strong>{e(v["term"])}</strong></td>'
+                 f'<td class="muted small">{e(label)}</td>'
+                 f'<td style="text-align:right;">'
+                 f'<form method="POST" action="{url_for("delete_parse_intent", vocab_id=v["id"])}" style="display:inline;" '
+                 f'onSubmit="return confirm(\'Remove this intent phrase?\');">'
+                 f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
+                 f'<button type="submit" style="background:transparent;color:#f87171;border:1px solid rgba(248,113,113,0.4);'
+                 f'border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;">Remove</button></form></td></tr>')
+    opts = "".join(f'<option value="{k}">{e(label)}</option>' for k, label in _INTENT_TYPES.items())
+    return f"""
+    <div class="card" id="parse-intent" style="margin-top:16px;">
+        <div class="row between" style="margin-bottom:16px;">
+            <h2 style="margin:0;">&#129504; Teach intent phrases</h2>
+        </div>
+        <p class="muted small" style="margin-bottom:14px;">Tell the parser what <b>your</b> words mean.
+        When you write one of these phrases in a dispatch text, the parser applies the intent —
+        e.g. <code>use it to</code> chains the following PR stops as swaps sharing one empty bin.</p>
+        <form method="POST" action="{url_for('add_parse_intent')}" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;">
+            <input type="hidden" name="_csrf_token" value="{_csrf}">
+            <input name="phrase" placeholder='phrase you write (e.g. use it to)' required
+                   style="flex:1;min-width:140px;min-height:48px;padding:8px 12px;background:var(--bg-0);
+                          border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);">
+            <select name="intent" required
+                    style="flex:1;min-width:140px;min-height:48px;padding:8px 12px;background:var(--bg-0);
+                           border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);">
+                {opts}
+            </select>
+            <button class="btn" type="submit" style="min-height:48px;">+ Add</button>
+        </form>
+        <div class="table-wrap">
+            <table>
+                <thead><tr><th>Phrase</th><th>Means</th><th></th></tr></thead>
+                <tbody>{rows or '<tr><td colspan="3" class="muted">No intent phrases yet — teach the first one above.</td></tr>'}</tbody>
+            </table>
+        </div>
+    </div>
+    """
+
+
+@app.route("/parse-intent/add", methods=["POST"])
+@boss_required
+def add_parse_intent():
+    phrase = (request.form.get("phrase") or "").strip().lower()[:80]
+    intent = (request.form.get("intent") or "").strip()[:30]
+    if not phrase or intent not in _INTENT_TYPES:
+        flash("A phrase and a valid intent are required.", "error")
+        return redirect(url_for("onboarding_parser_page") + "#parse-intent")
+    conn = get_db()
+    ts = now_ts()
+    existing = conn.execute(
+        "SELECT id FROM parse_vocab WHERE company_id=? AND kind='intent' AND LOWER(TRIM(term))=? ORDER BY id LIMIT 1",
+        (cid(), phrase)
+    ).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE parse_vocab SET intent=?, expansion=?, times_used=COALESCE(times_used,1)+1, last_used_at=? WHERE id=?",
+            (intent, _INTENT_TYPES[intent], ts, existing["id"]))
+        conn.execute("DELETE FROM parse_vocab WHERE company_id=? AND kind='intent' AND LOWER(TRIM(term))=? AND id!=?",
+                     (cid(), phrase, existing["id"]))
+    else:
+        conn.execute(
+            "INSERT INTO parse_vocab (company_id, term, expansion, kind, intent, times_used, last_used_at, created_at) "
+            "VALUES (?,?,?,'intent',?,1,?,?)",
+            (cid(), phrase, _INTENT_TYPES[intent], intent, ts, ts))
+    conn.commit()
+    conn.close()
+    flash("Intent phrase added — the parser will honor it.", "success")
+    return redirect(url_for("onboarding_parser_page") + "#parse-intent")
+
+
+@app.route("/parse-intent/<int:vocab_id>/delete", methods=["POST"])
+@boss_required
+def delete_parse_intent(vocab_id):
+    conn = get_db()
+    conn.execute("DELETE FROM parse_vocab WHERE id=? AND company_id=? AND kind='intent'", (vocab_id, cid()))
+    conn.commit()
+    conn.close()
+    flash("Intent phrase removed.", "success")
+    return redirect(url_for("onboarding_parser_page") + "#parse-intent")
 
 
 def _address_book_section_html():
