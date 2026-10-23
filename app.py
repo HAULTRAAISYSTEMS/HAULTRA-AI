@@ -11744,8 +11744,8 @@ def dashboard():
           if (d.error) { sub.textContent = 'Test failed: ' + d.error; return; }
           var det = (d.detail && d.detail[0]) || {};
           sub.textContent = 'Test: ' + d.sent + '/' + d.my_tokens +
-            ' | Apple: ' + (det.apns_status || '?') + ' ' + (det.apns_reason || '') +
-            ' | ' + (d.apns_host || '');
+            ' | Prod: ' + (det.apns_status || '?') + ' ' + (det.apns_reason || '') +
+            ' | Sandbox: ' + (det.sandbox_status || '?') + ' ' + (det.sandbox_reason || '');
         }).catch(function () {
           sub.textContent = 'Test request failed \\u2014 try again.';
         });
@@ -12986,6 +12986,8 @@ def api_push_test():
         toks = _apns_recipients(conn, cid(), roles=None)
         mine = [t for t in toks if t["user_id"] == session["user_id"]]
         # 2026-10-22: send directly so we can report Apple's real response.
+        # Also probe the SANDBOX host to definitively identify the token env.
+        import httpx as _httpx
         results = []
         for t in mine:
             ok, status, reason = _apns_send(
@@ -12994,8 +12996,27 @@ def api_push_test():
                 badge=_user_badge_count(conn, session["user_id"], cid(),
                                         session.get("role")),
                 data={"link": "/driver"})
+            # Sandbox probe: same payload to the sandbox host.
+            sb_status, sb_reason = 0, ""
+            try:
+                _payload = {"aps": {"alert": {"title": "env probe", "body": "x"}}}
+                _headers = {"authorization": "bearer %s" % _apns_jwt(),
+                            "apns-topic": APNS_BUNDLE_ID,
+                            "apns-push-type": "alert", "apns-priority": "10"}
+                with _httpx.Client(http2=True, timeout=10) as _c:
+                    _r = _c.post("https://api.sandbox.push.apple.com/3/device/%s"
+                                 % t["token"], json=_payload, headers=_headers)
+                sb_status = _r.status_code
+                try:
+                    sb_reason = _r.json().get("reason", "")
+                except Exception:
+                    pass
+            except Exception as _e:
+                sb_reason = "probe-exc: %s" % str(_e)[:60]
             results.append({"token_tail": t["token"][-8:], "accepted": ok,
-                            "apns_status": status, "apns_reason": reason})
+                            "apns_status": status, "apns_reason": reason,
+                            "sandbox_status": sb_status,
+                            "sandbox_reason": sb_reason})
             if not ok:
                 conn.execute("UPDATE push_tokens SET failed_at=? WHERE id=?",
                              (now_ts(), t["id"]))
@@ -13197,8 +13218,8 @@ def _phone_push_card():
           if (d.error) { sub.textContent = 'Test failed: ' + d.error; return; }
           var det = (d.detail && d.detail[0]) || {};
           sub.textContent = 'Test: ' + d.sent + '/' + d.my_tokens +
-            ' | Apple: ' + (det.apns_status || '?') + ' ' + (det.apns_reason || '') +
-            ' | ' + (d.apns_host || '');
+            ' | Prod: ' + (det.apns_status || '?') + ' ' + (det.apns_reason || '') +
+            ' | Sandbox: ' + (det.sandbox_status || '?') + ' ' + (det.sandbox_reason || '');
         }).catch(function () {
           sub.textContent = 'Test request failed \\u2014 try again.';
         });
@@ -13478,7 +13499,8 @@ def _push_settings_toggle():
         }).then(function (r) { return r.json(); }).then(function (d) {
           var det3 = (d.detail && d.detail[0]) || {};
           tsub.textContent = d.error ? ('Failed: ' + d.error)
-            : (d.sent + '/' + d.my_tokens + ' | Apple: ' + (det3.apns_status || '?') + ' ' + (det3.apns_reason || ''));
+            : (d.sent + '/' + d.my_tokens + ' | Prod: ' + (det3.apns_status || '?') + ' ' + (det3.apns_reason || '') +
+               ' | Sandbox: ' + (det3.sandbox_status || '?') + ' ' + (det3.sandbox_reason || ''));
         }).catch(function () { tsub.textContent = 'Test failed \u2014 try again.'; });
       };
     })();
