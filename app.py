@@ -33942,20 +33942,24 @@ def _containers_section_html():
             on_site_counts[r["container_id"]] = r["n"]
     conn.close()
 
+    # 2026-10-24 color system (user call): Deployed = green (out earning),
+    # At Yard = yellow (waiting in the yard — the color deployed vacated,
+    # so no two groups share a dot), On Truck = blue + pulsing glow,
+    # Needs review = amber warning, Lost = red, Retired = grey.
     STATUS_COLOR = {
-        "yard":     "#3DDC84",
-        "deployed": "#fbbf24",
+        "yard":     "#fbbf24",
+        "deployed": "#3DDC84",
         "loaded_at_yard": "#7FB8FF",
-        "stale":    "#fbbf24",
+        "stale":    "#FF9D5C",
         "lost":     "#f87171",
         "retired":  "#6b7280",
     }
 
     _GROUP_LABEL = {
-        "yard": "🟢 At Yard — in the yard, ready to assign",
+        "yard": "🟡 At Yard — in the yard, ready to assign",
         "loaded_at_yard": "🔵 On Truck (loaded at yard) — on a truck, between yard and customer",
         "stale": "⚠️ Needs review — was on a truck days ago, confirm where it is now",
-        "deployed": "🟡 Deployed — dropped at a customer",
+        "deployed": "🟢 Deployed — dropped at a customer",
         "lost": "🔴 Lost",
         "retired": "⚪ Retired",
     }
@@ -33994,8 +33998,9 @@ def _containers_section_html():
             _cur_group = _disp
             _collapsed = _cur_group in ("lost", "retired")
             _arrow = "▸" if _collapsed else "▾"
+            _grp_glow = " fl-glow" if _cur_group == "loaded_at_yard" else ""
             rows_html += (
-                f'<tr class="fl-group" data-group="{e(_cur_group)}" onclick="flToggleGroup(\'{e(_cur_group)}\')" '
+                f'<tr class="fl-group{_grp_glow}" data-group="{e(_cur_group)}" onclick="flToggleGroup(\'{e(_cur_group)}\')" '
                 f'style="cursor:pointer;background:rgba(255,255,255,.04);">'
                 f'<td colspan="5" style="text-align:left;"><strong><span id="fl-arrow-{e(_cur_group)}">{_arrow}</span> '
                 f'{e(_GROUP_LABEL.get(_cur_group, _cur_group))} — {_group_counts[_cur_group]}</strong></td></tr>'
@@ -34009,8 +34014,11 @@ def _containers_section_html():
             _badge_label = "needs review"
         else:
             _badge_label = {"loaded_at_yard": "on truck"}.get(_cd["status"], _cd["status"])
+        # 2026-10-24: a can actually on a truck gets a pulsing blue glow
+        # on its badge — stale cans never glow, they are not moving.
+        _badge_glow = " fl-glow" if _disp == "loaded_at_yard" else ""
         _badge = (
-            f'<span style="font-size:11px;padding:2px 8px;border-radius:5px;'
+            f'<span class="{_badge_glow.strip()}" style="font-size:11px;padding:2px 8px;border-radius:5px;'
             f'background:rgba(0,0,0,0.3);color:{_sc};border:1px solid {_sc}33;">'
             f'{e(_badge_label)}</span>'
         )
@@ -34070,13 +34078,13 @@ def _containers_section_html():
             }} catch (e) {{ btn.textContent = 'Deploy failed'; btn.disabled = false; }}
         }}
         </script>
-        <p class="ai-sub" style="margin-top:10px;">🟢 At Yard = sitting in the yard, ready to assign &nbsp;·&nbsp; 🔵 On Truck (loaded at yard) = loaded onto a truck at the yard — heading out or heading back, not at a customer yet &nbsp;·&nbsp; ⚠️ Needs review = was on a truck more than 2 days ago with no next move recorded — confirm where it is (Edit to fix) &nbsp;·&nbsp; 🟡 Deployed = dropped at a customer.</p>
+        <p class="ai-sub" style="margin-top:10px;">🟡 At Yard = sitting in the yard, ready to assign &nbsp;·&nbsp; 🔵 On Truck (loaded at yard) = loaded onto a truck at the yard — heading out or heading back, not at a customer yet &nbsp;·&nbsp; ⚠️ Needs review = was on a truck more than 2 days ago with no next move recorded — confirm where it is (Edit to fix) &nbsp;·&nbsp; 🟢 Deployed = dropped at a customer.</p>
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;" id="fl-chips">
             <button type="button" class="fl-chip active" data-fl-status="all" onclick="flSetStatus('all', this)">All ({len(containers)})</button>
-            <button type="button" class="fl-chip" data-fl-status="yard" onclick="flSetStatus('yard', this)">🟢 At Yard ({_group_counts.get("yard", 0)})</button>
-            <button type="button" class="fl-chip" data-fl-status="loaded_at_yard" onclick="flSetStatus('loaded_at_yard', this)">🔵 On Truck ({_group_counts.get("loaded_at_yard", 0)})</button>
+            <button type="button" class="fl-chip" data-fl-status="yard" onclick="flSetStatus('yard', this)">🟡 At Yard ({_group_counts.get("yard", 0)})</button>
+            <button type="button" class="fl-chip fl-glow" data-fl-status="loaded_at_yard" onclick="flSetStatus('loaded_at_yard', this)">🔵 On Truck ({_group_counts.get("loaded_at_yard", 0)})</button>
             <button type="button" class="fl-chip" data-fl-status="stale" onclick="flSetStatus('stale', this)">⚠️ Needs review ({_group_counts.get("stale", 0)})</button>
-            <button type="button" class="fl-chip" data-fl-status="deployed" onclick="flSetStatus('deployed', this)">🟡 Deployed ({_group_counts.get("deployed", 0)})</button>
+            <button type="button" class="fl-chip" data-fl-status="deployed" onclick="flSetStatus('deployed', this)">🟢 Deployed ({_group_counts.get("deployed", 0)})</button>
             <button type="button" class="fl-chip" data-fl-status="lost" onclick="flSetStatus('lost', this)">🔴 Lost ({_group_counts.get("lost", 0)})</button>
             <button type="button" class="fl-chip" data-fl-status="retired" onclick="flSetStatus('retired', this)">⚪ Retired ({_group_counts.get("retired", 0)})</button>
         </div>
@@ -34097,6 +34105,12 @@ def _containers_section_html():
         <style>
         .fl-chip{{padding:8px 16px;border-radius:999px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.04);color:#A6A69E;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;}}
         .fl-chip.active{{background:linear-gradient(135deg,#FF6B1A,#FF9D5C);color:#fff;border-color:transparent;}}
+        /* 2026-10-24: on-truck glow — a can actually moving pulses blue
+           on its chip, its group banner, and its row badge. Stale cans
+           never get this class. Motion respects reduced-motion. */
+        .fl-glow{{animation:flPulse 1.8s ease-in-out infinite;}}
+        @keyframes flPulse{{0%,100%{{box-shadow:0 0 4px rgba(127,184,255,.35);}}50%{{box-shadow:0 0 16px rgba(127,184,255,.95);}}}}
+        @media (prefers-reduced-motion: reduce){{.fl-glow{{animation:none;}}}}
         </style>
         <script>
         var flStatus = 'all';
@@ -35107,7 +35121,7 @@ def yard_setup_page():
             <div class="ys-card">
                 <div class="ai-kicker"><span class="ai-dot"></span>Fleet Tracking</div>
                 <div class="ys-num">{_yc["fleet"]}</div>
-                <div class="ys-sub">🟢 {_yc["yard"]} at yard &nbsp;·&nbsp; 🟡 {_yc["deployed"]} deployed &nbsp;·&nbsp; {_yc_truck_line}</div>
+                <div class="ys-sub">🟡 {_yc["yard"]} at yard &nbsp;·&nbsp; 🟢 {_yc["deployed"]} deployed &nbsp;·&nbsp; {_yc_truck_line}</div>
                 <button type="button" class="ai-btn solid" style="margin-top:14px;" onclick="ysShow('fleet')">Open fleet →</button>
             </div>
         </div>
