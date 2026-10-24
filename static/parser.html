@@ -2495,14 +2495,18 @@ function renderYardStrip() {
   yardInventory.forEach(function(c) {
     var el = document.createElement('span');
     el.className = 'yard-can' + (c.available ? '' : ' taken');
-    el.textContent = '#' + c.label + (c.size ? ' ' + c.size : '');
+    // 2026-10-24: some cans have no number on them — never render
+    // "#null". An unnumbered yard can shows as "30yd (no #)" and
+    // dispatches as a Delivery with no assigned can.
+    el.textContent = c.label ? ('#' + c.label + (c.size ? ' ' + c.size : ''))
+                             : ((c.size ? c.size : 'Can') + ' (no #)');
     el.title = (c.available ? 'Tap to use on a Delivery' : 'Already assigned to a route')
       + (c.source === 'route' ? ' — from route log' : '');
     if (c.available) {
       el.addEventListener('click', function() {
         // Open the confirm sheet prefilled as a Delivery with this can
         if (typeof openStopSheet === 'function') {
-          openStopSheet({ action: 'D', customer: '', address: '', container_size: c.size || '', assigned_can: c.label, dump_leg: '', return_leg: '', notes: '' }, null);
+          openStopSheet({ action: 'D', customer: '', address: '', container_size: c.size || '', assigned_can: c.label || '', dump_leg: '', return_leg: '', notes: '' }, null);
         }
       });
     }
