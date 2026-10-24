@@ -698,8 +698,8 @@
   @media (min-width: 768px) {
     .topnav {
       display: block;
-      background: #141412;
-      border-bottom: 1px solid rgba(255,255,255,.08);
+      background: #141414;
+      border-bottom: 1px solid rgba(255,107,26,0.12);
       position: sticky; top: 0; z-index: 1000;
       padding-top: env(safe-area-inset-top, 0px);
       box-shadow: 0 1px 0 rgba(255,107,26,.05), 0 2px 20px rgba(0,0,0,.4);
@@ -836,34 +836,29 @@
   .haul-more-items .nav-item { display: block; padding: 14px 20px; color: #fff; text-decoration: none; font-size: 16px; border-bottom: 1px solid rgba(255,255,255,0.05); }
   /* 2026-10-24: sheet icons match the Route Board sheet (outline, not emoji) */
   .haul-more-items .nav-item svg, .haul-more-owner-title svg, .haul-more-items button svg { width: 20px; height: 20px; vertical-align: -4px; margin-right: 10px; }
-  .haul-more-user { padding: 14px 20px 4px; color: #A6A69E; font-size: 13px; }
+  .haul-more-user { text-align: center; color: #888; font-size: 13px; padding: 8px; border-bottom: 1px solid rgba(255,255,255,0.08); margin-bottom: 8px; }
   /* 2026-10-24: topnav utility + More dropdown match the Route Board */
-  .topnav-links .nav-item svg { width: 16px; height: 16px; flex-shrink: 0; }
+  .topnav-links .nav-item { min-height: 48px; letter-spacing: .15px; }
+  .topnav-links .nav-item svg { width: 15px; height: 15px; flex-shrink: 0; }
   .topnav-utility { display: flex; align-items: center; gap: 12px; margin-left: auto; flex-shrink: 0; }
   .company-pill { font-size: 11.5px; font-weight: 700; letter-spacing: .3px; color: #A6A69E; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,107,26,0.14); border-radius: 20px; padding: 7px 14px; white-space: nowrap; }
   .topnav-right { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
   .topnav-more { position: relative; }
-  .topnav-more > summary { list-style: none; user-select: none; cursor: pointer; display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; padding: 10px 14px; border-radius: 9px; color: #8C8C82; font-weight: 600; font-size: 13px; }
+  .topnav-more > summary { list-style: none; user-select: none; cursor: pointer; display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; padding: 10px 14px; min-height: 48px; border-radius: 9px; color: #8C8C82; font-weight: 600; font-size: 13px; letter-spacing: .15px; }
   .topnav-more > summary:hover { background: rgba(255,107,26,.06); color: #E0E0D8; }
   .topnav-more > summary::-webkit-details-marker { display: none; }
-  .topnav-more-menu { position: absolute; top: calc(100% + 8px); right: 0; min-width: 220px; max-width: calc(100vw - 24px); background: #141417; border: 1px solid rgba(255,107,26,0.18); border-radius: 16px; padding: 10px; display: flex; flex-direction: column; gap: 2px; box-shadow: 0 12px 40px rgba(0,0,0,0.55); z-index: 1001; max-height: 70vh; overflow-y: auto; -webkit-overflow-scrolling: touch; }
-  .topnav-more-menu .nav-item { width: 100%; display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 9px; color: #E0E0D8; font-size: 13px; font-weight: 600; text-decoration: none; background: transparent; border: 1px solid transparent; cursor: pointer; font-family: inherit; text-align: left; }
-  .topnav-more-menu .nav-item:hover { background: rgba(255,107,26,.06); }
-  .topnav-more-menu .nav-item svg { width: 20px; height: 20px; flex-shrink: 0; }
-  .topnav-more-menu .nav-item.nav-logout { color: #FF9A9A; margin-top: 4px; }
-  .topnav-more-menu .nav-item.nav-logout:hover { background: rgba(255,50,50,0.10); border-color: rgba(255,60,60,0.20); color: #FF6B6B; }
+  .topnav-more-menu { position: absolute; top: calc(100% + 8px); right: 0; min-width: 220px; max-width: calc(100vw - 24px); background: rgba(23,23,23,0.55); border: 1px solid rgba(255,107,26,0.18); border-radius: 12px; padding: 10px; display: flex; flex-direction: column; gap: 2px; box-shadow: 0 12px 40px rgba(0,0,0,0.55); z-index: 1001; max-height: 70vh; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  .topnav-more-menu .nav-item { width: 100%; display: flex; align-items: center; gap: 7px; padding: 10px 14px; min-height: 48px; border-radius: 9px; color: #8C8C82; font-size: 13px; font-weight: 600; letter-spacing: .15px; text-decoration: none; background: transparent; border: 1px solid transparent; cursor: pointer; font-family: inherit; text-align: left; }
+  .topnav-more-menu .nav-item:hover { background: rgba(255,107,26,.06); border-color: rgba(255,107,26,0.12); color: #E0E0D8; }
+  .topnav-more-menu .nav-item svg { width: 15px; height: 15px; flex-shrink: 0; }
   .topnav-more-user { font-size: 11px; font-weight: 700; letter-spacing: .4px; color: #55554C; text-transform: uppercase; padding: 6px 10px 8px; border-bottom: 1px solid rgba(255,107,26,0.08); margin-bottom: 4px; }
   .topnav-more-sep { height: 1px; background: rgba(255,255,255,0.08); margin: 6px 4px; }
-  .topnav-more-menu .haul-more-owner-hero { display: block; padding: 10px 12px; border-radius: 9px; text-decoration: none; }
-  .topnav-more-menu .haul-more-owner-title { font-size: 15px; font-weight: 800; color: #FFB35C; display: flex; align-items: center; gap: 10px; }
-  .topnav-more-menu .haul-more-owner-title svg { width: 20px; height: 20px; }
-  .topnav-more-menu .haul-more-owner-sub { font-size: 12px; color: rgba(255,255,255,0.6); margin-top: 2px; }
-  .topnav-more-menu .topnav-more-head { font-size: 10px; font-weight: 800; letter-spacing: .6px; color: #78786F; text-transform: uppercase; padding: 10px 12px 4px; }
+  .topnav-more-menu .topnav-more-head { font-size: 10px; font-weight: 800; letter-spacing: .6px; color: #78786F; text-transform: uppercase; padding: 8px 10px 3px; margin-top: 2px; }
   .haul-more-logout { width: 100%; padding: 14px; background: rgba(255, 80, 80, 0.1); border: 1px solid rgba(255, 80, 80, 0.3); border-radius: 12px; color: #ff8080; font-size: 16px; font-weight: 600; cursor: pointer; }
   .haul-more-logout svg { width: 20px; height: 20px; vertical-align: -4px; margin-right: 10px; }
   .topnav-more-head {
-    font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase;
-    color: rgba(255,255,255,0.4); padding: 16px 20px 6px;
+    font-size: 10px; font-weight: 800; letter-spacing: .6px; text-transform: uppercase;
+    color: #78786F; padding: 8px 10px 3px; margin-top: 2px;
   }
   .haul-more-owner-hero {
     display: block; margin: 6px 16px 14px; padding: 18px 20px;
@@ -1033,7 +1028,7 @@
           <div class="topnav-more-sep"></div>
           <form method="POST" action="/logout" style="margin:0;padding:0;">
             <input type="hidden" name="_csrf_token" value="__CSRF_TOKEN__">
-            <button type="submit" class="nav-item nav-logout"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-power"/></svg>Logout</button>
+            <button type="submit" class="haul-more-logout"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-power"/></svg>Logout</button>
           </form>
         </div>
       </details>
