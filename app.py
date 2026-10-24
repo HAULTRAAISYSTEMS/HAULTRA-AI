@@ -23929,6 +23929,7 @@ def view_route(route_id):
             <p><strong>Action:</strong> {e(s['action'] or '')}{_can_pill}{_swap_badge}</p>
             {_swap_warning}
             <p><strong>Container:</strong> {e(s['container_size'] or '')}</p>
+            {('<p><strong>Yard Can:</strong> <span style="color:#3DDC84;font-weight:800;">🏗️ #' + e(dict(s).get('assigned_can') or '') + '</span></p>') if (dict(s).get('assigned_can') or '').strip() else (('<p><strong>Yard Can:</strong> <span class="muted">Not assigned — Edit to set it</span></p>') if (session.get('role') == 'boss' and 'delivery' in (dict(s).get('action') or '').lower()) else '')}
             <p><strong>Ticket:</strong> {e(s['ticket_number'] or '')}</p>
             {_weight_row_html(s)}
             {_fee_row_html(s)}
@@ -24846,27 +24847,58 @@ def edit_stop(stop_id):
         abort(404)
 
     if request.method == "POST":
-        conn.execute("""
-            UPDATE stops SET
-                customer_name=?, address=?, city=?, state=?, zip_code=?,
-                action=?, container_size=?, ticket_number=?, reference_number=?,
-                dump_location=?, notes=?, access_info=?
-            WHERE id=?
-        """, (
-            expand_abbrev(request.form.get("customer_name")),
-            expand_abbrev(request.form.get("address")),
-            expand_abbrev(request.form.get("city")),
-            expand_abbrev(request.form.get("state")),
-            expand_abbrev(request.form.get("zip_code")),
-            expand_abbrev(request.form.get("action")),
-            expand_abbrev(request.form.get("container_size")),
-            request.form.get("ticket_number"),
-            request.form.get("reference_number"),
-            expand_abbrev(request.form.get("dump_location", "")),
-            request.form.get("notes"),
-            request.form.get("access_info"),
-            stop_id
-        ))
+        # 2026-10-24: Yard Can # — boss can attach a yard can to an already
+        # dispatched stop (e.g. today's EW delivery -> 3117). This is what
+        # makes the delivery "complete" on the boss side and shows the
+        # driver the Hook-can banner in the cab.
+        _acan_form = (request.form.get("assigned_can") or "").strip()[:20]
+        try:
+            conn.execute("""
+                UPDATE stops SET
+                    customer_name=?, address=?, city=?, state=?, zip_code=?,
+                    action=?, container_size=?, ticket_number=?, reference_number=?,
+                    dump_location=?, notes=?, access_info=?, assigned_can=?
+                WHERE id=?
+            """, (
+                expand_abbrev(request.form.get("customer_name")),
+                expand_abbrev(request.form.get("address")),
+                expand_abbrev(request.form.get("city")),
+                expand_abbrev(request.form.get("state")),
+                expand_abbrev(request.form.get("zip_code")),
+                expand_abbrev(request.form.get("action")),
+                expand_abbrev(request.form.get("container_size")),
+                request.form.get("ticket_number"),
+                request.form.get("reference_number"),
+                expand_abbrev(request.form.get("dump_location", "")),
+                request.form.get("notes"),
+                request.form.get("access_info"),
+                _acan_form,
+                stop_id
+            ))
+        except Exception:
+            # Pre-migration DB without stops.assigned_can — save everything else.
+            conn.rollback()
+            conn.execute("""
+                UPDATE stops SET
+                    customer_name=?, address=?, city=?, state=?, zip_code=?,
+                    action=?, container_size=?, ticket_number=?, reference_number=?,
+                    dump_location=?, notes=?, access_info=?
+                WHERE id=?
+            """, (
+                expand_abbrev(request.form.get("customer_name")),
+                expand_abbrev(request.form.get("address")),
+                expand_abbrev(request.form.get("city")),
+                expand_abbrev(request.form.get("state")),
+                expand_abbrev(request.form.get("zip_code")),
+                expand_abbrev(request.form.get("action")),
+                expand_abbrev(request.form.get("container_size")),
+                request.form.get("ticket_number"),
+                request.form.get("reference_number"),
+                expand_abbrev(request.form.get("dump_location", "")),
+                request.form.get("notes"),
+                request.form.get("access_info"),
+                stop_id
+            ))
         conn.commit()
         route_id = ownership["route_id"]
         # Re-resolve the (possibly changed) dump site name to its location FK.
@@ -25054,6 +25086,10 @@ def edit_stop(stop_id):
                 <div>
                     <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Container Size</label>
                     <input name="container_size" value="{e(_stop['container_size'])}">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">🏗️ Yard Can #</label>
+                    <input name="assigned_can" value="{e(_stop.get('assigned_can') or '')}" placeholder="e.g. 3117 — leave blank if not from yard">
                 </div>
                 <div>
                     <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">{_edit_ticket_label}</label>
