@@ -17284,7 +17284,13 @@ def routes_page():
             lane_sort_assets += (
                 _STOP_DRAG_JS
                 .replace("__REORDER_STOPS_URL__", url_for("board_reorder_stops"))
-                .replace("__BOARD_PARTIAL_URL__", url_for("route_board_partial"))
+                # 2026-10-24: refreshBoard MUST carry the viewed day. The bare
+                # partial URL defaulted to today, so every stop cancel (and
+                # every reorder/retry refresh) silently swapped tomorrow's
+                # lanes for today's while the switcher still said TOMORROW.
+                # The 30s poll already passed ?day=; this was the only path
+                # that didn't.
+                .replace("__BOARD_PARTIAL_URL__", url_for("route_board_partial") + "?day=" + _board_day)
             )
         poll_script = f"""
         <script>
