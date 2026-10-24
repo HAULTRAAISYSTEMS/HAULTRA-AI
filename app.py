@@ -34069,7 +34069,7 @@ def _containers_section_html():
 
     _GROUP_LABEL = {
         "yard": "🟡 At Yard — in the yard, ready to assign",
-        "loaded_at_yard": "🔵 On Truck (loaded at yard) — on a truck, between yard and customer",
+        "loaded_at_yard": "🔵 On Truck — on a truck right now, heading to the dump, the yard, or back to the job",
         "stale": "⚠️ Needs review — was on a truck days ago, confirm where it is now",
         "deployed": "🟢 Deployed — dropped at a customer",
         "lost": "🔴 Lost",
@@ -34192,7 +34192,7 @@ def _containers_section_html():
             }} catch (e) {{ btn.textContent = 'Deploy failed'; btn.disabled = false; }}
         }}
         </script>
-        <p class="ai-sub" style="margin-top:10px;">🟡 At Yard = sitting in the yard, ready to assign &nbsp;·&nbsp; 🔵 On Truck (loaded at yard) = loaded onto a truck at the yard — heading out or heading back, not at a customer yet &nbsp;·&nbsp; ⚠️ Needs review = was on a truck more than 2 days ago with no next move recorded — confirm where it is (Edit to fix) &nbsp;·&nbsp; 🟢 Deployed = dropped at a customer.</p>
+        <p class="ai-sub" style="margin-top:10px;">🟡 At Yard = sitting in the yard, ready to assign &nbsp;·&nbsp; 🔵 On Truck = on a truck right now — picked up from a job and heading to the dump, the yard, or back to that job; not sitting at a customer yet &nbsp;·&nbsp; ⚠️ Needs review = was on a truck more than 2 days ago with no next move recorded — confirm where it is (Edit to fix) &nbsp;·&nbsp; 🟢 Deployed = dropped at a customer.</p>
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;" id="fl-chips">
             <button type="button" class="fl-chip active" data-fl-status="all" onclick="flSetStatus('all', this)">All ({len(containers)})</button>
             <button type="button" class="fl-chip fl-sign-glow" style="--glow:#fbbf24;" data-fl-status="yard" onclick="flSetStatus('yard', this)">🟡 At Yard ({_group_counts.get("yard", 0)})</button>
