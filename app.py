@@ -26209,6 +26209,12 @@ Rules:
 """
 
 
+_CONTAINER_LIST_OCR_PROMPT = "You read a CONTAINER / DUMPSTER INVENTORY LIST for a roll-off hauling company from a photo and return ONLY a JSON object. Each entry is a container with: can number / label, size (10yd, 20yd, 30yd, 40yd), status or location. NEVER guess. Return {\"containers\": [{\"label\": string|null, \"size\": string|null, \"status\": string|null, \"location\": string|null, \"confidence\": \"high\"|\"medium\"|\"low\"}], \"unreadable\": boolean}. status is one of: yard, deployed, lost. Skip headers and totals."
+
+_GARBAGE_ROUTE_OCR_PROMPT = "You read a WEEKLY GARBAGE ROUTE SHEET for a trash hauling company from a photo and return ONLY a JSON object. Each entry is a stop with: customer name and/or street address, city, container type. NEVER guess. Return {\"stops\": [{\"customer_name\": string|null, \"address\": string|null, \"city\": string|null, \"service_type\": string|null, \"notes\": string|null, \"confidence\": \"high\"|\"medium\"|\"low\"}], \"unreadable\": boolean}. service_type is one of: toter, hpu, landfill. Keep stops in route order. Skip headers and totals."
+
+
+
 _RATE_SHEET_OCR_PROMPT = """You read a RATE / PRICE SHEET for a roll-off dumpster hauling company from a photo and return ONLY a JSON object — no prose, no markdown fences.
 
 This could be a printed price list, a handwritten sheet, or a quote document. It lists container sizes (10yd, 20yd, 30yd, 40yd, etc.) with prices, and possibly extra fees (delivery, overweight, extra days, etc.).
@@ -26612,9 +26618,13 @@ def _onboarding_ocr_photo(kind):
     if not api_key:
         conn.close()
         return False, {"reason": "no_ai"}
-    prompt = _CUSTOMER_LIST_OCR_PROMPT if kind == "customers" else _RATE_SHEET_OCR_PROMPT
-    ask = ("Read this customer list. Return only the JSON." if kind == "customers"
-           else "Read this rate sheet. Return only the JSON.")
+    _OCR_PROMPTS = {
+        "customers": (_CUSTOMER_LIST_OCR_PROMPT, "Read this customer list. Return only the JSON."),
+        "rates": (_RATE_SHEET_OCR_PROMPT, "Read this rate sheet. Return only the JSON."),
+        "containers": (_CONTAINER_LIST_OCR_PROMPT, "Read this container inventory list. Return only the JSON."),
+        "garbage_route": (_GARBAGE_ROUTE_OCR_PROMPT, "Read this garbage route sheet. Return only the JSON."),
+    }
+    prompt, ask = _OCR_PROMPTS.get(kind, _OCR_PROMPTS["customers"])
     try:
         client = anthropic.Anthropic(api_key=api_key, timeout=30.0)
         resp = client.messages.create(
@@ -26810,6 +26820,193 @@ def api_confirm_rates():
         conn.rollback()
     conn.close()
     return jsonify({"ok": True, "imported": n})
+
+
+def _valid_container_status(s):
+    s = (s or "").strip().lower()
+    return s if s in ("yard", "deployed", "loaded_at_yard", "lost", "retired") else "yard"
+
+
+@app.route("/api/onboarding/containers/range", methods=["POST"])
+@login_required
+def api_containers_range():
+    """Bulk-create containers from a number range. e.g. 3001-3200, 20yd."""
+    if session.get("role") != "boss":
+        return jsonify({"ok": False}), 403
+    data = request.get_json(silent=True) or {}
+    try:
+        start = int(data.get("start"))
+        end = int(data.get("end"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "reason": "bad_range"}), 400
+    if start > end:
+        start, end = end, start
+    if end - start > 2000:
+        return jsonify({"ok": False, "reason": "too_many"}), 400
+    size = str(data.get("size") or "").strip()[:20] or "20yd"
+    status = _valid_container_status(data.get("status"))
+    prefix = str(data.get("prefix") or "").strip()[:10]
+    conn = get_db()
+    n = 0
+    ts = now_ts()
+    try:
+        for num in range(start, end + 1):
+            label = f"{prefix}{num}" if prefix else str(num)
+            conn.execute(
+                "INSERT INTO containers (company_id, size, label, status, created_at) VALUES (?,?,?,?,?)",
+                (cid(), size, label, status, ts))
+            n += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        n = 0
+    conn.close()
+    return jsonify({"ok": True, "imported": n})
+
+
+@app.route("/api/onboarding/scan-containers", methods=["POST"])
+@login_required
+def api_scan_containers():
+    """Boss photographs a container inventory list → AI extracts cans."""
+    if session.get("role") != "boss":
+        return jsonify({"ok": False, "reason": "forbidden"}), 403
+    try:
+        ok, payload = _onboarding_ocr_photo("containers")
+    except Exception as ex:
+        app.logger.warning("scan-containers: %s", ex)
+        return jsonify({"ok": False, "reason": "error"})
+    if not ok:
+        return jsonify({"ok": False, **payload})
+    if payload.get("unreadable") or not payload.get("containers"):
+        return jsonify({"ok": False, "reason": "unreadable"})
+    out = []
+    for c in payload["containers"][:500]:
+        if not isinstance(c, dict):
+            continue
+        def _s(v, n=40):
+            v = v or ""
+            return str(v).strip()[:n] if isinstance(v, (str, int, float)) else ""
+        conf = str(c.get("confidence", "medium")).lower()
+        label = _s(c.get("label"))
+        if not label:
+            continue
+        out.append({
+            "label": label,
+            "size": _s(c.get("size"), 20) or "20yd",
+            "status": _valid_container_status(c.get("status")),
+            "location": _s(c.get("location"), 120),
+            "confidence": conf if conf in ("high", "medium", "low") else "medium",
+        })
+    if not out:
+        return jsonify({"ok": False, "reason": "unreadable"})
+    return jsonify({"ok": True, "containers": out})
+
+
+@app.route("/api/onboarding/confirm-containers", methods=["POST"])
+@login_required
+def api_confirm_containers():
+    """Bulk-import reviewed containers."""
+    if session.get("role") != "boss":
+        return jsonify({"ok": False}), 403
+    data = request.get_json(silent=True) or {}
+    items = data.get("containers") or []
+    conn = get_db()
+    n = 0
+    ts = now_ts()
+    try:
+        for it in items[:1000]:
+            if not isinstance(it, dict):
+                continue
+            label = str(it.get("label") or "").strip()[:40]
+            if not label:
+                continue
+            size = str(it.get("size") or "").strip()[:20] or "20yd"
+            status = _valid_container_status(it.get("status"))
+            notes = str(it.get("location") or "").strip()[:200]
+            conn.execute(
+                "INSERT INTO containers (company_id, size, label, status, notes, created_at) VALUES (?,?,?,?,?,?)",
+                (cid(), size, label, status, notes, ts))
+            n += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        n = 0
+    conn.close()
+    return jsonify({"ok": True, "imported": n})
+
+
+@app.route("/api/onboarding/scan-garbage-route", methods=["POST"])
+@login_required
+def api_scan_garbage_route():
+    """Boss photographs a weekly garbage route sheet → AI extracts stops."""
+    if session.get("role") != "boss":
+        return jsonify({"ok": False, "reason": "forbidden"}), 403
+    try:
+        ok, payload = _onboarding_ocr_photo("garbage_route")
+    except Exception as ex:
+        app.logger.warning("scan-garbage-route: %s", ex)
+        return jsonify({"ok": False, "reason": "error"})
+    if not ok:
+        return jsonify({"ok": False, **payload})
+    if payload.get("unreadable") or not payload.get("stops"):
+        return jsonify({"ok": False, "reason": "unreadable"})
+    out = []
+    for s in payload["stops"][:300]:
+        if not isinstance(s, dict):
+            continue
+        def _s(v, n=200):
+            v = v or ""
+            return str(v).strip()[:n] if isinstance(v, (str, int, float)) else ""
+        conf = str(s.get("confidence", "medium")).lower()
+        addr = _s(s.get("address"))
+        nm = _s(s.get("customer_name"), 120)
+        if not (addr or nm):
+            continue
+        st = _s(s.get("service_type"), 20).lower()
+        out.append({
+            "customer_name": nm or None,
+            "address": addr or None,
+            "city": _s(s.get("city"), 60) or None,
+            "service_type": st if st in ("toter", "hpu", "landfill") else "toter",
+            "notes": _s(s.get("notes"), 300) or None,
+            "confidence": conf if conf in ("high", "medium", "low") else "medium",
+        })
+    if not out:
+        return jsonify({"ok": False, "reason": "unreadable"})
+    return jsonify({"ok": True, "stops": out})
+
+
+@app.route("/api/onboarding/confirm-garbage-template", methods=["POST"])
+@login_required
+def api_confirm_garbage_template():
+    """Save reviewed garbage route stops as a named weekly template."""
+    if session.get("role") != "boss":
+        return jsonify({"ok": False}), 403
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name") or "").strip()[:80]
+    if not name:
+        return jsonify({"ok": False, "reason": "need_name"}), 400
+    stops = _clean_garbage_stops(data.get("stops"))
+    if not stops:
+        return jsonify({"ok": False, "reason": "no_stops"}), 400
+    # Also learn each stop's address into the address book
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO garbage_templates (company_id, name, stops_json, created_by, created_at) VALUES (?,?,?,?,?)",
+            (cid(), name, json.dumps(stops), session["user_id"], now_ts()))
+        for s in stops:
+            try:
+                learn_location(conn, cid(), s["address"], city=s.get("city", ""))
+            except Exception:
+                pass
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        return jsonify({"ok": False, "reason": "error"}), 500
+    conn.close()
+    return jsonify({"ok": True, "imported": len(stops), "name": name})
 
 
 def _site_issues_tickets(conn, company_id, stop):
@@ -32916,9 +33113,14 @@ def _onboarding_steps(conn, company_id, user_id):
          "url": url_for("settings_page") + "#rate-card",
          "essential": False},
         {"key": "fleet", "title": "Container fleet",
-         "desc": "Track your cans — what's out, what's at the yard.",
+         "desc": "Range-add, scan, or upload — 200 cans in minutes, not hours.",
          "done": _count("SELECT COUNT(*) FROM containers WHERE company_id=?", company_id) > 0,
-         "url": url_for("yard_setup_page") + "#containers",
+         "url": url_for("onboarding_import_containers"),
+         "essential": False},
+        {"key": "garbage", "title": "Garbage routes",
+         "desc": "Scan each day's paper route — five photos and your week is set.",
+         "done": _count("SELECT COUNT(*) FROM garbage_templates WHERE company_id=?", company_id) > 0,
+         "url": url_for("onboarding_import_garbage"),
          "essential": False},
         {"key": "payroll", "title": "Work hours & pay cycle",
          "desc": "Clock-in rules and pay periods for the team.",
@@ -32994,6 +33196,423 @@ def onboarding_setup():
     </style>
     """
     return render_template_string(shell_page("Get Set Up", body))
+
+
+@app.route("/onboarding/import-garbage")
+@login_required
+def onboarding_import_garbage():
+    """Garbage route onboarding: scan each day's paper route → save as template."""
+    if session.get("role") != "boss":
+        return redirect(url_for("dashboard"))
+    _csrf = get_csrf_token()
+    conn = get_db()
+    try:
+        templates = conn.execute(
+            "SELECT id, name, stops_json FROM garbage_templates WHERE company_id=? ORDER BY name",
+            (cid(),)).fetchall()
+        _tn = len(templates)
+        _tlist = []
+        for t in templates:
+            try:
+                n = len(json.loads(t["stops_json"] or "[]"))
+            except (ValueError, TypeError):
+                n = 0
+            _tlist.append((t["name"], n))
+    except Exception:
+        _tn = 0
+        _tlist = []
+    conn.close()
+
+    _existing = "".join(f"<div class='ob-result'><strong>{e(nm)}</strong> <span class='muted small'>{n} stops</span></div>" for nm, n in _tlist)
+
+    body = f"""
+    {_onboarding_back_banner()}
+    <div class="hero">
+        <h1>🚛 Garbage Routes</h1>
+        <p>{_tn} weekly routes saved. Snap each day's paper route — five photos and your week lives in the app.</p>
+    </div>
+    <div class="card ob-scan-card">
+        <h2 style="margin-top:0;">📷 Scan a day's route</h2>
+        <p class="muted small">Photograph Monday's route sheet (or any day). AI reads every stop in order — you name it and save it as a weekly template.</p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:10px;">
+            <label class="muted small">Day<br><select id="gb-day" style="min-height:48px;padding:8px 12px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);">
+                <option>Monday</option><option>Tuesday</option><option>Wednesday</option>
+                <option>Thursday</option><option>Friday</option><option>Saturday</option>
+            </select></label>
+            <label class="btn gold ob-scan-btn" style="min-height:48px;">📷 Scan route sheet
+                <input type="file" id="gb-scan" accept="image/*" capture="environment" hidden>
+            </label>
+            <span id="gb-scan-status" class="muted small"></span>
+        </div>
+        <div id="gb-scan-results"></div>
+    </div>
+    <div class="card">
+        <h2 style="margin-top:0;">📋 Your weekly routes</h2>
+        {_existing or "<p class='muted'>No routes yet — scan your first day above.</p>"}
+        <p class="muted small" style="margin-top:10px;">Dispatch any day from the Garbage tab by loading its template.</p>
+    </div>
+    <style>
+    .ob-ok {{ color:#3DDC84; font-weight:700; }}
+    .ob-scan-card {{ border:1px solid rgba(255,107,26,.25); background:linear-gradient(135deg, rgba(255,107,26,.05), rgba(255,107,26,.01)); }}
+    .ob-scan-btn {{ min-height:52px; font-size:1rem; cursor:pointer; display:inline-flex; align-items:center; }}
+    .ob-result {{ border:1px solid rgba(255,255,255,.1); border-radius:12px; padding:12px; margin:8px 0; background:rgba(255,255,255,.02); }}
+    .ob-conf {{ font-size:.72rem; font-weight:800; padding:4px 10px; border-radius:999px; }}
+    .ob-conf.high {{ background:rgba(61,220,132,.15); color:#3DDC84; }}
+    .ob-conf.medium {{ background:rgba(245,180,60,.15); color:#F5B43C; }}
+    .ob-conf.low {{ background:rgba(255,82,82,.15); color:#FF5252; }}
+    .ob-import-bar {{ position:sticky; bottom:0; padding:12px; background:rgba(20,20,20,.95); border-top:1px solid rgba(255,107,26,.3); display:flex; gap:10px; justify-content:center; margin:16px -16px -16px; border-radius:0 0 12px 12px; }}
+    @keyframes ob-pulse {{ 0%,100% {{ opacity:1; }} 50% {{ opacity:.4; }} }}
+    .ob-reading {{ animation:ob-pulse 1.2s infinite; color:#FF9D5C; font-weight:700; }}
+    </style>
+    <script>
+    (function(){{
+        var csrf = '{_csrf}';
+        function esc(s){{ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }}
+        function downscale(file) {{
+            return new Promise(function(resolve) {{
+                var rd = new FileReader();
+                rd.onload = function() {{
+                    var img = new Image();
+                    img.onload = function() {{
+                        try {{
+                            var w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+                            var scale = Math.min(1, 1600 / Math.max(w, h));
+                            var cv = document.createElement('canvas');
+                            cv.width = Math.round(w * scale); cv.height = Math.round(h * scale);
+                            cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+                            cv.toBlob(function(blob) {{
+                                resolve(blob ? new File([blob], 'scan.jpg', {{type:'image/jpeg'}}) : file);
+                            }}, 'image/jpeg', 0.72);
+                        }} catch (e) {{ resolve(file); }}
+                    }};
+                    img.onerror = function() {{ resolve(file); }};
+                    img.src = rd.result;
+                }};
+                rd.onerror = function() {{ resolve(file); }};
+                rd.readAsDataURL(file);
+            }});
+        }}
+        var scInput = document.getElementById('gb-scan');
+        var scStatus = document.getElementById('gb-scan-status');
+        var scResults = document.getElementById('gb-scan-results');
+        var scData = [];
+        if (scInput) scInput.addEventListener('change', function(){{
+            var f = scInput.files[0];
+            if (!f) return;
+            var day = document.getElementById('gb-day').value;
+            scStatus.innerHTML = '<span class="ob-reading">Reading ' + day + '\\'s route...</span>';
+            scResults.innerHTML = '';
+            downscale(f).then(function(small){{
+                var fd = new FormData(); fd.append('photo', small);
+                return fetch('/api/onboarding/scan-garbage-route', {{method:'POST', headers:{{'X-CSRF-Token': csrf}}, body:fd}})
+                .then(function(r){{ return r.text().then(function(t){{
+                    var d=null; try{{ d=JSON.parse(t); }}catch(e){{}}
+                    if(!d) throw new Error('server'); return d; }}); }});
+            }}).then(function(d){{
+                if (!d.ok) {{
+                    var rmap = {{unreadable:'Could not read it - try a clearer photo.', cap:'Daily scan limit reached.',
+                        no_ai:'AI not configured - contact support.', error:'Server hiccup - try again.'}};
+                    scStatus.textContent = rmap[d.reason] || 'Scan failed - try again.';
+                    return;
+                }}
+                scData = d.stops;
+                scStatus.textContent = 'Found ' + scData.length + ' stops - review, name it, save.';
+                var h = '<div style="max-height:380px;overflow-y:auto;">';
+                scData.forEach(function(s, i){{
+                    h += '<div class="ob-result"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
+                        + '<strong>#' + (i+1) + ' ' + esc(s.customer_name || s.address || '') + '</strong>'
+                        + '<span class="ob-conf ' + s.confidence + '">' + s.confidence + '</span></div>'
+                        + '<div style="display:flex;gap:8px;flex-wrap:wrap;">'
+                        + '<input data-i="'+i+'" data-f="customer_name" value="'+esc(s.customer_name)+'" placeholder="Customer" style="flex:1;min-width:120px;min-height:40px;padding:6px 10px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);">'
+                        + '<input data-i="'+i+'" data-f="address" value="'+esc(s.address)+'" placeholder="Address" style="flex:2;min-width:160px;min-height:40px;padding:6px 10px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);">'
+                        + '<select data-i="'+i+'" data-f="service_type" style="min-height:40px;padding:6px 10px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);">'
+                        + ['toter','hpu','landfill'].map(function(t){{ return '<option'+(t===s.service_type?' selected':'')+'>'+t+'</option>'; }}).join('')
+                        + '</select>'
+                        + '</div></div>';
+                }});
+                h += '</div>';
+                h += '<div class="ob-import-bar">'
+                    + '<input id="gb-tname" value="' + esc(document.getElementById('gb-day').value) + ' Route" placeholder="Route name" style="min-height:52px;padding:8px 14px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);flex:1;max-width:220px;">'
+                    + '<button class="btn gold" id="gb-save" style="min-height:52px;">Save ' + scData.length + ' stops</button></div>';
+                scResults.innerHTML = h;
+                document.getElementById('gb-save').addEventListener('click', function(){{
+                    scResults.querySelectorAll('[data-i]').forEach(function(inp){{
+                        var i = +inp.getAttribute('data-i'), f = inp.getAttribute('data-f');
+                        scData[i][f] = inp.value.trim();
+                    }});
+                    var tname = document.getElementById('gb-tname').value.trim() || (day + ' Route');
+                    scStatus.innerHTML = '<span class="ob-reading">Saving...</span>';
+                    fetch('/api/onboarding/confirm-garbage-template', {{
+                        method:'POST', headers:{{'Content-Type':'application/json','X-CSRF-Token': csrf}},
+                        body: JSON.stringify({{name: tname, stops: scData}})
+                    }}).then(function(r){{ return r.json(); }}).then(function(d){{
+                        if (d.ok) {{
+                            scResults.innerHTML = '<p class="ob-ok" style="font-size:1.1rem;">' + esc(d.name) + ' saved — ' + d.imported + ' stops!</p>';
+                            scStatus.textContent = '';
+                            setTimeout(function(){{ location.reload(); }}, 1500);
+                        }} else scStatus.textContent = d.reason === 'need_name' ? 'Give the route a name.' : 'Save failed - try again.';
+                    }});
+                }});
+            }}).catch(function(){{ scStatus.textContent = 'Upload failed - try again.'; }});
+        }});
+    }})();
+    </script>
+    """
+    return render_template_string(shell_page("Garbage Routes", body))
+
+
+@app.route("/onboarding/import-containers", methods=["GET", "POST"])
+@login_required
+def onboarding_import_containers():
+    """Container fleet onboarding: range add, photo scan, CSV, manual."""
+    if session.get("role") != "boss":
+        return redirect(url_for("dashboard"))
+    _csrf = get_csrf_token()
+    msg = ""
+    if request.method == "POST":
+        mode = request.form.get("mode", "")
+        conn = get_db()
+        try:
+            if mode == "manual":
+                label = request.form.get("label", "").strip()[:40]
+                size = request.form.get("size", "").strip()[:20] or "20yd"
+                status = _valid_container_status(request.form.get("status"))
+                if label:
+                    conn.execute(
+                        "INSERT INTO containers (company_id, size, label, status, created_at) VALUES (?,?,?,?,?)",
+                        (cid(), size, label, status, now_ts()))
+                    conn.commit()
+                    msg = f"<p class='ob-ok'>Added can {e(label)}</p>"
+                else:
+                    msg = "<p class='ob-err'>Enter a can number.</p>"
+            elif mode == "csv":
+                f = request.files.get("csv_file")
+                if f and f.filename:
+                    import csv as _csv, io as _io
+                    text = f.read().decode("utf-8-sig", errors="replace")
+                    reader = _csv.DictReader(_io.StringIO(text))
+                    n = 0
+                    ts = now_ts()
+                    for row in reader:
+                        rl = {k.lower().strip(): (v or "").strip() for k, v in row.items() if k}
+                        label = rl.get("label") or rl.get("can") or rl.get("can_number") or rl.get("number") or ""
+                        if not label:
+                            continue
+                        size = rl.get("size") or "20yd"
+                        status = _valid_container_status(rl.get("status"))
+                        notes = rl.get("location") or rl.get("notes") or ""
+                        conn.execute(
+                            "INSERT INTO containers (company_id, size, label, status, notes, created_at) VALUES (?,?,?,?,?,?)",
+                            (cid(), size[:20], label[:40], status, notes[:200], ts))
+                        n += 1
+                    conn.commit()
+                    msg = f"<p class='ob-ok'>Imported {n} containers from CSV</p>"
+                else:
+                    msg = "<p class='ob-err'>Choose a CSV file.</p>"
+        except Exception as ex:
+            conn.rollback()
+            msg = f"<p class='ob-err'>Import failed: {e(str(ex)[:120])}</p>"
+        finally:
+            conn.close()
+
+    conn = get_db()
+    try:
+        _nc = conn.execute("SELECT COUNT(*) FROM containers WHERE company_id=?", (cid(),)).fetchone()[0] or 0
+        _ny = conn.execute("SELECT COUNT(*) FROM containers WHERE company_id=? AND status='yard'", (cid(),)).fetchone()[0] or 0
+        _nd = conn.execute("SELECT COUNT(*) FROM containers WHERE company_id=? AND status='deployed'", (cid(),)).fetchone()[0] or 0
+    except Exception:
+        _nc = _ny = _nd = 0
+    conn.close()
+
+    body = f"""
+    {_onboarding_back_banner()}
+    <div class="hero">
+        <h1>📦 Container Fleet</h1>
+        <p>{_nc} cans tracked ({_ny} at yard, {_nd} deployed). Three fast ways to add more.</p>
+    </div>
+    {msg}
+    <div class="card ob-scan-card">
+        <h2 style="margin-top:0;">⚡ Add a whole range</h2>
+        <p class="muted small">Numbered sequentially? <strong>Cans 3001–3200, all 20-yard</strong> → 200 cans in one tap.</p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;">
+            <label class="muted small">From<br><input id="ct-range-start" inputmode="numeric" placeholder="3001" style="width:100px;min-height:48px;padding:8px 12px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);"></label>
+            <label class="muted small">To<br><input id="ct-range-end" inputmode="numeric" placeholder="3200" style="width:100px;min-height:48px;padding:8px 12px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);"></label>
+            <label class="muted small">Size<br><select id="ct-range-size" style="min-height:48px;padding:8px 12px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);">
+                <option>10yd</option><option selected>20yd</option><option>30yd</option><option>40yd</option>
+            </select></label>
+            <label class="muted small">Where<br><select id="ct-range-status" style="min-height:48px;padding:8px 12px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);">
+                <option value="yard" selected>At yard</option><option value="deployed">Deployed</option>
+            </select></label>
+            <button class="btn gold" id="ct-range-go" style="min-height:48px;">Add range</button>
+        </div>
+        <div id="ct-range-status" class="muted small" style="margin-top:8px;"></div>
+    </div>
+    <div class="card ob-scan-card">
+        <h2 style="margin-top:0;">📷 Scan your can list</h2>
+        <p class="muted small">Photo of your inventory sheet — AI reads every can number, size, and location.</p>
+        <div class="ob-scan-row">
+            <label class="btn gold ob-scan-btn">📷 Scan can list
+                <input type="file" id="ct-scan" accept="image/*" capture="environment" hidden>
+            </label>
+            <span id="ct-scan-status" class="muted small"></span>
+        </div>
+        <div id="ct-scan-results"></div>
+    </div>
+    <div class="card">
+        <h2 style="margin-top:0;">📊 Upload a spreadsheet</h2>
+        <p class="muted small">CSV with headers like <code>label, size, status, location</code>.</p>
+        <form method="POST" enctype="multipart/form-data" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+            <input type="hidden" name="_csrf_token" value="{_csrf}">
+            <input type="hidden" name="mode" value="csv">
+            <input type="file" name="csv_file" accept=".csv" style="color:var(--text);">
+            <button class="btn" type="submit" style="min-height:48px;">Upload & Import</button>
+        </form>
+    </div>
+    <div class="card">
+        <h2 style="margin-top:0;">✏️ Add one manually</h2>
+        <form method="POST" style="display:flex;gap:8px;flex-wrap:wrap;">
+            <input type="hidden" name="_csrf_token" value="{_csrf}">
+            <input type="hidden" name="mode" value="manual">
+            <input name="label" placeholder="Can number (e.g. 3042)" style="flex:1;min-width:140px;min-height:48px;padding:8px 12px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);">
+            <select name="size" style="min-height:48px;padding:8px 12px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);">
+                <option>10yd</option><option selected>20yd</option><option>30yd</option><option>40yd</option>
+            </select>
+            <select name="status" style="min-height:48px;padding:8px 12px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);">
+                <option value="yard">At yard</option><option value="deployed">Deployed</option>
+            </select>
+            <button class="btn" type="submit" style="min-height:48px;">+ Add</button>
+        </form>
+    </div>
+    <style>
+    .ob-ok {{ color:#3DDC84; font-weight:700; }}
+    .ob-err {{ color:#FF6B6B; font-weight:700; }}
+    .ob-scan-card {{ border:1px solid rgba(255,107,26,.25); background:linear-gradient(135deg, rgba(255,107,26,.05), rgba(255,107,26,.01)); }}
+    .ob-scan-row {{ display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin:10px 0; }}
+    .ob-scan-btn {{ min-height:52px; font-size:1rem; cursor:pointer; }}
+    .ob-result {{ border:1px solid rgba(255,255,255,.1); border-radius:12px; padding:12px; margin:8px 0; background:rgba(255,255,255,.02); }}
+    .ob-conf {{ font-size:.72rem; font-weight:800; padding:4px 10px; border-radius:999px; }}
+    .ob-conf.high {{ background:rgba(61,220,132,.15); color:#3DDC84; }}
+    .ob-conf.medium {{ background:rgba(245,180,60,.15); color:#F5B43C; }}
+    .ob-conf.low {{ background:rgba(255,82,82,.15); color:#FF5252; }}
+    .ob-import-bar {{ position:sticky; bottom:0; padding:12px; background:rgba(20,20,20,.95); border-top:1px solid rgba(255,107,26,.3); display:flex; gap:10px; justify-content:center; margin:16px -16px -16px; border-radius:0 0 12px 12px; }}
+    @keyframes ob-pulse {{ 0%,100% {{ opacity:1; }} 50% {{ opacity:.4; }} }}
+    .ob-reading {{ animation:ob-pulse 1.2s infinite; color:#FF9D5C; font-weight:700; }}
+    </style>
+    <script>
+    (function(){{
+        var csrf = '{_csrf}';
+        function esc(s){{ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }}
+        function downscale(file) {{
+            return new Promise(function(resolve) {{
+                var rd = new FileReader();
+                rd.onload = function() {{
+                    var img = new Image();
+                    img.onload = function() {{
+                        try {{
+                            var w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+                            var scale = Math.min(1, 1600 / Math.max(w, h));
+                            var cv = document.createElement('canvas');
+                            cv.width = Math.round(w * scale); cv.height = Math.round(h * scale);
+                            cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+                            cv.toBlob(function(blob) {{
+                                resolve(blob ? new File([blob], 'scan.jpg', {{type:'image/jpeg'}}) : file);
+                            }}, 'image/jpeg', 0.72);
+                        }} catch (e) {{ resolve(file); }}
+                    }};
+                    img.onerror = function() {{ resolve(file); }};
+                    img.src = rd.result;
+                }};
+                rd.onerror = function() {{ resolve(file); }};
+                rd.readAsDataURL(file);
+            }});
+        }}
+        // Range add
+        var rgGo = document.getElementById('ct-range-go');
+        if (rgGo) rgGo.addEventListener('click', function(){{
+            var s = parseInt(document.getElementById('ct-range-start').value, 10);
+            var e = parseInt(document.getElementById('ct-range-end').value, 10);
+            var st = document.getElementById('ct-range-status');
+            if (!s || !e) {{ st.textContent = 'Enter both numbers.'; return; }}
+            var count = Math.abs(e - s) + 1;
+            if (!confirm('Add ' + count + ' containers?')) return;
+            st.innerHTML = '<span class="ob-reading">Adding...</span>';
+            fetch('/api/onboarding/containers/range', {{
+                method:'POST', headers:{{'Content-Type':'application/json','X-CSRF-Token': csrf}},
+                body: JSON.stringify({{start:s, end:e,
+                    size: document.getElementById('ct-range-size').value,
+                    status: document.getElementById('ct-range-status').value}})
+            }}).then(function(r){{ return r.json(); }}).then(function(d){{
+                st.innerHTML = d.ok ? '<span class="ob-ok">' + d.imported + ' containers added!</span>' : 'Failed - try again.';
+                if (d.ok) setTimeout(function(){{ location.reload(); }}, 1200);
+            }}).catch(function(){{ st.textContent = 'No signal - try again.'; }});
+        }});
+        // Photo scan
+        var scInput = document.getElementById('ct-scan');
+        var scStatus = document.getElementById('ct-scan-status');
+        var scResults = document.getElementById('ct-scan-results');
+        var scData = [];
+        if (scInput) scInput.addEventListener('change', function(){{
+            var f = scInput.files[0];
+            if (!f) return;
+            scStatus.innerHTML = '<span class="ob-reading">Reading your cans...</span>';
+            scResults.innerHTML = '';
+            downscale(f).then(function(small){{
+                var fd = new FormData(); fd.append('photo', small);
+                return fetch('/api/onboarding/scan-containers', {{method:'POST', headers:{{'X-CSRF-Token': csrf}}, body:fd}})
+                .then(function(r){{ return r.text().then(function(t){{
+                    var d=null; try{{ d=JSON.parse(t); }}catch(e){{}}
+                    if(!d) throw new Error('server'); return d; }}); }});
+            }}).then(function(d){{
+                if (!d.ok) {{
+                    var rmap = {{unreadable:'Could not read it - try a clearer photo.', cap:'Daily scan limit reached.',
+                        no_ai:'AI not configured - contact support.', error:'Server hiccup - try again.'}};
+                    scStatus.textContent = rmap[d.reason] || 'Scan failed - try again.';
+                    return;
+                }}
+                scData = d.containers;
+                scStatus.textContent = 'Found ' + scData.length + ' cans - review and tap Import.';
+                var h = '<div style="max-height:400px;overflow-y:auto;">';
+                scData.forEach(function(c, i){{
+                    h += '<div class="ob-result"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">'
+                        + '<strong>#' + esc(c.label) + '</strong>'
+                        + '<span class="ob-conf ' + c.confidence + '">' + c.confidence + '</span></div>'
+                        + '<div style="display:flex;gap:8px;">'
+                        + '<input data-i="'+i+'" data-f="label" value="'+esc(c.label)+'" style="width:90px;min-height:40px;padding:6px 10px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);">'
+                        + '<select data-i="'+i+'" data-f="size" style="min-height:40px;padding:6px 10px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);">'
+                        + ['10yd','20yd','30yd','40yd'].map(function(sz){{ return '<option'+(sz===c.size?' selected':'')+'>'+sz+'</option>'; }}).join('')
+                        + '</select>'
+                        + '<select data-i="'+i+'" data-f="status" style="min-height:40px;padding:6px 10px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);">'
+                        + ['yard','deployed','lost'].map(function(st){{ return '<option value="'+st+'"'+(st===c.status?' selected':'')+'>'+st+'</option>'; }}).join('')
+                        + '</select>'
+                        + '</div>'
+                        + (c.location ? '<div class="muted small" style="margin-top:4px;">'+esc(c.location)+'</div>' : '')
+                        + '</div>';
+                }});
+                h += '</div><div class="ob-import-bar"><button class="btn gold" id="ct-scan-import" style="min-height:52px;flex:1;max-width:320px;">Import ' + scData.length + ' cans</button></div>';
+                scResults.innerHTML = h;
+                document.getElementById('ct-scan-import').addEventListener('click', function(){{
+                    scResults.querySelectorAll('[data-i]').forEach(function(inp){{
+                        var i = +inp.getAttribute('data-i'), f = inp.getAttribute('data-f');
+                        scData[i][f] = inp.value.trim();
+                    }});
+                    scStatus.innerHTML = '<span class="ob-reading">Importing...</span>';
+                    fetch('/api/onboarding/confirm-containers', {{
+                        method:'POST', headers:{{'Content-Type':'application/json','X-CSRF-Token': csrf}},
+                        body: JSON.stringify({{containers: scData}})
+                    }}).then(function(r){{ return r.json(); }}).then(function(d){{
+                        if (d.ok) {{
+                            scResults.innerHTML = '<p class="ob-ok" style="font-size:1.1rem;">' + d.imported + ' cans added to your fleet!</p>';
+                            scStatus.textContent = '';
+                            setTimeout(function(){{ location.reload(); }}, 1500);
+                        }} else scStatus.textContent = 'Import failed - try again.';
+                    }});
+                }});
+            }}).catch(function(){{ scStatus.textContent = 'Upload failed - try again.'; }});
+        }});
+    }})();
+    </script>
+    """
+    return render_template_string(shell_page("Container Fleet", body))
 
 
 @app.route("/onboarding/import-customers", methods=["GET", "POST"])
