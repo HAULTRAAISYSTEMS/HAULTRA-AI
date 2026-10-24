@@ -33822,10 +33822,15 @@ def _containers_section_html():
     }
 
     rows_html = ""
-    for c in containers:
+    for _fidx, c in enumerate(containers):
         _cd   = dict(c)
         _cid  = _cd["id"]
         _sc   = STATUS_COLOR.get(_cd["status"], "#D8D8D0")
+        # 2026-10-24: fleet is long now that it auto-learns — show the
+        # first 25, search across all, 'Show all' reveals the rest.
+        _fsearch = " ".join(p for p in [_cd["label"] or "", _cd["size"] or "",
+                                        _cd["status"] or "", _cd["notes"] or ""] if p).lower()
+        _fextra = ' class="fl-extra" style="display:none;"' if _fidx >= 25 else ""
         _badge = (
             f'<span style="font-size:11px;padding:2px 8px;border-radius:5px;'
             f'background:rgba(0,0,0,0.3);color:{_sc};border:1px solid {_sc}33;">'
@@ -33835,7 +33840,7 @@ def _containers_section_html():
         if _cd["status"] == "deployed":
             _deployed_note = f'<div class="small muted" style="margin-top:2px;">On site at {on_site_counts.get(_cid, "?")} location(s)</div>'
         rows_html += f"""
-        <tr>
+        <tr data-search="{e(_fsearch)}"{_fextra}>
             <td><strong>{e(_cd["size"])}</strong></td>
             <td class="muted small">{e(_cd["label"] or "")}</td>
             <td>{_badge}{_deployed_note}</td>
@@ -33878,6 +33883,10 @@ def _containers_section_html():
             btn.disabled = false;
         }}
         </script>
+        <input id="fl-filter" type="text" placeholder="Search label, size, status, or notes&hellip;"
+               oninput="flFilter(this.value)"
+               style="width:100%;min-height:48px;padding:10px 14px;margin-bottom:14px;background:rgba(255,255,255,.04);
+                      border:1px solid rgba(255,255,255,0.12);border-radius:12px;color:var(--text);">
         <div class="table-wrap">
             <table class="ai-table">
                 <thead>
@@ -33888,6 +33897,22 @@ def _containers_section_html():
                 </tbody>
             </table>
         </div>
+        {('<div style="text-align:center;margin-top:12px;"><button type="button" class="ai-btn" id="fl-show-all" onclick="flShowAll()">Show all ' + str(len(containers)) + ' containers</button></div>') if len(containers) > 25 else ''}
+        <script>
+        var flAllShown = false;
+        function flFilter(v) {{
+            v = v.toLowerCase();
+            document.querySelectorAll('#containers tbody tr[data-search]').forEach(function(r) {{
+                if (v) {{ r.style.display = r.getAttribute('data-search').indexOf(v) > -1 ? '' : 'none'; }}
+                else {{ r.style.display = (r.classList.contains('fl-extra') && !flAllShown) ? 'none' : ''; }}
+            }});
+        }}
+        function flShowAll() {{
+            flAllShown = true;
+            document.querySelectorAll('#containers tr.fl-extra').forEach(function(r) {{ r.style.display = ''; }});
+            var b = document.getElementById('fl-show-all'); if (b) {{ b.style.display = 'none'; }}
+        }}
+        </script>
     </div>
     """
 
@@ -34750,6 +34775,28 @@ def yard_setup_page():
         conn.close()
     except Exception:
         pass
+    # 2026-10-24: Yard Setup is one long scroll no more — tabbed layout
+    # with an Overview of live counts. Counts are cheap COUNTs; the full
+    # sections still render into hidden panels, so every form, toggle and
+    # button works exactly as before.
+    _yc = {}
+    try:
+        conn = get_db()
+        def _cnt(q, *a):
+            try:
+                return conn.execute(q, a).fetchone()[0] or 0
+            except Exception:
+                return 0
+        _yc["dump"] = _cnt("SELECT COUNT(*) FROM dump_locations WHERE company_id=?", cid())
+        _yc["vocab"] = _cnt("SELECT COUNT(*) FROM parse_vocab WHERE company_id=?", cid())
+        _yc["addr"] = _cnt("SELECT COUNT(*) FROM saved_addresses WHERE company_id=? AND TRIM(COALESCE(address,'')) != ''", cid())
+        _yc["fleet"] = _cnt("SELECT COUNT(*) FROM containers WHERE company_id=?", cid())
+        _yc["yard"] = _cnt("SELECT COUNT(*) FROM containers WHERE company_id=? AND status='yard'", cid())
+        _yc["deployed"] = _cnt("SELECT COUNT(*) FROM containers WHERE company_id=? AND status='deployed'", cid())
+        _yc["truck"] = _cnt("SELECT COUNT(*) FROM containers WHERE company_id=? AND status='loaded_at_yard'", cid())
+        conn.close()
+    except Exception:
+        _yc = {"dump": 0, "vocab": 0, "addr": 0, "fleet": 0, "yard": 0, "deployed": 0, "truck": 0}
     body = f"""
     <div class="hero" style="position:relative;overflow:hidden;border-radius:24px;padding:36px 28px;margin-bottom:24px;
         background:radial-gradient(700px 320px at 30% 0%, rgba(255,107,26,.12), transparent 65%), rgba(255,255,255,.02);
@@ -34758,10 +34805,73 @@ def yard_setup_page():
         <h1 class="ai-title" style="font-size:2rem;">Yard Setup</h1>
         <p class="ai-sub" style="margin:0;">Dump locations and your container fleet, in one place — taught to the AI as you go.</p>
     </div>
-    {_dump_locations_section_html()}
-    {_parse_vocab_section_html()}
-    {_address_book_section_html()}
-    {_containers_section_html()}
+    <style>
+    .ys-tabs{{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px;}}
+    .ys-tab{{padding:10px 18px;border-radius:999px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.04);color:#A6A69E;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;}}
+    .ys-tab.active{{background:linear-gradient(135deg,#FF6B1A,#FF9D5C);color:#fff;border-color:transparent;box-shadow:0 4px 18px rgba(255,107,26,.35);}}
+    .ys-card{{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);border-radius:18px;padding:20px;}}
+    .ys-card .ys-num{{font-size:2rem;font-weight:800;color:#fff;line-height:1;}}
+    .ys-card .ys-sub{{color:#8CA0B3;font-size:13px;margin-top:6px;}}
+    </style>
+    <div class="ys-tabs" role="tablist">
+        <button type="button" class="ys-tab active" data-ys-tab="overview" onclick="ysShow('overview')">🏠 Overview</button>
+        <button type="button" class="ys-tab" data-ys-tab="disposal" onclick="ysShow('disposal')">🗑️ Disposal</button>
+        <button type="button" class="ys-tab" data-ys-tab="vocab" onclick="ysShow('vocab')">🧠 Vocabulary</button>
+        <button type="button" class="ys-tab" data-ys-tab="address" onclick="ysShow('address')">📍 Address Book</button>
+        <button type="button" class="ys-tab" data-ys-tab="fleet" onclick="ysShow('fleet')">🏗️ Fleet</button>
+    </div>
+    <div class="ys-panel" id="ys-panel-overview">
+        <div class="ai-grid" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr));">
+            <div class="ys-card">
+                <div class="ai-kicker"><span class="ai-dot"></span>Disposal Network</div>
+                <div class="ys-num">{_yc["dump"]}</div>
+                <div class="ys-sub">dump sites on file</div>
+                <button type="button" class="ai-btn solid" style="margin-top:14px;" onclick="ysShow('disposal')">Open disposal →</button>
+            </div>
+            <div class="ys-card">
+                <div class="ai-kicker"><span class="ai-dot"></span>AI Vocabulary</div>
+                <div class="ys-num">{_yc["vocab"]}</div>
+                <div class="ys-sub">custom shorthand + intent phrases</div>
+                <button type="button" class="ai-btn solid" style="margin-top:14px;" onclick="ysShow('vocab')">Teach the parser →</button>
+            </div>
+            <div class="ys-card">
+                <div class="ai-kicker"><span class="ai-dot"></span>Learned Locations</div>
+                <div class="ys-num">{_yc["addr"]}</div>
+                <div class="ys-sub">addresses learned from dispatched stops</div>
+                <button type="button" class="ai-btn solid" style="margin-top:14px;" onclick="ysShow('address')">Open address book →</button>
+            </div>
+            <div class="ys-card">
+                <div class="ai-kicker"><span class="ai-dot"></span>Fleet Tracking</div>
+                <div class="ys-num">{_yc["fleet"]}</div>
+                <div class="ys-sub">🟢 {_yc["yard"]} at yard &nbsp;·&nbsp; 🟡 {_yc["deployed"]} deployed &nbsp;·&nbsp; 🔵 {_yc["truck"]} on truck</div>
+                <button type="button" class="ai-btn solid" style="margin-top:14px;" onclick="ysShow('fleet')">Open fleet →</button>
+            </div>
+        </div>
+        <p class="ai-sub" style="margin-top:16px;">Everything still lives here — pick a tab above and only that section opens. Address Book and Fleet show the first 25 rows with search, so a hundred learned cans no longer means a hundred rows of scrolling.</p>
+    </div>
+    <div class="ys-panel" id="ys-panel-disposal" style="display:none;">{_dump_locations_section_html()}</div>
+    <div class="ys-panel" id="ys-panel-vocab" style="display:none;">{_parse_vocab_section_html()}</div>
+    <div class="ys-panel" id="ys-panel-address" style="display:none;">{_address_book_section_html()}</div>
+    <div class="ys-panel" id="ys-panel-fleet" style="display:none;">{_containers_section_html()}</div>
+    <script>
+    function ysShow(tab) {{
+        document.querySelectorAll('.ys-panel').forEach(function(p) {{ p.style.display = 'none'; }});
+        var panel = document.getElementById('ys-panel-' + tab);
+        if (panel) {{ panel.style.display = ''; }}
+        document.querySelectorAll('.ys-tab').forEach(function(b) {{
+            b.classList.toggle('active', b.getAttribute('data-ys-tab') === tab);
+        }});
+        try {{ sessionStorage.setItem('ys_tab', tab); }} catch (e) {{}}
+        window.scrollTo({{top: 0, behavior: 'smooth'}});
+    }}
+    (function() {{
+        var hash = (window.location.hash || '').replace('#', '');
+        var map = {{'containers': 'fleet', 'address-book': 'address', 'dump-locations': 'disposal', 'parse-vocab': 'vocab'}};
+        var tab = map[hash] || null;
+        if (!tab) {{ try {{ tab = sessionStorage.getItem('ys_tab'); }} catch (e) {{}} }}
+        if (tab && tab !== 'overview') {{ ysShow(tab); }}
+    }})();
+    </script>
     """
     return render_template_string(shell_page("Yard Setup", body))
 
@@ -34996,9 +35106,14 @@ def _address_book_section_html():
     conn.close()
     _csrf = get_csrf_token()
     rows = ""
-    for a in rows_db:
+    for _aidx, a in enumerate(rows_db):
         _a = dict(a)
         display = (_a["label"] or _a["customer_name"] or "").strip()
+        # 2026-10-24: address book is long — show the first 25, search
+        # across all, 'Show all' reveals the rest. (Class only — the
+        # section's stylesheet hides ab-extra rows, so it never fights
+        # the row's own opacity style for hidden locations.)
+        _aextra = ' class="ab-extra"' if _aidx >= 25 else ""
         addr = (_a["full_address"] or _a["address"] or "").strip()
         search = " ".join(p for p in [display, addr, _a["city"] or ""] if p).lower()
         is_hidden = bool(_a["hidden"])
@@ -35019,7 +35134,7 @@ def _address_book_section_html():
             ' onsubmit="return confirm(&quot;' + _hide_confirm + '&quot;)"')
         _hide_btn_label = "Unhide" if is_hidden else "&#10005; Remove"
         rows += (
-            f'<tr data-search="{e(search)}"{row_style}>'
+            f'<tr data-search="{e(search)}"{row_style}{_aextra}>'
             f'<td>{name_cell} {hidden_badge}'
             f'<div class="muted small">{e(addr)}</div></td>'
             f'<td class="muted small" style="text-align:center;">{_a["times_used"]}</td>'
@@ -35056,7 +35171,7 @@ def _address_book_section_html():
             <span class="ai-chip on">{len(rows_db)} saved</span>
         </div>
         <input id="ab-filter" type="text" placeholder="Search name, street, or city&hellip;"
-               oninput="(function(v){{v=v.toLowerCase();document.querySelectorAll('#address-book tbody tr[data-search]').forEach(function(r){{r.style.display=r.getAttribute('data-search').indexOf(v)>-1?'':'none';}});}})(this.value)"
+               oninput="abFilter(this.value)"
                style="width:100%;min-height:48px;padding:10px 14px;margin-bottom:14px;background:rgba(255,255,255,.04);
                       border:1px solid rgba(255,255,255,0.12);border-radius:12px;color:var(--text);">
         <div class="table-wrap">
@@ -35066,6 +35181,20 @@ def _address_book_section_html():
                 <tbody>{rows or '<tr><td colspan="4" class="muted">No locations learned yet — dispatch a stop and it&rsquo;ll appear here.</td></tr>'}</tbody>
             </table>
         </div>
+        {('<div style="text-align:center;margin-top:12px;"><button type="button" class="ai-btn" id="ab-show-all" onclick="abShowAll()">Show all ' + str(len(rows_db)) + ' locations</button></div>') if len(rows_db) > 25 else ''}
+        <style>#address-book tr.ab-extra{{display:none}} #address-book.ab-all tr.ab-extra{{display:table-row}}</style>
+        <script>
+        function abFilter(v) {{
+            v = v.toLowerCase();
+            document.querySelectorAll('#address-book tbody tr[data-search]').forEach(function(r) {{
+                r.style.display = v ? (r.getAttribute('data-search').indexOf(v) > -1 ? 'table-row' : 'none') : '';
+            }});
+        }}
+        function abShowAll() {{
+            document.getElementById('address-book').classList.add('ab-all');
+            var b = document.getElementById('ab-show-all'); if (b) {{ b.style.display = 'none'; }}
+        }}
+        </script>
     </div>
     """
 
