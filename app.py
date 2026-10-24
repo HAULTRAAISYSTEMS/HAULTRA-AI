@@ -24351,6 +24351,10 @@ def _sync_fleet_from_history(conn, company_id):
       hauled from that stop. A swap's pulled bin stays 'loaded_at_yard'
       (it goes to the next stop or the yard); a non-swap PR returns the same
       bin to the same customer, so it stays 'deployed' there.
+    - Swap-drop rule (2026-10-24): on a completed PR swap, the empty bin
+      carried in was left at that customer, so it becomes 'deployed'
+      there ("Dropped {date} — {customer}"). Without this, the carried-in
+      bin kept its old "Hauled" status forever.
     - Route end: the final bin on a finished route with no disposition
       counts as at the yard (the derived-yard rule); an explicit Yard /
       Customer disposition sets that status directly.
@@ -24408,6 +24412,11 @@ def _sync_fleet_from_history(conn, company_id):
         stops = conn.execute(
             "SELECT * FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
             (rt["id"],)).fetchall()
+        # Carried bin replayed with the SAME rules the Daily Log chain
+        # uses (see _route_final_bin_detail): only completed stops move
+        # it. Powers the swap-drop rule below.
+        _carried = ""
+        _carried_size = ""
         for s in stops:
             d = dict(s)
             act = (d.get("action") or "").lower()
@@ -24441,6 +24450,28 @@ def _sync_fleet_from_history(conn, company_id):
                     ins, ch = _fleet_upsert(conn, company_id, tcan, size, "loaded_at_yard",
                                             f"Hauled {rdate} — {who}" if who else f"Hauled {rdate}")
                 pass
+            if done:
+                # Swap-drop: on a completed PR swap, the carried-in empty
+                # was left at this customer. It needs its own ticket
+                # evidence (tcan) so an un-evidenced completion never
+                # invents a drop, and it must differ from the hauled bin.
+                _sd_pr = "pickup and return" in act or "return" in act
+                _sd_swap = bool(d.get("swap_with_prev_pull")) or bool(d.get("chain_takes_from_stop_id"))
+                if _sd_pr and _sd_swap and tcan and _carried and _carried != tcan:
+                    _drop_old = bool(bulk_dates.get(_carried) and rdate and rdate < bulk_dates[_carried])
+                    if not _drop_old:
+                        ins, ch = _fleet_upsert(conn, company_id, _carried, _carried_size, "deployed",
+                                                f"Dropped {rdate} — {who}, {where}" if who or where else f"Dropped {rdate}")
+                # Advance the carried bin, mirroring _route_final_bin_detail.
+                if _sd_pr and not _sd_swap:
+                    if tcan and _carried and _carried != tcan:
+                        _carried, _carried_size = tcan, size
+                    elif tcan:
+                        _carried, _carried_size = "", ""
+                    # no ticket: carried stays (still carrying incoming)
+                else:
+                    _carried = tcan or ""
+                    _carried_size = size if tcan else ""
         # Route-end final bin, for finished routes only.
         try:
             counts = conn.execute(
