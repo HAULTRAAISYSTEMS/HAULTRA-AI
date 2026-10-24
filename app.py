@@ -23974,6 +23974,18 @@ def view_route(route_id):
             '&#x1F4CB; Paste Route</button>'
             if has_role("dispatcher") else ''
         )
+        # 2026-10-24: one-tap erase for already-cancelled stops — Cancel stays
+        # the soft, restorable action; this button only appears when cancelled
+        # stops exist and permanently deletes exactly those.
+        _del_cancelled_btn = ""
+        if cancelled_count:
+            _del_cancelled_btn = f"""
+    <form class="inline" method="POST"
+      action="{url_for('delete_cancelled_stops', route_id=route_id)}"
+      onsubmit="return confirm('Permanently delete all {cancelled_count} cancelled stops on this route? This cannot be undone and Restore will no longer be available for them.')">
+        <button class="btn red" type="submit">Delete all cancelled ({cancelled_count})</button>
+    </form>
+    """
         route_action_buttons += f"""
     {_paste_route_btn}
     <form class="inline" method="POST"
@@ -23981,7 +23993,7 @@ def view_route(route_id):
       onsubmit="return confirm('Delete this entire route? This erases the stops and their photos. To take the work off the board but keep the record, use Cancel Route instead.')">
         <button class="btn red" type="submit">Delete Route</button>
     </form>
-    """
+    {_del_cancelled_btn}"""
 
         # Cancel Route — kills what is left, leaves completed stops billable.
         if route["cancelled_at"]:
@@ -26109,6 +26121,65 @@ def delete_route(route_id):
     # 2026-10-24: land back on the day the route lived on — deleting a
     # tomorrow route used to bounce the boss to today's board.
     return redirect(url_for("routes_page", day=_del_day)) if _del_day else redirect(url_for("routes_page"))
+
+
+@app.route("/route/<int:route_id>/delete-cancelled", methods=["POST"])
+@boss_required
+def delete_cancelled_stops(route_id):
+    """Bulk hard-delete every CANCELLED stop on a route (2026-10-24: the boss
+    asked for one tap instead of Delete on each cancelled card). Cancel stays
+    the soft, restorable action; this is the explicit permanent erase for
+    stops already cancelled. Mirrors delete_stop per stop: photos + dump
+    tickets removed, references detached, survivors renumbered 1..N, chain
+    columns re-resolved (a deleted cancelled stop may have been a chain
+    member), can flow recomputed."""
+    conn = get_db()
+    _row = conn.execute(
+        "SELECT id FROM routes WHERE id=? AND company_id=?", (route_id, cid())
+    ).fetchone()
+    if not _row:
+        conn.close()
+        abort(404)
+    _ids = [r["id"] for r in conn.execute(
+        "SELECT id FROM stops WHERE route_id=? AND cancelled_at IS NOT NULL",
+        (route_id,),
+    ).fetchall()]
+    if not _ids:
+        conn.close()
+        return redirect(url_for("view_route", route_id=route_id))
+    _ph = ",".join("?" * len(_ids))
+    upload_paths = [row["file_path"] for row in conn.execute(
+        f"SELECT file_path FROM route_photos WHERE stop_id IN ({_ph})", _ids
+    ).fetchall()]
+    upload_paths.extend(row["path"] for row in conn.execute(
+        f"""SELECT photo_path AS path FROM stops
+            WHERE id IN ({_ph}) AND photo_path IS NOT NULL
+            UNION ALL
+            SELECT photo_path AS path FROM dump_tickets
+            WHERE stop_id IN ({_ph}) AND photo_path IS NOT NULL""",
+        _ids + _ids,
+    ).fetchall())
+    _detach_stop_references(conn, _ids)
+    conn.execute(f"DELETE FROM route_photos WHERE stop_id IN ({_ph})", _ids)
+    conn.execute(f"DELETE FROM dump_tickets WHERE stop_id IN ({_ph})", _ids)
+    conn.execute(f"DELETE FROM stops WHERE id IN ({_ph})", _ids)
+    for _i, _srow in enumerate(conn.execute(
+        "SELECT id FROM stops WHERE route_id=? ORDER BY stop_order, id", (route_id,)
+    ).fetchall(), start=1):
+        conn.execute("UPDATE stops SET stop_order=? WHERE id=?", (_i, _srow["id"]))
+    conn.commit()
+    try:
+        _apply_route_chains(conn, route_id)
+    except Exception:
+        app.logger.warning("delete_cancelled_stops: chain recompute failed")
+    compute_can_flow(conn, route_id)
+    conn.commit()
+    conn.close()
+    for _p in upload_paths:
+        _remove_managed_upload(_p)
+    flash(f"Deleted {len(_ids)} cancelled stop(s).", "success")
+    return redirect(url_for("view_route", route_id=route_id))
+
 
 # =========================================
 # ORDER ACTIONS
