@@ -37478,7 +37478,9 @@ def recurring_off_create():
     conn.commit()
     conn.close()
     flash("Recurring day off " + ("added." if is_boss else "requested."), "success")
-    return redirect(url_for("team_time_off_page") if is_boss else url_for("driver_clock"))
+    if is_boss:
+        return redirect(request.form.get("return_to") or url_for("team_time_off_page"))
+    return redirect(url_for("driver_clock"))
 
 
 @app.route("/late/checkin", methods=["POST"])
@@ -37572,6 +37574,17 @@ def recurring_off_action(rule_id):
         conn.execute("UPDATE recurring_days_off SET status='approved' WHERE id=? AND company_id=?",
                      (rule_id, cid()))
         flash("Recurring day off approved.", "success")
+    elif act == "delete":
+        # 2026-10-24: rules could never be removed — ended ones piled up with
+        # no way out. Delete the rule and its per-day overrides outright.
+        conn.execute("DELETE FROM recurring_off_overrides WHERE rule_id=?", (rule_id,))
+        conn.execute("DELETE FROM recurring_days_off WHERE id=? AND company_id=?",
+                     (rule_id, cid()))
+        flash("Recurring rule deleted.", "success")
+    elif act == "resume":
+        conn.execute("UPDATE recurring_days_off SET ended_on=NULL WHERE id=? AND company_id=?",
+                     (rule_id, cid()))
+        flash("Recurring rule resumed.", "success")
     elif act == "end":
         # End from today (or a given date) — future dates only, never rewrites past.
         end_on = _parse_iso(request.form.get("ended_on")) or _parse_iso(today_str())
@@ -37655,16 +37668,18 @@ def team_time_off_page():
             conflict = bool(info and info["status"] == "approved" and late)
             if info and info["status"] == "approved":
                 style = ("background:rgba(0,232,125,0.14);color:#3DDC84;border:1px solid rgba(0,232,125,0.4);"
+                         "box-shadow:0 0 10px rgba(0,232,125,0.3);"
                          if not conflict else
-                         "background:rgba(255,82,82,0.16);color:#FF9B9B;border:1px solid rgba(255,82,82,0.55);")
+                         "background:rgba(255,82,82,0.16);color:#FF9B9B;border:1px solid rgba(255,82,82,0.55);"
+                         "box-shadow:0 0 10px rgba(255,82,82,0.3);")
                 lbl = nm + (" OFF" if not conflict else " OFF+LATE")
                 chips.append('<div class="tc-chip" style="' + style + '">' + lbl + '</div>')
             elif info and info["status"] == "pending":
                 chips.append('<div class="tc-chip" style="background:rgba(120,120,111,0.14);color:#A6A69E;'
-                             'border:1px solid rgba(140,160,179,0.4);">' + nm + '?</div>')
+                             'border:1px solid rgba(140,160,179,0.4);box-shadow:0 0 8px rgba(140,160,179,0.25);">' + nm + '?</div>')
             if late and not (info and info["status"] == "approved"):
                 chips.append('<div class="tc-chip" style="background:rgba(255,107,26,0.12);color:#FF9D5C;'
-                             'border:1px solid rgba(255,107,26,0.5);">' + nm + ' LATE ' + e(late["eta"] or "") + '</div>')
+                             'border:1px solid rgba(255,107,26,0.5);box-shadow:0 0 10px rgba(255,107,26,0.3);">' + nm + ' LATE ' + e(late["eta"] or "") + '</div>')
         return chips
 
     # Month grid.
@@ -37691,6 +37706,10 @@ def team_time_off_page():
         (company_id,)
     ).fetchall()
     csrf = get_csrf_token()
+    # 2026-10-24: every action on this page returns to the month being viewed.
+    # The old bare redirect bounced the boss to the current month, which made
+    # a successful End tap look like nothing happened.
+    _ret = url_for("team_time_off_page") + "?m=" + ("%04d-%02d" % (first.year, first.month))
     pend_html = ""
     for r in pend_rows:
         rng = e(r["start_date"]) + (" → " + e(r["end_date"]) if r["end_date"] != r["start_date"] else "")
@@ -37700,6 +37719,7 @@ def team_time_off_page():
             + ('<div class="muted small">' + e(r["reason"]) + '</div>' if r["reason"] else '') + '</div>'
             '<form method="POST" action="' + url_for("time_off_decide", req_id=r["id"]) + '" class="tc-decide">'
             '<input type="hidden" name="_csrf_token" value="' + csrf + '">'
+            '<input type="hidden" name="return_to" value="' + _ret + '">'
             '<input name="boss_note" placeholder="note (optional)" class="tc-note">'
             '<button name="decision" value="approved" class="tc-approve">Approve</button>'
             '<button name="decision" value="denied" class="tc-deny">Deny</button>'
@@ -37707,7 +37727,10 @@ def team_time_off_page():
     if not pend_html:
         pend_html = '<div class="muted small">No pending requests.</div>'
 
-    # Recurring rules (approve / end / with per-rule note).
+    # Recurring rules, split live vs ended (2026-10-24). Ended rules used to
+    # sit in the same list still wearing "approved", and there was no delete
+    # at all — so dead rules piled up with no way out. Live rules get
+    # Approve/End/Delete; ended ones get Resume/Delete and their own section.
     rule_rows = conn.execute(
         """SELECT id, driver_id, weekday, frequency, anchor_date, status, ended_on
              FROM recurring_days_off WHERE company_id=? ORDER BY status, anchor_date""",
@@ -37715,29 +37738,49 @@ def team_time_off_page():
     ).fetchall()
     freq_lbl = {"weekly": "every week", "biweekly": "every other week", "monthly": "monthly"}
     rules_html = ""
+    ended_html = ""
     for r in rule_rows:
         desc = (e(dname.get(r["driver_id"], "Driver")) + " &middot; " + _WEEKDAY_ABBR[r["weekday"]]
                 + " " + freq_lbl.get(r["frequency"], r["frequency"]) + " from " + e(r["anchor_date"]))
-        badge = ('<span class="tc-badge tc-ok">approved</span>' if r["status"] == "approved"
-                 else '<span class="tc-badge tc-pend">pending</span>')
-        if r["ended_on"]:
-            badge += ' <span class="tc-badge">ends ' + e(r["ended_on"]) + '</span>'
-        ctrls = ('<input type="hidden" name="_csrf_token" value="' + csrf + '">')
-        approve_btn = ('<button form="rule-appr-' + str(r["id"]) + '" class="tc-approve">Approve</button>'
-                       if r["status"] != "approved" else "")
-        rules_html += (
-            '<div class="tc-rule"><div>' + desc + ' ' + badge + '</div>'
-            '<div class="tc-rule-ctrls">'
-            + ('<form id="rule-appr-' + str(r["id"]) + '" method="POST" action="'
-               + url_for("recurring_off_action", rule_id=r["id"]) + '">' + ctrls
-               + '<input type="hidden" name="act" value="approve"></form>' + approve_btn
-               if r["status"] != "approved" else "")
-            + '<form method="POST" action="' + url_for("recurring_off_action", rule_id=r["id"]) + '">'
-            + ctrls + '<input type="hidden" name="act" value="end">'
-            + '<button class="tc-end">End (future)</button></form>'
-            '</div></div>')
+        ended = bool(r["ended_on"])
+        if ended:
+            badge = '<span class="tc-badge tc-ended">ended ' + e(r["ended_on"]) + '</span>'
+        elif r["status"] == "approved":
+            badge = '<span class="tc-badge tc-ok">approved</span>'
+        else:
+            badge = '<span class="tc-badge tc-pend">pending</span>'
+        ctrls = ('<input type="hidden" name="_csrf_token" value="' + csrf + '">'
+                 '<input type="hidden" name="return_to" value="' + _ret + '">')
+        _act_url = url_for("recurring_off_action", rule_id=r["id"])
+        _del = ('<form method="POST" action="' + _act_url + '" style="display:inline;">' + ctrls
+                + '<input type="hidden" name="act" value="delete">'
+                + '<button class="tc-delete" onclick="return confirm('
+                + "'Delete this recurring rule entirely? Days it marked off will stop showing as recurring off.')"
+                + '">Delete</button></form>')
+        if ended:
+            _btns = ('<form method="POST" action="' + _act_url + '" style="display:inline;">' + ctrls
+                     + '<input type="hidden" name="act" value="resume">'
+                     + '<button class="tc-resume">Resume</button></form>' + _del)
+        else:
+            _appr = ('<form id="rule-appr-' + str(r["id"]) + '" method="POST" action="' + _act_url + '">'
+                     + ctrls + '<input type="hidden" name="act" value="approve"></form>'
+                     + '<button form="rule-appr-' + str(r["id"]) + '" class="tc-approve">Approve</button>'
+                     if r["status"] != "approved" else "")
+            _btns = (_appr
+                     + '<form method="POST" action="' + _act_url + '" style="display:inline;">' + ctrls
+                     + '<input type="hidden" name="act" value="end">'
+                     + '<button class="tc-end">End (future)</button></form>' + _del)
+        _card = ('<div class="tc-rule' + (' tc-rule-ended' if ended else '') + '"><div>' + desc + ' ' + badge + '</div>'
+                 '<div class="tc-rule-ctrls">' + _btns + '</div></div>')
+        if ended:
+            ended_html += _card
+        else:
+            rules_html += _card
     if not rules_html:
         rules_html = '<div class="muted small">No recurring rules yet.</div>'
+    ended_section = ('<div class="card tc-sec"><h2 style="margin-top:0;">Ended rules</h2>'
+                     '<p class="muted small" style="margin-top:-6px;">These stopped marking days off. Resume one, or delete it for good.</p>'
+                     + ended_html + '</div>') if ended_html else ""
 
     driver_opts = "".join('<option value="' + str(d["id"]) + '">' + e(dname[d["id"]]) + '</option>' for d in drivers)
 
@@ -37769,63 +37812,79 @@ def team_time_off_page():
 
     css = """
     <style>
+    .tc-kicker{font-size:11px;font-weight:800;letter-spacing:2.5px;text-transform:uppercase;color:#FF9D5C;margin-bottom:6px;}
     .tc-toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:14px;flex-wrap:wrap;}
     .tc-nav{display:flex;align-items:center;gap:8px;}
     .tc-nav a,.tc-today-btn{min-height:44px;min-width:44px;display:inline-flex;align-items:center;justify-content:center;
-      padding:0 14px;border-radius:10px;border:1px solid rgba(255,255,255,0.14);color:var(--text);text-decoration:none;font-weight:700;}
-    .tc-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:6px;}
+      padding:0 14px;border-radius:12px;border:1px solid rgba(255,255,255,0.14);color:var(--text);text-decoration:none;font-weight:700;
+      background:rgba(255,255,255,0.03);transition:border-color .15s, box-shadow .15s;}
+    .tc-nav a:hover,.tc-today-btn:hover{border-color:rgba(255,107,26,0.6);box-shadow:0 0 18px rgba(255,107,26,0.25);}
+    .tc-month{font-size:20px;font-weight:800;background:linear-gradient(90deg,#fff,#FFB35C);-webkit-background-clip:text;background-clip:text;color:transparent;}
+    .tc-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:6px;}
     .tc-wd{font-size:11px;font-weight:800;letter-spacing:.4px;color:#8CA0B3;text-align:center;padding:4px 0;}
-    .tc-cell{min-height:92px;border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:6px;
-      display:flex;flex-direction:column;gap:3px;text-decoration:none;color:var(--text);background:rgba(255,255,255,0.02);}
-    .tc-cell:hover{border-color:rgba(255,107,26,0.5);}
+    .tc-cell{min-width:0;min-height:92px;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:6px;
+      display:flex;flex-direction:column;gap:3px;text-decoration:none;color:var(--text);background:rgba(255,255,255,0.02);
+      transition:border-color .15s, box-shadow .15s;}
+    .tc-cell:hover{border-color:rgba(255,107,26,0.55);box-shadow:0 0 18px rgba(255,107,26,0.18);}
     .tc-out{opacity:.4;}
-    .tc-today{border-color:#FF6B1A;box-shadow:0 0 0 1px #FF6B1A inset;}
+    .tc-today{border-color:#FF6B1A;box-shadow:0 0 0 1px #FF6B1A inset, 0 0 20px rgba(255,107,26,0.3);background:rgba(255,107,26,0.07);}
     .tc-daynum{font-size:12px;font-weight:800;color:#A6A69E;}
-    .tc-chip{font-size:10px;font-weight:800;letter-spacing:.2px;padding:2px 5px;border-radius:6px;line-height:1.25;
+    .tc-today .tc-daynum{color:#FFB35C;}
+    .tc-chip{font-size:10px;font-weight:800;letter-spacing:.2px;padding:2px 5px;border-radius:999px;line-height:1.25;
       overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    .tc-sec h2{font-size:18px;letter-spacing:.2px;}
     .tc-pend,.tc-rule{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;
-      padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.07);}
+      padding:12px 14px;border:1px solid rgba(255,255,255,0.08);border-radius:14px;background:rgba(255,255,255,0.02);
+      margin-bottom:8px;}
+    .tc-rule{border-left:3px solid #3DDC84;}
+    .tc-rule-ended{border-left-color:#78786F;opacity:.62;}
     .tc-decide,.tc-rule-ctrls{display:flex;gap:6px;align-items:center;flex-wrap:wrap;}
     .tc-note{min-height:40px;padding:6px 10px;background:var(--bg-0,#121212);border:1px solid rgba(255,255,255,0.12);
-      border-radius:8px;color:var(--text);font-size:13px;}
-    .tc-approve,.tc-deny,.tc-end{min-height:44px;padding:0 14px;border-radius:9px;border:none;cursor:pointer;font-weight:800;font-size:13px;}
-    .tc-approve{background:rgba(0,232,125,0.16);color:#3DDC84;border:1px solid rgba(0,232,125,0.5);}
-    .tc-deny{background:rgba(255,82,82,0.14);color:#FF9B9B;border:1px solid rgba(255,82,82,0.5);}
+      border-radius:10px;color:var(--text);font-size:13px;}
+    .tc-approve,.tc-deny,.tc-end,.tc-delete,.tc-resume{min-height:44px;padding:0 14px;border-radius:10px;cursor:pointer;font-weight:800;font-size:13px;
+      transition:transform .1s, box-shadow .15s;}
+    .tc-approve:hover,.tc-deny:hover,.tc-end:hover,.tc-delete:hover,.tc-resume:hover{transform:translateY(-1px);}
+    .tc-approve{background:rgba(0,232,125,0.16);color:#3DDC84;border:1px solid rgba(0,232,125,0.5);box-shadow:0 0 14px rgba(0,232,125,0.15);}
+    .tc-deny,.tc-delete{background:rgba(255,82,82,0.14);color:#FF9B9B;border:1px solid rgba(255,82,82,0.5);}
     .tc-end{background:rgba(255,157,92,0.12);color:#FF9D5C;border:1px solid rgba(255,157,92,0.45);}
-    .tc-badge{font-size:10px;font-weight:800;padding:2px 7px;border-radius:6px;background:rgba(255,255,255,0.06);color:#A6A69E;}
-    .tc-badge.tc-ok{background:rgba(0,232,125,0.14);color:#3DDC84;}
+    .tc-resume{background:rgba(255,107,26,0.14);color:#FFB35C;border:1px solid rgba(255,107,26,0.5);}
+    .tc-badge{font-size:10px;font-weight:800;padding:2px 7px;border-radius:999px;background:rgba(255,255,255,0.06);color:#A6A69E;}
+    .tc-badge.tc-ok{background:rgba(0,232,125,0.14);color:#3DDC84;box-shadow:0 0 10px rgba(0,232,125,0.25);}
     .tc-badge.tc-pend{background:rgba(120,120,111,0.14);color:#A6A69E;}
+    .tc-badge.tc-ended{background:rgba(120,120,111,0.16);color:#8C8C82;}
     .tc-daylist{margin:6px 0 0;padding-left:18px;line-height:1.7;}
-    .tc-addrule{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px;}
+    .tc-addrule{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.07);}
     .tc-addrule select,.tc-addrule input{min-height:44px;padding:6px 10px;background:var(--bg-0,#121212);
-      border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);}
+      border:1px solid rgba(255,255,255,0.12);border-radius:10px;color:var(--text);}
     </style>
     """
     body = css + (
-        '<div class="hero"><h1>Team Time Off</h1>'
+        '<div class="hero"><div class="tc-kicker">Team &middot; Time off</div><h1>Team Time Off</h1>'
         '<p>Approved days off, pending requests, recurring rules, and today&rsquo;s late check-ins &mdash; one calendar.</p></div>'
         + day_detail
-        + '<div class="card">'
+        + '<div class="card tc-cal">'
         + '<div class="tc-toolbar">'
         + '<div class="tc-nav">'
         + '<a href="' + url_for("team_time_off_page") + '?m=' + prev_m + '">&lsaquo;</a>'
-        + '<b style="font-size:18px;">' + e(month_label) + '</b>'
+        + '<span class="tc-month">' + e(month_label) + '</span>'
         + '<a href="' + url_for("team_time_off_page") + '?m=' + next_m + '">&rsaquo;</a>'
         + '</div>'
         + '<a class="tc-today-btn" href="' + url_for("team_time_off_page") + '">Today</a>'
         + '</div>'
         + '<div class="tc-grid">' + weekhdr + cells + '</div>'
         + '</div>'
-        + '<div class="card"><h2 style="margin-top:0;">Pending requests</h2>' + pend_html + '</div>'
-        + '<div class="card"><h2 style="margin-top:0;">Recurring days off</h2>' + rules_html
+        + '<div class="card tc-sec"><h2 style="margin-top:0;">Pending requests</h2>' + pend_html + '</div>'
+        + '<div class="card tc-sec"><h2 style="margin-top:0;">Recurring days off</h2>' + rules_html
         + '<form method="POST" action="' + url_for("recurring_off_create") + '" class="tc-addrule">'
         + '<input type="hidden" name="_csrf_token" value="' + csrf + '">'
+        + '<input type="hidden" name="return_to" value="' + _ret + '">'
         + '<select name="driver_id" required><option value="">Driver&hellip;</option>' + driver_opts + '</select>'
         + '<select name="frequency"><option value="weekly">Every week</option>'
         + '<option value="biweekly">Every other week</option><option value="monthly">Monthly</option></select>'
         + '<input type="date" name="start_date" required>'
         + '<button class="tc-approve" style="min-width:120px;">+ Add rule</button>'
         + '</form></div>'
+        + ended_section
     )
     return render_template_string(shell_page("Team Time Off", body))
 
