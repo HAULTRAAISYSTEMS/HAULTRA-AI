@@ -46511,15 +46511,38 @@ def garbage_dispatch_view():
             append_driver_id = r["assigned_to"]
     conn.close()
     csrf = get_csrf_token()
-    # 2026-10-24: garbage More sheet carries the same user header as the
-    # Route Board sheet.
+    # 2026-10-24: garbage More sheet + topnav carry the same user header,
+    # company pill, and message badge as the Route Board.
     try:
         _uconn = get_db()
         _urow = _uconn.execute("SELECT username, role FROM users WHERE id=?", (session.get("user_id"),)).fetchone()
+        _crow = _uconn.execute("SELECT name FROM companies WHERE id=?", (cid(),)).fetchone()
+        try:
+            _msg_n = _uconn.execute("""
+                SELECT (SELECT COUNT(*) FROM messages m JOIN routes r ON r.id=m.route_id
+                         WHERE r.company_id=? AND m.sender_user_id != ? AND m.read_at IS NULL)
+                     + (SELECT COUNT(*) FROM direct_messages
+                         WHERE company_id=? AND sender_user_id != ? AND read_at IS NULL)
+            """, (cid(), session.get("user_id"), cid(), session.get("user_id"))).fetchone()[0] or 0
+        except Exception:
+            _msg_n = 0
         _uconn.close()
         _more_user_div = f'<div class="haul-more-user">{e(_urow["username"])} &middot; {e(_urow["role"])}</div>' if _urow else ""
+        _topnav_user = f'<div class="topnav-more-user">{e(_urow["username"])} &middot; {e(_urow["role"])}</div>' if _urow else ""
+        _company_pill = f'<span class="company-pill">{e(_crow["name"])}</span>' if _crow and _crow["name"] else ""
+        _msg_svg = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-msg"/></svg>'
+        _msg_env = (f'<a href="{url_for("messages_page")}" aria-label="Messages" title="Messages" '
+                    f'style="position:relative;display:inline-flex;align-items:center;color:inherit;'
+                    f'text-decoration:none;padding:8px 6px;">{_msg_svg}'
+                    f'{_msg_nav_badge(_msg_n).replace("var(--cyan)", "#FF6B1A")}</a>') if _urow else ""
+        _shield_svg = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-shield"/></svg>'
+        _super_link = f'<a class="nav-item" href="{url_for("superadmin_panel")}">{_shield_svg}Superadmin</a>' if session.get("is_superadmin") else ""
     except Exception:
         _more_user_div = ""
+        _topnav_user = ""
+        _company_pill = ""
+        _msg_env = ""
+        _super_link = ""
     opts = "".join(
         '<option value="%d"%s>%s</option>'
         % (d["id"], " selected" if append_driver_id and d["id"] == append_driver_id else "",
@@ -46770,7 +46793,7 @@ def garbage_dispatch_view():
   @media (min-width: 768px) {
     .topnav { display: block; background: #141412;
       border-bottom: 1px solid rgba(255,255,255,.08);
-      position: sticky; top: 0; z-index: 200;
+      position: sticky; top: 0; z-index: 1000;
       padding-top: env(safe-area-inset-top, 0px);
       box-shadow: 0 1px 0 rgba(255,107,26,.05), 0 2px 20px rgba(0,0,0,.4); }
     .topnav-inner { display: flex; align-items: center; gap: 18px;
@@ -46823,6 +46846,30 @@ def garbage_dispatch_view():
   /* 2026-10-24: sheet icons match the Route Board sheet (outline, not emoji) */
   .haul-more-items .nav-item svg, .haul-more-owner-title svg, .haul-more-items button svg { width: 20px; height: 20px; vertical-align: -4px; margin-right: 10px; }
   .haul-more-user { padding: 14px 20px 4px; color: #A6A69E; font-size: 13px; }
+  /* 2026-10-24: topnav utility + More dropdown match the Route Board */
+  .topnav-links .nav-item svg { width: 16px; height: 16px; flex-shrink: 0; }
+  .topnav-utility { display: flex; align-items: center; gap: 12px; margin-left: auto; flex-shrink: 0; }
+  .company-pill { font-size: 11.5px; font-weight: 700; letter-spacing: .3px; color: #A6A69E; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,107,26,0.14); border-radius: 20px; padding: 7px 14px; white-space: nowrap; }
+  .topnav-right { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+  .topnav-more { position: relative; }
+  .topnav-more > summary { list-style: none; user-select: none; cursor: pointer; display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; padding: 10px 14px; border-radius: 9px; color: #8C8C82; font-weight: 600; font-size: 13px; }
+  .topnav-more > summary:hover { background: rgba(255,107,26,.06); color: #E0E0D8; }
+  .topnav-more > summary::-webkit-details-marker { display: none; }
+  .topnav-more-menu { position: absolute; top: calc(100% + 8px); right: 0; min-width: 220px; max-width: calc(100vw - 24px); background: #141417; border: 1px solid rgba(255,107,26,0.18); border-radius: 16px; padding: 10px; display: flex; flex-direction: column; gap: 2px; box-shadow: 0 12px 40px rgba(0,0,0,0.55); z-index: 1001; max-height: 70vh; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  .topnav-more-menu .nav-item { width: 100%; display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 9px; color: #E0E0D8; font-size: 13px; font-weight: 600; text-decoration: none; background: transparent; border: 1px solid transparent; cursor: pointer; font-family: inherit; text-align: left; }
+  .topnav-more-menu .nav-item:hover { background: rgba(255,107,26,.06); }
+  .topnav-more-menu .nav-item svg { width: 20px; height: 20px; flex-shrink: 0; }
+  .topnav-more-menu .nav-item.nav-logout { color: #FF9A9A; margin-top: 4px; }
+  .topnav-more-menu .nav-item.nav-logout:hover { background: rgba(255,50,50,0.10); border-color: rgba(255,60,60,0.20); color: #FF6B6B; }
+  .topnav-more-user { font-size: 11px; font-weight: 700; letter-spacing: .4px; color: #55554C; text-transform: uppercase; padding: 6px 10px 8px; border-bottom: 1px solid rgba(255,107,26,0.08); margin-bottom: 4px; }
+  .topnav-more-sep { height: 1px; background: rgba(255,255,255,0.08); margin: 6px 4px; }
+  .topnav-more-menu .haul-more-owner-hero { display: block; padding: 10px 12px; border-radius: 9px; text-decoration: none; }
+  .topnav-more-menu .haul-more-owner-title { font-size: 15px; font-weight: 800; color: #FFB35C; display: flex; align-items: center; gap: 10px; }
+  .topnav-more-menu .haul-more-owner-title svg { width: 20px; height: 20px; }
+  .topnav-more-menu .haul-more-owner-sub { font-size: 12px; color: rgba(255,255,255,0.6); margin-top: 2px; }
+  .topnav-more-menu .topnav-more-head { font-size: 10px; font-weight: 800; letter-spacing: .6px; color: #78786F; text-transform: uppercase; padding: 10px 12px 4px; }
+  .haul-more-logout { width: 100%; padding: 14px; background: rgba(255, 80, 80, 0.1); border: 1px solid rgba(255, 80, 80, 0.3); border-radius: 12px; color: #ff8080; font-size: 16px; font-weight: 600; cursor: pointer; }
+  .haul-more-logout svg { width: 20px; height: 20px; vertical-align: -4px; margin-right: 10px; }
   .topnav-more-head {
     font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase;
     color: rgba(255,255,255,0.4); padding: 16px 20px 6px;
@@ -46874,6 +46921,10 @@ def garbage_dispatch_view():
   <circle cx="12" cy="12" r="3.1"/><path d="M19.4 14.6a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1v.2a2 2 0 0 1-4 0v-.1a1.6 1.6 0 0 0-2.8-1.1l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0-1.1-2.7h-.2a2 2 0 0 1 0-4h.1A1.6 1.6 0 0 0 4.5 7l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 2.7-1.1v-.2a2 2 0 0 1 4 0v.1a1.6 1.6 0 0 0 2.8 1.1l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0 1.1 2.7h.2a2 2 0 0 1 0 4h-.1a1.6 1.6 0 0 0-1.4 1z"/></symbol>
 <symbol id="i-calendar" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
   <rect x="3.5" y="5" width="17" height="15.5" rx="2"/><path d="M3.5 10h17M8 3.4V6.6M16 3.4V6.6"/></symbol>
+<symbol id="i-msg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 9.6 9.6 0 0 1-2.8-.4L3 21l1.6-4.6A8.3 8.3 0 0 1 3.6 11 8.4 8.4 0 0 1 12 3a8.4 8.4 0 0 1 9 8.5Z"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M12 3l7.5 3v5.6C19.5 16.4 16.3 20 12 21.4 7.7 20 4.5 16.4 4.5 11.6V6L12 3Z"/></symbol>
 </defs>
 </svg>
 
@@ -46881,17 +46932,54 @@ def garbage_dispatch_view():
 <nav class="topnav" aria-label="Main">
   <div class="topnav-inner">
     <div class="topnav-links">
-      <a class="nav-item" href="/routes">Route Board</a>
-      <a class="nav-item" href="/parser">Roll-Off</a>
-      <a class="nav-item active" href="/garbage-dispatch">Garbage</a>
-      <a class="nav-item" href="/unassigned">Unassigned</a>
-      <a class="nav-item" href="/requests">Requests</a>
-      <a class="nav-item" href="/customers">Customers</a>
-      <a class="nav-item" href="/invoices">Invoices</a>
-      <a class="nav-item" href="/bin-tracker">Bin Tracker</a>
-      <a class="nav-item" href="/maintenance">Maintenance</a>
+      <a class="nav-item" href="/routes"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-board"/></svg>Route Board</a>
+      <a class="nav-item" href="/parser"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-box"/></svg>Roll-Off</a>
+      <a class="nav-item active" href="/garbage-dispatch"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-truck"/></svg>Garbage</a>
+      <a class="nav-item" href="/unassigned"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-clipboard"/></svg>Unassigned</a>
+      <a class="nav-item" href="/requests"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-inbox"/></svg>Requests</a>
+      <a class="nav-item" href="/customers"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-users"/></svg>Customers</a>
+      <a class="nav-item" href="/invoices"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-clipboard"/></svg>Invoices</a>
+      <a class="nav-item" href="/bin-tracker"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-box"/></svg>Bin Tracker</a>
+      <a class="nav-item" href="/maintenance"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-wrench"/></svg>Maintenance</a>
       <a class="nav-item" href="/dashboard">Owner</a>
-      <a class="nav-item" href="/boss/notifications">Alerts</a>
+      <a class="nav-item" href="/boss/notifications"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-bell"/></svg>Alerts</a>
+    </div>
+    <div class="topnav-utility">
+      __COMPANY_PILL__
+      __MSG_ENV__
+    </div>
+    <div class="topnav-right">
+      <details class="topnav-more">
+        <summary>More &#9662;</summary>
+        <div class="topnav-more-menu">
+          __TOPNAV_USER__
+          <a href="/dashboard" class="haul-more-owner-hero">
+            <div class="haul-more-owner-title"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-board"/></svg>Owner</div>
+            <div class="haul-more-owner-sub">Yard overview &middot; pulls &middot; revenue &middot; pay week</div>
+          </a>
+          <div class="topnav-more-head">Money &amp; Ops</div>
+          <a class="nav-item" href="/invoices"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-clipboard"/></svg>Invoices</a>
+          <a class="nav-item" href="/bin-tracker"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-box"/></svg>Bin Tracker</a>
+          <a class="nav-item" href="/boss/notifications"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-bell"/></svg>Alerts</a>
+          <div class="topnav-more-head">Team</div>
+          <a class="nav-item" href="/boss/team-hours"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-clock"/></svg>Team Hours</a>
+          <a class="nav-item" href="/team-time-off"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-calendar"/></svg>Team Time Off</a>
+          <div class="topnav-more-head">Fleet</div>
+          <a class="nav-item" href="/trucks"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-truck"/></svg>Trucks</a>
+          <a class="nav-item" href="/vendors"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-wrench"/></svg>Vendors</a>
+          <a class="nav-item" href="/maintenance"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-wrench"/></svg>Maintenance</a>
+          <a class="nav-item" href="/team"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-users"/></svg>Team</a>
+          <div class="topnav-more-head">Setup</div>
+          <a class="nav-item" href="/yard-setup"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-box"/></svg>Yard Setup</a>
+          <a class="nav-item" href="/settings"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-gear"/></svg>Settings</a>
+          __SUPERADMIN_LINK__
+          <div class="topnav-more-sep"></div>
+          <form method="POST" action="/logout" style="margin:0;padding:0;">
+            <input type="hidden" name="_csrf_token" value="__CSRF__">
+            <button type="submit" class="nav-item nav-logout"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-power"/></svg>Logout</button>
+          </form>
+        </div>
+      </details>
     </div>
   </div>
 </nav>
@@ -47014,9 +47102,9 @@ def garbage_dispatch_view():
       <a class="nav-item" href="/yard-setup"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-box"/></svg>Yard Setup</a>
       <a class="nav-item" href="/settings"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-gear"/></svg>Settings</a>
       <div style="height:1px;background:rgba(255,255,255,.08);margin:8px 0;"></div>
-      <form method="POST" action="/logout" style="margin:0;padding:0;">
+      <form method="POST" action="/logout" style="margin:0;padding:16px;">
         <input type="hidden" name="_csrf_token" value="__CSRF__">
-        <button type="submit" style="display:block;width:100%;text-align:left;background:transparent;border:0;color:#fff;padding:14px 20px;font-size:16px;cursor:pointer;"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-power"/></svg>Logout</button>
+        <button type="submit" class="haul-more-logout"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-power"/></svg>Logout</button>
       </form>
     </div>
   </div>
@@ -47369,6 +47457,8 @@ function fetchT(url, opts, ms){
 </script></body></html>
 """
     page = page.replace("__OPTS__", opts).replace("__TRUCK_OPTS__", truck_opts).replace("__CSRF__", csrf).replace("__MORE_USER_DIV__", _more_user_div)
+    page = page.replace("__TOPNAV_USER__", _topnav_user).replace("__COMPANY_PILL__", _company_pill).replace("__MSG_ENV__", _msg_env).replace("__SUPERADMIN_LINK__", _super_link)
+    page = page.replace("</body></html>", _MSG_BADGE_POLL_JS + "</body></html>")
     page = page.replace("__DAY__", _dispatch_day).replace("__DAY_LABEL__", _dispatch_label)
     page = page.replace("__CMD_META__", _cmd_meta)
     page = page.replace("__MODE__", e(mode_note) if mode_note else "")
@@ -47547,11 +47637,38 @@ def parser_view():
     try:
         _uconn = get_db()
         _urow = _uconn.execute("SELECT username, role FROM users WHERE id=?", (session.get("user_id"),)).fetchone()
+        _crow = _uconn.execute("SELECT name FROM companies WHERE id=?", (cid(),)).fetchone()
+        try:
+            _msg_n = _uconn.execute("""
+                SELECT (SELECT COUNT(*) FROM messages m JOIN routes r ON r.id=m.route_id
+                         WHERE r.company_id=? AND m.sender_user_id != ? AND m.read_at IS NULL)
+                     + (SELECT COUNT(*) FROM direct_messages
+                         WHERE company_id=? AND sender_user_id != ? AND read_at IS NULL)
+            """, (cid(), session.get("user_id"), cid(), session.get("user_id"))).fetchone()[0] or 0
+        except Exception:
+            _msg_n = 0
         _uconn.close()
         _more_user_div = f'<div class="haul-more-user">{e(_urow["username"])} &middot; {e(_urow["role"])}</div>' if _urow else ""
+        _topnav_user = f'<div class="topnav-more-user">{e(_urow["username"])} &middot; {e(_urow["role"])}</div>' if _urow else ""
+        _company_pill = f'<span class="company-pill">{e(_crow["name"])}</span>' if _crow and _crow["name"] else ""
+        _msg_svg = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-msg"/></svg>'
+        _msg_env = (f'<a href="{url_for("messages_page")}" aria-label="Messages" title="Messages" '
+                    f'style="position:relative;display:inline-flex;align-items:center;color:inherit;'
+                    f'text-decoration:none;padding:8px 6px;">{_msg_svg}'
+                    f'{_msg_nav_badge(_msg_n).replace("var(--cyan)", "#FF6B1A")}</a>') if _urow else ""
+        _shield_svg = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><use href="#i-shield"/></svg>'
+        _super_link = f'<a class="nav-item" href="{url_for("superadmin_panel")}">{_shield_svg}Superadmin</a>' if session.get("is_superadmin") else ""
     except Exception:
         _more_user_div = ""
+        _topnav_user = ""
+        _company_pill = ""
+        _msg_env = ""
+        _super_link = ""
     html = html.replace('__MORE_USER_DIV__', _more_user_div)
+    html = html.replace('__TOPNAV_USER__', _topnav_user)
+    html = html.replace('__COMPANY_PILL__', _company_pill)
+    html = html.replace('__MSG_ENV__', _msg_env)
+    html = html.replace('__SUPERADMIN_LINK__', _super_link)
     html = html.replace('<!--ASSIGN_SLOT-->', assign_html)
     html = html.replace('<!--ROUTE_SEQ_SLOT-->', route_seq_html)
     # 2026-10-17: command-center header meta — live day + driver count.
