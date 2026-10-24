@@ -3540,6 +3540,13 @@ def init_db():
         """)
         conn.commit()
 
+    # 2026-10-24: room for error — a boss correction must stick. When a
+    # boss edits a fleet row (or bulk-deploys), the row's boss_set_at date
+    # is stamped; the auto-learn sync then ignores history events dated
+    # BEFORE that stamp for that can, so a correction is never silently
+    # reverted by an old route replay. Newer real events still win.
+    safe_add_column(conn, "containers", "boss_set_at TEXT")
+
     # Structured disposal alternatives for exception resolution. company_id is
     # required even though the user-facing model is a site: every operational
     # lookup in HAULTRA must remain tenant-scoped.
@@ -18878,8 +18885,11 @@ def driver_route_detail(route_id):
             <p class="muted small" style="margin-top:8px;">Back at the yard? Clock out to end your day.</p>
             """
         # 2026-10-23: end-of-day bin disposition — if there's a bin on the
-        # truck and it hasn't been logged, ask where it went. Smart default:
-        # Pull/swap → Yard (most common); driver one-taps to confirm/change.
+        # truck, ask where it went. Smart default: Pull/swap → Yard (most
+        # common); driver one-taps to confirm/change.
+        # 2026-10-24: room for error — the prompt STAYS after the first
+        # tap, showing the current choice, so a wrong tap can be fixed
+        # right here instead of living in the log forever.
         _disp_html = ""
         try:
             _dconn = get_db()
@@ -18890,10 +18900,13 @@ def driver_route_detail(route_id):
             _already = (_rd["final_bin_disposition"] if _rd and "final_bin_disposition" in _rd.keys() else None)
         except Exception:
             _final_bin, _already = "", None
-        if _final_bin and not _already:
+        if _final_bin:
+            _disp_head = (f"&#x1F4E6; Bin {_final_bin} — where'd it go?"
+                          if not _already else
+                          f"&#x1F4E6; Bin {_final_bin} — currently marked {_already}. Tap to change it.")
             _disp_html = f"""
         <div id="cab-bin-disp" style="margin:18px 0;padding:16px;border:1px solid rgba(255,107,26,.4);border-radius:14px;background:rgba(255,107,26,.06);text-align:center;">
-            <div style="font-size:15px;font-weight:800;margin-bottom:4px;">&#x1F4E6; Bin {_final_bin} — where'd it go?</div>
+            <div style="font-size:15px;font-weight:800;margin-bottom:4px;">{_disp_head}</div>
             <div class="muted small" style="margin-bottom:12px;">Last bin on the truck. One tap.</div>
             <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
                 <button type="button" class="btn gold" data-disp="yard" data-bin="{_final_bin}" style="min-height:48px;flex:1;min-width:90px;">&#x1F3E0; Yard</button>
@@ -18923,9 +18936,12 @@ def driver_route_detail(route_id):
                         body: JSON.stringify({{disposition: disp, bin_number: bin, note: note}})
                     }}).then(function(r){{ return r.json(); }}).then(function(d){{
                         if (d.ok) {{
-                            box.innerHTML = '<div style="color:#3DDC84;font-weight:700;">&#10003; Bin ' + bin +
+                            // 2026-10-24: keep the buttons — a wrong tap
+                            // must be fixable by tapping again, not by
+                            // reloading and hunting for the prompt.
+                            msg.innerHTML = '<span style="color:#3DDC84;font-weight:700;">&#10003; Saved — Bin ' + bin +
                                 ' → ' + disp.charAt(0).toUpperCase() + disp.slice(1) +
-                                (note ? ' (' + note.replace(/</g,'&lt;') + ')' : '') + '</div>';
+                                (note ? ' (' + note.replace(/</g,'&lt;') + ')' : '') + '. Tap again to change it.</span>';
                         }} else {{
                             msg.textContent = 'Could not save — try again.';
                         }}
@@ -24351,15 +24367,25 @@ def _sync_fleet_from_history(conn, company_id):
             before[_c["label"]] = (_c["status"], _c["notes"] or "")
     except Exception:
         before = {}
-    # Bulk-deployed cans: a boss decision dated D beats any history event
-    # dated BEFORE D (an old route replayed after the bulk tap must not
-    # undo it). Events on/after D are real new movement and still win.
+    # Boss decisions beat old history: a can stamped boss_set_at (boss
+    # Edit, or a bulk deploy) dated D beats any history event dated
+    # BEFORE D (an old route replayed after the correction must not undo
+    # it). Events on/after D are real new movement and still win.
+    # Fallback: bulk-deployed cans stamped before this column existed
+    # carry their date in their notes ("Bulk deployed YYYY-MM-DD").
     bulk_dates = {}
     try:
-        for _c in conn.execute("SELECT label, notes FROM containers WHERE company_id=? AND notes LIKE 'Bulk deployed%'", (company_id,)).fetchall():
-            _m = re.search(r"Bulk deployed (\d{4}-\d{2}-\d{2})", _c["notes"] or "")
-            if _m:
-                bulk_dates[_c["label"]] = _m.group(1)
+        for _c in conn.execute("SELECT label, notes, boss_set_at FROM containers WHERE company_id=?", (company_id,)).fetchall():
+            _d = None
+            try:
+                _d = (_c["boss_set_at"] or "").strip() or None
+            except Exception:
+                _d = None
+            if not _d:
+                _m = re.search(r"Bulk deployed (\d{4}-\d{2}-\d{2})", _c["notes"] or "")
+                _d = _m.group(1) if _m else None
+            if _d and _c["label"]:
+                bulk_dates[_c["label"]] = _d
     except Exception:
         bulk_dates = {}
     routes = conn.execute(
@@ -27475,7 +27501,9 @@ def api_yard_inventory():
                             "available": False})
         except Exception:
             pass
-        out.sort(key=lambda c: c["label"])
+        # 2026-10-24: unnumbered cans have label None — sorting on it
+        # raw would TypeError and wipe the whole strip. Sort on "".
+        out.sort(key=lambda c: c["label"] or "")
     except Exception:
         out = []
     conn.close()
@@ -33902,7 +33930,7 @@ def _containers_section_html():
         rows_html += f"""
         <tr data-search="{e(_fsearch)}" data-status="{e(_cd["status"])}" class="fl-row"{_row_style}>
             <td><strong>{e(_cd["size"])}</strong></td>
-            <td class="muted small">{e(_cd["label"] or "")}</td>
+            <td class="muted small">{e(_cd["label"] or "(no #)")}</td>
             <td>{_badge}{_deployed_note}</td>
             <td class="muted small">{e(_cd["notes"] or "")}</td>
             <td style="text-align:right;white-space:nowrap;">
@@ -34881,9 +34909,14 @@ def api_fleet_deploy_all():
     """
     conn = get_db()
     try:
-        cur = conn.execute(
-            "UPDATE containers SET status='deployed', notes=? WHERE company_id=? AND status='yard'",
-            ("Bulk deployed " + today_str() + " — via Deploy all", cid()))
+        try:
+            cur = conn.execute(
+                "UPDATE containers SET status='deployed', notes=?, boss_set_at=? WHERE company_id=? AND status='yard'",
+                ("Bulk deployed " + today_str() + " — via Deploy all", today_str(), cid()))
+        except Exception:
+            cur = conn.execute(
+                "UPDATE containers SET status='deployed', notes=? WHERE company_id=? AND status='yard'",
+                ("Bulk deployed " + today_str() + " — via Deploy all", cid()))
         conn.commit()
         n = cur.rowcount or 0
     except Exception as exc:
@@ -35719,10 +35752,18 @@ def edit_container(c_id):
             flash("Container size is required.", "error")
             conn.close()
             return redirect(url_for("edit_container", c_id=c_id))
-        conn.execute(
-            "UPDATE containers SET size=?, label=?, status=?, notes=? WHERE id=?",
-            (size, label or None, status, notes or None, c_id)
-        )
+        # 2026-10-24: a boss edit is a decision — stamp it so the
+        # auto-learn sync will not revert it with an older route event.
+        try:
+            conn.execute(
+                "UPDATE containers SET size=?, label=?, status=?, notes=?, boss_set_at=? WHERE id=?",
+                (size, label or None, status, notes or None, today_str(), c_id)
+            )
+        except Exception:
+            conn.execute(
+                "UPDATE containers SET size=?, label=?, status=?, notes=? WHERE id=?",
+                (size, label or None, status, notes or None, c_id)
+            )
         conn.commit()
         conn.close()
         flash("Container updated.", "success")
@@ -35737,7 +35778,7 @@ def edit_container(c_id):
             for o in opts
         )
     size_opts   = _sel("size",   ["10yd","15yd","20yd","30yd","40yd","Other"], _c["size"])
-    status_opts = _sel("status", ["yard","deployed","lost","retired"], _c["status"])
+    status_opts = _sel("status", ["yard","deployed","loaded_at_yard","lost","retired"], _c["status"])
 
     body = f"""
     <div class="hero"><h1>Edit Container</h1></div>
