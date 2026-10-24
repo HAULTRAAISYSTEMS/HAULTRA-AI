@@ -1401,7 +1401,10 @@ def csrf_protect():
             form_token = (request.get_json(silent=True) or {}).get("_csrf_token") \
                          or request.headers.get("X-CSRF-Token")
         else:
-            form_token = request.form.get("_csrf_token")
+            # 2026-10-23: also accept the header for multipart file uploads
+            # (FormData can't always carry the token as a field).
+            form_token = request.form.get("_csrf_token") \
+                         or request.headers.get("X-CSRF-Token")
         if not token or token != form_token:
             abort(403)
 
