@@ -10364,6 +10364,99 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     .cab-card {{ padding: 14px 15px; padding-right: 52px; }}
 }}
 </style>
+    <!-- 2027 AI Design System — global glassmorphism, 3D tilt, ambient glow -->
+    <style>
+    /* ---- Page entrance ---- */
+    main.content {{ animation: ai-page-in .45s cubic-bezier(.22,1,.36,1); }}
+    @keyframes ai-page-in {{ from {{ opacity: 0; transform: translateY(14px); }} to {{ opacity: 1; transform: none; }} }}
+    /* ---- Glass cards everywhere ---- */
+    .card {{
+        background: linear-gradient(150deg, rgba(255,255,255,.055), rgba(255,255,255,.015)) !important;
+        border: 1px solid rgba(255,255,255,.09) !important;
+        border-radius: 20px !important;
+        backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+        box-shadow: 0 18px 44px -20px rgba(0,0,0,.7), inset 0 1px 0 rgba(255,255,255,.07) !important;
+        transition: border-color .25s, box-shadow .25s, transform .25s !important;
+        position: relative;
+    }}
+    .card:hover {{
+        border-color: rgba(255,107,26,.28) !important;
+        box-shadow: 0 22px 55px -20px rgba(255,107,26,.22), inset 0 1px 0 rgba(255,255,255,.1) !important;
+    }}
+    .card.no-tilt:hover {{ transform: none !important; }}
+    /* ---- Buttons: glow ---- */
+    .btn {{
+        border-radius: 12px !important;
+        transition: transform .18s, box-shadow .22s, border-color .2s, background .2s !important;
+    }}
+    .btn:hover {{ transform: translateY(-1px); }}
+    .btn:active {{ transform: translateY(0) scale(.98); }}
+    a.btn, button.btn {{ box-shadow: 0 8px 22px -10px rgba(255,107,26,.45); }}
+    /* ---- Inputs: focus glow ---- */
+    input:focus, select:focus, textarea:focus {{
+        outline: none !important;
+        border-color: rgba(255,107,26,.55) !important;
+        box-shadow: 0 0 0 3px rgba(255,107,26,.14) !important;
+    }}
+    /* ---- Headings: gradient ---- */
+    .hero h1, h1.ai-title {{
+        background: linear-gradient(135deg, #fff 35%, #FFB37A 100%);
+        -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+        letter-spacing: -.5px;
+    }}
+    /* ---- Scrollbar ---- */
+    ::-webkit-scrollbar {{ width: 10px; height: 10px; }}
+    ::-webkit-scrollbar-track {{ background: transparent; }}
+    ::-webkit-scrollbar-thumb {{ background: rgba(255,107,26,.25); border-radius: 8px; border: 2px solid transparent; background-clip: content-box; }}
+    ::-webkit-scrollbar-thumb:hover {{ background: rgba(255,107,26,.45); background-clip: content-box; border: 2px solid transparent; }}
+    /* ---- Badges: glow ---- */
+    .badge.completed {{ box-shadow: 0 0 12px rgba(61,220,132,.25); }}
+    /* ---- Tables: glass rows ---- */
+    .table-wrap table tbody tr {{ transition: background .2s, transform .2s; }}
+    .table-wrap table tbody tr:hover {{ background: rgba(255,107,26,.05) !important; }}
+    /* ---- Nav: glow active ---- */
+    .topnav a.active, .bottom-tabs a.active {{ text-shadow: 0 0 18px rgba(255,107,26,.8); }}
+    /* ---- Reduced motion ---- */
+    @media (prefers-reduced-motion: reduce) {{
+        main.content {{ animation: none; }}
+        .card {{ transition: none !important; }}
+    }}
+    </style>
+    <script>
+    (function(){{
+        // Global 3D tilt on cards — pointer-driven, skips touch + .no-tilt + sheets
+        if (window.matchMedia('(hover: none)').matches) return;
+        function bindTilt(scope){{
+            scope.querySelectorAll('.card:not(.no-tilt)').forEach(function(card){{
+                if (card._tiltBound) return; card._tiltBound = true;
+                var raf = null;
+                card.addEventListener('mousemove', function(ev){{
+                    if (raf) return;
+                    raf = requestAnimationFrame(function(){{
+                        raf = null;
+                        var r = card.getBoundingClientRect();
+                        if (r.width > 700) return; // wide layout cards stay flat
+                        var px = (ev.clientX - r.left) / r.width;
+                        var py = (ev.clientY - r.top) / r.height;
+                        card.style.transform = 'perspective(1000px) rotateX(' + ((0.5 - py) * 5).toFixed(2) +
+                            'deg) rotateY(' + ((px - 0.5) * 6).toFixed(2) + 'deg) translateY(-2px)';
+                    }});
+                }});
+                card.addEventListener('mouseleave', function(){{
+                    if (raf) {{ cancelAnimationFrame(raf); raf = null; }}
+                    card.style.transform = '';
+                }});
+            }});
+        }}
+        bindTilt(document);
+        // Re-bind for dynamically added cards
+        new MutationObserver(function(muts){{
+            muts.forEach(function(m){{ m.addedNodes.forEach(function(n){{
+                if (n.querySelectorAll) bindTilt(n.parentNode || document);
+            }}); }});
+        }}).observe(document.body, {{ childList: true, subtree: true }});
+    }})();
+    </script>
     </head>
     <body>
         {_BRAND_SPRITE}
