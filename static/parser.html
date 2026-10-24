@@ -979,6 +979,31 @@
 
 <!--ROUTE_SEQ_SLOT-->
 
+<!-- 2026-10-23: Yard Inventory Awareness — live yard stock strip -->
+<div id="yard-strip" class="yard-strip" hidden>
+  <span class="yard-strip-label">🏗️ YARD</span>
+  <span id="yard-strip-cans" class="yard-strip-cans"></span>
+</div>
+<style>
+.yard-strip {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 0 16px 12px; padding: 10px 16px; border-radius: 14px;
+  background: linear-gradient(135deg, rgba(255,107,26,.08), rgba(255,107,26,.02));
+  border: 1px solid rgba(255,107,26,.25);
+  font-size: .85rem;
+}
+.yard-strip-label { font-weight: 800; letter-spacing: 1px; color: #FF9D5C; font-size: .75rem; }
+.yard-strip-cans { display: flex; gap: 8px; flex-wrap: wrap; }
+.yard-can {
+  padding: 4px 12px; border-radius: 999px; font-weight: 700; font-size: .8rem;
+  background: rgba(61,220,132,.1); border: 1px solid rgba(61,220,132,.3); color: #3DDC84;
+  cursor: pointer; transition: all .2s;
+}
+.yard-can:hover { background: rgba(61,220,132,.2); transform: translateY(-1px); }
+.yard-can.taken { background: rgba(255,255,255,.04); border-color: rgba(255,255,255,.12); color: var(--text-muted); cursor: default; text-decoration: line-through; }
+.yard-strip-empty { color: var(--text-muted); font-style: italic; }
+</style>
+
 <main class="layout">
   <section class="col col-input">
     <div class="quick-add">
@@ -1053,6 +1078,12 @@
       <div class="sheet-field">
         <span class="sheet-label">Container size</span>
         <div id="sheet-sizes" class="sheet-chips" role="group" aria-label="Container size"></div>
+      </div>
+      <div class="sheet-field" id="sheet-can-field" hidden>
+        <label class="sheet-label" for="sheet-can">Yard can <span class="muted" style="font-weight:400;">— which can goes out</span></label>
+        <select id="sheet-can" class="sheet-input">
+          <option value="">Pick from yard…</option>
+        </select>
       </div>
       <div class="sheet-field">
         <label class="sheet-label" for="sheet-dump">Dump at (site)</label>
@@ -1682,6 +1713,7 @@
             address: s.address,
             customer: s.customer,
             container_size: s.container_size,
+            assigned_can: s.assigned_can || null,
             dump_leg: s.dump_leg,
             return_leg: s.return_leg,
             notes: s.notes,
@@ -1710,6 +1742,7 @@
             address: s.address,
             customer: s.customer,
             container_size: s.container_size,
+            assigned_can: s.assigned_can || null,
             dump_leg: s.dump_leg,
             return_leg: s.return_leg,
             notes: s.notes,
@@ -1790,6 +1823,7 @@
   var sheetEditId = null;     // stop id when editing an existing pending stop
   var sheetAction = 'P';
   var sheetSize   = '';
+  var sheetAssignedCan = '';
 
   function serializeManualStop(s) {
     return {
@@ -1845,9 +1879,36 @@
       chip.textContent = code;
       chip.title = meta.full;
       chip.setAttribute('aria-pressed', code === sheetAction ? 'true' : 'false');
-      chip.addEventListener('click', function () { sheetAction = code; renderSheetActionChips(); });
+      chip.addEventListener('click', function () { sheetAction = code; renderSheetActionChips(); renderSheetCanField(); });
       wrap.appendChild(chip);
     });
+  }
+
+  // 2026-10-23: Yard can picker — only for Deliveries. Lists available yard
+  // cans, filtered by selected size when one is picked.
+  function renderSheetCanField() {
+    var field = el('sheet-can-field');
+    var sel = el('sheet-can');
+    if (!field || !sel) return;
+    var isDelivery = (sheetAction === 'D');
+    field.hidden = !isDelivery;
+    if (!isDelivery) return;
+    sel.innerHTML = '<option value="">Pick from yard…</option>';
+    var avail = yardInventory.filter(function(c) { return c.available; });
+    if (sheetSize) avail = avail.filter(function(c) { return !c.size || c.size === sheetSize; });
+    avail.forEach(function(c) {
+      var o = document.createElement('option');
+      o.value = c.label;
+      o.textContent = '#' + c.label + (c.size ? ' (' + c.size + ')' : '');
+      if (c.label === sheetAssignedCan) o.selected = true;
+      sel.appendChild(o);
+    });
+    if (!avail.length) {
+      var o = document.createElement('option');
+      o.value = ''; o.textContent = 'No cans at yard' + (sheetSize ? ' in ' + sheetSize : '');
+      o.disabled = true;
+      sel.appendChild(o);
+    }
   }
 
   function renderSheetSizeChips() {
@@ -1864,6 +1925,7 @@
       chip.addEventListener('click', function () {
         sheetSize = (sheetSize === sz) ? '' : sz;
         renderSheetSizeChips();
+        renderSheetCanField();
       });
       wrap.appendChild(chip);
     });
@@ -1876,6 +1938,7 @@
     var pa = (prefill.action || '').toUpperCase();
     sheetAction = (ACTION_CODES.indexOf(pa) !== -1) ? pa : '';
     sheetSize = (CONTAINER_SIZES.indexOf(prefill.container_size) !== -1) ? prefill.container_size : '';
+    sheetAssignedCan = (prefill.assigned_can || '').trim();
     el('sheet-title').textContent = editId ? 'Edit Stop' : 'Confirm Stop';
     el('sheet-add').textContent = editId ? 'Save' : 'Add Stop';
     var addTop = el('sheet-add-top');
@@ -1889,6 +1952,7 @@
     el('sheet-note').value = prefill.notes || '';
     renderSheetActionChips();
     renderSheetSizeChips();
+    renderSheetCanField();
     var bd = el('stop-sheet-backdrop');
     bd.classList.add('open');
     bd.setAttribute('aria-hidden', 'false');
@@ -1922,12 +1986,16 @@
       if (awrap) { awrap.classList.add('invalid'); setTimeout(function(){ awrap.classList.remove('invalid'); }, 1200); }
       return;
     }
+    // 2026-10-23: capture the yard can for Deliveries
+    var canSel = el('sheet-can');
+    sheetAssignedCan = (sheetAction === 'D' && canSel) ? canSel.value.trim() : '';
     var fields = {
       source: 'manual',
       action: sheetAction,
       address: address,
       customer: el('sheet-customer').value.trim(),
       container_size: sheetSize,
+      assigned_can: sheetAssignedCan,
       dump_leg: el('sheet-dump').value.trim(),
       return_leg: el('sheet-return').value.trim(),
       notes: el('sheet-note').value.trim(),
@@ -2402,6 +2470,46 @@ function closeMoreSheet() {
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', dock);
   else dock();
 })();
+
+// 2026-10-23: Yard Inventory Awareness — live yard stock strip + can picker data
+var yardInventory = [];
+function loadYardInventory() {
+  fetch('/api/yard-inventory', { credentials: 'same-origin' })
+    .then(function(r) { return r.ok ? r.json() : { cans: [] }; })
+    .then(function(d) {
+      yardInventory = Array.isArray(d.cans) ? d.cans : [];
+      renderYardStrip();
+    })
+    .catch(function() { /* silent — strip stays hidden */ });
+}
+function renderYardStrip() {
+  var strip = document.getElementById('yard-strip');
+  var wrap = document.getElementById('yard-strip-cans');
+  if (!strip || !wrap) return;
+  strip.hidden = false;
+  if (!yardInventory.length) {
+    wrap.innerHTML = '<span class="yard-strip-empty">No cans at yard</span>';
+    return;
+  }
+  wrap.innerHTML = '';
+  yardInventory.forEach(function(c) {
+    var el = document.createElement('span');
+    el.className = 'yard-can' + (c.available ? '' : ' taken');
+    el.textContent = '#' + c.label + (c.size ? ' ' + c.size : '');
+    el.title = c.available ? 'Tap to use on a Delivery' : 'Already assigned to a route';
+    if (c.available) {
+      el.addEventListener('click', function() {
+        // Open the confirm sheet prefilled as a Delivery with this can
+        if (typeof openStopSheet === 'function') {
+          openStopSheet({ action: 'D', customer: '', address: '', container_size: c.size || '', assigned_can: c.label, dump_leg: '', return_leg: '', notes: '' }, null);
+        }
+      });
+    }
+    wrap.appendChild(el);
+  });
+}
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', loadYardInventory);
+else loadYardInventory();
 </script>
 </body>
 </html>
