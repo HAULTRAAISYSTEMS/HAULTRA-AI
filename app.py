@@ -9983,8 +9983,22 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .cab-complete-btn:disabled {{ background: rgba(255,255,255,0.06); color: #55554C; cursor: not-allowed; box-shadow: none; }}
 
 .cab-all-done {{
-    text-align: center; padding: 60px 20px;
+    text-align: center; padding: 30px 18px 22px; margin-top: 4px;
+    border: 1px solid rgba(255,255,255,0.09); border-radius: 20px;
+    background: radial-gradient(120% 90% at 50% 0%, rgba(255,107,26,0.14), rgba(255,255,255,0.02) 55%);
+    box-shadow: 0 12px 34px rgba(0,0,0,0.35);
 }}
+.cab-done-sub {{ color: #D8D8CE; font-size: 15px; margin-top: 8px; }}
+.cab-done-actions {{ margin-top: 22px; display: flex; flex-direction: column; gap: 10px; }}
+.cab-done-actions form {{ display: block; width: 100%; }}
+.cab-done-actions .btn {{ width: 100%; min-height: 52px; border-radius: 14px; font-size: 16px; }}
+.cab-done-quiet {{ display: flex; gap: 10px; }}
+.cab-done-quiet > form, .cab-done-quiet > a {{ flex: 1; }}
+.cab-done-quiet .btn {{ width: 100%; min-height: 48px; }}
+.cab-done-dayend {{ margin-top: 18px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.08); }}
+.cab-done-kicker {{ font-size: 11px; font-weight: 800; letter-spacing: 2px; text-transform: uppercase; color: #FF9D5C; margin-bottom: 4px; }}
+.cab-done-old {{ text-align: center; font-size: 13px; color: #FFB35C; background: rgba(255,107,26,0.10);
+    border: 1px solid rgba(255,107,26,0.30); border-radius: 10px; padding: 8px 12px; margin: 0 0 12px; }}
 /* Victory badge — glowing ember checkmark instead of the stock green emoji */
 .cab-all-done-icon {{
     width: 92px; height: 92px; margin: 0 auto 20px;
@@ -10017,7 +10031,8 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
     box-shadow: 0 10px 28px rgba(0,0,0,0.45), inset 0 2px 5px rgba(255,255,255,0.06);
     color: #8A8A84; font-size: 40px; font-weight: 300; line-height: 1;
 }}
-.cab-all-done h2 {{ font-family: var(--font-head); font-size: 30px; letter-spacing: .5px; color: #F5F5F0; }}
+.cab-all-done h2 {{ font-family: var(--font-head); font-size: 30px; letter-spacing: .5px;
+    background: linear-gradient(90deg,#fff,#FFB35C); -webkit-background-clip: text; background-clip: text; color: transparent; }}
 
 /* Photo-proof "Encouraged" nudge (Cab View: complete with zero photos) */
 .no-photo-confirm-overlay {{
@@ -18695,16 +18710,37 @@ def driver_route_detail(route_id):
 
     # 2026-10-21: truck bar — the boss-assigned truck for this route, else the
     # driver's usual. Computed before conn.close().
+    # 2026-10-24: the bar said "today" for ANY route — opening the Oct 21
+    # route claimed "You're in Truck 3 today" while he was in Truck 8. Past
+    # routes now show their own truck + date, never "today", and never fall
+    # back to the driver's current usual truck (that may have changed since).
     _truck_bar_html = ""
     try:
         _trow = _route_truck(conn, route_id)
     except Exception:
         _trow = None
+    _rd = ""
+    try:
+        _rd = route["route_date"] or ""
+    except Exception:
+        pass
+    _is_today_route = (_rd == today_str())
+    if _trow and not _is_today_route:
+        try:
+            _own = (conn.execute("SELECT name FROM trucks WHERE id=?", (route["truck_id"],)).fetchone()
+                    if route["truck_id"] else None)
+        except Exception:
+            _own = None
+        _trow = _own if _own else None
     if _trow:
+        if _is_today_route:
+            _truck_txt = 'You&rsquo;re in <strong>' + e(_trow["name"]) + '</strong> today'
+        else:
+            _truck_txt = '<strong>' + e(_trow["name"]) + '</strong> &middot; ' + e(_rd)
         _truck_bar_html = (
             '<div class="cab-truck-bar">'
             '<span class="cab-truck-icon">&#128666;</span>'
-            '<span class="cab-truck-text">You&rsquo;re in <strong>' + e(_trow["name"]) + '</strong> today</span>'
+            '<span class="cab-truck-text">' + _truck_txt + '</span>'
             '</div>')
 
     conn.close()
@@ -19130,12 +19166,21 @@ def driver_route_detail(route_id):
             }});
         }})();
         </script>"""
+        # 2026-10-24: clock-out is end-of-DAY, not end-of-route — it gets its
+        # own separated block instead of looking like one more orange button.
+        # And a past route says so outright (the Truck 3 / Oct 21 confusion).
+        _dayend_html = ('<div class="cab-done-dayend"><div class="cab-done-kicker">End of day</div>'
+                        + _clock_out_html + '</div>') if _clock_out_html else ""
+        _old_route_note = ""
+        if route["route_date"] and route["route_date"] != today_str():
+            _old_route_note = ('<div class="cab-done-old">Viewing ' + e(route["route_date"])
+                               + ' &mdash; not today&rsquo;s route. Today&rsquo;s route is under Back to My Routes.</div>')
         body = f"""
 <div class="cab-wrap">
     <div class="cab-header">
         <div class="cab-title">MY ROUTE</div>
         <div style="display:flex;align-items:center;gap:10px;">
-            <span class="cab-online-badge" id="online-badge"><span class="cab-online-dot"></span>ONLINE</span>
+            <span class="cab-online-badge" id="online-badge"><span class="cab-online-dot\"></span>ONLINE</span>
         </div>
     </div>
     {nav_pref_modal_html}
@@ -19144,26 +19189,28 @@ def driver_route_detail(route_id):
     {_truck_bar_html}
     <div class="cab-progress-label">{e(route['route_name'])} &middot; {e(route['route_date'])}</div>
     <div class="cab-progress-track"><div class="cab-progress-fill" style="width:100%;"></div></div>
-
+    {_old_route_note}
     <div class="cab-all-done">
         <div class="cab-all-done-icon"></div>
         <h2>All Stops Done</h2>
-        <p style="color:var(--text-muted);margin-top:8px;">{total_count} of {total_count} stops completed.</p>
+        <p class="cab-done-sub">{total_count} of {total_count} stops completed.</p>
         {_disp_html}
-        <div style="margin-top:22px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
+        <div class="cab-done-actions">
             {route_action_buttons}
-            {f'''
-            <form method="POST" action="{url_for('toggle_stop_complete', stop_id=stops[-1]['id'])}"
-                  onsubmit="return confirm('Reopen the last stop? It will become your current stop again, right where you left off.');">
-                <input type="hidden" name="_csrf_token" value="{_csrf}">
-                <input type="hidden" name="intent" value="reopen">
-                <button type="submit" class="btn secondary" style="min-height:48px;">&#8592; Fix Last Stop</button>
-            </form>
-            ''' if total_count > 0 else ''}
             {_yard_nav_html}
-            <a class="btn secondary" href="{url_for('driver_dashboard')}">&#8592; Back to My Routes</a>
+            <div class="cab-done-quiet">
+                {f'''
+                <form method="POST" action="{url_for('toggle_stop_complete', stop_id=stops[-1]['id'])}"
+                      onsubmit="return confirm('Reopen the last stop? It will become your current stop again, right where you left off.');">
+                    <input type="hidden" name="_csrf_token" value="{_csrf}">
+                    <input type="hidden" name="intent" value="reopen">
+                    <button type="submit" class="btn secondary">&#8592; Fix Last Stop</button>
+                </form>
+                ''' if total_count > 0 else ''}
+                <a class="btn secondary" href="{url_for('driver_dashboard')}">&#8592; Back to My Routes</a>
+            </div>
         </div>
-        {_clock_out_html}
+        {_dayend_html}
     </div>
 </div>
 <script>
