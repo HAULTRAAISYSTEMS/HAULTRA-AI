@@ -5271,16 +5271,19 @@ def is_native_app():
 
 
 def driver_active_route_id(conn, user_id):
-    """Best current route for a driver: today's route first (any live status
-    — a finished today still owns the Cab View tab), else the earliest other
-    open/in_progress route. Returns None if none.
+    """Best current route for a driver: today's ACTIVE route first
+    (open/in_progress), else today's newest finished route (so the all-done
+    screen still owns the tab when nothing is active), else the earliest
+    other open/in_progress route. Returns None if none.
     2026-10-24: the old open-only query let an unfinished Oct 21 route keep
-    hijacking the Cab View tab every time today's route was finished."""
+    hijacking the Cab View tab every time today's route was finished.
+    2026-10-24 (audit fix): newest-id-first let a completed route shadow a
+    live one (reopened route, mixed rolloff+garbage day, cancelled route)."""
     row = conn.execute(
         """SELECT id FROM routes
            WHERE assigned_to=? AND route_date=?
              AND status IN ('open','in_progress','completed')
-           ORDER BY id DESC LIMIT 1""",
+           ORDER BY (status IN ('open','in_progress')) DESC, id DESC LIMIT 1""",
         (user_id, today_str())
     ).fetchone()
     if row:
@@ -25137,10 +25140,13 @@ def api_bin_disposition(route_id):
             conn.rollback()
     # 2026-10-24: fleet auto-learn — a disposition also replays history,
     # so the fleet stays consistent with routes and the Daily Log.
+    # 2026-10-24 (audit fix): log sync failures — the old silent rollback
+    # left the fleet stale with no trace. The disposition itself stands.
     try:
         _sync_fleet_from_history(conn, cid())
         conn.commit()
     except Exception:
+        app.logger.exception("fleet sync failed after bin disposition")
         conn.rollback()
     conn.close()
     return jsonify({"ok": True})
@@ -25735,10 +25741,12 @@ def edit_stop(stop_id):
         conn.commit()
         # 2026-10-24: fleet auto-learn — an Edit that sets a yard can or a
         # notes can immediately feeds the fleet.
+        # 2026-10-24 (audit fix): log sync failures instead of silent rollback.
         try:
             _sync_fleet_from_history(conn, cid())
             conn.commit()
         except Exception:
+            app.logger.exception("fleet sync failed after Edit Stop save")
             conn.rollback()
         _flash_chain_result(_chain_res)
         upsert_saved_address(conn, cid(),
@@ -26742,7 +26750,9 @@ def toggle_stop_complete(stop_id):
         try:
             _sync_fleet_from_history(conn, cid())
         except Exception:
-            pass
+            # 2026-10-24 (audit fix): the completion stands, but the failure
+            # must leave a trace — the old bare pass hid stale fleet data.
+            app.logger.exception("fleet sync failed after stop completion")
     # Customer Request System: mirror completion/reopen onto a linked request
     # (no-op for normal stops with no request_id).
     cascade_request_from_stop(conn, stop_id)
@@ -27159,7 +27169,8 @@ def stop_driver_action(stop_id):
         if action in ("box_out", "going_to_dump") and _stop_updated > 0:
             _sync_fleet_from_history(conn, cid())
     except Exception:
-        pass
+        # 2026-10-24 (audit fix): log it; the driver action still stands.
+        app.logger.exception("fleet sync failed after box_out/going_to_dump")
     conn.commit()
     conn.close()
 
@@ -29267,10 +29278,15 @@ def route_daily_log(route_id):
         # for the next stop. Pull/PR-swap carries the (now empty) bin forward.
         # 2026-10-23: incomplete stop — truck still has the incoming bin.
         # 2026-10-23: field swap — truck now carries the pulled bin.
-        # 2026-10-24: a Delivery leaves its can at the customer — the truck
-        # leaves empty no matter what the previous stop carried.
+        # 2026-10-24 (audit fix): only a COMPLETED Delivery empties the
+        # truck. A pending delivery must leave _prev_box_out untouched —
+        # the truck still carries the incoming bin. The first attempt only
+        # gated the reset; the pending delivery then fell through to the
+        # else branch, which stored its empty Box Out and wiped the bin
+        # anyway. Delivery now short-circuits the whole carry-forward.
         if _is_delivery:
-            _prev_box_out = ""
+            if s["status"] == "completed":
+                _prev_box_out = ""
         elif _is_pr and not _is_swap:
             if box_out and _prev_box_out and _prev_box_out != box_out:
                 _prev_box_out = box_out
@@ -35611,7 +35627,12 @@ def yard_setup_page():
         conn.commit()
         conn.close()
     except Exception:
-        pass
+        # 2026-10-24 (audit fix): log it, and don't leak the connection.
+        app.logger.exception("fleet sync failed on Yard Setup open")
+        try:
+            conn.close()
+        except Exception:
+            pass
     # 2026-10-24: Yard Setup is one long scroll no more — tabbed layout
     # with an Overview of live counts. Counts are cheap COUNTs; the full
     # sections still render into hidden panels, so every form, toggle and
@@ -39747,10 +39768,12 @@ def api_dispatch():
     conn.commit()  # persist the (partial) links either way so the boss can see/fix them
     # 2026-10-24: fleet auto-learn — a dispatched Delivery's can (picker or
     # notes) joins the fleet as on-the-truck right away.
+    # 2026-10-24 (audit fix): log sync failures instead of silent rollback.
     try:
         _sync_fleet_from_history(conn, cid())
         conn.commit()
     except Exception:
+        app.logger.exception("fleet sync failed after dispatch")
         conn.rollback()
     if _blocking:
         conn.close()
