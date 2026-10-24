@@ -33859,14 +33859,16 @@ def _containers_section_html():
                 f'{e(_GROUP_LABEL.get(_cur_group, _cur_group))} — {_group_counts[_cur_group]}</strong></td></tr>'
             )
         _row_style = ' style="display:none;"' if _cur_group in ("lost", "retired") else ""
+        # 2026-10-24: the old "On site at ? location(s)" line read from the
+        # disabled customer_containers table, so it always printed "?" —
+        # removed. The Notes column already carries the customer/address.
+        _deployed_note = ""
+        _badge_label = {"loaded_at_yard": "on truck"}.get(_cd["status"], _cd["status"])
         _badge = (
             f'<span style="font-size:11px;padding:2px 8px;border-radius:5px;'
             f'background:rgba(0,0,0,0.3);color:{_sc};border:1px solid {_sc}33;">'
-            f'{e(_cd["status"])}</span>'
+            f'{e(_badge_label)}</span>'
         )
-        _deployed_note = ""
-        if _cd["status"] == "deployed":
-            _deployed_note = f'<div class="small muted" style="margin-top:2px;">On site at {on_site_counts.get(_cid, "?")} location(s)</div>'
         rows_html += f"""
         <tr data-search="{e(_fsearch)}" data-status="{e(_cd["status"])}" class="fl-row"{_row_style}>
             <td><strong>{e(_cd["size"])}</strong></td>
