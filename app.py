@@ -27026,6 +27026,10 @@ def api_yard_inventory():
     A derived bin is dropped when an explicit disposition says it went to
     a customer/landfill, or when a later completed Delivery already took
     it out of the yard. Cans promised to an open route show as taken.
+    Derived scope (2026-10-24, after the 19-bin flood): only each
+    driver's LATEST route (up to today), and only if that route is
+    finished and within the last 7 days. Older yard stays need an
+    explicit Yard tap, which persists in the fleet table indefinitely.
     """
     conn = get_db()
     try:
@@ -27051,42 +27055,63 @@ def api_yard_inventory():
                for c in cans]
         seen = {c["label"] for c in cans}
         # --- Derived from finished routes, newest first ---
+        # 2026-10-24 FIX (the 19-bin flood): the first version kept the
+        # final bin of EVERY finished route in history, forever, unless a
+        # later Delivery happened to carry assigned_can. Most old deliveries
+        # were dispatched without assigned_can, so every old Pull's bin
+        # piled up in the strip. A derived bin is only trustworthy from a
+        # driver's LATEST route, and only for a week: if a bin really sits
+        # at the yard longer than that, a Yard tap puts it in the fleet
+        # table, where it stays indefinitely.
         try:
             today = today_str()
+            try:
+                import datetime as _dt
+                _cutoff = (_dt.date.fromisoformat(today) - _dt.timedelta(days=7)).isoformat()
+            except Exception:
+                _cutoff = ""
             routes = conn.execute(
-                """SELECT id, route_date, status, final_bin_number,
+                """SELECT id, route_date, status, assigned_to, final_bin_number,
                           final_bin_disposition FROM routes
-                   WHERE company_id=? ORDER BY route_date DESC, id DESC""",
-                (cid(),)).fetchall()
-            blocked = set()
+                   WHERE company_id=? AND route_date <= ?
+                   ORDER BY route_date DESC, id DESC""",
+                (cid(), today)).fetchall()
             derived = {}
+            seen_drivers = set()
             for r in routes:
                 rd = dict(r)
-                disp = (rd.get("final_bin_disposition") or "").strip().lower()
-                rbin = (rd.get("final_bin_number") or "").strip()
-                # An explicit non-yard disposition blocks older routes for
-                # that same bin (it left the yard for good, until a later
-                # route brings it back — later routes are seen first).
-                if disp in ("landfill", "customer") and rbin:
-                    blocked.add(rbin)
+                driver_key = rd.get("assigned_to")
+                if driver_key in seen_drivers:
                     continue
-                if disp == "yard":
-                    continue  # explicit fleet row already covers it
+                # Count stops first: an unstarted (open, 0 done) route has
+                # not touched any bin yet, so it does not block the driver's
+                # previous finished route. Any other latest route does —
+                # its bin, if any, is the only one that can still be on
+                # that driver's truck.
+                counts = conn.execute(
+                    """SELECT COUNT(*) total,
+                              SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) done
+                       FROM stops WHERE route_id=? AND cancelled_at IS NULL""",
+                    (rd["id"],)).fetchone()
+                _done = counts["done"] if counts else 0
+                if rd.get("status") == "open" and not _done:
+                    continue
+                seen_drivers.add(driver_key)
+                if _cutoff and (rd.get("route_date") or "") < _cutoff:
+                    continue
+                disp = (rd.get("final_bin_disposition") or "").strip().lower()
+                if disp in ("landfill", "customer", "yard"):
+                    continue  # yard is covered by the fleet row; others are not yard
                 # Only finished routes count: marked completed, or a past
                 # day's route with every stop done (even if nobody tapped
                 # Finish Route). Today's all-done-but-unfinished route does
                 # NOT count yet — the bin is still on that truck.
                 if rd.get("status") != "completed" and (rd.get("route_date") or "") >= today:
                     continue
-                counts = conn.execute(
-                    """SELECT COUNT(*) total,
-                              SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) done
-                       FROM stops WHERE route_id=? AND cancelled_at IS NULL""",
-                    (rd["id"],)).fetchone()
                 if not counts or not counts["total"] or counts["done"] < counts["total"]:
                     continue
                 bin_no, bin_size = _route_final_bin_detail(conn, rd["id"])
-                if not bin_no or bin_no in blocked or bin_no in derived:
+                if not bin_no or bin_no in derived:
                     continue
                 derived[bin_no] = {"size": bin_size, "route_date": rd.get("route_date") or ""}
             # Drop derived bins a later completed Delivery already took out.
