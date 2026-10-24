@@ -24219,44 +24219,81 @@ def mark_route_in_progress(route_id):
     return redirect(url_for("view_route", route_id=route_id))
 
 
-@app.route("/route/<int:route_id>/complete", methods=["POST"])
-@login_required
-def _route_final_bin_on_truck(conn, route_id):
-    """Bin number on the truck after the last stop ('' if none).
-    Replays the box chain: Pull carries forward, PR-return empties the truck,
-    PR field-swap carries the pulled bin. Used for end-of-day disposition."""
+def _route_final_bin_detail(conn, route_id):
+    """(bin, size) on the truck after a route's last completed stop.
+
+    Replays the SAME box chain the Daily Log uses, so the route sheet and
+    the yard strip can never disagree about the last bin:
+    - Pull / PR-swap: truck carries the ticket bin forward.
+    - PR non-swap: bin returns to the customer (truck empties), unless the
+      ticket bin differs from the incoming bin (field swap — truck now
+      carries the pulled bin).
+    - Delivery / other with no ticket: truck empties (the carried bin was
+      just dropped). This is the fix for the old helper, which kept the
+      previous bin after a Delivery and could prompt for a bin that was
+      no longer on the truck.
+    Returns ('', '') when nothing is on the truck or the chain is unknown.
+    """
     prev = ""
+    prev_size = ""
     try:
-        stops = conn.execute(
-            """SELECT s.id, s.action, s.swap_with_previous_empty,
-                      dt.can_number AS ticket_can
-               FROM stops s LEFT JOIN dump_tickets dt ON dt.stop_id = s.id
-               WHERE s.route_id=? AND s.status='completed' AND s.cancelled_at IS NULL
-               ORDER BY s.stop_order, s.id""",
-            (route_id,)).fetchall()
+        try:
+            takes_rows = conn.execute(
+                "SELECT id FROM stops WHERE route_id=? AND chain_takes_from_stop_id IS NOT NULL",
+                (route_id,)).fetchall()
+            takes_from = {r["id"] for r in takes_rows}
+        except Exception:
+            takes_from = set()
+        # 2026-10-24 ROOT CAUSE: the old helper selected
+        # s.swap_with_previous_empty, a column that does not exist (the real
+        # column is swap_with_prev_pull). The query failed, the except
+        # swallowed it, and the function always returned '' — so the
+        # end-of-day Yard prompt never fired and the yard strip stayed
+        # empty. Query the real column, with a no-swap-column fallback.
+        try:
+            stops = conn.execute(
+                """SELECT s.id, s.action, s.swap_with_prev_pull AS swap_flag, s.container_size,
+                          dt.can_number AS ticket_can
+                   FROM stops s LEFT JOIN dump_tickets dt ON dt.stop_id = s.id
+                   WHERE s.route_id=? AND s.status='completed' AND s.cancelled_at IS NULL
+                   ORDER BY s.stop_order, s.id""",
+                (route_id,)).fetchall()
+        except Exception:
+            stops = conn.execute(
+                """SELECT s.id, s.action, s.container_size,
+                          dt.can_number AS ticket_can
+                   FROM stops s LEFT JOIN dump_tickets dt ON dt.stop_id = s.id
+                   WHERE s.route_id=? AND s.status='completed' AND s.cancelled_at IS NULL
+                   ORDER BY s.stop_order, s.id""",
+                (route_id,)).fetchall()
         for s in stops:
             sd = dict(s)
             ticket_can = (sd.get("ticket_can") or "").strip()
+            size = (sd.get("container_size") or "").strip()
             act = (sd.get("action") or "").lower()
             is_pr = "pickup and return" in act
-            is_swap = bool(sd.get("swap_with_previous_empty"))
-            if not is_pr:
-                # Pull (or other): truck carries the pulled bin forward.
-                if ticket_can:
-                    prev = ticket_can
-            elif is_swap:
-                if ticket_can:
-                    prev = ticket_can
-            else:
-                # PR: field swap if incoming differs from ticket.
+            is_swap = bool(sd.get("swap_flag")) or sd.get("id") in takes_from
+            if is_pr and not is_swap:
                 if ticket_can and prev and prev != ticket_can:
-                    prev = ticket_can  # swapped — now carrying the pulled bin
+                    prev = ticket_can
+                    prev_size = size
                 elif ticket_can:
-                    prev = ""  # true PR — bin returned to customer
+                    prev = ""
+                    prev_size = ""
                 # incomplete PR: prev stays (still carrying incoming)
+            else:
+                # Pull / swap / Delivery / other: Box Out is the ticket bin
+                # (empty when there is no ticket, e.g. a Delivery).
+                prev = ticket_can
+                prev_size = size if ticket_can else ""
     except Exception:
         pass
-    return prev
+    return prev, prev_size
+
+
+def _route_final_bin_on_truck(conn, route_id):
+    """Bin number on the truck after the last stop ('' if none)."""
+    return _route_final_bin_detail(conn, route_id)[0]
 
 
 @app.route("/api/route/<int:route_id>/bin-disposition", methods=["POST"])
@@ -24314,6 +24351,8 @@ def api_bin_disposition(route_id):
     return jsonify({"ok": True})
 
 
+@app.route("/route/<int:route_id>/complete", methods=["POST"])
+@login_required
 def mark_route_completed(route_id):
     conn = get_db()
     route = conn.execute(
@@ -26974,8 +27013,20 @@ def _valid_container_status(s):
 @app.route("/api/yard-inventory")
 @login_required
 def api_yard_inventory():
-    """Live yard inventory for dispatch: cans with status='yard', minus cans
-    already assigned to open (non-completed) routes."""
+    """Live yard inventory for dispatch.
+
+    Two sources, newest first:
+    1. Fleet rows with status='yard' (explicit — driver tapped Yard, or the
+       boss set it in Yard Setup).
+    2. DERIVED from routes (2026-10-24 fix): a bin left on the truck at the
+       end of a finished route counts as at the yard, even if nobody tapped
+       the end-of-day disposition. This is what yesterday's miss was — the
+       route/Daily Log knew the bin, but the strip only read the fleet
+       table, so a skipped tap meant "No cans at yard".
+    A derived bin is dropped when an explicit disposition says it went to
+    a customer/landfill, or when a later completed Delivery already took
+    it out of the yard. Cans promised to an open route show as taken.
+    """
     conn = get_db()
     try:
         cans = conn.execute(
@@ -26995,8 +27046,76 @@ def api_yard_inventory():
         except Exception:
             pass
         out = [{"id": c["id"], "label": c["label"], "size": c["size"] or "",
-                "notes": c["notes"] or "", "available": c["label"] not in taken}
+                "notes": c["notes"] or "", "source": "fleet",
+                "available": c["label"] not in taken}
                for c in cans]
+        seen = {c["label"] for c in cans}
+        # --- Derived from finished routes, newest first ---
+        try:
+            today = today_str()
+            routes = conn.execute(
+                """SELECT id, route_date, status, final_bin_number,
+                          final_bin_disposition FROM routes
+                   WHERE company_id=? ORDER BY route_date DESC, id DESC""",
+                (cid(),)).fetchall()
+            blocked = set()
+            derived = {}
+            for r in routes:
+                rd = dict(r)
+                disp = (rd.get("final_bin_disposition") or "").strip().lower()
+                rbin = (rd.get("final_bin_number") or "").strip()
+                # An explicit non-yard disposition blocks older routes for
+                # that same bin (it left the yard for good, until a later
+                # route brings it back — later routes are seen first).
+                if disp in ("landfill", "customer") and rbin:
+                    blocked.add(rbin)
+                    continue
+                if disp == "yard":
+                    continue  # explicit fleet row already covers it
+                # Only finished routes count: marked completed, or a past
+                # day's route with every stop done (even if nobody tapped
+                # Finish Route). Today's all-done-but-unfinished route does
+                # NOT count yet — the bin is still on that truck.
+                if rd.get("status") != "completed" and (rd.get("route_date") or "") >= today:
+                    continue
+                counts = conn.execute(
+                    """SELECT COUNT(*) total,
+                              SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) done
+                       FROM stops WHERE route_id=? AND cancelled_at IS NULL""",
+                    (rd["id"],)).fetchone()
+                if not counts or not counts["total"] or counts["done"] < counts["total"]:
+                    continue
+                bin_no, bin_size = _route_final_bin_detail(conn, rd["id"])
+                if not bin_no or bin_no in blocked or bin_no in derived:
+                    continue
+                derived[bin_no] = {"size": bin_size, "route_date": rd.get("route_date") or ""}
+            # Drop derived bins a later completed Delivery already took out.
+            if derived:
+                try:
+                    delivs = conn.execute(
+                        """SELECT s.assigned_can, r.route_date FROM stops s
+                           JOIN routes r ON r.id = s.route_id
+                           WHERE r.company_id=? AND s.status='completed'
+                           AND lower(s.action) LIKE '%delivery%'
+                           AND s.assigned_can IS NOT NULL AND s.assigned_can != ''""",
+                        (cid(),)).fetchall()
+                    for d in delivs:
+                        lab = d["assigned_can"]
+                        if lab in derived and (d["route_date"] or "") >= derived[lab]["route_date"]:
+                            del derived[lab]
+                except Exception:
+                    pass
+            for lab in sorted(derived):
+                if lab in seen:
+                    continue
+                seen.add(lab)
+                out.append({"id": None, "label": lab, "size": derived[lab]["size"],
+                            "notes": "From " + derived[lab]["route_date"] + " route",
+                            "source": "route",
+                            "available": lab not in taken})
+        except Exception:
+            pass
+        out.sort(key=lambda c: c["label"])
     except Exception:
         out = []
     conn.close()
@@ -28289,6 +28408,15 @@ def route_daily_log(route_id):
         _dtext = f"End of day: Bin {_dbin} → {_dlabel}"
         if _dnote:
             _dtext += f" ({_dnote})"
+        _disp_row = (f'<tr><td colspan="15" style="text-align:center;padding:10px;'
+                     f'color:#FF9D5C;font-weight:700;">{e(_dtext)}</td></tr>')
+    elif _prev_box_out and stops and done_count >= len(stops):
+        # 2026-10-24: no disposition was tapped, but the Daily Log chain
+        # itself ends with a bin on the truck — that bin is at the yard for
+        # dispatch purposes, and the log now says so instead of staying
+        # silent. Labelled as from-route, not as a confirmed tap.
+        _dtext = (f"End of day: Bin {_prev_box_out} → 🏠 Yard "
+                  f"(from route log — no disposition tapped)")
         _disp_row = (f'<tr><td colspan="15" style="text-align:center;padding:10px;'
                      f'color:#FF9D5C;font-weight:700;">{e(_dtext)}</td></tr>')
 
