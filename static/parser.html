@@ -834,6 +834,9 @@
   }
   .haul-more-handle { width: 40px; height: 4px; background: rgba(255,255,255,0.2); border-radius: 2px; margin: 12px auto 8px; }
   .haul-more-items .nav-item { display: block; padding: 14px 20px; color: #fff; text-decoration: none; font-size: 16px; border-bottom: 1px solid rgba(255,255,255,0.05); }
+  /* 2026-10-24: sheet icons match the Route Board sheet (outline, not emoji) */
+  .haul-more-items .nav-item svg, .haul-more-owner-title svg, .haul-more-items button svg { width: 20px; height: 20px; vertical-align: -4px; margin-right: 10px; }
+  .haul-more-user { padding: 14px 20px 4px; color: #A6A69E; font-size: 13px; }
   .topnav-more-head {
     font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase;
     color: rgba(255,255,255,0.4); padding: 16px 20px 6px;
@@ -936,6 +939,20 @@
   <circle cx="9" cy="8" r="3.2"/><path d="M2.8 20a6.4 6.4 0 0 1 12.4 0M16.5 5.2a3.2 3.2 0 0 1 0 5.9M18 20a6 6 0 0 0-2.2-4.4"/></symbol>
 <symbol id="i-truck" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
   <path d="M1.5 6h12v10h-12z"/><path d="M13.5 10h4l3.5 3.5V16h-7.5z"/><circle cx="6" cy="18" r="1.8"/><circle cx="17" cy="18" r="1.8"/></symbol>
+<symbol id="i-wrench" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M15.5 3.5a5.5 5.5 0 0 0-5 7.7L3.6 18a2 2 0 1 0 2.8 2.8l6.8-6.9a5.5 5.5 0 0 0 6.9-7.2l-3 3-2.6-2.6 3-3a5.4 5.4 0 0 0-2-.6Z"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="12" cy="12" r="8.6"/><path d="M12 7v5.3l3.2 2"/></symbol>
+<symbol id="i-clipboard" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="5" y="5" width="14" height="16" rx="2"/><path d="M9 5V3.6h6V5"/><path d="M9 11h6M9 15h4"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M18 9a6 6 0 1 0-12 0c0 5-2 6.5-2 6.5h16S18 14 18 9Z"/><path d="M13.7 19.5a2 2 0 0 1-3.4 0"/></symbol>
+<symbol id="i-power" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M12 3.5v8"/><path d="M17.5 6.6a7.5 7.5 0 1 1-11 0"/></symbol>
+<symbol id="i-gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="12" cy="12" r="3.1"/><path d="M19.4 14.6a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1v.2a2 2 0 0 1-4 0v-.1a1.6 1.6 0 0 0-2.8-1.1l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0-1.1-2.7h-.2a2 2 0 0 1 0-4h.1A1.6 1.6 0 0 0 4.5 7l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 2.7-1.1v-.2a2 2 0 0 1 4 0v.1a1.6 1.6 0 0 0 2.8 1.1l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0 1.1 2.7h.2a2 2 0 0 1 0 4h-.1a1.6 1.6 0 0 0-1.4 1z"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3.5" y="5" width="17" height="15.5" rx="2"/><path d="M3.5 10h17M8 3.4V6.6M16 3.4V6.6"/></symbol>
 </defs>
 </svg>
 
@@ -2348,26 +2365,32 @@
   <div class="haul-more-backdrop" onclick="closeMoreSheet()"></div>
   <div class="haul-more-panel" id="haul-more-panel">
     <div class="haul-more-handle"></div>
+    __MORE_USER_DIV__
     <div class="haul-more-items">
       <a href="/dashboard" class="haul-more-owner-hero">
-        <div class="haul-more-owner-title">Owner</div>
+        <div class="haul-more-owner-title"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-board"/></svg>Owner</div>
         <div class="haul-more-owner-sub">Yard overview &middot; pulls &middot; revenue &middot; pay week</div>
       </a>
       <div class="topnav-more-head">Money &amp; Ops</div>
-      <a class="nav-item" href="/invoices">Invoices</a>
-      <a class="nav-item" href="/bin-tracker">Bin Tracker</a>
-      <a class="nav-item" href="/boss/notifications">Alerts</a>
+      <a class="nav-item" href="/invoices"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-clipboard"/></svg>Invoices</a>
+      <a class="nav-item" href="/bin-tracker"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-box"/></svg>Bin Tracker</a>
+      <a class="nav-item" href="/boss/notifications"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-bell"/></svg>Alerts</a>
       <div class="topnav-more-head">Team</div>
-      <a class="nav-item" href="/boss/team-hours">&#x1F552; Team Hours</a>
-      <a class="nav-item" href="/team-time-off">Team Time Off</a>
+      <a class="nav-item" href="/boss/team-hours"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-clock"/></svg>Team Hours</a>
+      <a class="nav-item" href="/team-time-off"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-calendar"/></svg>Team Time Off</a>
       <div class="topnav-more-head">Fleet</div>
-      <a class="nav-item" href="/trucks">&#x1F69A; Trucks</a>
-      <a class="nav-item" href="/vendors">Vendors</a>
-      <a class="nav-item" href="/maintenance">Maintenance</a>
-      <a class="nav-item" href="/team">&#x1F465; Team</a>
+      <a class="nav-item" href="/trucks"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-truck"/></svg>Trucks</a>
+      <a class="nav-item" href="/vendors"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-wrench"/></svg>Vendors</a>
+      <a class="nav-item" href="/maintenance"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-wrench"/></svg>Maintenance</a>
+      <a class="nav-item" href="/team"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-users"/></svg>Team</a>
       <div class="topnav-more-head">Setup</div>
-      <a class="nav-item" href="/yard-setup">Yard Setup</a>
-      <a class="nav-item" href="/settings">&#x2699; Settings</a>
+      <a class="nav-item" href="/yard-setup"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-box"/></svg>Yard Setup</a>
+      <a class="nav-item" href="/settings"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-gear"/></svg>Settings</a>
+      <div style="height:1px;background:rgba(255,255,255,.08);margin:8px 0;"></div>
+      <form method="POST" action="/logout" style="margin:0;padding:0;">
+        <input type="hidden" name="_csrf_token" value="__CSRF_TOKEN__">
+        <button type="submit" style="display:block;width:100%;text-align:left;background:transparent;border:0;color:#fff;padding:14px 20px;font-size:16px;cursor:pointer;"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-power"/></svg>Logout</button>
+      </form>
     </div>
   </div>
 </div>
