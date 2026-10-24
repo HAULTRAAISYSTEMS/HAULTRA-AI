@@ -335,6 +335,13 @@
   }
   .qa-badge.pickup { background: var(--orange-dim); color: var(--orange); border: 1px solid var(--orange-border); }
   .qa-badge.dropswap { background: var(--slate-dim); color: var(--slate); border: 1px solid var(--slate-border); }
+  /* 2026-10-23: no presumed action — dotted "?" badge invites the pick. */
+  .qa-badge.badge-unset {
+    background: transparent; color: var(--text-muted);
+    border: 2px dashed rgba(255,255,255,.25); font-weight: 800;
+  }
+  #sheet-actions.invalid { animation: qa-shake .3s; border: 2px solid #FF5252; border-radius: 12px; }
+  @keyframes qa-shake { 0%,100% { transform: translateX(0); } 25% { transform: translateX(-4px); } 75% { transform: translateX(4px); } }
   /* Action-badge palette — solid fill + near-black ink (matches haultra-theme.css). */
   .badge-pr,.badge-p,.badge-d,.badge-s,.badge-r,.badge-yard,.badge-ll {
     color:#0A0A0A !important; border:none !important; box-shadow:none !important; text-shadow:none !important; }
@@ -1794,8 +1801,9 @@
 
   function prefillFromLoc(loc) {
     // Copy-on-write: values are READ off the saved location into a plain object.
+    // Null action = no presumption; the sheet forces an explicit pick.
     return {
-      action: codeFromAction(loc.default_action),
+      action: loc.default_action ? codeFromAction(loc.default_action) : null,
       customer: loc.customer_name || '',
       address: locFullAddress(loc),
       container_size: loc.default_container_size || '',
@@ -1866,7 +1874,7 @@
     sheetMode = editId ? 'edit' : 'add';
     sheetEditId = editId || null;
     var pa = (prefill.action || '').toUpperCase();
-    sheetAction = (ACTION_CODES.indexOf(pa) !== -1) ? pa : 'P';
+    sheetAction = (ACTION_CODES.indexOf(pa) !== -1) ? pa : '';
     sheetSize = (CONTAINER_SIZES.indexOf(prefill.container_size) !== -1) ? prefill.container_size : '';
     el('sheet-title').textContent = editId ? 'Edit Stop' : 'Confirm Stop';
     el('sheet-add').textContent = editId ? 'Save' : 'Add Stop';
@@ -1908,6 +1916,12 @@
       return;
     }
     addrEl.classList.remove('invalid');
+    if (!sheetAction) {
+      showToast('Pick an action for this stop');
+      var awrap = el('sheet-actions');
+      if (awrap) { awrap.classList.add('invalid'); setTimeout(function(){ awrap.classList.remove('invalid'); }, 1200); }
+      return;
+    }
     var fields = {
       source: 'manual',
       action: sheetAction,
@@ -2022,15 +2036,24 @@
   function hideSuggest() { if (qaSuggest) { qaSuggest.hidden = true; qaSuggest.innerHTML = ''; } }
 
   function buildQaRow(loc) {
-    var meta = ACTION_META[codeFromAction(loc.default_action)] || ACTION_META.P;
+    // 2026-10-23: no presumed action. Learned default shows as a badge;
+    // new customers get a "?" — the boss picks the action in the sheet.
+    var learnedCode = loc.default_action ? codeFromAction(loc.default_action) : null;
     var row = document.createElement('button');
     row.type = 'button';
     row.className = 'qa-row';
     row.setAttribute('role', 'option');
 
     var badge = document.createElement('span');
-    badge.className = 'qa-badge badge-' + String(codeFromAction(loc.default_action) || 'D').toLowerCase();
-    badge.textContent = codeFromAction(loc.default_action);
+    if (learnedCode) {
+      badge.className = 'qa-badge badge-' + learnedCode.toLowerCase();
+      badge.textContent = learnedCode;
+      badge.title = 'Usual: ' + ((ACTION_META[learnedCode] || {}).full || learnedCode);
+    } else {
+      badge.className = 'qa-badge badge-unset';
+      badge.textContent = '?';
+      badge.title = 'Pick an action';
+    }
     row.appendChild(badge);
 
     var text = document.createElement('span');
@@ -2149,7 +2172,9 @@
       tap.className = 'qa-chip-tap';
       var b = document.createElement('span');
       b.className = 'qa-chip-badge';
-      b.textContent = codeFromAction(loc.default_action);
+      var chipCode = loc.default_action ? codeFromAction(loc.default_action) : null;
+      b.textContent = chipCode || '?';
+      if (!chipCode) b.style.border = '2px dashed rgba(255,255,255,.25)';
       tap.appendChild(b);
 
       var txt = document.createElement('span');
