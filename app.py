@@ -19924,9 +19924,10 @@ def driver_route_detail(route_id):
         f'{"hidden" if not unread_messages else ""}>{unread_messages or ""}</span></button>'
     )
     # 2026-10-23: Yard Inventory Awareness — show the assigned yard can.
+    # 2026-10-24: notes-derived too — 'Can 3117 at yard' in notes counts.
     _acan = ""
     try:
-        _acan = (dict(s).get("assigned_can") or "").strip()
+        _acan = _effective_can(s)
     except Exception:
         pass
     _assigned_can_html = (
@@ -23929,7 +23930,7 @@ def view_route(route_id):
             <p><strong>Action:</strong> {e(s['action'] or '')}{_can_pill}{_swap_badge}</p>
             {_swap_warning}
             <p><strong>Container:</strong> {e(s['container_size'] or '')}</p>
-            {('<p><strong>Yard Can:</strong> <span style="color:#3DDC84;font-weight:800;">🏗️ #' + e(dict(s).get('assigned_can') or '') + '</span></p>') if (dict(s).get('assigned_can') or '').strip() else (('<p><strong>Yard Can:</strong> <span class="muted">Not assigned — Edit to set it</span></p>') if (session.get('role') == 'boss' and 'delivery' in (dict(s).get('action') or '').lower()) else '')}
+            {('<p><strong>Yard Can:</strong> <span style="color:#3DDC84;font-weight:800;">🏗️ #' + e(_effective_can(s)) + (' <span class="muted" style="font-weight:400;">(from notes)</span>' if not (dict(s).get('assigned_can') or '').strip() else '') + '</span></p>') if _effective_can(s) else (('<p><strong>Yard Can:</strong> <span class="muted">Not assigned — Edit to set it</span></p>') if (session.get('role') == 'boss' and 'delivery' in (dict(s).get('action') or '').lower()) else '')}
             <p><strong>Ticket:</strong> {e(s['ticket_number'] or '')}</p>
             {_weight_row_html(s)}
             {_fee_row_html(s)}
@@ -24218,6 +24219,62 @@ def mark_route_in_progress(route_id):
     if session.get("role") != "boss":
         return redirect(url_for("driver_route_detail", route_id=route_id))
     return redirect(url_for("view_route", route_id=route_id))
+
+
+import re as _re_for_can_notes
+_CAN_WORD_RE = _re_for_can_notes.compile(r'\b(?:can|container|bin)s?\s*#?\s*(\d{3,5})\b', _re_for_can_notes.IGNORECASE)
+_CAN_HASH_RE = _re_for_can_notes.compile(r'#\s*(\d{3,5})\b')
+
+
+def _can_from_notes(text):
+    """Can number written in free text, or '' if none can be read safely.
+
+    Matches 'Can 3117', 'container #3117', 'bin 3117', '#3117', and a
+    number next to the word 'yard' ('3117 at yard'). It deliberately does
+    NOT match bare numbers on their own — 'place at lot 20', '30yd', and
+    street numbers like 11496 must never be mistaken for a can.
+    """
+    if not text:
+        return ""
+    m = _CAN_WORD_RE.search(text)
+    if m:
+        return m.group(1)
+    m = _CAN_HASH_RE.search(text)
+    if m:
+        return m.group(1)
+    low = text.lower()
+    if "yard" in low:
+        m = _re_for_can_notes.search(r'\b(\d{3,5})\b', text)
+        if m:
+            return m.group(1)
+    stripped = text.strip()
+    if stripped.isdigit() and 3 <= len(stripped) <= 5:
+        return stripped
+    return ""
+
+
+def _effective_can(stop):
+    """The yard can for a stop: explicit assigned_can first, else a can
+    number read from the stop's notes/placement note.
+
+    Only Delivery stops carry a yard can — a Pull stop's notes can is the
+    bin being pulled from the customer, not a yard can, so it is never
+    treated as one here.
+    """
+    try:
+        d = dict(stop)
+    except Exception:
+        return ""
+    ac = (d.get("assigned_can") or "").strip()
+    if ac:
+        return ac
+    if "delivery" not in (d.get("action") or "").lower():
+        return ""
+    for field in ("notes", "placement_note"):
+        can = _can_from_notes(d.get(field) or "")
+        if can:
+            return can
+    return ""
 
 
 def _route_final_bin_detail(conn, route_id):
@@ -25892,9 +25949,12 @@ def toggle_stop_complete(stop_id):
         update_container_flow(conn, stop_id)
         # 2026-10-23: Yard Inventory Awareness — a completed Delivery leaves
         # its assigned yard can at the customer (deployed).
+        # 2026-10-24: notes-derived too, and UPSERT — a derived can (e.g.
+        # yesterday's 3117, never in the fleet table) must still land as
+        # deployed, otherwise the yard logic would resurrect it later.
         try:
-            _srow = conn.execute("SELECT assigned_can, action FROM stops WHERE id=?", (stop_id,)).fetchone()
-            _acan_done = (dict(_srow).get("assigned_can") or "").strip() if _srow else ""
+            _srow = conn.execute("SELECT assigned_can, action, notes, placement_note, container_size FROM stops WHERE id=?", (stop_id,)).fetchone()
+            _acan_done = _effective_can(_srow) if _srow else ""
             _aact = (dict(_srow).get("action") or "").lower() if _srow else ""
             if _acan_done and "delivery" in _aact:
                 _ex = conn.execute("SELECT id FROM containers WHERE company_id=? AND label=? LIMIT 1",
@@ -25902,6 +25962,11 @@ def toggle_stop_complete(stop_id):
                 if _ex:
                     conn.execute("UPDATE containers SET status='deployed', notes=? WHERE id=?",
                                  ("Delivered " + now_ts()[:10], _ex["id"]))
+                else:
+                    conn.execute("""INSERT INTO containers (company_id, size, label, status, notes, created_at)
+                                    VALUES (?,?,?,?,?,?)""",
+                                 (cid(), (dict(_srow).get("container_size") or ""), _acan_done, "deployed",
+                                  "Delivered " + now_ts()[:10], now_ts()))
         except Exception:
             pass
     # Customer Request System: mirror completion/reopen onto a linked request
@@ -27073,16 +27138,24 @@ def api_yard_inventory():
             """SELECT id, label, size, notes FROM containers
                WHERE company_id=? AND status='yard' ORDER BY label""",
             (cid(),)).fetchall()
-        # Cans already promised to an open route's delivery stop
+        # Cans already promised to an open route's delivery stop.
+        # 2026-10-24: notes-derived too — a Delivery whose notes say
+        # 'Can 3117' counts as promised, and is shown in the strip as
+        # taken (struck-through) while it is out, instead of vanishing.
         taken = set()
+        assigned_out = {}
         try:
             rows = conn.execute(
-                """SELECT s.assigned_can FROM stops s
+                """SELECT s.assigned_can, s.notes, s.placement_note, s.action, s.container_size FROM stops s
                    JOIN routes r ON r.id = s.route_id
-                   WHERE r.company_id=? AND r.status != 'completed'
-                   AND s.assigned_can IS NOT NULL AND s.assigned_can != ''""",
+                   WHERE r.company_id=? AND r.status != 'completed'""",
                 (cid(),)).fetchall()
-            taken = {r["assigned_can"] for r in rows}
+            for _orow in rows:
+                _eff = _effective_can(_orow)
+                if _eff:
+                    taken.add(_eff)
+                    if _eff not in assigned_out:
+                        assigned_out[_eff] = (dict(_orow).get("container_size") or "")
         except Exception:
             pass
         out = [{"id": c["id"], "label": c["label"], "size": c["size"] or "",
@@ -27150,18 +27223,18 @@ def api_yard_inventory():
                 if not bin_no or bin_no in derived:
                     continue
                 derived[bin_no] = {"size": bin_size, "route_date": rd.get("route_date") or ""}
-            # Drop derived bins a later completed Delivery already took out.
+            # Drop derived bins a later completed Delivery already took out
+            # (explicit assigned_can OR notes-derived).
             if derived:
                 try:
                     delivs = conn.execute(
-                        """SELECT s.assigned_can, r.route_date FROM stops s
+                        """SELECT s.assigned_can, s.notes, s.placement_note, s.action, r.route_date FROM stops s
                            JOIN routes r ON r.id = s.route_id
                            WHERE r.company_id=? AND s.status='completed'
-                           AND lower(s.action) LIKE '%delivery%'
-                           AND s.assigned_can IS NOT NULL AND s.assigned_can != ''""",
+                           AND lower(s.action) LIKE '%delivery%'""",
                         (cid(),)).fetchall()
                     for d in delivs:
-                        lab = d["assigned_can"]
+                        lab = _effective_can(d)
                         if lab in derived and (d["route_date"] or "") >= derived[lab]["route_date"]:
                             del derived[lab]
                 except Exception:
@@ -27174,6 +27247,15 @@ def api_yard_inventory():
                             "notes": "From " + derived[lab]["route_date"] + " route",
                             "source": "route",
                             "available": lab not in taken})
+            # Cans out on an open Delivery (explicit or notes-derived) show
+            # as taken, so the boss sees them in use instead of missing.
+            for lab in sorted(assigned_out):
+                if lab in seen:
+                    continue
+                seen.add(lab)
+                out.append({"id": None, "label": lab, "size": assigned_out[lab],
+                            "notes": "On route", "source": "assigned",
+                            "available": False})
         except Exception:
             pass
         out.sort(key=lambda c: c["label"])
@@ -29584,6 +29666,10 @@ YARD CANS (important): "deliver can 3117 to <addr>" / "drop can 3117 at <addr>" 
   "3117" (digits only). The word "can" before a number is the can identifier, NOT a street
   address. "deliver a 30yd to <addr>" (no can number) is a Delivery with container_size
   "30yd" and no assigned_can — the boss picks the can from yard inventory.
+  Same rule for "start with can 3117 from the yard" / "grab can 3117 at the yard and deliver
+  it to <addr>" / "go pick up container 3117 from the dump and deliver it to <addr>": the
+  Delivery stop gets assigned_can "3117" — the can starts at the yard/dump and ends
+  deployed at the customer.
 
 NAME TOLERANCE: dispatchers mistype names ("restorstion" for "Restoration"). Match a
   misspelled customer/location to the closest KNOWN CUSTOMERS / KNOWN LOCATIONS entry and
@@ -29826,7 +29912,9 @@ def _normalize_manual_stops(stops_in):
             "address": address,
             "customer": _cap(s.get("customer")),
             "container_size": size,
-            "assigned_can": (s.get("assigned_can") or "").strip()[:20],
+            # 2026-10-24: notes-derived yard can for manual stops too.
+            "assigned_can": ((s.get("assigned_can") or "").strip()[:20]
+                              or (_can_from_notes(_cap(s.get("notes"))) if action == "D" else "")),
             "dump_leg": _cap(s.get("dump_leg")),
             "return_leg": _cap(s.get("return_leg")),
             "notes": _cap(s.get("notes")),
@@ -38095,7 +38183,10 @@ def _validate_parser_stops(stops_in):
                               if (s.get("empty_can_plan") or "").strip() in _EMPTY_CAN_PLANS else "",
             "carry_can_ref": (str(s.get("carry_can_ref") or "").strip()[:40]),
             # 2026-10-23: Yard Inventory Awareness — the specific yard can.
-            "assigned_can": (str(s.get("assigned_can") or "").strip()[:20]),
+            # 2026-10-24: notes-derived — 'Can 3117' in notes fills this in
+            # when the picker was not used, so a Delivery still tracks.
+            "assigned_can": ((str(s.get("assigned_can") or "").strip()[:20])
+                              or (_can_from_notes(_notes) if "delivery" in _PARSER_ACTION_MAP[action_code].lower() else "")),
             # A confirm-sheet [change] -> delivery pick: the POSITION (0-based) of the
             # D stop this stop's chain delivers its final empty to. Translated to a
             # real stop id after insert (positions are all we have pre-insert).
