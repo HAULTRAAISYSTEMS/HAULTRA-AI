@@ -13005,6 +13005,10 @@ def _push_settings_toggle():
         <span class="muted small" id="push-test-sub"></span>
       </div>
     </div>
+    <div class="card" id="push-desktop-note" hidden style="margin-bottom:14px;">
+      <div class="muted small">📱 Phone notifications are set up in the <strong>HAULTRA iPhone app</strong> —
+      open it, go to Settings → Notifications and Alerts, and flip the toggle there.</div>
+    </div>
     <script>
     (function () {
       var card = document.getElementById('push-card');
@@ -13013,7 +13017,13 @@ def _push_settings_toggle():
       var tsub = document.getElementById('push-test-sub');
       var ua = navigator.userAgent || '';
       var isNativeShell = ua.indexOf('HaultraNativeApp') !== -1;
-      if (!isNativeShell) return;
+      if (!isNativeShell) {
+        // 2026-10-23: on desktop browsers the toggle can't work — show a
+        // pointer to the iPhone app instead of an empty section header.
+        var note = document.getElementById('push-desktop-note');
+        if (note) note.hidden = false;
+        return;
+      }
       var cap = (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.PushNotifications) || null;
       card.hidden = false;
       if (!cap) {
