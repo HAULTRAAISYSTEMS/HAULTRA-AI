@@ -24277,13 +24277,19 @@ def _effective_can(stop):
     return ""
 
 
-def _fleet_upsert(conn, company_id, label, size, status, notes):
+def _fleet_upsert(conn, company_id, label, size, status, notes, force=True):
     """Learn a can into the fleet table, or update the one already there.
 
     No unique constraint exists on (company_id, label), so this is
     SELECT-then-INSERT/UPDATE, never ON CONFLICT. A boss-set 'lost' or
     'retired' status is never overwritten by auto-learning — a human
     decision wins over a replayed route.
+    Same protection for a bulk deploy: a can whose notes start with
+    'Bulk deployed' keeps that status against DERIVED/intermediate
+    updates (force=False: an open delivery's on-truck state, a finished
+    route's derived yard bin). Definitive events (force=True: a completed
+    Delivery, a dump-ticket haul/return, an explicit disposition) still
+    win, so a bulk-deployed can that really moves is not frozen.
     Returns (inserted, changed).
     """
     label = (label or "").strip()
@@ -24299,6 +24305,10 @@ def _fleet_upsert(conn, company_id, label, size, status, notes):
         return (True, False)
     d = dict(row)
     if d.get("status") in ("lost", "retired"):
+        if not (d.get("size") or "") and size:
+            conn.execute("UPDATE containers SET size=? WHERE id=?", (size, d["id"]))
+        return (False, False)
+    if not force and (d.get("notes") or "").startswith("Bulk deployed"):
         if not (d.get("size") or "") and size:
             conn.execute("UPDATE containers SET size=? WHERE id=?", (size, d["id"]))
         return (False, False)
@@ -24341,6 +24351,17 @@ def _sync_fleet_from_history(conn, company_id):
             before[_c["label"]] = (_c["status"], _c["notes"] or "")
     except Exception:
         before = {}
+    # Bulk-deployed cans: a boss decision dated D beats any history event
+    # dated BEFORE D (an old route replayed after the bulk tap must not
+    # undo it). Events on/after D are real new movement and still win.
+    bulk_dates = {}
+    try:
+        for _c in conn.execute("SELECT label, notes FROM containers WHERE company_id=? AND notes LIKE 'Bulk deployed%'", (company_id,)).fetchall():
+            _m = re.search(r"Bulk deployed (\d{4}-\d{2}-\d{2})", _c["notes"] or "")
+            if _m:
+                bulk_dates[_c["label"]] = _m.group(1)
+    except Exception:
+        bulk_dates = {}
     routes = conn.execute(
         "SELECT id, route_date, status, final_bin_disposition FROM routes "
         "WHERE company_id=? ORDER BY route_date ASC, id ASC",
@@ -24369,16 +24390,22 @@ def _sync_fleet_from_history(conn, company_id):
             where = (d.get("address") or "").strip()
             done = (d.get("status") or "") == "completed"
             eff = _effective_can(d)
-            if eff:
+            # Bulk-deployed before this route's date: old history must not
+            # undo the boss's newer decision.
+            _eff_old = bool(eff and bulk_dates.get(eff) and rdate and rdate < bulk_dates[eff])
+            if eff and not _eff_old:
                 if done:
                     ins, ch = _fleet_upsert(conn, company_id, eff, size, "deployed",
                                             f"Delivered {rdate} — {who}, {where}" if who or where else f"Delivered {rdate}")
                 else:
+                    # Intermediate state only — must not revert a bulk deploy.
                     ins, ch = _fleet_upsert(conn, company_id, eff, size, "loaded_at_yard",
-                                            f"On route {rdate} — {who}" if who else f"On route {rdate}")
+                                            f"On route {rdate} — {who}" if who else f"On route {rdate}",
+                                            force=False)
                 pass
             tcan = tickets.get(d["id"])
-            if tcan and "delivery" not in act and done:
+            _tcan_old = bool(tcan and bulk_dates.get(tcan) and rdate and rdate < bulk_dates[tcan])
+            if tcan and not _tcan_old and "delivery" not in act and done:
                 is_pr = "pickup and return" in act or "return" in act
                 is_swap = bool(d.get("swap_with_prev_pull")) or bool(d.get("chain_takes_from_stop_id"))
                 if is_pr and not is_swap:
@@ -24397,7 +24424,8 @@ def _sync_fleet_from_history(conn, company_id):
                 rdate and rdate < today and counts and counts["total"] and counts["done"] >= counts["total"])
             if finished:
                 bin_no, bin_size = _route_final_bin_detail(conn, rt["id"])
-                if bin_no:
+                _bin_old = bool(bin_no and bulk_dates.get(bin_no) and rdate and rdate < bulk_dates[bin_no])
+                if bin_no and not _bin_old:
                     disp = (rt["final_bin_disposition"] or "").strip().lower() if "final_bin_disposition" in rt.keys() else ""
                     if disp == "yard":
                         ins, ch = _fleet_upsert(conn, company_id, bin_no, bin_size, "yard",
@@ -24408,8 +24436,10 @@ def _sync_fleet_from_history(conn, company_id):
                                                 f"At customer — end of {rdate} route")
                         pass
                     elif disp == "":
+                        # Derived yard bin only — must not revert a bulk deploy.
                         ins, ch = _fleet_upsert(conn, company_id, bin_no, bin_size, "yard",
-                                                f"At yard — end of {rdate} route (from route log)")
+                                                f"At yard — end of {rdate} route (from route log)",
+                                                force=False)
                         pass
                     # 'landfill' disposition: leave the fleet row alone.
         except Exception:
@@ -33899,6 +33929,7 @@ def _containers_section_html():
             </div>
             <div style="display:flex;gap:8px;flex-wrap:wrap;">
                 <button type="button" class="ai-btn" id="fleet-sync-btn" onclick="fleetSync(this)">🔄 Sync from history</button>
+                <button type="button" class="ai-btn" id="fleet-deploy-all-btn" data-yard-count="{_group_counts.get("yard", 0)}" onclick="fleetDeployAll(this)">🚚 Deploy all yard ({_group_counts.get("yard", 0)})</button>
                 <a class="ai-btn solid" href="{url_for('add_container')}">+ Add Container</a>
             </div>
         </div>
@@ -33911,6 +33942,17 @@ def _containers_section_html():
                 if (j.ok) {{ location.reload(); }} else {{ btn.textContent = 'Sync failed'; }}
             }} catch (e) {{ btn.textContent = 'Sync failed'; }}
             btn.disabled = false;
+        }}
+        async function fleetDeployAll(btn) {{
+            var n = btn.getAttribute('data-yard-count') || '0';
+            if (n === '0') {{ alert('No yard cans to deploy.'); return; }}
+            if (!confirm('Deploy all ' + n + ' yard cans? They will leave the yard strip and show as deployed with no customer attached, until a delivery or an Edit gives them one. This is for when your yard is truly empty — cans physically sitting in the yard will disappear from dispatch.')) {{ return; }}
+            btn.disabled = true; btn.textContent = 'Deploying…';
+            try {{
+                var r = await fetch('/api/fleet/deploy-all', {{method: 'POST', headers: {{'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]') ? document.querySelector('meta[name="csrf-token"]').content : ''}}}});
+                var j = await r.json();
+                if (j.ok) {{ location.reload(); }} else {{ btn.textContent = 'Deploy failed'; btn.disabled = false; }}
+            }} catch (e) {{ btn.textContent = 'Deploy failed'; btn.disabled = false; }}
         }}
         </script>
         <p class="ai-sub" style="margin-top:10px;">🟢 At Yard = sitting in the yard, ready to assign &nbsp;·&nbsp; 🔵 On Truck (loaded at yard) = loaded onto a truck at the yard — heading out or heading back, not at a customer yet &nbsp;·&nbsp; 🟡 Deployed = dropped at a customer.</p>
@@ -34822,6 +34864,34 @@ def api_fleet_sync():
         return jsonify({"ok": False, "error": str(exc)}), 500
     conn.close()
     return jsonify({"ok": True, **res})
+
+
+@app.route("/api/fleet/deploy-all", methods=["POST"])
+@boss_required
+def api_fleet_deploy_all():
+    """Bulk deploy: mark every yard can as deployed, in one tap.
+
+    Only status='yard' rows move — deployed, on-truck, lost and retired
+    cans are untouched. The note is marked 'Bulk deployed' so the
+    auto-learn sync treats it as a boss decision: derived yard events
+    will not silently flip these cans back to the yard (definitive
+    events — a completed Delivery, a dump-ticket haul — still win).
+    A bulk-deployed can carries no customer/address until a real
+    delivery or an Edit gives it one.
+    """
+    conn = get_db()
+    try:
+        cur = conn.execute(
+            "UPDATE containers SET status='deployed', notes=? WHERE company_id=? AND status='yard'",
+            ("Bulk deployed " + today_str() + " — via Deploy all", cid()))
+        conn.commit()
+        n = cur.rowcount or 0
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    conn.close()
+    return jsonify({"ok": True, "deployed": n})
 
 
 @app.route("/yard-setup")
