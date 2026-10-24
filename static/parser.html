@@ -2496,7 +2496,8 @@ function renderYardStrip() {
     var el = document.createElement('span');
     el.className = 'yard-can' + (c.available ? '' : ' taken');
     el.textContent = '#' + c.label + (c.size ? ' ' + c.size : '');
-    el.title = c.available ? 'Tap to use on a Delivery' : 'Already assigned to a route';
+    el.title = (c.available ? 'Tap to use on a Delivery' : 'Already assigned to a route')
+      + (c.source === 'route' ? ' — from route log' : '');
     if (c.available) {
       el.addEventListener('click', function() {
         // Open the confirm sheet prefilled as a Delivery with this can
