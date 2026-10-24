@@ -24297,6 +24297,29 @@ def _effective_can(stop):
     return ""
 
 
+def _pickup_can(stop):
+    """The container number the boss put on a PICKUP route for this stop.
+
+    A Pull/PR stop's can is the bin being picked up from the customer —
+    the opposite of _effective_can's yard can, so it gets its own reader.
+    Sources, in order: an explicit assigned_can (boss Edit), then a can
+    number read from notes/placement_note ('can 3101'). Strict patterns
+    only — a bare number in notes is never guessed as a can.
+    """
+    try:
+        d = dict(stop)
+    except Exception:
+        return ""
+    ac = (d.get("assigned_can") or "").strip()
+    if ac:
+        return ac
+    for field in ("notes", "placement_note"):
+        can = _can_from_notes(d.get(field) or "")
+        if can:
+            return can
+    return ""
+
+
 def _fleet_upsert(conn, company_id, label, size, status, notes, force=True):
     """Learn a can into the fleet table, or update the one already there.
 
@@ -24432,7 +24455,10 @@ def _sync_fleet_from_history(conn, company_id):
             # Bulk-deployed before this route's date: old history must not
             # undo the boss's newer decision.
             _eff_old = bool(eff and bulk_dates.get(eff) and rdate and rdate < bulk_dates[eff])
-            if eff and not _eff_old:
+            # 2026-10-24: a yard can belongs to a Delivery only. A Pull/PR
+            # stop carrying an assigned_can is a PICKUP can — handled by
+            # the route-can branch below, never as a delivery.
+            if eff and "delivery" in act and not _eff_old:
                 if done:
                     ins, ch = _fleet_upsert(conn, company_id, eff, size, "deployed",
                                             f"Delivered {rdate} — {who}, {where}" if who or where else f"Delivered {rdate}")
@@ -24454,6 +24480,36 @@ def _sync_fleet_from_history(conn, company_id):
                     ins, ch = _fleet_upsert(conn, company_id, tcan, size, "loaded_at_yard",
                                             f"Hauled {rdate} — {who}" if who else f"Hauled {rdate}")
                 pass
+            # 2026-10-24: route can on a pickup — the boss put the container
+            # number on the route itself ('can 3101' in the stop notes), so
+            # the driver picking it up puts it on the truck even with no
+            # dump ticket yet. A ticket, when one exists, still wins
+            # (driver evidence beats boss text): the ticket branch above
+            # already handled a ticketed stop, so this branch only fires
+            # ticket-less — or, live, for a ticket already entered
+            # mid-route on a stop that is not yet completed.
+            _is_pickup = ("delivery" not in act
+                          and ("pull" in act or "pickup" in act or "return" in act))
+            if _is_pickup:
+                _pcan = _pickup_can(d)
+                _pcan_old = bool(_pcan and bulk_dates.get(_pcan) and rdate and rdate < bulk_dates[_pcan])
+                if _pcan and not _pcan_old:
+                    if done and not tcan:
+                        # Completed pickup, no ticket: last known state is
+                        # on the truck until a disposition or delivery
+                        # moves it (or it ages into Needs review).
+                        ins, ch = _fleet_upsert(conn, company_id, _pcan, size, "loaded_at_yard",
+                                                f"Picked up {rdate} — {who}" if who else f"Picked up {rdate}")
+                    elif not done and (d.get("driver_status") or "") in ("box_out", "going_to_dump", "need_box_in"):
+                        # Live pickup: bin already hooked, stop not yet
+                        # completed. A ticket entered mid-route describes
+                        # it best; otherwise the route can stands.
+                        if tcan and not _tcan_old:
+                            ins, ch = _fleet_upsert(conn, company_id, tcan, size, "loaded_at_yard",
+                                                    f"Hauled {rdate} — {who}" if who else f"Hauled {rdate}")
+                        elif not tcan:
+                            ins, ch = _fleet_upsert(conn, company_id, _pcan, size, "loaded_at_yard",
+                                                    f"Picked up {rdate} — {who}" if who else f"Picked up {rdate}")
             if done:
                 # Swap-drop: on a completed PR swap, the carried-in empty
                 # was left at this customer. It needs its own ticket
@@ -26654,6 +26710,16 @@ def stop_driver_action(stop_id):
         else:
             _flash_msg = "✓ %s complete." % _done_name
 
+    # 2026-10-24: fleet auto-learn — boxing out / heading to the dump with
+    # a route can puts it on the truck NOW (live pickup), not only when
+    # the stop completes. The sync itself now reads in-progress pickups,
+    # so this just triggers it at the pickup moment. Never blocks the
+    # driver action if the sync fails.
+    try:
+        if action in ("box_out", "going_to_dump") and _stop_updated > 0:
+            _sync_fleet_from_history(conn, cid())
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -29950,6 +30016,12 @@ YARD CANS (important): "deliver can 3117 to <addr>" / "drop can 3117 at <addr>" 
   it to <addr>" / "go pick up container 3117 from the dump and deliver it to <addr>": the
   Delivery stop gets assigned_can "3117" — the can starts at the yard/dump and ends
   deployed at the customer.
+
+PICKUP CANS: on a P or PR stop, a number right after the customer name ("Marlyn 3101")
+  is that customer's container number — put "can 3101" in notes (digits only after
+  "can"). Never confuse it with the street number ("697 independence pkwy" is an
+  address, not a can). The app marks that can on the truck the moment the driver
+  picks it up, so this number must survive into notes verbatim.
 
 NAME TOLERANCE: dispatchers mistype names ("restorstion" for "Restoration"). Match a
   misspelled customer/location to the closest KNOWN CUSTOMERS / KNOWN LOCATIONS entry and
