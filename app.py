@@ -29903,8 +29903,8 @@ def _onboarding_back_banner():
         <div class="card" style="border:1px solid rgba(255,107,26,.4);background:linear-gradient(135deg,rgba(255,107,26,.08),rgba(255,107,26,.02));margin-bottom:16px;">
             <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
                 <div style="flex:1;min-width:200px;">
-                    <strong>\U0001F680 Finish your setup</strong>
-                    <div class="muted small">{done_n} of {total_n} steps done — you\u2019re almost there.</div>
+                    <strong>Finish your setup</strong>
+                    <div class="muted small">{done_n} of {total_n} steps done.</div>
                 </div>
                 <a class="btn gold" href="{url_for('onboarding_setup')}" style="min-height:48px;display:inline-flex;align-items:center;">Back to checklist</a>
             </div>
@@ -30304,6 +30304,18 @@ def settings_page():
             40-yard has its own. The app uses these to total revenue per route
             and per day. Blank = unpriced.
         </p>
+        <div style="border:1px solid rgba(255,107,26,.25);border-radius:12px;padding:14px;margin-bottom:16px;background:linear-gradient(135deg,rgba(255,107,26,.05),rgba(255,107,26,.01));">
+            <div style="font-weight:800;margin-bottom:4px;">📷 Scan a paper rate sheet</div>
+            <div class="muted small" style="margin-bottom:10px;">Snap your price list — AI pulls every size and price in. Review, then it fills the table below.</div>
+            <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                <label class="btn gold" style="min-height:48px;cursor:pointer;">
+                    📷 Scan rate sheet
+                    <input type="file" id="rc-rate-scan" accept="image/*" hidden>
+                </label>
+                <span id="rc-rate-status" class="muted small"></span>
+            </div>
+            <div id="rc-rate-results"></div>
+        </div>
         <form method="POST">
             <input type="hidden" name="_action" value="rate_card">
             <div style="overflow-x:auto;">
@@ -30640,6 +30652,92 @@ def settings_page():
     {_phone_section}
     {subscription_body}
     {delete_account_body}
+    <script>
+    (function(){{
+        var csrfEl = document.querySelector('meta[name="csrf-token"]');
+        var csrf = csrfEl ? csrfEl.getAttribute('content') : '';
+        function esc(s){{ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }}
+        function downscale(file) {{
+            return new Promise(function(resolve) {{
+                var rd = new FileReader();
+                rd.onload = function() {{
+                    var img = new Image();
+                    img.onload = function() {{
+                        try {{
+                            var w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+                            var scale = Math.min(1, 1600 / Math.max(w, h));
+                            var cv = document.createElement('canvas');
+                            cv.width = Math.round(w * scale); cv.height = Math.round(h * scale);
+                            cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+                            cv.toBlob(function(blob) {{
+                                resolve(blob ? new File([blob], 'scan.jpg', {{type:'image/jpeg'}}) : file);
+                            }}, 'image/jpeg', 0.72);
+                        }} catch (e) {{ resolve(file); }}
+                    }};
+                    img.onerror = function() {{ resolve(file); }};
+                    img.src = rd.result;
+                }};
+                rd.onerror = function() {{ resolve(file); }};
+                rd.readAsDataURL(file);
+            }});
+        }}
+        var rateInput = document.getElementById('rc-rate-scan');
+        var rateStatus = document.getElementById('rc-rate-status');
+        var rateResults = document.getElementById('rc-rate-results');
+        if (rateInput) rateInput.addEventListener('change', function(){{
+            var f = rateInput.files[0];
+            if (!f) return;
+            rateStatus.innerHTML = '<span style="color:#FF9D5C;font-weight:700;">Reading your prices...</span>';
+            rateResults.innerHTML = '';
+            downscale(f).then(function(small) {{
+                var fd = new FormData();
+                fd.append('photo', small);
+                return fetch('/api/onboarding/scan-rates', {{method:'POST', headers:{{'X-CSRF-Token': csrf}}, body:fd}})
+                .then(function(r) {{ return r.text().then(function(t) {{
+                    var d = null; try {{ d = JSON.parse(t); }} catch (e) {{}}
+                    if (!d) throw new Error('server');
+                    return d;
+                }}); }});
+            }}).then(function(d){{
+                if (!d.ok) {{
+                    var rmap = {{unreadable:'Could not read it - try a clearer photo.',
+                        cap:'Daily scan limit reached.', no_ai:'AI not configured - contact support.',
+                        error:'Server hiccup - try again.'}};
+                    rateStatus.textContent = rmap[d.reason] || 'Scan failed - try again.';
+                    return;
+                }}
+                var n = d.rates.length + d.fees.length;
+                rateStatus.textContent = 'Found ' + n + ' prices. Review, edit, then Save Rate Card below to apply.';
+                var h = '';
+                d.rates.forEach(function(r){{
+                    h += '<div style="border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:10px;margin:6px 0;display:flex;justify-content:space-between;align-items:center;">'
+                        + '<strong>' + esc(r.size || 'Size') + '</strong>'
+                        + '<span>$' + esc(r.price_usd) + ' <span style="font-size:.72rem;opacity:.7;">(' + r.confidence + ')</span></span></div>';
+                }});
+                d.fees.forEach(function(fe){{
+                    h += '<div style="border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:10px;margin:6px 0;display:flex;justify-content:space-between;align-items:center;">'
+                        + '<strong>' + esc(fe.name || 'Fee') + '</strong>'
+                        + '<span>$' + esc(fe.price_usd) + ' <span style="font-size:.72rem;opacity:.7;">(' + fe.confidence + ')</span></span></div>';
+                }});
+                h += '<button class="btn gold" id="rc-rate-apply" style="min-height:48px;margin-top:8px;">Apply ' + n + ' prices to rate card</button>';
+                h += '<div class="muted small" style="margin-top:6px;">This saves them straight to your rate card.</div>';
+                rateResults.innerHTML = h;
+                document.getElementById('rc-rate-apply').addEventListener('click', function(){{
+                    rateStatus.textContent = 'Saving...';
+                    fetch('/api/onboarding/confirm-rates', {{method:'POST',
+                        headers:{{'Content-Type':'application/json','X-CSRF-Token': csrf}},
+                        body: JSON.stringify(d)}})
+                    .then(function(r){{ return r.json(); }}).then(function(rd){{
+                        if (rd.ok) {{
+                            rateResults.innerHTML = '<p style="color:#3DDC84;font-weight:700;">' + rd.imported + ' prices saved! Refresh to see them in the table.</p>';
+                            rateStatus.textContent = '';
+                        }} else rateStatus.textContent = 'Save failed - try again.';
+                    }});
+                }});
+            }}).catch(function(){{ rateStatus.textContent = 'Upload failed - try again.'; }});
+        }});
+    }})();
+    </script>
     """
     return render_template_string(shell_page("Settings", body))
 
@@ -32996,6 +33094,7 @@ def onboarding_import_customers():
     conn.close()
 
     body = f"""
+    {_onboarding_back_banner()}
     <div class="hero">
         <h1>📇 Import Customers</h1>
         <p>{_nc} customers in your address book. Four ways to add more.</p>
@@ -33012,18 +33111,6 @@ def onboarding_import_customers():
             <span id="ob-cust-status" class="muted small"></span>
         </div>
         <div id="ob-cust-results"></div>
-    </div>
-    <div class="card ob-scan-card">
-        <h2 style="margin-top:0;">💲 Scan your rate sheet</h2>
-        <p class="muted small">Photo of your paper price list → AI pulls every size and price straight into your rate card.</p>
-        <div class="ob-scan-row">
-            <label class="btn gold ob-scan-btn">
-                📷 Scan rate sheet
-                <input type="file" id="ob-rate-scan" accept="image/*" capture="environment" hidden>
-            </label>
-            <span id="ob-rate-status" class="muted small"></span>
-        </div>
-        <div id="ob-rate-results"></div>
     </div>
     <div class="card">
         <h2 style="margin-top:0;">✏️ Add one manually</h2>
@@ -33179,66 +33266,6 @@ def onboarding_import_customers():
             }}).catch(function(err){{
                 var m = String((err && err.message) || '');
                 custStatus.textContent = m.indexOf('server:') === 0 ? 'Server error — try again in a minute.'
-                    : m.indexOf('http:') === 0 ? 'Upload failed — try a smaller photo.'
-                    : 'No signal - try again.';
-            }});
-        }});
-        var rateInput = document.getElementById('ob-rate-scan');
-        var rateStatus = document.getElementById('ob-rate-status');
-        var rateResults = document.getElementById('ob-rate-results');
-        var rateData = {{rates:[], fees:[]}};
-        if (rateInput) rateInput.addEventListener('change', function(){{
-            var f = rateInput.files[0];
-            if (!f) return;
-            rateStatus.innerHTML = '<span class="ob-reading">Reading your prices...</span>';
-            rateResults.innerHTML = '';
-            postScan('/api/onboarding/scan-rates', f).then(function(d){{
-                if (!d.ok) {{
-                    var rmap2 = {{unreadable:'Could not read it - try a clearer photo.',
-                        cap:'Daily scan limit reached.', no_ai:'AI not configured - contact support.',
-                        error:'Server hiccup - try again.', no_photo:'No photo received.',
-                        too_large:'Photo too large.', bad_type:'Photo format not supported.'}};
-                    rateStatus.textContent = rmap2[d.reason] || ('Scan failed (' + d.reason + ') - try again.');
-                    return;
-                }}
-                rateData = d;
-                var n = d.rates.length + d.fees.length;
-                rateStatus.textContent = 'Found ' + n + ' prices - review and tap Import.';
-                var h = '';
-                d.rates.forEach(function(r, i){{
-                    h += '<div class="ob-result"><div class="ob-result-head">'
-                        + '<strong>'+esc(r.size||'Size')+'</strong>'
-                        + '<span style="display:flex;gap:8px;align-items:center;"><span class="ob-conf '+r.confidence+'">'+r.confidence+'</span>'
-                        + '$<input data-k="rates" data-i="'+i+'" data-f="price_usd" value="'+(r.price_usd==null?'':r.price_usd)+'" inputmode="decimal" style="width:100px;min-height:40px;padding:6px 10px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);"></span></div></div>';
-                }});
-                d.fees.forEach(function(fe, i){{
-                    h += '<div class="ob-result"><div class="ob-result-head">'
-                        + '<strong>'+esc(fe.name||'Fee')+'</strong>'
-                        + '<span style="display:flex;gap:8px;align-items:center;"><span class="ob-conf '+fe.confidence+'">'+fe.confidence+'</span>'
-                        + '$<input data-k="fees" data-i="'+i+'" data-f="price_usd" value="'+(fe.price_usd==null?'':fe.price_usd)+'" inputmode="decimal" style="width:100px;min-height:40px;padding:6px 10px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);"></span></div></div>';
-                }});
-                h += '<div class="ob-import-bar"><button class="btn gold" id="ob-rate-import" style="min-height:52px;flex:1;max-width:320px;">Import '+n+' prices to rate card</button></div>';
-                rateResults.innerHTML = h;
-                document.getElementById('ob-rate-import').addEventListener('click', function(){{
-                    rateResults.querySelectorAll('input[data-k]').forEach(function(inp){{
-                        var k = inp.getAttribute('data-k'), i = +inp.getAttribute('data-i'), f = inp.getAttribute('data-f');
-                        var v = inp.value.trim();
-                        rateData[k][i][f] = (f==='price_usd') ? (parseFloat(v)||null) : (v||null);
-                    }});
-                    rateStatus.innerHTML = '<span class="ob-reading">Importing...</span>';
-                    fetch('/api/onboarding/confirm-rates', {{
-                        method:'POST', headers:{{'Content-Type':'application/json','X-CSRF-Token': csrf}},
-                        body: JSON.stringify(rateData)
-                    }}).then(function(r){{ return r.json(); }}).then(function(d){{
-                        if (d.ok) {{
-                            rateResults.innerHTML = '<p class="ob-ok" style="font-size:1.1rem;">'+d.imported+' prices added to your rate card!</p>';
-                            rateStatus.textContent = '';
-                        }} else rateStatus.textContent = 'Import failed - try again.';
-                    }});
-                }});
-            }}).catch(function(err){{
-                var m = String((err && err.message) || '');
-                rateStatus.textContent = m.indexOf('server:') === 0 ? 'Server error — try again in a minute.'
                     : m.indexOf('http:') === 0 ? 'Upload failed — try a smaller photo.'
                     : 'No signal - try again.';
             }});
