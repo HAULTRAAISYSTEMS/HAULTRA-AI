@@ -12134,54 +12134,64 @@ def dashboard():
         else:
             pulls_trend_sub = '<div class="sub">0 vs 7-day avg</div>'
 
-    # Containers out (live, derived from stop history — see compute_containers_out)
-    containers_out = compute_containers_out(conn, company_id)
-    out_count = len(containers_out)
-    for c in containers_out:
-        c["days_out"] = _days_out(c["since"])
-    # 2026-10-16: overdue is per-customer rental terms, not a flat 10 days.
-    overdue_count = sum(
-        1 for c in containers_out
-        if _container_money(conn, company_id, c)["overdue"]
-    )
+    # Containers out (2026-10-24): ONE source of truth — the containers fleet
+    # table, the same table the Container Fleet page reads. The old code mixed
+    # universes: out_count came from an address replay (one record per ADDRESS
+    # holding a can, not per can), total_fleet came from the fleet table minus
+    # any size that didn't fit the four buckets, and "in yard" was total minus
+    # out — addresses subtracted from cans. That is why the Overview said
+    # 110/134 + 24 in yard while Fleet said 138 total, 137 deployed, 0 in
+    # yard. Now every number below comes from containers rows, so the
+    # Overview and the Fleet page always agree.
+    _fleet_rows = conn.execute(
+        "SELECT size, status, notes FROM containers WHERE company_id=?",
+        (company_id,)).fetchall()
+    _OUT_STATUSES = ("deployed", "loaded_at_yard")
+    out_count = sum(1 for _fr in _fleet_rows if _fr["status"] in _OUT_STATUSES)
+    total_fleet = len(_fleet_rows)
+    in_yard_count = sum(1 for _fr in _fleet_rows if _fr["status"] == "yard")
+    fleet_by_bucket = {}
+    out_by_bucket = {}
+    for _fr in _fleet_rows:
+        _b = size_bucket(_fr["size"]) or "Other"
+        fleet_by_bucket[_b] = fleet_by_bucket.get(_b, 0) + 1
+        if _fr["status"] in _OUT_STATUSES:
+            out_by_bucket[_b] = out_by_bucket.get(_b, 0) + 1
+    # Buckets render in size order (10/20/30/40, then Other) — the inv loop
+    # below iterates fleet_by_bucket, so keep insertion order stable.
+    fleet_by_bucket = dict(sorted(
+        fleet_by_bucket.items(), key=lambda kv: (kv[0] == "Other", kv[0])))
+    out_by_bucket = {b: out_by_bucket.get(b, 0) for b in fleet_by_bucket}
 
-    # ── Overdue 7-day trend — reconstructed from real stop history, not stored snapshots ──
+    # Overdue (2026-10-24): same fleet rows, aged by the deployment date in
+    # the sync-written notes ("Delivered|Returned|Dropped {date} — {customer},
+    # {address}"), under the same per-customer rental terms. A deployed row
+    # with no parseable date is not counted overdue — never invent an age.
+    # The old 7-day trend came from the address replay and cannot be rebuilt
+    # from fleet rows, so it is dropped; the count itself is now exact.
+    overdue_count = 0
+    for _fr in _fleet_rows:
+        if _fr["status"] != "deployed":
+            continue
+        try:
+            _m = re.search(r"(\d{4}-\d{2}-\d{2})", _fr["notes"] or "")
+            if not _m:
+                continue
+            _rest = (_fr["notes"] or "")[_m.end():].strip()
+            if _rest.startswith("—"):
+                _rest = _rest[1:].strip()
+            if ", " in _rest:
+                _cust, _addr = _rest.split(", ", 1)
+            else:
+                _cust, _addr = _rest, ""
+            if _container_money(conn, company_id, {
+                    "since": _m.group(1), "address": _addr or None,
+                    "city": None, "customer_name": _cust or None})["overdue"]:
+                overdue_count += 1
+        except Exception:
+            continue
     overdue_trend_sub = ""
-    _has_history_7d_ago = conn.execute("""
-        SELECT COUNT(*) n FROM stops s JOIN routes r ON s.route_id=r.id
-        WHERE r.company_id=? AND s.status='completed'
-          AND substr(COALESCE(s.completed_at, r.route_date), 1, 10) <= ?
-    """, (company_id, window_start)).fetchone()["n"] > 0
-    if _has_history_7d_ago:
-        containers_out_7d_ago = compute_containers_out(conn, company_id, asof_date=window_start)
-        overdue_7d_ago = sum(
-            1 for c in containers_out_7d_ago
-            if _container_money(conn, company_id, c, asof_date=window_start)["overdue"]
-        )
-        delta = overdue_count - overdue_7d_ago
-        if delta == 0:
-            overdue_trend_sub = '<div class="sub">flat vs 7 days ago</div>'
-        else:
-            sign = "+" if delta > 0 else ""
-            overdue_trend_sub = f'<div class="sub">{sign}{delta} vs 7 days ago</div>'
 
-    # Fleet totals by size (real, boss-registered inventory — 0 if not registered yet)
-    fleet_rows = conn.execute(
-        "SELECT size, COUNT(*) n FROM containers WHERE company_id=? AND status != 'retired' GROUP BY size",
-        (company_id,)
-    ).fetchall()
-    fleet_by_bucket = {"10yd": 0, "20yd": 0, "30yd": 0, "40yd": 0}
-    for fr in fleet_rows:
-        b = size_bucket(fr["size"])
-        if b:
-            fleet_by_bucket[b] += fr["n"]
-    total_fleet = sum(fleet_by_bucket.values())
-
-    out_by_bucket = {"10yd": 0, "20yd": 0, "30yd": 0, "40yd": 0}
-    for c in containers_out:
-        b = size_bucket(c["size"])
-        if b:
-            out_by_bucket[b] += 1
 
     # "Recent Routes" = this pay period only, not just "the last 8 ever" —
     # otherwise old routes linger on the dashboard indefinitely once volume
@@ -12301,7 +12311,7 @@ def dashboard():
         inv_html = '<div class="empty-state" style="padding:20px 0;">No containers registered yet &mdash; add your fleet in Containers to track inventory.</div>'
     else:
         inv_html = ""
-        for bucket in ("10yd", "20yd", "30yd", "40yd"):
+        for bucket in fleet_by_bucket:
             y = fleet_by_bucket[bucket]
             x = out_by_bucket[bucket]
             if y == 0 and x == 0:
@@ -12327,7 +12337,7 @@ def dashboard():
     # ── Containers Out stat card body ───────────────────────────
     if total_fleet > 0:
         containers_out_num = f"{out_count}/{total_fleet}"
-        in_yard = max(0, total_fleet - out_count)
+        in_yard = in_yard_count
         containers_out_sub = f"{in_yard} in yard"
     else:
         containers_out_num = str(out_count)
