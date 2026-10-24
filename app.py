@@ -8800,6 +8800,10 @@ body {{
 /* 2026-10-17: Owner hero card at the top of the More sheet */
 .haul-more-owner-hero {{
     display: block; margin: 6px 16px 14px; padding: 18px 20px;
+    /* 2026-10-24: flex-shrink 0 — the 70vh menu clamps and flex-shrinks its
+       items; overflow:hidden makes the hero's auto min-height 0, so it used
+       to crush to ~38px, clipping the title and hiding the subtitle. */
+    flex-shrink: 0;
     border-radius: 16px; text-decoration: none; position: relative; overflow: hidden;
     background: linear-gradient(135deg, rgba(255,107,26,0.18), rgba(255,107,26,0.06));
     border: 1px solid rgba(255,107,26,0.35);
@@ -47385,6 +47389,7 @@ def garbage_dispatch_view():
   }
   .haul-more-owner-hero {
     display: block; margin: 6px 16px 14px; padding: 18px 20px;
+    flex-shrink: 0;
     border-radius: 16px; text-decoration: none; position: relative; overflow: hidden;
     background: linear-gradient(135deg, rgba(255,107,26,0.18), rgba(255,107,26,0.06));
     border: 1px solid rgba(255,107,26,0.35);
