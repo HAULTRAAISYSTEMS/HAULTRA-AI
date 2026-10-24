@@ -39638,6 +39638,252 @@ def _validate_garbage_stops(stops_in):
     return clean, None
 
 
+# ── Mid-day rewrite engine ──────────────────────────────────────────────
+# The boss sends route changes WHILE the driver is mid-route ("Two additions
+# today. Before you return central dr. Use it to ..."). A plain append puts
+# the new stops at the end and leaves the old stops untouched — so the
+# original Central Dr PR (pull AND return) would still return its empty
+# mid-route, and the new swap PRs would have no empty to share. The rewrite
+# instead reshapes the existing route into the correct chain:
+#   source PR -> P (its return leg moves to the end of the day)
+#   new swap PRs inserted right after the source, with "use to swap" notes
+#   so the chain resolver links them (source -> PR -> PR -> final D)
+#   final return D at the end (new, or the existing D moved there)
+# Safety, absolute: never touches completed or cancelled stops, never
+# deletes anything, never invents a location. An unmatched reference falls
+# back to a plain append with a note. The engine only PLANS — api_dispatch
+# applies the plan, then the normal chain resolver links the result.
+def _midday_norm(text):
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+def _midday_label(stop):
+    addr = (stop.get("address") or "").strip()
+    cust = (stop.get("customer_name") or stop.get("customer") or "").strip()
+    return f"{addr} ({cust})" if cust and cust.lower() not in addr.lower() else (addr or cust or "stop")
+
+
+def _midday_match_stop(ref, stops, open_only=True, skip_ids=None):
+    """Match a boss reference ("central dr") to an existing stop by address
+    or customer token-subset. Prefers open stops, then the latest order.
+    skip_ids: stops that must never match (locked: completed/current) — the
+    caller reports those separately instead of silently acting on them."""
+    skip_ids = set(skip_ids or [])
+    rtoks = _midday_norm(ref).split()
+    if not rtoks:
+        return None
+    best = None
+    for s in stops:
+        if s.get("id") in skip_ids:
+            continue
+        if open_only and (s.get("cancelled_at") or s.get("status") == "completed"):
+            continue
+        atoks = _midday_norm(s.get("address") or "").split()
+        ctoks = _midday_norm(s.get("customer_name") or s.get("customer") or "").split()
+        score = 0
+        if atoks and all(t in atoks for t in rtoks):
+            score = 2
+        elif ctoks and all(t in ctoks for t in rtoks):
+            score = 1
+        if not score:
+            continue
+        key = (score, s.get("stop_order") or 0)
+        if best is None or key > best[0]:
+            best = (key, s)
+    return best[1] if best else None
+
+
+def _midday_return_ref(raw_text):
+    """"Before you return central dr" -> "central dr". None when absent."""
+    m = re.search(r"before\s+you\s+return\s+(?:it\s+)?(?:to\s+)?([A-Za-z0-9][^.,;\n]{0,60})",
+                  raw_text or "", re.I)
+    if not m:
+        return None
+    ref = m.group(1).strip()
+    ref = re.sub(r"\s+to\s+end\s+(?:the\s+)?day\s*$", "", ref, flags=re.I).strip()
+    return ref or None
+
+
+def _midday_skip_refs(raw_text):
+    refs = []
+    for line in (raw_text or "").splitlines():
+        m = re.match(r"\s*(?:skip|cancel|remove|drop)\s+(?:the\s+)?(.+?)\s*[.,;]?\s*$", line, re.I)
+        if m and m.group(1).strip():
+            refs.append(m.group(1).strip())
+    return refs
+
+
+def _midday_before_anchor(raw_text):
+    """Generic "before <ref>" anchor (NOT the you-return chain form)."""
+    for line in (raw_text or "").splitlines():
+        if re.search(r"before\s+you\s+return\b", line, re.I):
+            continue
+        m = re.search(r"\bbefore\s+(?:the\s+)?([A-Za-z0-9][^.,;\n]{0,60})", line, re.I)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return None
+
+
+def plan_midday_edits(existing, new_stops, raw_text, route_type, locked_ids=None,
+                      pinned_ids=None):
+    """Plan a mid-day rewrite. existing: route stops in order (dicts with id,
+    action, address, customer_name, status, cancelled_at, stop_order). new_stops:
+    validated clean stops. locked_ids: stops the driver has STARTED (arrived or
+    later) — never converted, moved, or cancelled by text; completed work is
+    already excluded by matching. pinned_ids (insert-stops only): the locked
+    prefix (completed + next stop) that must keep its leading positions — new
+    stops never insert before a pinned stop and a pinned delivery is never
+    moved to the end. Returns a plan dict:
+      order: [("old", stop_id) | ("new", clean_index)] in FINAL live order
+      converts: [(stop_id, new_action, note_add)]
+      cancels: [stop_id]
+      dropped_new: [index into new_stops] (duplicate auto-created return)
+      changes: human-readable change list; notes: advisory strings
+      rewrite: True when anything beyond a plain end-append happens
+    """
+    locked = set(locked_ids or [])
+    pinned = set(pinned_ids or [])
+    live = [dict(s) for s in existing if not s.get("cancelled_at")]
+    live.sort(key=lambda s: (s.get("stop_order") or 0, s.get("id") or 0))
+    new = list(new_stops)
+    converts, cancels, dropped = [], [], []
+    changes, notes = [], []
+    rewrite = False
+
+    # --- Skips (every route type): "skip 123 Oak St" cancels that open stop.
+    for ref in _midday_skip_refs(raw_text):
+        m = _midday_match_stop(ref, live, skip_ids=locked)
+        if m:
+            cancels.append(m["id"])
+            live = [s for s in live if s["id"] != m["id"]]
+            changes.append(f"Cancelled {_midday_label(m)} (boss text: skip it)")
+            rewrite = True
+        else:
+            m_locked = _midday_match_stop(ref, [s for s in live if s["id"] in locked])
+            if m_locked:
+                notes.append(f"Couldn't cancel {_midday_label(m_locked)} — the driver is already on it.")
+
+    def _is_pr(s):
+        return "pickup and return" in (s.get("action") or "").lower()
+
+    def _is_pull(s):
+        a = (s.get("action") or "").lower()
+        return "pull" in a and "return" not in a
+
+    def _is_delivery(s):
+        a = (s.get("action") or "").lower()
+        return "delivery" in a or a == "d" or a == "drop"
+
+    # --- Roll-off chain rewrite: "before you return X" + new PRs.
+    chain_done = False
+    note_adds = {}
+    if (route_type or "rolloff") == "rolloff":
+        ref = _midday_return_ref(raw_text)
+        prs_idx = [i for i, s in enumerate(new) if _is_pr(s)]
+        if ref and prs_idx:
+            # The source of the shared empty is a pull-type stop, not the
+            # final delivery that happens to share the address.
+            src = _midday_match_stop(ref, [s for s in live if _is_pr(s) or _is_pull(s)],
+                                     skip_ids=locked)
+            if src is None:
+                _any = _midday_match_stop(ref, [s for s in existing if _is_pr(s) or _is_pull(s)],
+                                          open_only=False)
+                if _any is not None and _any.get("status") == "completed" and not _any.get("cancelled_at"):
+                    notes.append(f"{_midday_label(_any)} is already completed — it can't be rewritten, so new stops were appended at the end.")
+                elif _any is not None and _any.get("id") in locked:
+                    notes.append(f"{_midday_label(_any)} is already in progress — finish it first, then rewrite; new stops appended at the end.")
+                else:
+                    notes.append(f"Couldn't match '{ref}' to an open stop — new stops appended at the end, check the chain.")
+            else:
+                if _is_pr(src):
+                    converts.append((src["id"], "Pull", "use to swap"))
+                    changes.append(f"{_midday_label(src)}: Pickup and Return → Pull (its return moved to the end of the day)")
+                else:
+                    converts.append((src["id"], None, "use to swap"))
+                    changes.append(f"{_midday_label(src)} stays the pull feeding the new swap chain")
+                rewrite = True
+                chain_done = True
+                # Splice the chain PRs right after the source, with
+                # "use to swap" notes so the chain resolver links them:
+                # source -> PR1 -> PR2 ... ; the tail PR needs no signal,
+                # the size-matching D right after it is the terminal.
+                for j, ci in enumerate(prs_idx):
+                    if j < len(prs_idx) - 1:
+                        note_adds[ci] = "use to swap"
+                idx = next(i for i, s in enumerate(live) if s["id"] == src["id"])
+                rest_idx = [i for i, s in enumerate(new) if not _is_pr(s) and not _is_delivery(s)]
+                ds_idx = [i for i, s in enumerate(new) if _is_delivery(s)]
+                ex_d = None
+                if ds_idx:
+                    ex_d = _midday_match_stop(new[ds_idx[0]].get("address") or "",
+                                              [s for s in live if _is_delivery(s)],
+                                              skip_ids=locked | pinned)
+                if ds_idx and ex_d is not None:
+                    dropped.append(ds_idx[0])
+                    changes.append(f"Return to {_midday_label(ex_d)} was already on the route — moved to the end of the day, no duplicate added")
+                elif ds_idx:
+                    _pin_d = _midday_match_stop(new[ds_idx[0]].get("address") or "",
+                                                [s for s in live if _is_delivery(s) and s["id"] in pinned])
+                    if _pin_d is not None:
+                        notes.append(f"A return to {_midday_label(_pin_d)} is already the driver's next stop — the new return was added separately; check for a duplicate.")
+                else:
+                    notes.append("No return stop in this text — the final empty has nowhere to go yet; add a return when the boss names one.")
+                order = []
+                for s in live[:idx + 1]:
+                    order.append(("old", s["id"]))
+                for ci in prs_idx:
+                    order.append(("new", ci))
+                for ci in rest_idx:
+                    order.append(("new", ci))
+                if ds_idx:
+                    order.append(("old", ex_d["id"]) if ex_d is not None else ("new", ds_idx[0]))
+                for s in live[idx + 1:]:
+                    if ex_d is not None and s["id"] == ex_d["id"]:
+                        continue
+                    order.append(("old", s["id"]))
+                return {"order": order, "converts": converts, "cancels": cancels,
+                        "dropped_new": dropped, "note_adds": note_adds,
+                        "changes": changes, "notes": notes, "rewrite": True}
+
+    # --- Generic positioning: "before <ref>" anchor, else end.
+    anchor = None
+    if not chain_done:
+        aref = _midday_before_anchor(raw_text)
+        if aref:
+            anchor = _midday_match_stop(aref, live, skip_ids=locked | pinned)
+            if anchor:
+                rewrite = True
+                changes.append(f"New stops inserted before {_midday_label(anchor)}")
+    order = [("old", s["id"]) for s in live]
+    if anchor is not None:
+        ai = next(i for i, (k, v) in enumerate(order) if v == anchor["id"])
+        order = order[:ai] + [("new", i) for i in range(len(new))] + order[ai:]
+    else:
+        order = order + [("new", i) for i in range(len(new))]
+    return {"order": order, "converts": converts, "cancels": cancels,
+            "dropped_new": dropped, "note_adds": note_adds,
+            "changes": changes, "notes": notes, "rewrite": rewrite}
+
+
+def _apply_midday_plan_ops(conn, route_id, plan, user_id):
+    """Apply a plan's converts + cancels. Sequencing and insertion stay with
+    the caller (each endpoint inserts with its own columns)."""
+    for _cid, _new_action, _note_add in plan.get("converts", []):
+        _old = conn.execute("SELECT notes FROM stops WHERE id=?", (_cid,)).fetchone()
+        _notes = (_old["notes"] or "") if _old else ""
+        if _note_add and _note_add not in _notes:
+            _notes = (_notes + " " + _note_add).strip()
+        if _new_action:
+            conn.execute("UPDATE stops SET action=?, notes=? WHERE id=?", (_new_action, _notes, _cid))
+        else:
+            conn.execute("UPDATE stops SET notes=? WHERE id=?", (_notes, _cid))
+    for _sid in plan.get("cancels", []):
+        conn.execute(
+            "UPDATE stops SET cancelled_at=?, cancelled_by=?, cancel_source=?, cancel_client_uuid=? "
+            "WHERE id=? AND cancelled_at IS NULL",
+            (now_ts(), user_id, "midday-edit", f"midday-edit:{route_id}:{_sid}", _sid))
+
+
 @app.route("/api/dispatch", methods=["POST"])
 @roles_required("dispatcher", api=True)
 def api_dispatch():
@@ -39738,18 +39984,54 @@ def api_dispatch():
             route_id = cur.lastrowid
             appended_to_existing = False
 
-    next_order = conn.execute(
-        "SELECT COALESCE(MAX(stop_order), 0) AS m FROM stops WHERE route_id=?", (route_id,)
-    ).fetchone()["m"]
+    # 2026-10-24: mid-day rewrite — when the boss pastes follow-up text
+    # (raw_text) into an existing route, reshape it instead of appending.
+    # Without raw_text, or when the plan is a plain append, this is
+    # byte-for-byte the old path.
+    _rewrite = None
+    if appended_to_existing and (data.get("raw_text") or "").strip():
+        _ex_rows = conn.execute(
+            "SELECT id, action, address, city, customer_name, status, cancelled_at, stop_order, "
+            "driver_status FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
+            (route_id,)).fetchall()
+        _ex = [dict(r) for r in _ex_rows]
+        # Lock only stops the driver has STARTED (arrived or later) — the cab
+        # must never change underneath him mid-stop. A merely-next stop (open,
+        # pending) CAN be rewritten: Thursday's Central Dr was exactly that.
+        _locked = {s["id"] for s in _ex
+                   if (s.get("driver_status") or "pending") in
+                   ("arrived", "box_out", "going_to_dump", "need_box_in")}
+        _rewrite = plan_midday_edits(_ex, clean_stops, data.get("raw_text") or "", route_type,
+                                     locked_ids=_locked)
+    if _rewrite and _rewrite["rewrite"]:
+        _apply_midday_plan_ops(conn, route_id, _rewrite, session["user_id"])
+        for _pos, (_kind, _key) in enumerate(_rewrite["order"], start=1):
+            if _kind == "old":
+                conn.execute("UPDATE stops SET stop_order=? WHERE id=?", (_pos, _key))
+        _to_insert = []
+        for _pos, (_kind, _key) in enumerate(_rewrite["order"], start=1):
+            if _kind == "new":
+                _s = dict(clean_stops[_key])
+                _na = _rewrite.get("note_adds", {}).get(_key)
+                if _na and _na not in (_s.get("notes") or ""):
+                    _s["notes"] = ((_s.get("notes") or "") + " " + _na).strip()
+                _to_insert.append((_s, _pos))
+    else:
+        _next = conn.execute(
+            "SELECT COALESCE(MAX(stop_order), 0) AS m FROM stops WHERE route_id=?", (route_id,)
+        ).fetchone()["m"]
+        _to_insert = []
+        for s in clean_stops:
+            _next += 1
+            _to_insert.append((s, _next))
     _new_ids = []
-    for s in clean_stops:
-        next_order += 1
+    for s, _ord in _to_insert:
         if route_type == "garbage":
             cur.execute("""
                 INSERT INTO stops (route_id, stop_order, customer_name, address, city, action,
                                     notes, not_before, status, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
-            """, (route_id, next_order, s.get("customer") or "", s["address"],
+            """, (route_id, _ord, s.get("customer") or "", s["address"],
                   s.get("city") or "", s["action"], s["notes"], s["not_before"], now_ts()))
             _new_ids.append(cur.lastrowid)
             learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
@@ -39762,7 +40044,7 @@ def api_dispatch():
                                     dump_location, return_destination, notes,
                                     empty_can_plan, carry_can_ref, assigned_can, status, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
-            """, (route_id, next_order, s.get("customer") or "", s["address"], s["action"],
+            """, (route_id, _ord, s.get("customer") or "", s["address"], s["action"],
                   s["container_size"], s.get("dump_leg") or "", s.get("return_leg") or "",
                   s["notes"], s.get("empty_can_plan") or "", s.get("carry_can_ref") or "",
                   _acan_val, now_ts()))
@@ -39773,7 +40055,7 @@ def api_dispatch():
                                     dump_location, return_destination, notes,
                                     empty_can_plan, carry_can_ref, status, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
-            """, (route_id, next_order, s.get("customer") or "", s["address"], s["action"],
+            """, (route_id, _ord, s.get("customer") or "", s["address"], s["action"],
                   s["container_size"], s.get("dump_leg") or "", s.get("return_leg") or "",
                   s["notes"], s.get("empty_can_plan") or "", s.get("carry_can_ref") or "", now_ts()))
         _new_ids.append(cur.lastrowid)
@@ -39846,10 +40128,13 @@ def api_dispatch():
         "success": True,
         "route_id": route_id,
         "driver": driver["username"],
-        "stop_count": len(clean_stops),
+        "stop_count": len(_new_ids),
         "appended": appended_to_existing,
         "route_date": route_date,
         "notices": _chain_notices(_chain_res),
+        # 2026-10-24: mid-day rewrite report — what the reshape changed, so
+        # the boss sees the PR -> P conversion instead of discovering it.
+        "midday_edits": (_rewrite["changes"] + _rewrite["notes"]) if _rewrite else [],
     })
 
 
@@ -39878,7 +40163,8 @@ def api_insert_stops(route_id):
         return jsonify({"error": err}), 400
 
     existing = conn.execute(
-        "SELECT id, status FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
+        "SELECT id, action, address, city, customer_name, status, cancelled_at, stop_order, "
+        "driver_status FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
         (route_id,)
     ).fetchall()
 
@@ -39902,10 +40188,33 @@ def api_insert_stops(route_id):
         else:
             working.append(s["id"])
 
+    # 2026-10-24: mid-day rewrite — same engine as /api/dispatch. The rewrite
+    # lock is started stops only; the ORDER lock is this endpoint's locked
+    # prefix (completed + next stop keep their leading positions).
+    _rewrite = None
+    if (data.get("raw_text") or "").strip():
+        _started = {r["id"] for r in existing
+                    if (r["driver_status"] or "pending") in
+                    ("arrived", "box_out", "going_to_dump", "need_box_in")}
+        _rewrite = plan_midday_edits(
+            [dict(r) for r in existing], clean_stops, data.get("raw_text") or "",
+            "garbage" if is_garbage else "rolloff",
+            locked_ids=_started, pinned_ids=set(locked_prefix))
+        if _rewrite and _rewrite["rewrite"]:
+            _apply_midday_plan_ops(conn, route_id, _rewrite, session["user_id"])
+
     cur = conn.cursor()
     new_stops = []
+    _new_by_index = {}
     _chain_batch = []
-    for s in clean_stops:
+    for _ci, s in enumerate(clean_stops):
+        if _rewrite and _rewrite["rewrite"] and _ci in _rewrite.get("dropped_new", []):
+            continue
+        if _rewrite and _rewrite["rewrite"]:
+            s = dict(s)
+            _na = _rewrite.get("note_adds", {}).get(_ci)
+            if _na and _na not in (s.get("notes") or ""):
+                s["notes"] = ((s.get("notes") or "") + " " + _na).strip()
         if is_garbage:
             cur.execute("""
                 INSERT INTO stops (route_id, stop_order, customer_name, address, city, action,
@@ -39914,6 +40223,7 @@ def api_insert_stops(route_id):
             """, (route_id, s.get("customer") or "", s["address"], s.get("city") or "",
                   s["action"], s["notes"], s["not_before"], now_ts()))
             new_stops.append((cur.lastrowid, s.get("insert_before", "end")))
+            _new_by_index[_ci] = cur.lastrowid
             learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
                            action=s["action"])
             continue
@@ -39926,6 +40236,7 @@ def api_insert_stops(route_id):
               s.get("dump_leg") or "", s.get("return_leg") or "", s["notes"],
               s.get("empty_can_plan") or "", s.get("carry_can_ref") or "", now_ts()))
         new_stops.append((cur.lastrowid, s["insert_before"]))
+        _new_by_index[_ci] = cur.lastrowid
         # Resolve the dump/return site names to location records + set the FKs.
         _link_stop_sites(conn, cid(), cur.lastrowid, s.get("dump_leg") or "", s.get("return_leg") or "")
         # Self-building address book: learn every inserted stop's address.
@@ -39933,17 +40244,23 @@ def api_insert_stops(route_id):
                        action=s["action"], container_size=s["container_size"],
                        dump_location=s.get("dump_leg") or "")
 
-    # Merge new stops into the insertable (unlocked) sequence at their chosen position.
-    # Multiple stops targeting the same anchor stack in submission order, immediately
-    # before that anchor. Anything targeting "end" or a locked/unknown stop goes last.
-    for new_id, insert_before_raw in new_stops:
-        target_id = int(insert_before_raw) if insert_before_raw.isdigit() else None
-        if target_id is not None and target_id in working:
-            working.insert(working.index(target_id), new_id)
-        else:
-            working.append(new_id)
+    if _rewrite and _rewrite["rewrite"]:
+        # Plan order already accounts for converts, cancels, and the locked
+        # prefix; map new entries to their freshly inserted ids.
+        final_order = [v if k == "old" else _new_by_index[v]
+                       for k, v in _rewrite["order"]]
+    else:
+        # Merge new stops into the insertable (unlocked) sequence at their chosen position.
+        # Multiple stops targeting the same anchor stack in submission order, immediately
+        # before that anchor. Anything targeting "end" or a locked/unknown stop goes last.
+        for new_id, insert_before_raw in new_stops:
+            target_id = int(insert_before_raw) if insert_before_raw.isdigit() else None
+            if target_id is not None and target_id in working:
+                working.insert(working.index(target_id), new_id)
+            else:
+                working.append(new_id)
 
-    final_order = locked_prefix + working
+        final_order = locked_prefix + working
     for pos, sid in enumerate(final_order, start=1):
         cur.execute("UPDATE stops SET stop_order=? WHERE id=?", (pos, sid))
 
@@ -39953,8 +40270,9 @@ def api_insert_stops(route_id):
         return jsonify({
             "success": True,
             "route_id": route_id,
-            "stop_count": len(clean_stops),
+            "stop_count": len(_new_by_index),
             "notices": [],
+            "midday_edits": (_rewrite["changes"] + _rewrite["notes"]) if _rewrite else [],
         })
     try:
         compute_can_flow(conn, route_id)
@@ -39975,8 +40293,9 @@ def api_insert_stops(route_id):
     return jsonify({
         "success": True,
         "route_id": route_id,
-        "stop_count": len(clean_stops),
+        "stop_count": len(_new_by_index),
         "notices": _chain_notices(_chain_res),
+        "midday_edits": (_rewrite["changes"] + _rewrite["notes"]) if _rewrite else [],
     })
 
 
