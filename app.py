@@ -12355,6 +12355,71 @@ def dashboard():
 </tr>
 """
 
+    # Trucks on the road (2026-10-24): one row per truck actually out today —
+    # truck number, driver, what's on it, and the step the driver is on.
+    # NOTE: the dashboard's conn is already closed by this point (12282), so
+    # the card opens its own connection. Wrapped defensively: a live-truck
+    # lookup must never 500 the dashboard.
+    _trucks_rows = ""
+    _trk_conn = None
+    try:
+        _trk_conn = get_db()
+        _today_routes = _trk_conn.execute(
+            "SELECT r.id, r.truck_id, r.assigned_to, u.username AS driver_username "
+            "FROM routes r LEFT JOIN users u ON r.assigned_to = u.id "
+            "WHERE r.company_id=? AND r.route_date=? AND r.status='in_progress' ORDER BY r.id",
+            (company_id, today)).fetchall()
+        for _tr in _today_routes:
+            _ot = _route_on_truck(_trk_conn, _tr["id"])
+            if not _ot:
+                continue
+            _tname = None
+            if _tr["truck_id"]:
+                _trow = _trk_conn.execute("SELECT name FROM trucks WHERE id=?", (_tr["truck_id"],)).fetchone()
+                _tname = _trow["name"] if _trow else None
+            if not _tname and _tr["assigned_to"]:
+                _ut = _driver_truck_id(_trk_conn, _tr["assigned_to"])
+                if _ut:
+                    _urow = _trk_conn.execute("SELECT name FROM trucks WHERE id=?", (_ut,)).fetchone()
+                    _tname = _urow["name"] if _urow else None
+            if _ot["has_can"]:
+                _can_html = (f'<span style="color:#7FB8FF;font-weight:800;">&#128666; #{e(_ot["can"])}'
+                             f'{(" " + e(_ot["size"])) if _ot["size"] else ""}</span>')
+            else:
+                _can_html = '<span style="color:#8C8C82;">&#128666; empty</span>'
+            _dest_txt = ""
+            if _ot["dest"] and _ot["dest"] != _ot["customer"]:
+                _dest_txt = f' &middot; {e(_ot["customer"])} &rarr; {e(_ot["dest"])}'
+            elif _ot["customer"]:
+                _dest_txt = f' &middot; {e(_ot["customer"])}'
+            _trucks_rows += (
+                '<div style="display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;'
+                'padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.06);">'
+                f'<span style="font-weight:800;">&#128666; {e(_tname or "Truck ?")}</span>'
+                f'<span style="color:#A6A69E;">{e(_tr["driver_username"] or "Unassigned")}</span>'
+                f'{_can_html}'
+                f'<span>{e(_ot["step"])}{_dest_txt}</span>'
+                f'<a href="{url_for("view_route", route_id=_tr["id"])}" style="margin-left:auto;color:var(--orange);">Open &rsaquo;</a>'
+                '</div>')
+    except Exception:
+        app.logger.warning("trucks-on-road card failed", exc_info=True)
+        _trucks_rows = ""
+    finally:
+        try:
+            if _trk_conn is not None:
+                _trk_conn.close()
+        except Exception:
+            pass
+    _trucks_card = f"""
+    <div class="card" style="margin-bottom:16px;">
+        <div class="row between" style="margin-bottom:4px;">
+            <h2 style="margin:0;">&#128666; Trucks on the Road</h2>
+            <span style="font-size:10px;font-weight:700;letter-spacing:1px;color:#7CFC90;display:flex;align-items:center;gap:6px;"><span style="width:7px;height:7px;border-radius:50%;background:#7CFC90;box-shadow:0 0 8px rgba(124,252,144,0.9);display:inline-block;"></span>LIVE</span>
+        </div>
+        {_trucks_rows or '<div class="empty-state" style="padding:14px 0;">No trucks on the road right now.</div>'}
+    </div>
+    """
+
     _owner_meta = (f"{e(today)} &middot; {pulls_today} pull{'s' if pulls_today != 1 else ''} today"
                    f" &middot; {containers_out_num} containers out")
     body = f"""
@@ -12388,6 +12453,8 @@ def dashboard():
             {overdue_trend_sub}
         </div>
     </div>
+
+    {_trucks_card}
 
     <div class="row" style="align-items:stretch;gap:16px;flex-wrap:wrap;margin-bottom:16px;">
         <div class="card" style="flex:1;min-width:300px;margin-bottom:0;">
@@ -16356,6 +16423,8 @@ def _build_route_board_html(user, day=None):
                u.avatar_path AS driver_avatar,
                s.id AS stop_id, s.stop_order, s.customer_name, s.address, s.city,
                s.action, s.container_size, s.status AS stop_status, s.driver_status,
+               s.notes, s.placement_note, s.assigned_can, s.dump_location,
+               (SELECT dt.can_number FROM dump_tickets dt WHERE dt.stop_id = s.id ORDER BY dt.id DESC LIMIT 1) AS ticket_can,
                s.completed_at, s.held_at, s.empty_can_plan,
                s.blocked_at, s.blocked_note, s.access_info,
                s.service_count, s.not_before, s.weight_tons,
@@ -16673,6 +16742,29 @@ def _build_route_board_html(user, day=None):
                 if t:
                     time_html = f'<div class="stop-mini-time">{e(t)}</div>'
 
+            # On-truck line (2026-10-24): this stop's can, once the driver has
+            # actually picked it up — never before. A Pull/PR still sitting at
+            # the customer (arrived, no box-out yet) shows nothing; any bin
+            # already on the truck from earlier stops rides on the lane pill.
+            ontruck_html = ""
+            if stop_status != "completed" and driver_status != "pending":
+                _tcan = (_sd.get("ticket_can") or "").strip() if _sd.get("ticket_can") else ""
+                _act_l = (_sd.get("action") or "").strip().lower()
+                if "delivery" in _act_l:
+                    _ocan = _tcan or _effective_can(_sd)
+                    _olive = driver_status == "arrived"
+                    _ostep = "at stop"
+                else:
+                    _ocan = _tcan or _pickup_can(_sd)
+                    _olive = driver_status in ("box_out", "going_to_dump", "need_box_in")
+                    _ostep = {"box_out": "to the dump", "going_to_dump": "to the dump",
+                              "need_box_in": "returning empty"}.get(driver_status, "on truck")
+                if _ocan and _olive:
+                    ontruck_html = (
+                        '<div style="margin-top:5px;font-size:10px;font-weight:800;'
+                        'color:#7FB8FF;white-space:nowrap;overflow:hidden;'
+                        f'text-overflow:ellipsis;">&#128666; #{e(_ocan)} &middot; {_ostep}</div>')
+
             addr_key = (s["address"] or "").strip().lower() + "|" + (s["city"] or "").strip().lower()
             is_urgent = group == "pickup" and stop_status != "completed" and addr_key in overdue_addr_keys
             urgent_html = '<span class="stop-mini-urgent">&#9888; OVERDUE</span>' if is_urgent else ""
@@ -16713,6 +16805,7 @@ def _build_route_board_html(user, day=None):
                 </div>
                 <div class="{addr_cls}">{e(addr_text)}</div>
                 {chain_badge}
+                {ontruck_html}
                 <div class="stop-mini-bottom">
                     <span class="stop-mini-size">{e(size_label) if size_label else '&mdash;'}</span>
                     <span class="stop-mini-pill {pill_cls}">{e(pill_label)}</span>
@@ -16773,6 +16866,40 @@ def _build_route_board_html(user, day=None):
         except Exception:
             app.logger.warning("truck chip failed for lane %s", lane.get("driver_username"), exc_info=True)
             _truck_chip = ""
+        # On-truck pill (2026-10-24): the can currently on this lane's truck —
+        # live stop or carried bin — same helper as the Yard Overview card.
+        # NOTE: the board's conn is already closed by lane-render time (16509),
+        # so the pill opens its own connection. Wrapped defensively: a pill
+        # lookup must never 500 the board.
+        _ontruck_pill = ""
+        _pill_conn = None
+        try:
+            _pill_conn = get_db()
+            _seen_rids = []
+            for _s in stops:
+                if _s["route_id"] not in _seen_rids:
+                    _seen_rids.append(_s["route_id"])
+            for _rid in _seen_rids:
+                _ot = _route_on_truck(_pill_conn, _rid)
+                if _ot and _ot.get("has_can"):
+                    _ontruck_pill = (
+                        f'<span title="{e(_ot["step"])}" style="display:inline-block;margin-left:8px;'
+                        'padding:2px 9px;border-radius:999px;font-size:11px;font-weight:800;'
+                        'color:#7FB8FF;background:rgba(127,184,255,0.12);'
+                        'border:1px solid rgba(127,184,255,0.5);'
+                        f'box-shadow:0 0 10px rgba(127,184,255,0.25);">&#128666; #{e(_ot["can"])}</span>')
+                    break
+        except Exception:
+            app.logger.warning("on-truck pill failed for lane %s", lane.get("driver_username"), exc_info=True)
+            _ontruck_pill = ""
+        finally:
+            try:
+                if _pill_conn is not None:
+                    _pill_conn.close()
+            except Exception:
+                pass
+        if _ontruck_pill:
+            _truck_row = f'<div class="lane-truck-row">{_truck_chip}{_ontruck_pill}</div>'
         _drag_grip = ('<span class="lane-drag-handle" title="Press &amp; hold to reorder">&#x2833;&#x2833;</span>'
                       if user["role"] == "boss" else "")
         lanes_html += f"""
@@ -24664,6 +24791,99 @@ def _route_final_bin_detail(conn, route_id):
 def _route_final_bin_on_truck(conn, route_id):
     """Bin number on the truck after the last stop ('' if none)."""
     return _route_final_bin_detail(conn, route_id)[0]
+
+
+def _route_on_truck(conn, route_id):
+    """Live state of a route's truck: what's on it + the step the driver is on.
+
+    Returns None for finished routes (or on any read failure). Otherwise:
+      can / size / step / customer / dest / stop_id / has_can
+    - Live stop: a Pull/PR the driver has boxed out / is hauling / is
+      returning empty, or an active Delivery the driver has arrived at — the
+      can is that stop's dump-ticket can, route can, or yard can.
+    - Between stops: the carried bin after the completed stops (Daily Log
+      chain) — the driver is heading to the next stop with it.
+    - Empty truck: step comes from the current stop (en route / at stop).
+    Never invents a can: a stop with no ticket, no route can, and no yard
+    can yields no can, not a guess. Shared by the Route Board lane pill
+    and the Yard Overview Trucks card.
+    """
+    try:
+        _r = conn.execute("SELECT status FROM routes WHERE id=?", (route_id,)).fetchone()
+        if not _r or (_r["status"] or "") == "completed":
+            return None
+        _stops = [dict(s) for s in conn.execute(
+            "SELECT * FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
+            (route_id,)).fetchall()]
+    except Exception:
+        return None
+    _stops = [s for s in _stops if not stop_is_cancelled(s)]
+    _tickets = {}
+    try:
+        for _t in conn.execute(
+                "SELECT stop_id, can_number FROM dump_tickets WHERE route_id=? ORDER BY id ASC",
+                (route_id,)).fetchall():
+            if (_t["can_number"] or "").strip():
+                _tickets[_t["stop_id"]] = _t["can_number"].strip()
+    except Exception:
+        pass
+
+    def _who(s):
+        return (s.get("customer_name") or s.get("address") or "Stop").strip()
+
+    def _can_for(s):
+        if _tickets.get(s.get("id")):
+            return _tickets[s["id"]]
+        _act = (s.get("action") or "").lower()
+        if "delivery" in _act:
+            return _effective_can(s)
+        return _pickup_can(s)
+
+    for _s in _stops:
+        if (_s.get("status") or "") == "completed":
+            continue
+        _drv = (_s.get("driver_status") or "pending")
+        _act = (_s.get("action") or "").lower()
+        if "delivery" in _act:
+            # Arrived with the yard can still on the truck. Once the driver
+            # boxes it in, the can is down at the customer — not on truck.
+            if _drv == "arrived":
+                _can = _effective_can(_s)
+                if _can:
+                    return {"can": _can, "size": _s.get("container_size") or "",
+                            "step": "At " + _who(_s) + " — can on truck",
+                            "customer": _who(_s), "dest": _who(_s),
+                            "stop_id": _s.get("id"), "has_can": True}
+            continue
+        if _drv in ("box_out", "going_to_dump", "need_box_in"):
+            _can = _can_for(_s)
+            if _can:
+                _step = {"box_out": "Can on truck — to the dump",
+                         "going_to_dump": "Heading to the dump",
+                         "need_box_in": "Returning the empty"}[_drv]
+                _dest = (_s.get("dump_location") or "").strip()
+                return {"can": _can, "size": _s.get("container_size") or "",
+                        "step": _step, "customer": _who(_s),
+                        "dest": _dest or _who(_s), "stop_id": _s.get("id"),
+                        "has_can": True}
+    try:
+        _b, _bs = _route_final_bin_detail(conn, route_id)
+    except Exception:
+        _b, _bs = "", ""
+    _nxt = next((s for s in _stops if (s.get("status") or "") != "completed"), None)
+    if _b:
+        _who_n = _who(_nxt) if _nxt else ""
+        return {"can": _b, "size": _bs or "",
+                "step": ("On truck — heading to " + _who_n) if _who_n else "On truck — end of route",
+                "customer": _who_n, "dest": _who_n,
+                "stop_id": _nxt.get("id") if _nxt else None, "has_can": True}
+    if _nxt:
+        _drv = (_nxt.get("driver_status") or "pending")
+        return {"can": "", "size": "",
+                "step": ("At " if _drv == "arrived" else "En route to ") + _who(_nxt),
+                "customer": _who(_nxt), "dest": _who(_nxt),
+                "stop_id": _nxt.get("id"), "has_can": False}
+    return None
 
 
 @app.route("/api/route/<int:route_id>/bin-disposition", methods=["POST"])
