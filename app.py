@@ -30507,6 +30507,15 @@ MULTI-LEG STOPS (important): a single job can have up to three legs but is still
   Text like "pull the 30yd at <addr>, dump <site>, then return it to <yard>" is ONE stop:
   action PR, address <addr>, dump_leg "<site>", return_leg "<yard>". Never split the dump
   or return into their own stops.
+  EXCEPTION — end-of-day return to a NAMED place (Alix pattern, 2026-10-24): "then
+  return <place> to end the day" / "return <place> at end of day", where <place> is a
+  street address, site, or customer name (e.g. "central dr"), is NOT a return_leg. Emit
+  a SEPARATE final stop: action D, address <place>, notes "end of day". The final empty
+  is delivered to <place> at day's end, after the other stops — it is not the previous
+  stop's own return leg. This exception needs BOTH parts: a named destination AND the
+  end-of-day marker. A plain "return it to <yard>" with no end-of-day marker stays a
+  return_leg, and "return it to the yard to end the day" (no named place) also stays a
+  return_leg — the yard is where the truck ends up, not a delivery stop.
 
 NEW STOP vs LEG (important): "and then <action> <place>" starts a NEW stop, not a leg.
   A dump leg hauls to a KNOWN DUMP SITE ("dump dominion"); a return leg says "return it to
