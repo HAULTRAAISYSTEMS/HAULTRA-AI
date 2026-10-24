@@ -26651,7 +26651,11 @@ def api_scan_customers():
     """Boss photographs a customer list → AI extracts entries for review."""
     if session.get("role") != "boss":
         return jsonify({"ok": False, "reason": "forbidden"}), 403
-    ok, payload = _onboarding_ocr_photo("customers")
+    try:
+        ok, payload = _onboarding_ocr_photo("customers")
+    except Exception as ex:
+        app.logger.warning("scan-customers: %s", ex)
+        return jsonify({"ok": False, "reason": "error"})
     if not ok:
         return jsonify({"ok": False, **payload})
     if payload.get("unreadable") or not payload.get("customers"):
@@ -26685,7 +26689,11 @@ def api_scan_rates():
     """Boss photographs a rate sheet → AI extracts sizes/prices/fees."""
     if session.get("role") != "boss":
         return jsonify({"ok": False, "reason": "forbidden"}), 403
-    ok, payload = _onboarding_ocr_photo("rates")
+    try:
+        ok, payload = _onboarding_ocr_photo("rates")
+    except Exception as ex:
+        app.logger.warning("scan-rates: %s", ex)
+        return jsonify({"ok": False, "reason": "error"})
     if not ok:
         return jsonify({"ok": False, **payload})
     if payload.get("unreadable"):
@@ -33124,9 +33132,11 @@ def onboarding_import_customers():
             custResults.innerHTML = '';
             postScan('/api/onboarding/scan-customers', f).then(function(d){{
                 if (!d.ok) {{
-                    custStatus.textContent = d.reason==='unreadable' ? 'Could not read it - try a clearer photo.'
-                        : d.reason==='cap' ? 'Daily scan limit reached.'
-                        : 'Scan failed - try again or add manually.';
+                    var rmap = {{unreadable:'Could not read it - try a clearer photo.',
+                        cap:'Daily scan limit reached.', no_ai:'AI not configured - contact support.',
+                        error:'Server hiccup - try again.', no_photo:'No photo received.',
+                        too_large:'Photo too large.', bad_type:'Photo format not supported.'}};
+                    custStatus.textContent = rmap[d.reason] || ('Scan failed (' + d.reason + ') - try again.');
                     return;
                 }}
                 custData = d.customers;
@@ -33181,7 +33191,11 @@ def onboarding_import_customers():
             rateResults.innerHTML = '';
             postScan('/api/onboarding/scan-rates', f).then(function(d){{
                 if (!d.ok) {{
-                    rateStatus.textContent = d.reason==='unreadable' ? 'Could not read it - try a clearer photo.' : 'Scan failed - try again.';
+                    var rmap2 = {{unreadable:'Could not read it - try a clearer photo.',
+                        cap:'Daily scan limit reached.', no_ai:'AI not configured - contact support.',
+                        error:'Server hiccup - try again.', no_photo:'No photo received.',
+                        too_large:'Photo too large.', bad_type:'Photo format not supported.'}};
+                    rateStatus.textContent = rmap2[d.reason] || ('Scan failed (' + d.reason + ') - try again.');
                     return;
                 }}
                 rateData = d;
