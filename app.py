@@ -29877,6 +29877,31 @@ def company_register():
 # =========================================================
 # SETTINGS — merged Company Settings + Subscription
 # =========================================================
+def _onboarding_back_banner():
+    """2026-10-23: when setup is incomplete, show a banner at the top of
+    Settings/Team/Yard pages linking back to the onboarding checklist."""
+    try:
+        conn = get_db()
+        steps = _onboarding_steps(conn, cid(), session.get("user_id"))
+        conn.close()
+        done_n = sum(1 for s in steps if s["done"])
+        total_n = len(steps)
+        if done_n >= total_n:
+            return ""
+        return f"""
+        <div class="card" style="border:1px solid rgba(255,107,26,.4);background:linear-gradient(135deg,rgba(255,107,26,.08),rgba(255,107,26,.02));margin-bottom:16px;">
+            <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                <div style="flex:1;min-width:200px;">
+                    <strong>\U0001F680 Finish your setup</strong>
+                    <div class="muted small">{done_n} of {total_n} steps done — you\u2019re almost there.</div>
+                </div>
+                <a class="btn gold" href="{url_for('onboarding_setup')}" style="min-height:48px;display:inline-flex;align-items:center;">Back to checklist</a>
+            </div>
+        </div>"""
+    except Exception:
+        return ""
+
+
 @app.route("/settings", methods=["GET", "POST"])
 @boss_required
 def settings_page():
@@ -30599,6 +30624,7 @@ def settings_page():
         <h1>Settings</h1>
         <p>Company profile, yard location, work hours, and subscription — all in one place.</p>
     </div>
+    {_onboarding_back_banner()}
     {settings_body}
     {_phone_section}
     {subscription_body}
