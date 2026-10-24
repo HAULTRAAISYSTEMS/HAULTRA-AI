@@ -3445,6 +3445,8 @@ def init_db():
     safe_add_column(conn, "route_photos", "uploaded_by INTEGER")
     safe_add_column(conn, "routes", "dump_location_id INTEGER")
     safe_add_column(conn, "stops", "phone TEXT")
+    # 2026-10-23: Yard Inventory Awareness — which yard can a Delivery uses.
+    safe_add_column(conn, "stops", "assigned_can TEXT")
 
     # --- dump tickets table ---
     cur.execute("""
@@ -19921,6 +19923,17 @@ def driver_route_detail(route_id):
         f'{icon("msg")} Message<span id="msg-boss-badge" class="lane-msg-badge" '
         f'{"hidden" if not unread_messages else ""}>{unread_messages or ""}</span></button>'
     )
+    # 2026-10-23: Yard Inventory Awareness — show the assigned yard can.
+    _acan = ""
+    try:
+        _acan = (dict(s).get("assigned_can") or "").strip()
+    except Exception:
+        pass
+    _assigned_can_html = (
+        f'<div style="margin:8px 0;padding:10px 14px;border-radius:10px;background:rgba(61,220,132,.08);'
+        f'border:1px solid rgba(61,220,132,.3);font-weight:800;color:#3DDC84;">'
+        f'🏗️ Hook can #{e(_acan)} at yard</div>'
+    ) if _acan else ""
     _arrive_action = url_for('stop_driver_action', stop_id=stop_id)
     if _arrived:
         _phase_body = f"""
@@ -20305,6 +20318,7 @@ def driver_route_detail(route_id):
             {cab_action_badge}
             <div class="cab-action-name">{e(s['customer_name'] or ('Stop ' + str(current_stop_num)))}</div>
         </div>
+        {_assigned_can_html}
 
         {_leg_switch_html or legs_html}
         {_phase_body}
@@ -24273,6 +24287,29 @@ def api_bin_disposition(route_id):
         conn.commit()
     except Exception:
         conn.rollback()
+    # 2026-10-23: Yard Inventory Awareness — the disposition is not a dead-end
+    # note anymore. It syncs the container fleet so dispatch knows what's where.
+    if bin_no:
+        try:
+            existing = conn.execute(
+                "SELECT id FROM containers WHERE company_id=? AND label=? LIMIT 1",
+                (cid(), bin_no)).fetchone()
+            if disp == "yard":
+                # Can is back at the yard, available for the next delivery.
+                if existing:
+                    conn.execute("UPDATE containers SET status='yard', notes=? WHERE id=?",
+                                 ("Returned " + now_ts()[:10], existing["id"]))
+                else:
+                    conn.execute("""INSERT INTO containers (company_id, size, label, status, notes, created_at)
+                                    VALUES (?,?,?,?,?,?)""",
+                                 (cid(), "", bin_no, "yard", "Returned " + now_ts()[:10], now_ts()))
+            elif disp == "customer" and existing:
+                # Can was left with a customer — deployed.
+                conn.execute("UPDATE containers SET status='deployed', notes=? WHERE id=?",
+                             ((note or "Delivered")[:200], existing["id"]))
+            conn.commit()
+        except Exception:
+            conn.rollback()
     conn.close()
     return jsonify({"ok": True})
 
@@ -25778,6 +25815,20 @@ def toggle_stop_complete(stop_id):
           _wtons, stop_id))
     if new_status == "completed":
         update_container_flow(conn, stop_id)
+        # 2026-10-23: Yard Inventory Awareness — a completed Delivery leaves
+        # its assigned yard can at the customer (deployed).
+        try:
+            _srow = conn.execute("SELECT assigned_can, action FROM stops WHERE id=?", (stop_id,)).fetchone()
+            _acan_done = (dict(_srow).get("assigned_can") or "").strip() if _srow else ""
+            _aact = (dict(_srow).get("action") or "").lower() if _srow else ""
+            if _acan_done and "delivery" in _aact:
+                _ex = conn.execute("SELECT id FROM containers WHERE company_id=? AND label=? LIMIT 1",
+                                   (cid(), _acan_done)).fetchone()
+                if _ex:
+                    conn.execute("UPDATE containers SET status='deployed', notes=? WHERE id=?",
+                                 ("Delivered " + now_ts()[:10], _ex["id"]))
+        except Exception:
+            pass
     # Customer Request System: mirror completion/reopen onto a linked request
     # (no-op for normal stops with no request_id).
     cascade_request_from_stop(conn, stop_id)
@@ -26918,6 +26969,38 @@ def api_confirm_rates():
 def _valid_container_status(s):
     s = (s or "").strip().lower()
     return s if s in ("yard", "deployed", "loaded_at_yard", "lost", "retired") else "yard"
+
+
+@app.route("/api/yard-inventory")
+@login_required
+def api_yard_inventory():
+    """Live yard inventory for dispatch: cans with status='yard', minus cans
+    already assigned to open (non-completed) routes."""
+    conn = get_db()
+    try:
+        cans = conn.execute(
+            """SELECT id, label, size, notes FROM containers
+               WHERE company_id=? AND status='yard' ORDER BY label""",
+            (cid(),)).fetchall()
+        # Cans already promised to an open route's delivery stop
+        taken = set()
+        try:
+            rows = conn.execute(
+                """SELECT s.assigned_can FROM stops s
+                   JOIN routes r ON r.id = s.route_id
+                   WHERE r.company_id=? AND r.status != 'completed'
+                   AND s.assigned_can IS NOT NULL AND s.assigned_can != ''""",
+                (cid(),)).fetchall()
+            taken = {r["assigned_can"] for r in rows}
+        except Exception:
+            pass
+        out = [{"id": c["id"], "label": c["label"], "size": c["size"] or "",
+                "notes": c["notes"] or "", "available": c["label"] not in taken}
+               for c in cans]
+    except Exception:
+        out = []
+    conn.close()
+    return jsonify({"cans": out})
 
 
 @app.route("/api/onboarding/containers/range", methods=["POST"])
@@ -29307,6 +29390,12 @@ ORDERING DIRECTIVES: phrases like "before final delivery", "after <stop>", "do t
   today. Before final delivery") is context for the stops that follow: do NOT emit it as
   its own stop; attach the directive to the next stop's notes instead.
 
+YARD CANS (important): "deliver can 3117 to <addr>" / "drop can 3117 at <addr>" / "D can 3117
+  <addr>" means a Delivery using the specific yard can numbered 3117 — set assigned_can to
+  "3117" (digits only). The word "can" before a number is the can identifier, NOT a street
+  address. "deliver a 30yd to <addr>" (no can number) is a Delivery with container_size
+  "30yd" and no assigned_can — the boss picks the can from yard inventory.
+
 NAME TOLERANCE: dispatchers mistype names ("restorstion" for "Restoration"). Match a
   misspelled customer/location to the closest KNOWN CUSTOMERS / KNOWN LOCATIONS entry and
   use the KNOWN spelling in customer/address — never invent a new customer for an obvious
@@ -29548,6 +29637,7 @@ def _normalize_manual_stops(stops_in):
             "address": address,
             "customer": _cap(s.get("customer")),
             "container_size": size,
+            "assigned_can": (s.get("assigned_can") or "").strip()[:20],
             "dump_leg": _cap(s.get("dump_leg")),
             "return_leg": _cap(s.get("return_leg")),
             "notes": _cap(s.get("notes")),
@@ -37594,6 +37684,13 @@ def add_parsed_stops(route_id):
                   swap_flag, now_ts()))
             added += 1
             _link_stop_sites(conn, cid(), _cur.lastrowid, dump_location, return_destination)
+            # 2026-10-23: Yard Inventory Awareness — save the assigned yard can.
+            _acan = (stop.get("assigned_can") or "").strip()[:20]
+            if _acan:
+                try:
+                    conn.execute("UPDATE stops SET assigned_can=? WHERE id=?", (_acan, _cur.lastrowid))
+                except Exception:
+                    pass
             upsert_saved_address(conn, cid(),
                 customer_name, address, city, state, zip_code,
                 action, container_size, dump_location)
@@ -37808,6 +37905,8 @@ def _validate_parser_stops(stops_in):
             "empty_can_plan": (s.get("empty_can_plan") or "").strip()
                               if (s.get("empty_can_plan") or "").strip() in _EMPTY_CAN_PLANS else "",
             "carry_can_ref": (str(s.get("carry_can_ref") or "").strip()[:40]),
+            # 2026-10-23: Yard Inventory Awareness — the specific yard can.
+            "assigned_can": (str(s.get("assigned_can") or "").strip()[:20]),
             # A confirm-sheet [change] -> delivery pick: the POSITION (0-based) of the
             # D stop this stop's chain delivers its final empty to. Translated to a
             # real stop id after insert (positions are all we have pre-insert).
@@ -38027,14 +38126,27 @@ def api_dispatch():
             learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
                            action=s["action"])
             continue
-        cur.execute("""
-            INSERT INTO stops (route_id, stop_order, customer_name, address, action, container_size,
-                                dump_location, return_destination, notes,
-                                empty_can_plan, carry_can_ref, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
-        """, (route_id, next_order, s.get("customer") or "", s["address"], s["action"],
-              s["container_size"], s.get("dump_leg") or "", s.get("return_leg") or "",
-              s["notes"], s.get("empty_can_plan") or "", s.get("carry_can_ref") or "", now_ts()))
+        _acan_val = (s.get("assigned_can") or "").strip()[:20]
+        try:
+            cur.execute("""
+                INSERT INTO stops (route_id, stop_order, customer_name, address, action, container_size,
+                                    dump_location, return_destination, notes,
+                                    empty_can_plan, carry_can_ref, assigned_can, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+            """, (route_id, next_order, s.get("customer") or "", s["address"], s["action"],
+                  s["container_size"], s.get("dump_leg") or "", s.get("return_leg") or "",
+                  s["notes"], s.get("empty_can_plan") or "", s.get("carry_can_ref") or "",
+                  _acan_val, now_ts()))
+        except Exception:
+            # Migration not yet run on this DB — insert without assigned_can.
+            cur.execute("""
+                INSERT INTO stops (route_id, stop_order, customer_name, address, action, container_size,
+                                    dump_location, return_destination, notes,
+                                    empty_can_plan, carry_can_ref, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+            """, (route_id, next_order, s.get("customer") or "", s["address"], s["action"],
+                  s["container_size"], s.get("dump_leg") or "", s.get("return_leg") or "",
+                  s["notes"], s.get("empty_can_plan") or "", s.get("carry_can_ref") or "", now_ts()))
         _new_ids.append(cur.lastrowid)
         # Resolve the dump/return site names to location records + set the FKs.
         _link_stop_sites(conn, cid(), cur.lastrowid, s.get("dump_leg") or "", s.get("return_leg") or "")
