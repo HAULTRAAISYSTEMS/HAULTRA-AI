@@ -33071,6 +33071,48 @@ def onboarding_import_customers():
     (function(){{
         var csrf = '{_csrf}';
         function esc(s){{ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }}
+        // 2026-10-23: shrink phone photos to JPEG before upload — fixes HEIC
+        // rejection and multi-MB uploads timing out on slow connections.
+        function downscale(file) {{
+            return new Promise(function(resolve) {{
+                var rd = new FileReader();
+                rd.onload = function() {{
+                    var img = new Image();
+                    img.onload = function() {{
+                        try {{
+                            var w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+                            var scale = Math.min(1, 1600 / Math.max(w, h));
+                            var cv = document.createElement('canvas');
+                            cv.width = Math.round(w * scale); cv.height = Math.round(h * scale);
+                            cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+                            cv.toBlob(function(blob) {{
+                                resolve(blob ? new File([blob], 'scan.jpg', {{type:'image/jpeg'}}) : file);
+                            }}, 'image/jpeg', 0.72);
+                        }} catch (e) {{ resolve(file); }}
+                    }};
+                    img.onerror = function() {{ resolve(file); }};
+                    img.src = rd.result;
+                }};
+                rd.onerror = function() {{ resolve(file); }};
+                rd.readAsDataURL(file);
+            }});
+        }}
+        function postScan(url, file) {{
+            return downscale(file).then(function(small) {{
+                var fd = new FormData();
+                fd.append('photo', small);
+                return fetch(url, {{method:'POST', headers:{{'X-CSRF-Token': csrf}}, body:fd}})
+                .then(function(r) {{
+                    return r.text().then(function(t) {{
+                        var d = null;
+                        try {{ d = JSON.parse(t); }} catch (e) {{}}
+                        if (!d) throw new Error('server:' + r.status);
+                        if (!r.ok && !d.ok) throw new Error(d.reason || ('http:' + r.status));
+                        return d;
+                    }});
+                }});
+            }});
+        }}
         var custInput = document.getElementById('ob-cust-scan');
         var custStatus = document.getElementById('ob-cust-status');
         var custResults = document.getElementById('ob-cust-results');
@@ -33080,11 +33122,7 @@ def onboarding_import_customers():
             if (!f) return;
             custStatus.innerHTML = '<span class="ob-reading">Reading your list...</span>';
             custResults.innerHTML = '';
-            var fd = new FormData();
-            fd.append('photo', f);
-            fetch('/api/onboarding/scan-customers', {{
-                method:'POST', headers:{{'X-CSRF-Token': csrf}}, body:fd
-            }}).then(function(r){{ return r.json(); }}).then(function(d){{
+            postScan('/api/onboarding/scan-customers', f).then(function(d){{
                 if (!d.ok) {{
                     custStatus.textContent = d.reason==='unreadable' ? 'Could not read it - try a clearer photo.'
                         : d.reason==='cap' ? 'Daily scan limit reached.'
@@ -33125,7 +33163,12 @@ def onboarding_import_customers():
                         }} else custStatus.textContent = 'Import failed - try again.';
                     }});
                 }});
-            }}).catch(function(){{ custStatus.textContent = 'No signal - try again.'; }});
+            }}).catch(function(err){{
+                var m = String((err && err.message) || '');
+                custStatus.textContent = m.indexOf('server:') === 0 ? 'Server error — try again in a minute.'
+                    : m.indexOf('http:') === 0 ? 'Upload failed — try a smaller photo.'
+                    : 'No signal - try again.';
+            }});
         }});
         var rateInput = document.getElementById('ob-rate-scan');
         var rateStatus = document.getElementById('ob-rate-status');
@@ -33136,11 +33179,7 @@ def onboarding_import_customers():
             if (!f) return;
             rateStatus.innerHTML = '<span class="ob-reading">Reading your prices...</span>';
             rateResults.innerHTML = '';
-            var fd = new FormData();
-            fd.append('photo', f);
-            fetch('/api/onboarding/scan-rates', {{
-                method:'POST', headers:{{'X-CSRF-Token': csrf}}, body:fd
-            }}).then(function(r){{ return r.json(); }}).then(function(d){{
+            postScan('/api/onboarding/scan-rates', f).then(function(d){{
                 if (!d.ok) {{
                     rateStatus.textContent = d.reason==='unreadable' ? 'Could not read it - try a clearer photo.' : 'Scan failed - try again.';
                     return;
@@ -33180,7 +33219,12 @@ def onboarding_import_customers():
                         }} else rateStatus.textContent = 'Import failed - try again.';
                     }});
                 }});
-            }}).catch(function(){{ rateStatus.textContent = 'No signal - try again.'; }});
+            }}).catch(function(err){{
+                var m = String((err && err.message) || '');
+                rateStatus.textContent = m.indexOf('server:') === 0 ? 'Server error — try again in a minute.'
+                    : m.indexOf('http:') === 0 ? 'Upload failed — try a smaller photo.'
+                    : 'No signal - try again.';
+            }});
         }});
     }})();
     </script>
