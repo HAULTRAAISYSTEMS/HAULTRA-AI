@@ -33798,8 +33798,15 @@ def bin_dispatch_pull():
 # =========================================================
 def _containers_section_html():
     conn = get_db()
+    # 2026-10-24: fleet is grouped by status (yard → on truck → deployed
+    # → lost → retired) and sorted by can NUMBER inside each group, so
+    # the list reads like a yard walk instead of a size-sorted dump.
     containers = conn.execute(
-        "SELECT * FROM containers WHERE company_id=? ORDER BY size ASC, label ASC",
+        """SELECT * FROM containers WHERE company_id=?
+           ORDER BY CASE status WHEN 'yard' THEN 0 WHEN 'loaded_at_yard' THEN 1
+                    WHEN 'deployed' THEN 2 WHEN 'lost' THEN 3 WHEN 'retired' THEN 4
+                    ELSE 5 END,
+                    CAST(label AS INTEGER) ASC, label ASC""",
         (cid(),)
     ).fetchall()
     # Count how many on-site records exist per container
@@ -33821,16 +33828,37 @@ def _containers_section_html():
         "retired":  "#6b7280",
     }
 
+    _GROUP_LABEL = {
+        "yard": "🟢 At Yard — in the yard, ready to assign",
+        "loaded_at_yard": "🔵 On Truck (loaded at yard) — on a truck, between yard and customer",
+        "deployed": "🟡 Deployed — dropped at a customer",
+        "lost": "🔴 Lost",
+        "retired": "⚪ Retired",
+    }
+    _group_counts = {}
+    for _gc in containers:
+        _group_counts[dict(_gc)["status"]] = _group_counts.get(dict(_gc)["status"], 0) + 1
     rows_html = ""
-    for _fidx, c in enumerate(containers):
+    _cur_group = None
+    for c in containers:
         _cd   = dict(c)
         _cid  = _cd["id"]
         _sc   = STATUS_COLOR.get(_cd["status"], "#D8D8D0")
-        # 2026-10-24: fleet is long now that it auto-learns — show the
-        # first 25, search across all, 'Show all' reveals the rest.
         _fsearch = " ".join(p for p in [_cd["label"] or "", _cd["size"] or "",
                                         _cd["status"] or "", _cd["notes"] or ""] if p).lower()
-        _fextra = ' class="fl-extra" style="display:none;"' if _fidx >= 25 else ""
+        # Group header row when the status changes. Lost/retired start
+        # collapsed — they are history, not today's yard.
+        if _cd["status"] != _cur_group:
+            _cur_group = _cd["status"]
+            _collapsed = _cur_group in ("lost", "retired")
+            _arrow = "▸" if _collapsed else "▾"
+            rows_html += (
+                f'<tr class="fl-group" data-group="{e(_cur_group)}" onclick="flToggleGroup(\'{e(_cur_group)}\')" '
+                f'style="cursor:pointer;background:rgba(255,255,255,.04);">'
+                f'<td colspan="5"><strong><span id="fl-arrow-{e(_cur_group)}">{_arrow}</span> '
+                f'{e(_GROUP_LABEL.get(_cur_group, _cur_group))} — {_group_counts[_cur_group]}</strong></td></tr>'
+            )
+        _row_style = ' style="display:none;"' if _cur_group in ("lost", "retired") else ""
         _badge = (
             f'<span style="font-size:11px;padding:2px 8px;border-radius:5px;'
             f'background:rgba(0,0,0,0.3);color:{_sc};border:1px solid {_sc}33;">'
@@ -33840,7 +33868,7 @@ def _containers_section_html():
         if _cd["status"] == "deployed":
             _deployed_note = f'<div class="small muted" style="margin-top:2px;">On site at {on_site_counts.get(_cid, "?")} location(s)</div>'
         rows_html += f"""
-        <tr data-search="{e(_fsearch)}"{_fextra}>
+        <tr data-search="{e(_fsearch)}" data-status="{e(_cd["status"])}" class="fl-row"{_row_style}>
             <td><strong>{e(_cd["size"])}</strong></td>
             <td class="muted small">{e(_cd["label"] or "")}</td>
             <td>{_badge}{_deployed_note}</td>
@@ -33883,6 +33911,15 @@ def _containers_section_html():
             btn.disabled = false;
         }}
         </script>
+        <p class="ai-sub" style="margin-top:10px;">🟢 At Yard = sitting in the yard, ready to assign &nbsp;·&nbsp; 🔵 On Truck (loaded at yard) = loaded onto a truck at the yard — heading out or heading back, not at a customer yet &nbsp;·&nbsp; 🟡 Deployed = dropped at a customer.</p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;" id="fl-chips">
+            <button type="button" class="fl-chip active" data-fl-status="all" onclick="flSetStatus('all', this)">All ({len(containers)})</button>
+            <button type="button" class="fl-chip" data-fl-status="yard" onclick="flSetStatus('yard', this)">🟢 At Yard ({_group_counts.get("yard", 0)})</button>
+            <button type="button" class="fl-chip" data-fl-status="loaded_at_yard" onclick="flSetStatus('loaded_at_yard', this)">🔵 On Truck ({_group_counts.get("loaded_at_yard", 0)})</button>
+            <button type="button" class="fl-chip" data-fl-status="deployed" onclick="flSetStatus('deployed', this)">🟡 Deployed ({_group_counts.get("deployed", 0)})</button>
+            <button type="button" class="fl-chip" data-fl-status="lost" onclick="flSetStatus('lost', this)">🔴 Lost ({_group_counts.get("lost", 0)})</button>
+            <button type="button" class="fl-chip" data-fl-status="retired" onclick="flSetStatus('retired', this)">⚪ Retired ({_group_counts.get("retired", 0)})</button>
+        </div>
         <input id="fl-filter" type="text" placeholder="Search label, size, status, or notes&hellip;"
                oninput="flFilter(this.value)"
                style="width:100%;min-height:48px;padding:10px 14px;margin-bottom:14px;background:rgba(255,255,255,.04);
@@ -33897,20 +33934,43 @@ def _containers_section_html():
                 </tbody>
             </table>
         </div>
-        {('<div style="text-align:center;margin-top:12px;"><button type="button" class="ai-btn" id="fl-show-all" onclick="flShowAll()">Show all ' + str(len(containers)) + ' containers</button></div>') if len(containers) > 25 else ''}
+        <style>
+        .fl-chip{{padding:8px 16px;border-radius:999px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.04);color:#A6A69E;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;}}
+        .fl-chip.active{{background:linear-gradient(135deg,#FF6B1A,#FF9D5C);color:#fff;border-color:transparent;}}
+        </style>
         <script>
-        var flAllShown = false;
-        function flFilter(v) {{
-            v = v.toLowerCase();
-            document.querySelectorAll('#containers tbody tr[data-search]').forEach(function(r) {{
-                if (v) {{ r.style.display = r.getAttribute('data-search').indexOf(v) > -1 ? '' : 'none'; }}
-                else {{ r.style.display = (r.classList.contains('fl-extra') && !flAllShown) ? 'none' : ''; }}
+        var flStatus = 'all';
+        var flQuery = '';
+        var flCollapsed = {{'lost': true, 'retired': true}};
+        function flApply() {{
+            document.querySelectorAll('#containers tbody tr.fl-row').forEach(function(r) {{
+                var st = r.getAttribute('data-status');
+                var okStatus = (flStatus === 'all' || st === flStatus);
+                var okSearch = (!flQuery || r.getAttribute('data-search').indexOf(flQuery) > -1);
+                var okGroup = !flCollapsed[st] || !!flQuery;
+                r.style.display = (okStatus && okSearch && okGroup) ? '' : 'none';
+            }});
+            document.querySelectorAll('#containers tbody tr.fl-group').forEach(function(g) {{
+                var st = g.getAttribute('data-group');
+                var anyVisible = false;
+                document.querySelectorAll('#containers tbody tr.fl-row[data-status="' + st + '"]').forEach(function(r) {{
+                    if (r.style.display !== 'none') {{ anyVisible = true; }}
+                }});
+                g.style.display = (flStatus !== 'all' && st !== flStatus) ? 'none' : '';
+                if (flQuery && !anyVisible) {{ g.style.display = 'none'; }}
             }});
         }}
-        function flShowAll() {{
-            flAllShown = true;
-            document.querySelectorAll('#containers tr.fl-extra').forEach(function(r) {{ r.style.display = ''; }});
-            var b = document.getElementById('fl-show-all'); if (b) {{ b.style.display = 'none'; }}
+        function flFilter(v) {{ flQuery = v.toLowerCase(); flApply(); }}
+        function flSetStatus(st, btn) {{
+            flStatus = st;
+            document.querySelectorAll('#fl-chips .fl-chip').forEach(function(b) {{ b.classList.toggle('active', b === btn); }});
+            flApply();
+        }}
+        function flToggleGroup(st) {{
+            flCollapsed[st] = !flCollapsed[st];
+            var a = document.getElementById('fl-arrow-' + st);
+            if (a) {{ a.textContent = flCollapsed[st] ? '▸' : '▾'; }}
+            flApply();
         }}
         </script>
     </div>
@@ -34847,7 +34907,7 @@ def yard_setup_page():
                 <button type="button" class="ai-btn solid" style="margin-top:14px;" onclick="ysShow('fleet')">Open fleet →</button>
             </div>
         </div>
-        <p class="ai-sub" style="margin-top:16px;">Everything still lives here — pick a tab above and only that section opens. Address Book and Fleet show the first 25 rows with search, so a hundred learned cans no longer means a hundred rows of scrolling.</p>
+        <p class="ai-sub" style="margin-top:16px;">Everything still lives here — pick a tab above and only that section opens. Fleet is grouped by status with filters, and Address Book shows the first 25 rows with search, so a hundred learned cans no longer means a hundred rows of scrolling.</p>
     </div>
     <div class="ys-panel" id="ys-panel-disposal" style="display:none;">{_dump_locations_section_html()}</div>
     <div class="ys-panel" id="ys-panel-vocab" style="display:none;">{_parse_vocab_section_html()}</div>
