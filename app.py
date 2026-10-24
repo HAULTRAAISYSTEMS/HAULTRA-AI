@@ -5264,14 +5264,25 @@ def is_native_app():
 
 
 def driver_active_route_id(conn, user_id):
-    """Best current route for a driver: today's assigned route if open,
-    else the earliest other open/in_progress route. Returns None if none."""
+    """Best current route for a driver: today's route first (any live status
+    — a finished today still owns the Cab View tab), else the earliest other
+    open/in_progress route. Returns None if none.
+    2026-10-24: the old open-only query let an unfinished Oct 21 route keep
+    hijacking the Cab View tab every time today's route was finished."""
+    row = conn.execute(
+        """SELECT id FROM routes
+           WHERE assigned_to=? AND route_date=?
+             AND status IN ('open','in_progress','completed')
+           ORDER BY id DESC LIMIT 1""",
+        (user_id, today_str())
+    ).fetchone()
+    if row:
+        return row["id"]
     row = conn.execute(
         """SELECT id FROM routes
            WHERE assigned_to=? AND status IN ('open','in_progress')
-           ORDER BY (route_date = ?) DESC, route_date ASC, id ASC
-           LIMIT 1""",
-        (user_id, today_str())
+           ORDER BY route_date ASC, id ASC LIMIT 1""",
+        (user_id,)
     ).fetchone()
     return row["id"] if row else None
 
@@ -9818,7 +9829,7 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 
 .cab-progress-label {{ font-size: 12px; font-weight: 700; letter-spacing: 1px; color: var(--text-muted); text-transform: uppercase; margin-bottom: 6px; }}
 .cab-progress-track {{ height: 8px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; margin-bottom: 12px; }}
-.cab-progress-fill {{ height: 100%; background: linear-gradient(90deg, #FF8A42, #FF6B1A); border-radius: 4px; transition: width .4s; }}
+.cab-progress-fill {{ height: 100%; background: linear-gradient(90deg, #FF8A42, #FF6B1A); border-radius: 4px; transition: width .4s; box-shadow: 0 0 12px rgba(255,107,26,0.45); }}
 
 .route-updated-banner {{
     display: flex; align-items: center; justify-content: space-between; gap: 10px;
@@ -9983,11 +9994,32 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
 .cab-complete-btn:disabled {{ background: rgba(255,255,255,0.06); color: #55554C; cursor: not-allowed; box-shadow: none; }}
 
 .cab-all-done {{
+    position: relative; overflow: hidden;
     text-align: center; padding: 30px 18px 22px; margin-top: 4px;
     border: 1px solid rgba(255,255,255,0.09); border-radius: 20px;
     background: radial-gradient(120% 90% at 50% 0%, rgba(255,107,26,0.14), rgba(255,255,255,0.02) 55%);
     box-shadow: 0 12px 34px rgba(0,0,0,0.35);
 }}
+.cab-done-embers {{ position: absolute; inset: 0; pointer-events: none; }}
+.cab-done-embers i {{ position: absolute; bottom: -8px; width: 6px; height: 6px; border-radius: 50%;
+    background: #FF8A42; opacity: 0; animation: ember-rise 7s ease-in infinite; }}
+.cab-done-embers i:nth-child(1) {{ left: 12%; animation-delay: 0s; }}
+.cab-done-embers i:nth-child(2) {{ left: 28%; width: 4px; height: 4px; animation-delay: 1.4s; }}
+.cab-done-embers i:nth-child(3) {{ left: 47%; width: 7px; height: 7px; animation-delay: 2.6s; }}
+.cab-done-embers i:nth-child(4) {{ left: 63%; animation-delay: 0.8s; }}
+.cab-done-embers i:nth-child(5) {{ left: 78%; width: 5px; height: 5px; animation-delay: 3.4s; }}
+.cab-done-embers i:nth-child(6) {{ left: 88%; animation-delay: 2.0s; }}
+@keyframes ember-rise {{ 0% {{ transform: translateY(0); opacity: 0; }} 12% {{ opacity: .45; }} 100% {{ transform: translateY(-280px); opacity: 0; }} }}
+.cab-all-done-icon {{ position: relative; }}
+.cab-all-done-icon::before {{ content: ''; position: absolute; inset: -12px; border-radius: 50%;
+    border: 1px solid rgba(255,107,26,0.35); animation: done-ring 2.6s ease-in-out infinite; }}
+@keyframes done-ring {{ 0%, 100% {{ transform: scale(1); opacity: .7; }} 50% {{ transform: scale(1.08); opacity: .2; }} }}
+@media (prefers-reduced-motion: reduce) {{ .cab-done-embers i, .cab-all-done-icon, .cab-all-done-icon::before {{ animation: none; }} }}
+.cab-done-stats {{ display: flex; gap: 8px; justify-content: center; margin-top: 16px; flex-wrap: wrap; }}
+.cab-done-stat {{ flex: 1; min-width: 90px; max-width: 150px; padding: 10px 8px; border-radius: 12px;
+    background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); }}
+.cab-done-stat span {{ display: block; font-size: 10px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase; color: #8C8C82; margin-bottom: 2px; }}
+.cab-done-stat b {{ font-size: 16px; color: #F5F5F0; }}
 .cab-done-sub {{ color: #D8D8CE; font-size: 15px; margin-top: 8px; }}
 .cab-done-actions {{ margin-top: 22px; display: flex; flex-direction: column; gap: 10px; }}
 .cab-done-actions form {{ display: block; width: 100%; }}
@@ -19175,6 +19207,26 @@ def driver_route_detail(route_id):
         if route["route_date"] and route["route_date"] != today_str():
             _old_route_note = ('<div class="cab-done-old">Viewing ' + e(route["route_date"])
                                + ' &mdash; not today&rsquo;s route. Today&rsquo;s route is under Back to My Routes.</div>')
+        # 2026-10-24: route summary strip — stops, time on route, truck.
+        # All from in-scope data; nothing here can disagree with the log.
+        _dur = ""
+        try:
+            _st = route["started_at"] or ""
+            _fin = stops[-1]["completed_at"] if stops else ""
+            if _st and _fin:
+                _a = datetime.strptime(_st[:19], "%Y-%m-%d %H:%M:%S")
+                _b = datetime.strptime(_fin[:19], "%Y-%m-%d %H:%M:%S")
+                _mins = int((_b - _a).total_seconds() // 60)
+                if _mins >= 0:
+                    _dur = (f"{_mins // 60}h {_mins % 60}m" if _mins >= 60 else f"{_mins}m")
+        except Exception:
+            _dur = ""
+        _stat_tiles = ['<div class="cab-done-stat"><span>Stops</span><b>' + str(total_count) + '</b></div>']
+        if _dur:
+            _stat_tiles.append('<div class="cab-done-stat"><span>Time</span><b>' + e(_dur) + '</b></div>')
+        if _trow:
+            _stat_tiles.append('<div class="cab-done-stat"><span>Truck</span><b>' + e(_trow["name"]) + '</b></div>')
+        _done_stats = '<div class="cab-done-stats">' + "".join(_stat_tiles) + '</div>'
         body = f"""
 <div class="cab-wrap">
     <div class="cab-header">
@@ -19191,9 +19243,11 @@ def driver_route_detail(route_id):
     <div class="cab-progress-track"><div class="cab-progress-fill" style="width:100%;"></div></div>
     {_old_route_note}
     <div class="cab-all-done">
+        <div class="cab-done-embers" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></div>
         <div class="cab-all-done-icon"></div>
         <h2>All Stops Done</h2>
         <p class="cab-done-sub">{total_count} of {total_count} stops completed.</p>
+        {_done_stats}
         {_disp_html}
         <div class="cab-done-actions">
             {route_action_buttons}
