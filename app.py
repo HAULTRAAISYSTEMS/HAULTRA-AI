@@ -6755,7 +6755,7 @@ _ANNOTATION_LINE_RE = re.compile(
     re.I,
 )
 # Pattern for "return to <destination>" / "return it to <destination>" in notes
-_RETURN_TO_RE = re.compile(r"\breturn\s+(?:it\s+)?to\s+(.+)", re.I)
+_RETURN_TO_RE = re.compile(r"\breturn\s+(?:it\s+)?(?:to\s+)?(.+)", re.I)
 # Ordering-directive lines: not stops — they place the NEXT stop(s).
 # e.g. "One addition today. Before final delivery", "do this one after the pull"
 _ORDER_DIRECTIVE_RE = re.compile(
@@ -6873,13 +6873,17 @@ def _apply_intent_engine(stops, raw_text=""):
     return stops
 
 
-def _apply_swap_inference(stops):
+def _apply_swap_inference(stops, initial_pending_swap=False):
     """Post-process a stop list to detect cross-stop SWAP / pending-empty patterns.
 
     Carries a pending_swap flag past non-PR stops so the NEXT PR stop after a
     trigger phrase receives the SWAP mark, regardless of intervening stops.
+    initial_pending_swap arms the chain from the first stop — for pastes where
+    the trigger phrase sits on a header line before any stop exists (Alix's
+    "Before you return central dr. Use it to" additions), so both PRs below
+    are swaps sharing the existing route's empty.
     """
-    pending_swap = False  # carries until consumed by a PR stop
+    pending_swap = bool(initial_pending_swap)  # carries until consumed by a PR stop
 
     for stop in stops:
         notes     = stop.get("notes") or ""
@@ -6932,12 +6936,42 @@ def _apply_swap_inference(stops):
                         _already = True
                         break
                 if not _already:
+                    # 2026-10-24: resolve the shorthand dest against the
+                    # address book ("central dr" -> "543 Central Dr") so the
+                    # auto-created return dispatches to a real address, and
+                    # carry the size under BOTH keys — parsed stops use
+                    # container_size, and the old bare "size" key was dropped
+                    # by validation, leaving the return stop sizeless.
+                    _d_addr, _d_city, _d_cust = _dest.title(), "", ""
+                    try:
+                        _cc = cid()
+                        if _cc:
+                            _conn = get_db()
+                            try:
+                                _rows = _conn.execute(
+                                    "SELECT address, city, customer_name FROM saved_addresses "
+                                    "WHERE company_id=? ORDER BY times_used DESC, last_used_at DESC",
+                                    (_cc,)).fetchall()
+                            finally:
+                                _conn.close()
+                            _dl = _dest.lower()
+                            for _r in _rows:
+                                if _dl and _dl in ((_r["address"] or "").lower()):
+                                    _d_addr = _r["address"] or _d_addr
+                                    _d_city = _r["city"] or ""
+                                    _d_cust = _r["customer_name"] or ""
+                                    break
+                    except Exception:
+                        pass
+                    _d_size = _last.get("container_size") or _last.get("size") or "30yd"
                     stops.append({
                         "action": "Delivery",
-                        "address": _dest,
-                        "customer_name": "",
+                        "address": _d_addr,
+                        "city": _d_city,
+                        "customer_name": _d_cust,
                         "notes": f"Auto-created return: {_rd}",
-                        "size": _last.get("size") or "30yd",
+                        "size": _d_size,
+                        "container_size": _d_size,
                         "dump_location": "",
                     })
 
@@ -7030,7 +7064,21 @@ def parse_boss_text(raw_text):
     # 2026-10-22: Intent Engine (the moat) — understands what the boss MEANS,
     # converts actions, rearranges, before the swap inference runs.
     stops = _apply_intent_engine(stops, raw_text)
-    stops = _apply_swap_inference(stops)
+    # 2026-10-24: a swap trigger on its own header line ("Before you return
+    # central dr. Use it to") is dropped by the shorthand parser before any
+    # stop exists, so the inference never sees it and the PRs below parse as
+    # plain pickups-and-returns. If the text before the first action line
+    # carries a trigger phrase, arm the chain from the start.
+    _header_trigger = False
+    if detected_format == "rolloff":
+        for _ln in raw_text.splitlines():
+            _stripped = _ln.strip()
+            if _ROLLOFF_LINE_RE.match(_stripped):
+                break
+            if _PENDING_EMPTY_RE.search(_stripped):
+                _header_trigger = True
+                break
+    stops = _apply_swap_inference(stops, initial_pending_swap=_header_trigger)
     return stops, dump
 
 # =========================================================
