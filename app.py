@@ -29054,7 +29054,8 @@ def route_daily_log(route_id):
         # Box Out = the bin hauled from THIS stop (from the dump ticket —
         # that's where the driver enters it). Box In = what was on the truck
         # coming in = previous stop's Box Out. An explicit swap chain
-        # (takes_from) overrides the sequential Box In.
+        # (takes_from) overrides the sequential Box In. A Delivery's Box In
+        # is its own yard can (assigned, else notes) — never the prev stop.
         _skeys = s.keys()
         _ticket_can = (s["ticket_can_number"] if "ticket_can_number" in _skeys else None) or ""
         _ticket_can = _ticket_can.strip()
@@ -29065,8 +29066,16 @@ def route_daily_log(route_id):
         _sid = s["id"] if "id" in _skeys else None
         _is_swap = bool(_swap_flag) or (_sid in (takes_from or {}))
         _giver = (takes_from or {}).get(_sid)
+        _is_delivery = "delivery" in _act_lc
+        _deliv_can = _effective_can(s) if _is_delivery else ""
         if _giver and can_by_stop.get(_giver):
             box_in = can_by_stop.get(_giver)
+        elif _deliv_can:
+            # 2026-10-24: a Delivery drops the yard can it hooked — that can
+            # is the stop's own (assigned_can, else notes), NOT the previous
+            # stop's Box Out. A first-stop delivery used to show a blank Box
+            # In here even when the note named the can (EW / 3117, 2026-10-24).
+            box_in = _deliv_can
         elif _is_pr and not _is_swap:
             # 2026-10-22: PR (non-swap): Box In = Box Out = SAME bin.
             # Driver pulls the full bin, dumps it, returns the empty to THIS
@@ -29087,7 +29096,11 @@ def route_daily_log(route_id):
         # for the next stop. Pull/PR-swap carries the (now empty) bin forward.
         # 2026-10-23: incomplete stop — truck still has the incoming bin.
         # 2026-10-23: field swap — truck now carries the pulled bin.
-        if _is_pr and not _is_swap:
+        # 2026-10-24: a Delivery leaves its can at the customer — the truck
+        # leaves empty no matter what the previous stop carried.
+        if _is_delivery:
+            _prev_box_out = ""
+        elif _is_pr and not _is_swap:
             if box_out and _prev_box_out and _prev_box_out != box_out:
                 _prev_box_out = box_out
             else:
