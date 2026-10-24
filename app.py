@@ -24277,6 +24277,171 @@ def _effective_can(stop):
     return ""
 
 
+def _fleet_upsert(conn, company_id, label, size, status, notes):
+    """Learn a can into the fleet table, or update the one already there.
+
+    No unique constraint exists on (company_id, label), so this is
+    SELECT-then-INSERT/UPDATE, never ON CONFLICT. A boss-set 'lost' or
+    'retired' status is never overwritten by auto-learning — a human
+    decision wins over a replayed route.
+    Returns (inserted, changed).
+    """
+    label = (label or "").strip()
+    if not label:
+        return (False, False)
+    row = conn.execute(
+        "SELECT id, size, status, notes FROM containers WHERE company_id=? AND label=? LIMIT 1",
+        (company_id, label)).fetchone()
+    if not row:
+        conn.execute(
+            "INSERT INTO containers (company_id, size, label, status, notes, created_at) VALUES (?,?,?,?,?,?)",
+            (company_id, size or "", label, status, notes or "", now_ts()))
+        return (True, False)
+    d = dict(row)
+    if d.get("status") in ("lost", "retired"):
+        if not (d.get("size") or "") and size:
+            conn.execute("UPDATE containers SET size=? WHERE id=?", (size, d["id"]))
+        return (False, False)
+    changed = False
+    if (d.get("status") or "") != status:
+        conn.execute("UPDATE containers SET status=?, notes=? WHERE id=?", (status, notes or "", d["id"]))
+        changed = True
+    elif notes and (d.get("notes") or "") != notes:
+        conn.execute("UPDATE containers SET notes=? WHERE id=?", (notes, d["id"]))
+        changed = True
+    if not (d.get("size") or "") and size:
+        conn.execute("UPDATE containers SET size=? WHERE id=?", (size, d["id"]))
+    return (False, changed)
+
+
+def _sync_fleet_from_history(conn, company_id):
+    """Auto-learn the container fleet from real work, as you go.
+
+    One replay, oldest route first, so the LATEST event for each can wins:
+    - Routes: a Delivery's yard can (explicit assigned_can, or read from
+      notes — 'Can 3117 at yard') → 'deployed' once completed, 'loaded_at_yard'
+      (on the truck) while the delivery is still open.
+    - Daily Log chain: a completed Pull/PR stop's dump-ticket can → the bin
+      hauled from that stop. A swap's pulled bin stays 'loaded_at_yard'
+      (it goes to the next stop or the yard); a non-swap PR returns the same
+      bin to the same customer, so it stays 'deployed' there.
+    - Route end: the final bin on a finished route with no disposition
+      counts as at the yard (the derived-yard rule); an explicit Yard /
+      Customer disposition sets that status directly.
+    - Bin Tracker: containers still out at an address (compute_containers_out)
+      confirm any fleet can whose last note names that address as 'deployed'.
+    Never deletes a fleet row and never overwrites a boss-set lost/retired
+    can. Returns {"learned": n, "updated": n, "total": n} — counted from a
+    before/after snapshot, so intermediate states a can passes through
+    during the replay (hauled, then back at the yard) do not inflate it.
+    """
+    before = {}
+    try:
+        for _c in conn.execute("SELECT label, status, notes FROM containers WHERE company_id=?", (company_id,)).fetchall():
+            before[_c["label"]] = (_c["status"], _c["notes"] or "")
+    except Exception:
+        before = {}
+    routes = conn.execute(
+        "SELECT id, route_date, status, final_bin_disposition FROM routes "
+        "WHERE company_id=? ORDER BY route_date ASC, id ASC",
+        (company_id,)).fetchall()
+    tickets = {}
+    try:
+        for t in conn.execute(
+                "SELECT dt.stop_id, dt.can_number FROM dump_tickets dt "
+                "JOIN routes r ON r.id = dt.route_id WHERE r.company_id=? ORDER BY dt.id ASC",
+                (company_id,)).fetchall():
+            if (t["can_number"] or "").strip():
+                tickets[t["stop_id"]] = (t["can_number"] or "").strip()
+    except Exception:
+        tickets = {}
+    today = today_str()
+    for rt in routes:
+        rdate = rt["route_date"] or ""
+        stops = conn.execute(
+            "SELECT * FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
+            (rt["id"],)).fetchall()
+        for s in stops:
+            d = dict(s)
+            act = (d.get("action") or "").lower()
+            size = d.get("container_size") or ""
+            who = (d.get("customer_name") or "").strip()
+            where = (d.get("address") or "").strip()
+            done = (d.get("status") or "") == "completed"
+            eff = _effective_can(d)
+            if eff:
+                if done:
+                    ins, ch = _fleet_upsert(conn, company_id, eff, size, "deployed",
+                                            f"Delivered {rdate} — {who}, {where}" if who or where else f"Delivered {rdate}")
+                else:
+                    ins, ch = _fleet_upsert(conn, company_id, eff, size, "loaded_at_yard",
+                                            f"On route {rdate} — {who}" if who else f"On route {rdate}")
+                pass
+            tcan = tickets.get(d["id"])
+            if tcan and "delivery" not in act and done:
+                is_pr = "pickup and return" in act or "return" in act
+                is_swap = bool(d.get("swap_with_prev_pull")) or bool(d.get("chain_takes_from_stop_id"))
+                if is_pr and not is_swap:
+                    ins, ch = _fleet_upsert(conn, company_id, tcan, size, "deployed",
+                                            f"Returned {rdate} — {who}, {where}" if who or where else f"Returned {rdate}")
+                else:
+                    ins, ch = _fleet_upsert(conn, company_id, tcan, size, "loaded_at_yard",
+                                            f"Hauled {rdate} — {who}" if who else f"Hauled {rdate}")
+                pass
+        # Route-end final bin, for finished routes only.
+        try:
+            counts = conn.execute(
+                "SELECT COUNT(*) total, COALESCE(SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END),0) done "
+                "FROM stops WHERE route_id=?", (rt["id"],)).fetchone()
+            finished = (rt["status"] == "completed") or (
+                rdate and rdate < today and counts and counts["total"] and counts["done"] >= counts["total"])
+            if finished:
+                bin_no, bin_size = _route_final_bin_detail(conn, rt["id"])
+                if bin_no:
+                    disp = (rt["final_bin_disposition"] or "").strip().lower() if "final_bin_disposition" in rt.keys() else ""
+                    if disp == "yard":
+                        ins, ch = _fleet_upsert(conn, company_id, bin_no, bin_size, "yard",
+                                                f"At yard — end of {rdate} route")
+                        pass
+                    elif disp == "customer":
+                        ins, ch = _fleet_upsert(conn, company_id, bin_no, bin_size, "deployed",
+                                                f"At customer — end of {rdate} route")
+                        pass
+                    elif disp == "":
+                        ins, ch = _fleet_upsert(conn, company_id, bin_no, bin_size, "yard",
+                                                f"At yard — end of {rdate} route (from route log)")
+                        pass
+                    # 'landfill' disposition: leave the fleet row alone.
+        except Exception:
+            pass
+    # Bin Tracker cross-check: still out at an address → deployed there.
+    try:
+        for out in compute_containers_out(conn, company_id):
+            addr = (out.get("address") or "").strip()
+            if not addr:
+                continue
+            for c in conn.execute(
+                    "SELECT id, label, status, notes FROM containers WHERE company_id=? AND status='loaded_at_yard'",
+                    (company_id,)).fetchall():
+                if addr.lower() in (c["notes"] or "").lower():
+                    ins, ch = _fleet_upsert(conn, company_id, c["label"], "", "deployed",
+                                            f"On site at {addr} (Bin Tracker)")
+                    pass
+    except Exception:
+        pass
+    total = conn.execute("SELECT COUNT(*) n FROM containers WHERE company_id=?", (company_id,)).fetchone()["n"]
+    learned = updated = 0
+    try:
+        for _c in conn.execute("SELECT label, status, notes FROM containers WHERE company_id=?", (company_id,)).fetchall():
+            if _c["label"] not in before:
+                learned += 1
+            elif before[_c["label"]] != (_c["status"], _c["notes"] or ""):
+                updated += 1
+    except Exception:
+        pass
+    return {"learned": learned, "updated": updated, "total": total}
+
+
 def _route_final_bin_detail(conn, route_id):
     """(bin, size) on the truck after a route's last completed stop.
 
@@ -24405,6 +24570,13 @@ def api_bin_disposition(route_id):
             conn.commit()
         except Exception:
             conn.rollback()
+    # 2026-10-24: fleet auto-learn — a disposition also replays history,
+    # so the fleet stays consistent with routes and the Daily Log.
+    try:
+        _sync_fleet_from_history(conn, cid())
+        conn.commit()
+    except Exception:
+        conn.rollback()
     conn.close()
     return jsonify({"ok": True})
 
@@ -24978,6 +25150,13 @@ def edit_stop(stop_id):
                          (int(_mgt), stop_id))
         _chain_res = _apply_route_chains(conn, route_id)
         conn.commit()
+        # 2026-10-24: fleet auto-learn — an Edit that sets a yard can or a
+        # notes can immediately feeds the fleet.
+        try:
+            _sync_fleet_from_history(conn, cid())
+            conn.commit()
+        except Exception:
+            conn.rollback()
         _flash_chain_result(_chain_res)
         upsert_saved_address(conn, cid(),
             expand_abbrev(request.form.get("customer_name")), expand_abbrev(request.form.get("address")),
@@ -25967,6 +26146,14 @@ def toggle_stop_complete(stop_id):
                                     VALUES (?,?,?,?,?,?)""",
                                  (cid(), (dict(_srow).get("container_size") or ""), _acan_done, "deployed",
                                   "Delivered " + now_ts()[:10], now_ts()))
+        except Exception:
+            pass
+    # 2026-10-24: fleet auto-learn — completing a stop feeds the can into
+    # the container fleet (deployed / on-truck / yard), never blocking the
+    # completion itself if the sync fails.
+    if new_status == "completed":
+        try:
+            _sync_fleet_from_history(conn, cid())
         except Exception:
             pass
     # Customer Request System: mirror completion/reopen onto a linked request
@@ -33629,6 +33816,7 @@ def _containers_section_html():
     STATUS_COLOR = {
         "yard":     "#3DDC84",
         "deployed": "#fbbf24",
+        "loaded_at_yard": "#7FB8FF",
         "lost":     "#f87171",
         "retired":  "#6b7280",
     }
@@ -33672,10 +33860,24 @@ def _containers_section_html():
         <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;">
             <div>
                 <h2 class="ai-title">&#128230; Container Fleet</h2>
-                <p class="ai-sub">Your roll-off containers by size and status.</p>
+                <p class="ai-sub">Your roll-off containers by size and status. Learned automatically from routes, dump tickets and the Daily Log as you go — no retyping.</p>
             </div>
-            <a class="ai-btn solid" href="{url_for('add_container')}">+ Add Container</a>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <button type="button" class="ai-btn" id="fleet-sync-btn" onclick="fleetSync(this)">🔄 Sync from history</button>
+                <a class="ai-btn solid" href="{url_for('add_container')}">+ Add Container</a>
+            </div>
         </div>
+        <script>
+        async function fleetSync(btn) {{
+            btn.disabled = true; var old = btn.textContent; btn.textContent = 'Syncing…';
+            try {{
+                var r = await fetch('/api/fleet/sync', {{method: 'POST', headers: {{'X-CSRF-Token': document.querySelector('meta[name="csrf-token"]') ? document.querySelector('meta[name="csrf-token"]').content : ''}}}});
+                var j = await r.json();
+                if (j.ok) {{ location.reload(); }} else {{ btn.textContent = 'Sync failed'; }}
+            }} catch (e) {{ btn.textContent = 'Sync failed'; }}
+            btn.disabled = false;
+        }}
+        </script>
         <div class="table-wrap">
             <table class="ai-table">
                 <thead>
@@ -34519,9 +34721,35 @@ def onboarding_import_customers():
     return render_template_string(shell_page("Import Customers", body))
 
 
+@app.route("/api/fleet/sync", methods=["POST"])
+@boss_required
+def api_fleet_sync():
+    """Manual fleet backfill: replay route history into the fleet table."""
+    conn = get_db()
+    try:
+        res = _sync_fleet_from_history(conn, cid())
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        conn.close()
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    conn.close()
+    return jsonify({"ok": True, **res})
+
+
 @app.route("/yard-setup")
 @boss_required
 def yard_setup_page():
+    # 2026-10-24: fleet auto-learn backfill — opening Yard Setup replays
+    # route history once, so every can ever seen on a route, ticket or
+    # Daily Log lands in the fleet without anyone retyping it.
+    try:
+        conn = get_db()
+        _sync_fleet_from_history(conn, cid())
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
     body = f"""
     <div class="hero" style="position:relative;overflow:hidden;border-radius:24px;padding:36px 28px;margin-bottom:24px;
         background:radial-gradient(700px 320px at 30% 0%, rgba(255,107,26,.12), transparent 65%), rgba(255,255,255,.02);
@@ -38471,6 +38699,13 @@ def api_dispatch():
     _chain_res = _apply_route_chains(conn, route_id)
     _blocking = _chain_blocking_errors(_chain_res)
     conn.commit()  # persist the (partial) links either way so the boss can see/fix them
+    # 2026-10-24: fleet auto-learn — a dispatched Delivery's can (picker or
+    # notes) joins the fleet as on-the-truck right away.
+    try:
+        _sync_fleet_from_history(conn, cid())
+        conn.commit()
+    except Exception:
+        conn.rollback()
     if _blocking:
         conn.close()
         return jsonify({"error": " ".join(dict.fromkeys(e["msg"] for e in _blocking))}), 400
