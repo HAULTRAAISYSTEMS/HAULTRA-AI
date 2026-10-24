@@ -31894,6 +31894,160 @@ def support_page():
 # =========================================================
 # YARD SETUP — merged Dump Locations + Container Fleet
 # =========================================================
+# --- Yard Setup AI design system (2026-10-23) --------------------------------
+# haultrausa.com-inspired: frosted glass, 3D tilt, orange glow. HAULTRA orange
+# replaces their blue. Applied to Yard Setup sections (dump locations,
+# shorthand, address book).
+def _yard_ai_design():
+    return """
+    <style>
+    /* AI backdrop: hex grid + orange nebula glow */
+    .ai-stage {
+        position: relative;
+        border-radius: 24px;
+        padding: 28px 24px;
+        margin-bottom: 24px;
+        background:
+            radial-gradient(600px 300px at 20% 0%, rgba(255,107,26,0.08), transparent 60%),
+            radial-gradient(500px 260px at 85% 100%, rgba(255,107,26,0.05), transparent 60%),
+            rgba(255,255,255,0.015);
+        border: 1px solid rgba(255,255,255,0.07);
+        backdrop-filter: blur(24px);
+        -webkit-backdrop-filter: blur(24px);
+        overflow: hidden;
+    }
+    .ai-stage::before {
+        content: ""; position: absolute; inset: 0; pointer-events: none; opacity: .5;
+        background-image:
+            linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
+        background-size: 44px 44px;
+        mask-image: radial-gradient(700px 420px at 50% 0%, black, transparent 75%);
+        -webkit-mask-image: radial-gradient(700px 420px at 50% 0%, black, transparent 75%);
+    }
+    .ai-stage > * { position: relative; z-index: 1; }
+    .ai-kicker {
+        display: inline-flex; align-items: center; gap: 8px;
+        font-size: 11px; font-weight: 800; letter-spacing: 2.5px; text-transform: uppercase;
+        color: #FF9D5C; margin-bottom: 10px;
+    }
+    .ai-kicker .ai-dot {
+        width: 7px; height: 7px; border-radius: 50%;
+        background: #FF6B1A; box-shadow: 0 0 12px 2px rgba(255,107,26,.8);
+        animation: ai-pulse 2.2s infinite;
+    }
+    @keyframes ai-pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+    .ai-title {
+        margin: 0 0 6px; font-size: 1.6rem; font-weight: 800; letter-spacing: -0.5px;
+        background: linear-gradient(135deg, #fff 30%, #FFB37A 100%);
+        -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+    }
+    .ai-sub { color: var(--text-muted); font-size: .9rem; margin-bottom: 18px; max-width: 640px; }
+    /* 3D glass cards */
+    .ai-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; perspective: 1200px; }
+    .ai-card {
+        position: relative;
+        background: linear-gradient(145deg, rgba(255,255,255,0.06), rgba(255,255,255,0.015));
+        border: 1px solid rgba(255,255,255,0.1);
+        border-radius: 20px;
+        padding: 18px;
+        backdrop-filter: blur(20px);
+        -webkit-backdrop-filter: blur(20px);
+        transform-style: preserve-3d;
+        transition: border-color .25s, box-shadow .25s;
+        will-change: transform;
+    }
+    .ai-card:hover {
+        border-color: rgba(255,107,26,0.45);
+        box-shadow: 0 20px 50px -18px rgba(255,107,26,0.35), inset 0 1px 0 rgba(255,255,255,0.12);
+    }
+    .ai-card .ai-glare {
+        content: ""; position: absolute; inset: 0; border-radius: 20px; pointer-events: none;
+        background: radial-gradient(420px circle at var(--gx, 50%) var(--gy, 50%), rgba(255,255,255,0.09), transparent 55%);
+        opacity: 0; transition: opacity .25s;
+    }
+    .ai-card:hover .ai-glare { opacity: 1; }
+    .ai-card-inner { transform: translateZ(24px); }
+    .ai-chip {
+        display: inline-flex; align-items: center; gap: 6px;
+        font-size: 11px; font-weight: 800; padding: 5px 12px; border-radius: 999px;
+        letter-spacing: .5px;
+    }
+    .ai-chip.on { background: rgba(61,220,132,.12); color: #3DDC84; border: 1px solid rgba(61,220,132,.35); box-shadow: 0 0 14px rgba(61,220,132,.15); }
+    .ai-chip.off { background: rgba(255,255,255,.05); color: var(--text-muted); border: 1px solid rgba(255,255,255,.14); }
+    .ai-name { font-weight: 800; font-size: 1.05rem; margin-bottom: 4px; letter-spacing: -0.2px; }
+    .ai-addr { font-size: .82rem; color: var(--text-muted); }
+    .ai-notes { font-size: .78rem; color: var(--text-muted); margin-top: 6px; font-style: italic; }
+    .ai-actions { display: flex; gap: 8px; align-items: center; padding-top: 12px; margin-top: 12px; border-top: 1px solid rgba(255,255,255,0.07); }
+    .ai-btn {
+        font-size: 12px; font-weight: 700; padding: 8px 14px; border-radius: 10px;
+        border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.04);
+        color: var(--text); cursor: pointer; text-decoration: none; transition: all .2s;
+    }
+    .ai-btn:hover { border-color: rgba(255,107,26,.5); background: rgba(255,107,26,.1); }
+    .ai-btn.danger:hover { border-color: rgba(255,82,82,.6); background: rgba(255,82,82,.12); color: #FF8A8A; }
+    .ai-btn.solid { background: linear-gradient(135deg, #FF6B1A, #E85A0F); border: none; color: #fff; box-shadow: 0 6px 20px -6px rgba(255,107,26,.6); }
+    .ai-btn.solid:hover { transform: translateY(-1px); box-shadow: 0 10px 26px -6px rgba(255,107,26,.7); }
+    /* Glass table rows */
+    .ai-table { width: 100%; border-collapse: separate; border-spacing: 0 8px; }
+    .ai-table thead th {
+        font-size: 10.5px; letter-spacing: 1.8px; text-transform: uppercase;
+        color: var(--text-muted); text-align: left; padding: 0 16px 4px; font-weight: 800;
+    }
+    .ai-table tbody tr {
+        background: linear-gradient(145deg, rgba(255,255,255,0.045), rgba(255,255,255,0.012));
+        border: 1px solid rgba(255,255,255,0.07);
+        backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+        transition: border-color .2s, box-shadow .2s, transform .2s;
+    }
+    .ai-table tbody tr:hover {
+        border-color: rgba(255,107,26,.35);
+        box-shadow: 0 12px 32px -14px rgba(255,107,26,.4);
+        transform: translateY(-1px);
+    }
+    .ai-table tbody td { padding: 14px 16px; font-size: .9rem; vertical-align: middle; }
+    .ai-table tbody tr td:first-child { border-radius: 14px 0 0 14px; }
+    .ai-table tbody tr td:last-child { border-radius: 0 14px 14px 0; text-align: right; }
+    .ai-term {
+        font-weight: 800; font-size: 1rem; color: #FFB37A;
+        background: rgba(255,107,26,.1); border: 1px solid rgba(255,107,26,.25);
+        padding: 4px 12px; border-radius: 8px; display: inline-block;
+    }
+    @media (max-width: 768px) {
+        .ai-stage { padding: 20px 14px; border-radius: 18px; }
+        .ai-title { font-size: 1.3rem; }
+    }
+    </style>
+    <script>
+    (function(){
+        // 3D tilt on .ai-card — subtle, pointer-driven, disabled on touch
+        if (window.matchMedia('(hover: none)').matches) return;
+        document.querySelectorAll('.ai-card').forEach(function(card){
+            var raf = null;
+            card.addEventListener('mousemove', function(ev){
+                if (raf) return;
+                raf = requestAnimationFrame(function(){
+                    raf = null;
+                    var r = card.getBoundingClientRect();
+                    var px = (ev.clientX - r.left) / r.width;
+                    var py = (ev.clientY - r.top) / r.height;
+                    var rx = (0.5 - py) * 10;
+                    var ry = (px - 0.5) * 12;
+                    card.style.transform = 'perspective(900px) rotateX(' + rx.toFixed(2) + 'deg) rotateY(' + ry.toFixed(2) + 'deg) translateY(-2px)';
+                    card.style.setProperty('--gx', (px * 100).toFixed(1) + '%');
+                    card.style.setProperty('--gy', (py * 100).toFixed(1) + '%');
+                });
+            });
+            card.addEventListener('mouseleave', function(){
+                if (raf) { cancelAnimationFrame(raf); raf = null; }
+                card.style.transform = '';
+            });
+        });
+    })();
+    </script>
+    """
+
+
 def _dump_locations_section_html():
     conn = get_db()
     locs = conn.execute(
@@ -31908,9 +32062,9 @@ def _dump_locations_section_html():
     for dl in locs:
         addr = ", ".join(p for p in [dl["address"], dl["city"], dl["state"], dl["zip_code"]] if p)
         active_badge = (
-            '<span class="badge completed">Active</span>'
+            '<span class="ai-chip on"><span class="ai-dot"></span>Active</span>'
             if dl["active"]
-            else '<span class="badge" style="opacity:0.5;">Inactive</span>'
+            else '<span class="ai-chip off">Inactive</span>'
         )
         toggle_label = "Deactivate" if dl["active"] else "Activate"
         toggle_class = "dl-toggle-off" if dl["active"] else "dl-toggle-on"
@@ -31933,41 +32087,48 @@ def _dump_locations_section_html():
             f'{_dl_tt_label}</button></form>'
         )
         rows += f"""
-        <div class="dl-card">
-            <div class="dl-card-head">
-                <div>
-                    <div class="dl-card-name">{_dlname}</div>
-                    <div class="dl-card-addr">{e(addr) or '<span class="muted">No address</span>'}</div>
-                    {f'<div class="dl-card-notes">{_notes}</div>' if _notes else ''}
+        <div class="ai-card">
+            <div class="ai-glare"></div>
+            <div class="ai-card-inner">
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:12px;">
+                    <div>
+                        <div class="ai-name">{_dlname}</div>
+                        <div class="ai-addr">{e(addr) or '<span class="muted">No address</span>'}</div>
+                        {f'<div class="ai-notes">{_notes}</div>' if _notes else ''}
+                    </div>
+                    {active_badge}
                 </div>
-                {active_badge}
-            </div>
-            {_dl_ticket_toggle}
-            <div class="dl-card-actions">
-                <a href="{url_for('edit_dump_location', loc_id=_dlid)}" class="dl-action">Edit</a>
-                <form method="POST" action="{url_for('toggle_dump_location', loc_id=_dlid)}" style="display:inline;">
-                    <button type="submit" class="dl-action {toggle_class}">{toggle_label}</button>
-                </form>
-                <form method="POST" action="{url_for('delete_dump_location', loc_id=_dlid)}" style="display:inline;"
-                      onsubmit="return confirm('Delete {_dlname}?');">
-                    <button type="submit" class="dl-action dl-delete">Delete</button>
-                </form>
+                {_dl_ticket_toggle}
+                <div class="ai-actions">
+                    <a href="{url_for('edit_dump_location', loc_id=_dlid)}" class="ai-btn">Edit</a>
+                    <form method="POST" action="{url_for('toggle_dump_location', loc_id=_dlid)}" style="display:inline;">
+                        <button type="submit" class="ai-btn">{toggle_label}</button>
+                    </form>
+                    <form method="POST" action="{url_for('delete_dump_location', loc_id=_dlid)}" style="display:inline;"
+                          onsubmit="return confirm('Delete {_dlname}?');">
+                        <button type="submit" class="ai-btn danger">Delete</button>
+                    </form>
+                </div>
             </div>
         </div>"""
 
     return f"""
-    <div class="card" id="dump-locations">
-        <div class="row between" style="margin-bottom:16px;">
-            <h2 style="margin:0;">&#128465; Dump Locations</h2>
-            <div style="display:flex;gap:8px;">
-                <a class="btn secondary" href="{url_for('onboarding_parser_page')}">&#10024; Teach the parser</a>
-                <a class="btn" href="{url_for('add_dump_location')}">+ Add Location</a>
+    {_yard_ai_design()}
+    <div class="ai-stage" id="dump-locations">
+        <div class="ai-kicker"><span class="ai-dot"></span>Disposal Network</div>
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;">
+            <div>
+                <h2 class="ai-title">&#128465; Dump Locations</h2>
+                <p class="ai-sub">Disposal sites available for route assignment.
+                New here? <a href="{url_for('onboarding_parser_page')}">Paste a few recent dispatch texts</a> and the
+                parser learns your dump sites, customers and addresses automatically.</p>
+            </div>
+            <div style="display:flex;gap:8px;flex-shrink:0;">
+                <a class="ai-btn" href="{url_for('onboarding_parser_page')}">&#10024; Teach the parser</a>
+                <a class="ai-btn solid" href="{url_for('add_dump_location')}">+ Add Location</a>
             </div>
         </div>
-        <p class="muted small" style="margin-bottom:14px;">Disposal sites available for route assignment.
-        New here? <a href="{url_for('onboarding_parser_page')}">Paste a few recent dispatch texts</a> and the
-        parser learns your dump sites, customers and addresses automatically.</p>
-        <div class="dl-grid">
+        <div class="ai-grid">
             {rows or '<p class="muted">No dump locations found.</p>'}
         </div>
     </div>
@@ -33046,14 +33207,17 @@ def _containers_section_html():
         </tr>"""
 
     return f"""
-    <div class="card" id="containers">
-        <div class="row between" style="margin-bottom:16px;">
-            <h2 style="margin:0;">&#128230; Container Fleet</h2>
-            <a class="btn" href="{url_for('add_container')}">+ Add Container</a>
+    <div class="ai-stage" id="containers">
+        <div class="ai-kicker"><span class="ai-dot"></span>Fleet Tracking</div>
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;">
+            <div>
+                <h2 class="ai-title">&#128230; Container Fleet</h2>
+                <p class="ai-sub">Your roll-off containers by size and status.</p>
+            </div>
+            <a class="ai-btn solid" href="{url_for('add_container')}">+ Add Container</a>
         </div>
-        <p class="muted small" style="margin-bottom:14px;">Your roll-off containers by size and status.</p>
         <div class="table-wrap">
-            <table>
+            <table class="ai-table">
                 <thead>
                     <tr><th>Size</th><th>Label / Serial</th><th>Status</th><th>Notes</th><th style="width:160px;"></th></tr>
                 </thead>
@@ -33899,9 +34063,12 @@ def onboarding_import_customers():
 @boss_required
 def yard_setup_page():
     body = f"""
-    <div class="hero">
-        <h1>Yard Setup</h1>
-        <p>Dump locations and your container fleet, in one place.</p>
+    <div class="hero" style="position:relative;overflow:hidden;border-radius:24px;padding:36px 28px;margin-bottom:24px;
+        background:radial-gradient(700px 320px at 30% 0%, rgba(255,107,26,.12), transparent 65%), rgba(255,255,255,.02);
+        border:1px solid rgba(255,255,255,.08);">
+        <div class="ai-kicker"><span class="ai-dot"></span>Yard Intelligence</div>
+        <h1 class="ai-title" style="font-size:2rem;">Yard Setup</h1>
+        <p class="ai-sub" style="margin:0;">Dump locations and your container fleet, in one place — taught to the AI as you go.</p>
     </div>
     {_dump_locations_section_html()}
     {_parse_vocab_section_html()}
@@ -33934,29 +34101,28 @@ def _parse_vocab_section_html(back=None):
             f'<button type="submit" style="background:transparent;color:#f87171;border:1px solid rgba(248,113,113,0.4);'
             f'border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;">Remove</button></form>'
         )
-        rows += (f'<tr><td><strong>{e(v["term"])}</strong></td><td class="muted small">{e(v["expansion"])}</td>'
+        rows += (f'<tr><td><span class="ai-term">{e(v["term"])}</span></td><td class="muted">{e(v["expansion"])}</td>'
                  f'<td>{scope}</td><td style="text-align:right;">{del_cell}</td></tr>')
     return f"""
-    <div class="card" id="parse-vocab">
-        <div class="row between" style="margin-bottom:16px;">
-            <h2 style="margin:0;">&#128172; Parser Shorthand</h2>
-        </div>
-        <p class="muted small" style="margin-bottom:14px;">Abbreviations the AI parser expands when reading your dispatch text
+    <div class="ai-stage" id="parse-vocab">
+        <div class="ai-kicker"><span class="ai-dot"></span>AI Vocabulary</div>
+        <h2 class="ai-title">&#128172; Parser Shorthand</h2>
+        <p class="ai-sub">Abbreviations the AI parser expands when reading your dispatch text
         (e.g. <code>newpt</code> &rarr; Newport News). Defaults apply to everyone; add your own below.</p>
-        <form method="POST" action="{url_for('add_parse_vocab')}" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;">
+        <form method="POST" action="{url_for('add_parse_vocab')}" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px;">
             <input type="hidden" name="_csrf_token" value="{_csrf}">{_next_field}
             <input name="term" placeholder="shorthand (e.g. wburg)" required autocomplete="off"
                    autocapitalize="none" spellcheck="false"
-                   style="flex:1;min-width:140px;min-height:48px;padding:8px 12px;background:var(--bg-0);
-                          border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);">
+                   style="flex:1;min-width:140px;min-height:48px;padding:8px 12px;background:rgba(255,255,255,.04);
+                          border:1px solid rgba(255,255,255,0.12);border-radius:12px;color:var(--text);">
             <input name="expansion" placeholder="means… (e.g. Williamsburg)" required autocomplete="off"
                    autocapitalize="words" spellcheck="false"
-                   style="flex:1;min-width:140px;min-height:48px;padding:8px 12px;background:var(--bg-0);
-                          border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);">
-            <button class="btn" type="submit" style="min-height:48px;">+ Add</button>
+                   style="flex:1;min-width:140px;min-height:48px;padding:8px 12px;background:rgba(255,255,255,.04);
+                          border:1px solid rgba(255,255,255,0.12);border-radius:12px;color:var(--text);">
+            <button class="ai-btn solid" type="submit" style="min-height:48px;">+ Add</button>
         </form>
         <div class="table-wrap">
-            <table>
+            <table class="ai-table">
                 <thead><tr><th>Shorthand</th><th>Means</th><th>Scope</th><th></th></tr></thead>
                 <tbody>{rows or '<tr><td colspan="4" class="muted">No shorthand yet.</td></tr>'}</tbody>
             </table>
@@ -34190,20 +34356,23 @@ def _address_book_section_html():
             f'</td></tr>'
         )
     return f"""
-    <div class="card" id="address-book">
-        <div class="row between" style="margin-bottom:16px;">
-            <h2 style="margin:0;">&#128205; Address Book</h2>
-            <span class="muted small">{len(rows_db)} saved location{'' if len(rows_db) == 1 else 's'}</span>
+    <div class="ai-stage" id="address-book">
+        <div class="ai-kicker"><span class="ai-dot"></span>Learned Locations</div>
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;">
+            <div>
+                <h2 class="ai-title">&#128205; Address Book</h2>
+                <p class="ai-sub">Every dispatched stop is learned here automatically and powers
+                Quick&nbsp;Add on the parser. Set a display name to override what shows in suggestions, or hide a location to keep it
+                out of the quick-add list (its history stays).</p>
+            </div>
+            <span class="ai-chip on">{len(rows_db)} saved</span>
         </div>
-        <p class="muted small" style="margin-bottom:14px;">Every dispatched stop is learned here automatically and powers
-        Quick&nbsp;Add on the parser. Set a display name to override what shows in suggestions, or hide a location to keep it
-        out of the quick-add list (its history stays).</p>
         <input id="ab-filter" type="text" placeholder="Search name, street, or city&hellip;"
                oninput="(function(v){{v=v.toLowerCase();document.querySelectorAll('#address-book tbody tr[data-search]').forEach(function(r){{r.style.display=r.getAttribute('data-search').indexOf(v)>-1?'':'none';}});}})(this.value)"
-               style="width:100%;min-height:48px;padding:10px 14px;margin-bottom:14px;background:var(--bg-0);
-                      border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);">
+               style="width:100%;min-height:48px;padding:10px 14px;margin-bottom:14px;background:rgba(255,255,255,.04);
+                      border:1px solid rgba(255,255,255,0.12);border-radius:12px;color:var(--text);">
         <div class="table-wrap">
-            <table>
+            <table class="ai-table">
                 <thead><tr><th>Location</th><th style="width:60px;text-align:center;">Uses</th>
                 <th style="width:260px;">Display name</th><th style="width:90px;"></th></tr></thead>
                 <tbody>{rows or '<tr><td colspan="4" class="muted">No locations learned yet — dispatch a stop and it&rsquo;ll appear here.</td></tr>'}</tbody>
