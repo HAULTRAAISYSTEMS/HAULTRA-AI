@@ -33854,6 +33854,39 @@ def bin_dispatch_pull():
 # =========================================================
 # PHASE 5A — CONTAINER FLEET INVENTORY  (part of /yard-setup)
 # =========================================================
+# 2026-10-24: stale in-transit rule — DISPLAY ONLY, never a status
+# change and never an invented location. A loaded_at_yard can whose
+# last recorded move (the date in its notes: "Hauled 2026-08-19" or
+# "On route 2026-10-24") is more than 2 days old is not on a truck
+# anymore — it is a cold trail: hauled, then no next step recorded.
+# It belongs in a "Needs review" group, not inflating On Truck.
+# A boss touch within the last 2 days (boss_set_at) counts as fresh
+# info; a row with no parseable date is never called stale.
+_STALE_AFTER_DAYS = 2
+def _fleet_is_stale(cd):
+    if (cd.get("status") or "") != "loaded_at_yard":
+        return False
+    try:
+        _today = date.fromisoformat(today_str()[:10])
+    except Exception:
+        return False
+    _boss = (cd.get("boss_set_at") or "").strip()[:10]
+    if _boss:
+        try:
+            if (_today - date.fromisoformat(_boss)).days <= _STALE_AFTER_DAYS:
+                return False
+        except Exception:
+            pass
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", cd.get("notes") or "")
+    if not m:
+        return False
+    try:
+        _ev = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except Exception:
+        return False
+    return (_today - _ev).days > _STALE_AFTER_DAYS
+
+
 def _containers_section_html():
     conn = get_db()
     # 2026-10-24: fleet is grouped by status (yard → on truck → deployed
@@ -33882,6 +33915,7 @@ def _containers_section_html():
         "yard":     "#3DDC84",
         "deployed": "#fbbf24",
         "loaded_at_yard": "#7FB8FF",
+        "stale":    "#fbbf24",
         "lost":     "#f87171",
         "retired":  "#6b7280",
     }
@@ -33889,31 +33923,50 @@ def _containers_section_html():
     _GROUP_LABEL = {
         "yard": "🟢 At Yard — in the yard, ready to assign",
         "loaded_at_yard": "🔵 On Truck (loaded at yard) — on a truck, between yard and customer",
+        "stale": "⚠️ Needs review — was on a truck days ago, confirm where it is now",
         "deployed": "🟡 Deployed — dropped at a customer",
         "lost": "🔴 Lost",
         "retired": "⚪ Retired",
     }
+    # Display groups: stale in-transit cans split out of On Truck, then
+    # re-sorted so each group stays contiguous (SQL order alone would
+    # interleave fresh and stale rows by can number).
+    _GROUP_ORDER = {"yard": 0, "loaded_at_yard": 1, "stale": 2, "deployed": 3, "lost": 4, "retired": 5}
+    _disp_rows = []
+    for _r in containers:
+        _d = dict(_r)
+        _disp = "stale" if _fleet_is_stale(_d) else _d["status"]
+        _lab = _d.get("label") or ""
+        try:
+            _num = int(_lab)
+        except Exception:
+            _num = 10 ** 9
+        _disp_rows.append((_GROUP_ORDER.get(_disp, 6), _num, _lab, _disp, _d))
+    _disp_rows.sort(key=lambda t: (t[0], t[1], t[2]))
     _group_counts = {}
-    for _gc in containers:
-        _group_counts[dict(_gc)["status"]] = _group_counts.get(dict(_gc)["status"], 0) + 1
+    for _t in _disp_rows:
+        _group_counts[_t[3]] = _group_counts.get(_t[3], 0) + 1
     rows_html = ""
     _cur_group = None
-    for c in containers:
-        _cd   = dict(c)
+    for _go, _num, _lab, _disp, _cd in _disp_rows:
         _cid  = _cd["id"]
-        _sc   = STATUS_COLOR.get(_cd["status"], "#D8D8D0")
+        _sc   = STATUS_COLOR.get(_disp, "#D8D8D0")
         _fsearch = " ".join(p for p in [_cd["label"] or "", _cd["size"] or "",
-                                        _cd["status"] or "", _cd["notes"] or ""] if p).lower()
-        # Group header row when the status changes. Lost/retired start
-        # collapsed — they are history, not today's yard.
-        if _cd["status"] != _cur_group:
-            _cur_group = _cd["status"]
+                                        _cd["status"] or "", _cd["notes"] or "",
+                                        "stale needs review" if _disp == "stale" else ""] if p).lower()
+        # Group header row when the display group changes. Lost/retired
+        # start collapsed — they are history, not today's yard.
+        # 2026-10-24: header cell is explicitly left-aligned — the
+        # table's last-column right-align rule was pushing these
+        # banners to the far right edge.
+        if _disp != _cur_group:
+            _cur_group = _disp
             _collapsed = _cur_group in ("lost", "retired")
             _arrow = "▸" if _collapsed else "▾"
             rows_html += (
                 f'<tr class="fl-group" data-group="{e(_cur_group)}" onclick="flToggleGroup(\'{e(_cur_group)}\')" '
                 f'style="cursor:pointer;background:rgba(255,255,255,.04);">'
-                f'<td colspan="5"><strong><span id="fl-arrow-{e(_cur_group)}">{_arrow}</span> '
+                f'<td colspan="5" style="text-align:left;"><strong><span id="fl-arrow-{e(_cur_group)}">{_arrow}</span> '
                 f'{e(_GROUP_LABEL.get(_cur_group, _cur_group))} — {_group_counts[_cur_group]}</strong></td></tr>'
             )
         _row_style = ' style="display:none;"' if _cur_group in ("lost", "retired") else ""
@@ -33921,14 +33974,17 @@ def _containers_section_html():
         # disabled customer_containers table, so it always printed "?" —
         # removed. The Notes column already carries the customer/address.
         _deployed_note = ""
-        _badge_label = {"loaded_at_yard": "on truck"}.get(_cd["status"], _cd["status"])
+        if _disp == "stale":
+            _badge_label = "needs review"
+        else:
+            _badge_label = {"loaded_at_yard": "on truck"}.get(_cd["status"], _cd["status"])
         _badge = (
             f'<span style="font-size:11px;padding:2px 8px;border-radius:5px;'
             f'background:rgba(0,0,0,0.3);color:{_sc};border:1px solid {_sc}33;">'
             f'{e(_badge_label)}</span>'
         )
         rows_html += f"""
-        <tr data-search="{e(_fsearch)}" data-status="{e(_cd["status"])}" class="fl-row"{_row_style}>
+        <tr data-search="{e(_fsearch)}" data-status="{e(_disp)}" class="fl-row"{_row_style}>
             <td><strong>{e(_cd["size"])}</strong></td>
             <td class="muted small">{e(_cd["label"] or "(no #)")}</td>
             <td>{_badge}{_deployed_note}</td>
@@ -33983,11 +34039,12 @@ def _containers_section_html():
             }} catch (e) {{ btn.textContent = 'Deploy failed'; btn.disabled = false; }}
         }}
         </script>
-        <p class="ai-sub" style="margin-top:10px;">🟢 At Yard = sitting in the yard, ready to assign &nbsp;·&nbsp; 🔵 On Truck (loaded at yard) = loaded onto a truck at the yard — heading out or heading back, not at a customer yet &nbsp;·&nbsp; 🟡 Deployed = dropped at a customer.</p>
+        <p class="ai-sub" style="margin-top:10px;">🟢 At Yard = sitting in the yard, ready to assign &nbsp;·&nbsp; 🔵 On Truck (loaded at yard) = loaded onto a truck at the yard — heading out or heading back, not at a customer yet &nbsp;·&nbsp; ⚠️ Needs review = was on a truck more than 2 days ago with no next move recorded — confirm where it is (Edit to fix) &nbsp;·&nbsp; 🟡 Deployed = dropped at a customer.</p>
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;" id="fl-chips">
             <button type="button" class="fl-chip active" data-fl-status="all" onclick="flSetStatus('all', this)">All ({len(containers)})</button>
             <button type="button" class="fl-chip" data-fl-status="yard" onclick="flSetStatus('yard', this)">🟢 At Yard ({_group_counts.get("yard", 0)})</button>
             <button type="button" class="fl-chip" data-fl-status="loaded_at_yard" onclick="flSetStatus('loaded_at_yard', this)">🔵 On Truck ({_group_counts.get("loaded_at_yard", 0)})</button>
+            <button type="button" class="fl-chip" data-fl-status="stale" onclick="flSetStatus('stale', this)">⚠️ Needs review ({_group_counts.get("stale", 0)})</button>
             <button type="button" class="fl-chip" data-fl-status="deployed" onclick="flSetStatus('deployed', this)">🟡 Deployed ({_group_counts.get("deployed", 0)})</button>
             <button type="button" class="fl-chip" data-fl-status="lost" onclick="flSetStatus('lost', this)">🔴 Lost ({_group_counts.get("lost", 0)})</button>
             <button type="button" class="fl-chip" data-fl-status="retired" onclick="flSetStatus('retired', this)">⚪ Retired ({_group_counts.get("retired", 0)})</button>
@@ -34959,9 +35016,20 @@ def yard_setup_page():
         _yc["yard"] = _cnt("SELECT COUNT(*) FROM containers WHERE company_id=? AND status='yard'", cid())
         _yc["deployed"] = _cnt("SELECT COUNT(*) FROM containers WHERE company_id=? AND status='deployed'", cid())
         _yc["truck"] = _cnt("SELECT COUNT(*) FROM containers WHERE company_id=? AND status='loaded_at_yard'", cid())
+        # 2026-10-24: overview On Truck counts only fresh in-transit cans;
+        # stale ones (last move >2 days ago) get their own count.
+        _yc["stale"] = 0
+        try:
+            for _sr in conn.execute("SELECT status, notes, boss_set_at FROM containers WHERE company_id=? AND status='loaded_at_yard'", (cid(),)).fetchall():
+                if _fleet_is_stale(dict(_sr)):
+                    _yc["stale"] += 1
+        except Exception:
+            _yc["stale"] = 0
+        _yc["truck"] = max(0, _yc["truck"] - _yc["stale"])
         conn.close()
     except Exception:
-        _yc = {"dump": 0, "vocab": 0, "addr": 0, "fleet": 0, "yard": 0, "deployed": 0, "truck": 0}
+        _yc = {"dump": 0, "vocab": 0, "addr": 0, "fleet": 0, "yard": 0, "deployed": 0, "truck": 0, "stale": 0}
+    _yc_truck_line = f"🔵 {_yc['truck']} on truck" + (f" &nbsp;·&nbsp; ⚠️ {_yc['stale']} need review" if _yc.get("stale") else "")
     body = f"""
     <div class="hero" style="position:relative;overflow:hidden;border-radius:24px;padding:36px 28px;margin-bottom:24px;
         background:radial-gradient(700px 320px at 30% 0%, rgba(255,107,26,.12), transparent 65%), rgba(255,255,255,.02);
@@ -35008,7 +35076,7 @@ def yard_setup_page():
             <div class="ys-card">
                 <div class="ai-kicker"><span class="ai-dot"></span>Fleet Tracking</div>
                 <div class="ys-num">{_yc["fleet"]}</div>
-                <div class="ys-sub">🟢 {_yc["yard"]} at yard &nbsp;·&nbsp; 🟡 {_yc["deployed"]} deployed &nbsp;·&nbsp; 🔵 {_yc["truck"]} on truck</div>
+                <div class="ys-sub">🟢 {_yc["yard"]} at yard &nbsp;·&nbsp; 🟡 {_yc["deployed"]} deployed &nbsp;·&nbsp; {_yc_truck_line}</div>
                 <button type="button" class="ai-btn solid" style="margin-top:14px;" onclick="ysShow('fleet')">Open fleet →</button>
             </div>
         </div>
