@@ -33326,10 +33326,12 @@ def _parse_vocab_section_html(back=None):
         (e.g. <code>newpt</code> &rarr; Newport News). Defaults apply to everyone; add your own below.</p>
         <form method="POST" action="{url_for('add_parse_vocab')}" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;">
             <input type="hidden" name="_csrf_token" value="{_csrf}">{_next_field}
-            <input name="term" placeholder="shorthand (e.g. wburg)" required
+            <input name="term" placeholder="shorthand (e.g. wburg)" required autocomplete="off"
+                   autocapitalize="none" spellcheck="false"
                    style="flex:1;min-width:140px;min-height:48px;padding:8px 12px;background:var(--bg-0);
                           border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);">
-            <input name="expansion" placeholder="means… (e.g. Williamsburg)" required
+            <input name="expansion" placeholder="means… (e.g. Williamsburg)" required autocomplete="off"
+                   autocapitalize="words" spellcheck="false"
                    style="flex:1;min-width:140px;min-height:48px;padding:8px 12px;background:var(--bg-0);
                           border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);">
             <button class="btn" type="submit" style="min-height:48px;">+ Add</button>
