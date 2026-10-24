@@ -12366,7 +12366,9 @@ def dashboard():
 """
 
     # Trucks on the road (2026-10-24): one row per truck actually out today —
-    # truck number, driver, what's on it, and the step the driver is on.
+    # truck number, driver, what's on it, and the step the driver is on. A
+    # truck stays on the card until yard disposition or clock-out, even after
+    # its route is finished.
     # NOTE: the dashboard's conn is already closed by this point (12282), so
     # the card opens its own connection. Wrapped defensively: a live-truck
     # lookup must never 500 the dashboard.
@@ -12375,14 +12377,51 @@ def dashboard():
     try:
         _trk_conn = get_db()
         _today_routes = _trk_conn.execute(
-            "SELECT r.id, r.truck_id, r.assigned_to, u.username AS driver_username "
+            "SELECT r.id, r.truck_id, r.assigned_to, r.status, r.final_bin_disposition, "
+            "u.username AS driver_username "
             "FROM routes r LEFT JOIN users u ON r.assigned_to = u.id "
-            "WHERE r.company_id=? AND r.route_date=? AND r.status='in_progress' ORDER BY r.id",
+            "WHERE r.company_id=? AND r.route_date=? AND r.status IN ('in_progress', 'completed') "
+            "ORDER BY r.id DESC",
             (company_id, today)).fetchall()
+        # One row per driver: their latest route today. A finished route keeps
+        # its truck on the card until the driver gets to the yard (end-of-day
+        # Yard disposition) or clocks out — finishing the last stop alone
+        # never takes a truck off the road (2026-10-24).
+        _seen_drivers = set()
         for _tr in _today_routes:
-            _ot = _route_on_truck(_trk_conn, _tr["id"])
-            if not _ot:
+            _drv = _tr["assigned_to"]
+            if _drv is not None:
+                if _drv in _seen_drivers:
+                    continue
+                _seen_drivers.add(_drv)
+            _clocked_out = False
+            if _drv is not None:
+                _clk = _trk_conn.execute(
+                    "SELECT clock_out_at FROM driver_clock_entries "
+                    "WHERE company_id=? AND driver_id=? AND date=?",
+                    (company_id, _drv, today)).fetchone()
+                _clocked_out = bool(_clk and _clk["clock_out_at"])
+            if _clocked_out:
                 continue
+            if _tr["status"] == "completed":
+                if (_tr["final_bin_disposition"] or "") == "yard":
+                    continue
+                _fb, _fbs = "", ""
+                try:
+                    _fb, _fbs = _route_final_bin_detail(_trk_conn, _tr["id"])
+                except Exception:
+                    pass
+                # Landfill/customer disposition means the bin is gone, but the
+                # truck is still out until the yard or clock-out.
+                _disp = (_tr["final_bin_disposition"] or "")
+                _can = _fb if not _disp else ""
+                _ot = {"can": _can, "size": _fbs if _can else "",
+                       "step": "Route finished — still on the road",
+                       "customer": "", "dest": "", "has_can": bool(_can)}
+            else:
+                _ot = _route_on_truck(_trk_conn, _tr["id"])
+                if not _ot:
+                    continue
             _tname = None
             if _tr["truck_id"]:
                 _trow = _trk_conn.execute("SELECT name FROM trucks WHERE id=?", (_tr["truck_id"],)).fetchone()
