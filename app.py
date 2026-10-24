@@ -3689,6 +3689,13 @@ def init_db():
         # reconnect lands exactly once -- same contract as
         # route_exceptions.client_uuid.
         safe_add_column(conn, _cancel_tbl, "cancel_client_uuid TEXT")
+    # 2026-10-24: cancel now closes the route (status='completed') so it
+    # frees the one-open-route-per-day slot. Retire pre-change cancels the
+    # same way, or they would keep blocking (and catching) the next dispatch.
+    conn.execute(
+        "UPDATE routes SET status='completed' "
+        "WHERE cancelled_at IS NOT NULL AND status IN ('open','in_progress')"
+    )
     safe_add_column(conn, "companies", "stripe_customer_id TEXT")
     safe_add_column(conn, "companies", "stripe_subscription_id TEXT")
     safe_add_column(conn, "users", "email TEXT")
@@ -5278,11 +5285,15 @@ def driver_active_route_id(conn, user_id):
     ).fetchone()
     if row:
         return row["id"]
+    # 2026-10-24: the fallback is PAST work only. An unbounded fallback could
+    # hand the driver a FUTURE route (e.g. tomorrow's) when today has none,
+    # and today's done times would land on tomorrow's date on the board.
     row = conn.execute(
         """SELECT id FROM routes
            WHERE assigned_to=? AND status IN ('open','in_progress')
+             AND route_date <= ?
            ORDER BY route_date ASC, id ASC LIMIT 1""",
-        (user_id,)
+        (user_id, today_str())
     ).fetchone()
     return row["id"] if row else None
 
@@ -12432,6 +12443,7 @@ def dashboard():
             "u.username AS driver_username "
             "FROM routes r LEFT JOIN users u ON r.assigned_to = u.id "
             "WHERE r.company_id=? AND r.route_date=? AND r.status IN ('in_progress', 'completed') "
+            "AND r.cancelled_at IS NULL "
             "ORDER BY r.id DESC",
             (company_id, today)).fetchall()
         # One row per driver: their latest route today. A finished route keeps
@@ -16513,10 +16525,27 @@ def _build_route_board_html(user, day=None):
     _has_truck_col = _ensure_routes_truck_id(conn)
     _truck_select = "r.truck_id, t.name AS truck_name," if _has_truck_col else "NULL AS truck_id, NULL AS truck_name,"
     _truck_join = "LEFT JOIN trucks t ON r.truck_id = t.id" if _has_truck_col else ""
+    # 2026-10-24: same self-healing for cancelled_at — a persistent session
+    # may predate the deploy that added it, and the SELECT below must not 500.
+    try:
+        _has_rc = any(c["name"] == "cancelled_at" for c in conn.execute("PRAGMA table_info(routes)").fetchall())
+        _has_sc = any(c["name"] == "cancelled_at" for c in conn.execute("PRAGMA table_info(stops)").fetchall())
+        if not _has_rc or not _has_sc:
+            if not _has_rc:
+                conn.execute("ALTER TABLE routes ADD COLUMN cancelled_at TEXT")
+            if not _has_sc:
+                conn.execute("ALTER TABLE stops ADD COLUMN cancelled_at TEXT")
+            conn.commit()
+            _has_rc = _has_sc = True
+    except Exception:
+        _has_rc = _has_sc = False
+    _cancel_select = ("r.cancelled_at AS route_cancelled_at, s.cancelled_at AS stop_cancelled_at,"
+                      if (_has_rc and _has_sc) else "NULL AS route_cancelled_at, NULL AS stop_cancelled_at,")
 
     params = [company_id, day]
     sql = f"""
         SELECT r.id AS route_id, r.route_name, r.assigned_to,
+               {_cancel_select}
                COALESCE(r.route_type, 'rolloff') AS route_type,
                {_truck_select}
                u.username AS driver_username, u.full_name AS driver_full_name,
@@ -16545,6 +16574,20 @@ def _build_route_board_html(user, day=None):
     sql += " ORDER BY r.id, s.stop_order, s.id"
 
     board_rows = conn.execute(sql, tuple(params)).fetchall()
+    # 2026-10-24: cancel means "off the board, record kept" (the Delete confirm
+    # says exactly that) — but the board never selected cancelled_at, so a
+    # cancelled route rendered as a live one and Cancel looked like a no-op.
+    # Drop cancelled routes entirely and cancelled stops from live routes.
+    # They still live in History, the Daily Log, and the route detail page.
+    _live_rows = []
+    for _r in board_rows:
+        _d = dict(_r)
+        if _d.get("route_cancelled_at"):
+            continue
+        if _d.get("stop_id") is not None and _d.get("stop_cancelled_at"):
+            continue
+        _live_rows.append(_r)
+    board_rows = _live_rows
     # Short label per stop (so a chain card can name its neighbor without another
     # query) and the size of each chain group (for the "SWAP n of m" badge).
     _chain_label_by_id = {}
@@ -24424,6 +24467,7 @@ def view_route(route_id):
             {route_action_buttons}
             {f'<a class="btn gold" href="{url_for("invoice_new", route_id=route_id)}">&#x1F9FE; Create Invoice</a>' if session.get("role") == "boss" and completed_count else ''}
         </div>
+        <div style="margin-top:10px;"><a href="{url_for('routes_page', day=route['route_date'])}" style="color:#8C8C82;font-size:13px;">&larr; Back to {e(route['route_date'])} board</a></div>
     </div>
 
     <div id="stop-list">
@@ -25150,6 +25194,16 @@ def reopen_route(route_id):
         flash("Access denied.", "error")
         return redirect(url_for("dashboard"))
 
+    # 2026-10-24: a cancelled route must come back via Reinstate (which
+    # clears cancelled_at), not Reopen — otherwise it would be live work
+    # that the board still hides.
+    if route["cancelled_at"]:
+        conn.close()
+        flash("That route is cancelled — use Reinstate Route to bring it back.", "info")
+        if session.get("role") == "boss":
+            return redirect(url_for("view_route", route_id=route_id))
+        return redirect(url_for("driver_route_detail", route_id=route_id))
+
     conn.execute("""
         UPDATE routes SET status='open', completed_at=NULL
         WHERE id=? AND company_id=?
@@ -25429,10 +25483,15 @@ def cancel_route(route_id):
         (ts, session["user_id"], reason, source, child_uuid, route_id),
     ).rowcount
 
+    # 2026-10-24: cancelling also closes the route (status='completed').
+    # A cancelled route kept status 'open', so it still occupied the
+    # one-open-route-per-day slot: the next dispatch appended to the dead
+    # route, and the cab fallback could serve it. cancelled_at stays the
+    # true state (banner, audit); status just stops it being live work.
     conn.execute(
         """UPDATE routes
               SET cancelled_at=?, cancelled_by=?, cancel_reason=?,
-                  cancel_source=?, cancel_client_uuid=?
+                  cancel_source=?, cancel_client_uuid=?, status='completed'
             WHERE id=? AND cancelled_at IS NULL""",
         (ts, session["user_id"], reason, source, client_uuid, route_id),
     )
@@ -25477,7 +25536,7 @@ def uncancel_route(route_id):
     """
     conn = get_db()
     route = conn.execute(
-        "SELECT id, cancelled_at, cancel_client_uuid FROM routes WHERE id=? AND company_id=?",
+        "SELECT id, cancelled_at, cancel_client_uuid, started_at FROM routes WHERE id=? AND company_id=?",
         (route_id, cid()),
     ).fetchone()
     if not route:
@@ -25496,12 +25555,15 @@ def uncancel_route(route_id):
         (route_id, "route-cancel:%d:%%" % route_id),
     ).rowcount
 
+    # 2026-10-24: cancel closes the route (status='completed'), so
+    # reinstating must reopen it — in_progress if it was ever started.
+    _restore_status = "in_progress" if route["started_at"] else "open"
     conn.execute(
         """UPDATE routes SET cancelled_at=NULL, cancelled_by=NULL,
                              cancel_reason=NULL, cancel_source=NULL,
-                             cancel_client_uuid=NULL
+                             cancel_client_uuid=NULL, status=?
             WHERE id=?""",
-        (route_id,),
+        (_restore_status, route_id),
     )
     _who = _actor_name(conn)
     _cancel_note(conn, route_id, session["user_id"],
@@ -25939,11 +26001,13 @@ def _detach_stop_references(conn, stop_ids):
 @boss_required
 def delete_route(route_id):
     conn = get_db()
-    if not conn.execute(
-        "SELECT id FROM routes WHERE id=? AND company_id=?", (route_id, cid())
-    ).fetchone():
+    _del_row = conn.execute(
+        "SELECT id, route_date FROM routes WHERE id=? AND company_id=?", (route_id, cid())
+    ).fetchone()
+    if not _del_row:
         conn.close()
         abort(404)
+    _del_day = _del_row["route_date"]
 
     stop_rows = conn.execute(
         "SELECT id FROM stops WHERE route_id=?", (route_id,)
@@ -25980,7 +26044,9 @@ def delete_route(route_id):
         _remove_managed_upload(upload_path)
 
     flash("Route deleted.", "success")
-    return redirect(url_for("routes_page"))
+    # 2026-10-24: land back on the day the route lived on — deleting a
+    # tomorrow route used to bounce the boss to today's board.
+    return redirect(url_for("routes_page", day=_del_day)) if _del_day else redirect(url_for("routes_page"))
 
 # =========================================
 # ORDER ACTIONS
@@ -39550,6 +39616,7 @@ def api_dispatch():
         """SELECT id FROM routes
             WHERE company_id=? AND assigned_to=? AND route_date=?
               AND status IN ('open','in_progress')
+              AND cancelled_at IS NULL
               AND COALESCE(route_type,'rolloff')=?
             ORDER BY id LIMIT 1""",
         (cid(), driver_id, route_date, route_type)
@@ -39583,6 +39650,7 @@ def api_dispatch():
                 """SELECT id FROM routes
                     WHERE company_id=? AND assigned_to=? AND route_date=?
                       AND status IN ('open','in_progress')
+                      AND cancelled_at IS NULL
                       AND COALESCE(route_type,'rolloff')=?
                     ORDER BY id LIMIT 1""",
                 (cid(), driver_id, route_date, route_type)
