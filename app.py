@@ -3696,6 +3696,10 @@ def init_db():
     safe_add_column(conn, "companies", "yard_city TEXT")
     safe_add_column(conn, "companies", "yard_state TEXT")
     safe_add_column(conn, "companies", "yard_zip TEXT")
+    # 2026-10-24: a live company should not be nagged by the setup banner
+    # forever — the boss can hide it for good (a quiet one-line link to
+    # the checklist remains instead).
+    safe_add_column(conn, "companies", "onboarding_banner_dismissed INTEGER DEFAULT 0")
     safe_add_column(conn, "stops", "can_state_before TEXT")
     safe_add_column(conn, "stops", "placement_note TEXT")
     safe_add_column(conn, "stops", "relocate_to_address TEXT")
@@ -30823,27 +30827,63 @@ def company_register():
 # =========================================================
 def _onboarding_back_banner():
     """2026-10-23: when setup is incomplete, show a banner at the top of
-    Settings/Team/Yard pages linking back to the onboarding checklist."""
+    Settings/Team/Yard pages linking back to the onboarding checklist.
+    2026-10-24: the banner is dismissible — a live company is not nagged
+    forever. Dismissing leaves one quiet one-line link (same pages) so
+    the checklist is never lost, and finishing all steps removes it all."""
     try:
         conn = get_db()
+        try:
+            _flag = conn.execute("SELECT onboarding_banner_dismissed FROM companies WHERE id=?", (cid(),)).fetchone()
+            _dismissed = bool(_flag and _flag[0])
+        except Exception:
+            _dismissed = False
         steps = _onboarding_steps(conn, cid(), session.get("user_id"))
         conn.close()
         done_n = sum(1 for s in steps if s["done"])
         total_n = len(steps)
         if done_n >= total_n:
             return ""
+        if _dismissed:
+            return f"""<div style="margin-bottom:16px;"><a class="muted small" href="{url_for('onboarding_setup')}">Setup checklist — {done_n} of {total_n} done</a></div>"""
         return f"""
-        <div class="card" style="border:1px solid rgba(255,107,26,.4);background:linear-gradient(135deg,rgba(255,107,26,.08),rgba(255,107,26,.02));margin-bottom:16px;">
+        <div id="ob-banner" class="card" style="border:1px solid rgba(255,107,26,.4);background:linear-gradient(135deg,rgba(255,107,26,.08),rgba(255,107,26,.02));margin-bottom:16px;">
             <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
                 <div style="flex:1;min-width:200px;">
                     <strong>Finish your setup</strong>
                     <div class="muted small">{done_n} of {total_n} steps done.</div>
                 </div>
                 <a class="btn gold" href="{url_for('onboarding_setup')}" style="min-height:48px;display:inline-flex;align-items:center;">Back to checklist</a>
+                <button type="button" onclick="obDismissBanner()" style="background:transparent;border:0;color:#A6A69E;font-size:13px;cursor:pointer;padding:10px;">&#10005; Hide</button>
             </div>
-        </div>"""
+        </div>
+        <script>
+        function obDismissBanner() {{
+            var csrfEl = document.querySelector('meta[name="csrf-token"]');
+            var csrf = csrfEl ? csrfEl.getAttribute('content') : '';
+            fetch('/api/onboarding/dismiss-banner', {{method: 'POST', headers: {{'X-CSRF-Token': csrf}}}}).then(function(r) {{ return r.json(); }}).then(function(d) {{
+                if (d.ok) {{ var b = document.getElementById('ob-banner'); if (b) b.remove(); }}
+            }}).catch(function() {{}});
+        }}
+        </script>"""
     except Exception:
         return ""
+
+
+@app.route("/api/onboarding/dismiss-banner", methods=["POST"])
+@boss_required
+def api_dismiss_onboarding_banner():
+    """Boss hides the Finish-your-setup banner for good (this company).
+    A quiet checklist link remains on setup pages; finishing all steps
+    removes that too."""
+    conn = get_db()
+    try:
+        conn.execute("UPDATE companies SET onboarding_banner_dismissed=1 WHERE id=?", (cid(),))
+        conn.commit()
+    except Exception:
+        pass
+    conn.close()
+    return jsonify({"ok": True})
 
 
 @app.route("/settings", methods=["GET", "POST"])
@@ -46471,6 +46511,15 @@ def garbage_dispatch_view():
             append_driver_id = r["assigned_to"]
     conn.close()
     csrf = get_csrf_token()
+    # 2026-10-24: garbage More sheet carries the same user header as the
+    # Route Board sheet.
+    try:
+        _uconn = get_db()
+        _urow = _uconn.execute("SELECT username, role FROM users WHERE id=?", (session.get("user_id"),)).fetchone()
+        _uconn.close()
+        _more_user_div = f'<div class="haul-more-user">{e(_urow["username"])} &middot; {e(_urow["role"])}</div>' if _urow else ""
+    except Exception:
+        _more_user_div = ""
     opts = "".join(
         '<option value="%d"%s>%s</option>'
         % (d["id"], " selected" if append_driver_id and d["id"] == append_driver_id else "",
@@ -46771,6 +46820,9 @@ def garbage_dispatch_view():
     padding-bottom: env(safe-area-inset-bottom, 0px); max-height: 70vh; overflow-y: auto; }
   .haul-more-handle { width: 40px; height: 4px; background: rgba(255,255,255,.2); border-radius: 2px; margin: 12px auto 8px; }
   .haul-more-items .nav-item { display: block; padding: 14px 20px; color: #fff; text-decoration: none; font-size: 16px; border-bottom: 1px solid rgba(255,255,255,.05); }
+  /* 2026-10-24: sheet icons match the Route Board sheet (outline, not emoji) */
+  .haul-more-items .nav-item svg, .haul-more-owner-title svg, .haul-more-items button svg { width: 20px; height: 20px; vertical-align: -4px; margin-right: 10px; }
+  .haul-more-user { padding: 14px 20px 4px; color: #A6A69E; font-size: 13px; }
   .topnav-more-head {
     font-size: 11px; font-weight: 800; letter-spacing: 1.5px; text-transform: uppercase;
     color: rgba(255,255,255,0.4); padding: 16px 20px 6px;
@@ -46808,6 +46860,20 @@ def garbage_dispatch_view():
   <path d="M3.5 13 6 5h12l2.5 8v6h-17z"/><path d="M3.5 13H9l1 2.5h4l1-2.5h5.5"/></symbol>
 <symbol id="i-users" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
   <circle cx="9" cy="8" r="3.2"/><path d="M2.8 20a6.4 6.4 0 0 1 12.4 0M16.5 5.2a3.2 3.2 0 0 1 0 5.9M18 20a6 6 0 0 0-2.2-4.4"/></symbol>
+<symbol id="i-wrench" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M15.5 3.5a5.5 5.5 0 0 0-5 7.7L3.6 18a2 2 0 1 0 2.8 2.8l6.8-6.9a5.5 5.5 0 0 0 6.9-7.2l-3 3-2.6-2.6 3-3a5.4 5.4 0 0 0-2-.6Z"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="12" cy="12" r="8.6"/><path d="M12 7v5.3l3.2 2"/></symbol>
+<symbol id="i-clipboard" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="5" y="5" width="14" height="16" rx="2"/><path d="M9 5V3.6h6V5"/><path d="M9 11h6M9 15h4"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M18 9a6 6 0 1 0-12 0c0 5-2 6.5-2 6.5h16S18 14 18 9Z"/><path d="M13.7 19.5a2 2 0 0 1-3.4 0"/></symbol>
+<symbol id="i-power" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M12 3.5v8"/><path d="M17.5 6.6a7.5 7.5 0 1 1-11 0"/></symbol>
+<symbol id="i-gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="12" cy="12" r="3.1"/><path d="M19.4 14.6a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1v.2a2 2 0 0 1-4 0v-.1a1.6 1.6 0 0 0-2.8-1.1l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0-1.1-2.7h-.2a2 2 0 0 1 0-4h.1A1.6 1.6 0 0 0 4.5 7l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 2.7-1.1v-.2a2 2 0 0 1 4 0v.1a1.6 1.6 0 0 0 2.8 1.1l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0 1.1 2.7h.2a2 2 0 0 1 0 4h-.1a1.6 1.6 0 0 0-1.4 1z"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <rect x="3.5" y="5" width="17" height="15.5" rx="2"/><path d="M3.5 10h17M8 3.4V6.6M16 3.4V6.6"/></symbol>
 </defs>
 </svg>
 
@@ -46926,26 +46992,32 @@ def garbage_dispatch_view():
   <div class="haul-more-backdrop" onclick="closeMoreSheet()"></div>
   <div class="haul-more-panel" id="haul-more-panel">
     <div class="haul-more-handle"></div>
+    __MORE_USER_DIV__
     <div class="haul-more-items">
       <a href="/dashboard" class="haul-more-owner-hero">
-        <div class="haul-more-owner-title">Owner</div>
+        <div class="haul-more-owner-title"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-board"/></svg>Owner</div>
         <div class="haul-more-owner-sub">Yard overview &middot; pulls &middot; revenue &middot; pay week</div>
       </a>
       <div class="topnav-more-head">Money &amp; Ops</div>
-      <a class="nav-item" href="/invoices">Invoices</a>
-      <a class="nav-item" href="/bin-tracker">Bin Tracker</a>
-      <a class="nav-item" href="/boss/notifications">Alerts</a>
+      <a class="nav-item" href="/invoices"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-clipboard"/></svg>Invoices</a>
+      <a class="nav-item" href="/bin-tracker"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-box"/></svg>Bin Tracker</a>
+      <a class="nav-item" href="/boss/notifications"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-bell"/></svg>Alerts</a>
       <div class="topnav-more-head">Team</div>
-      <a class="nav-item" href="/boss/team-hours">Team Hours</a>
-      <a class="nav-item" href="/team-time-off">Team Time Off</a>
+      <a class="nav-item" href="/boss/team-hours"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-clock"/></svg>Team Hours</a>
+      <a class="nav-item" href="/team-time-off"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-calendar"/></svg>Team Time Off</a>
       <div class="topnav-more-head">Fleet</div>
-      <a class="nav-item" href="/trucks">Trucks</a>
-      <a class="nav-item" href="/vendors">Vendors</a>
-      <a class="nav-item" href="/maintenance">Maintenance</a>
-      <a class="nav-item" href="/team">Team</a>
+      <a class="nav-item" href="/trucks"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-truck"/></svg>Trucks</a>
+      <a class="nav-item" href="/vendors"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-wrench"/></svg>Vendors</a>
+      <a class="nav-item" href="/maintenance"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-wrench"/></svg>Maintenance</a>
+      <a class="nav-item" href="/team"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-users"/></svg>Team</a>
       <div class="topnav-more-head">Setup</div>
-      <a class="nav-item" href="/yard-setup">Yard Setup</a>
-      <a class="nav-item" href="/settings">Settings</a>
+      <a class="nav-item" href="/yard-setup"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-box"/></svg>Yard Setup</a>
+      <a class="nav-item" href="/settings"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-gear"/></svg>Settings</a>
+      <div style="height:1px;background:rgba(255,255,255,.08);margin:8px 0;"></div>
+      <form method="POST" action="/logout" style="margin:0;padding:0;">
+        <input type="hidden" name="_csrf_token" value="__CSRF__">
+        <button type="submit" style="display:block;width:100%;text-align:left;background:transparent;border:0;color:#fff;padding:14px 20px;font-size:16px;cursor:pointer;"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><use href="#i-power"/></svg>Logout</button>
+      </form>
     </div>
   </div>
 </div>
@@ -47296,7 +47368,7 @@ function fetchT(url, opts, ms){
 }
 </script></body></html>
 """
-    page = page.replace("__OPTS__", opts).replace("__TRUCK_OPTS__", truck_opts).replace("__CSRF__", csrf)
+    page = page.replace("__OPTS__", opts).replace("__TRUCK_OPTS__", truck_opts).replace("__CSRF__", csrf).replace("__MORE_USER_DIV__", _more_user_div)
     page = page.replace("__DAY__", _dispatch_day).replace("__DAY_LABEL__", _dispatch_label)
     page = page.replace("__CMD_META__", _cmd_meta)
     page = page.replace("__MODE__", e(mode_note) if mode_note else "")
@@ -47470,6 +47542,16 @@ def parser_view():
     with open(path, encoding='utf-8') as f:
         html = f.read()
     html = html.replace('__CSRF_TOKEN__', get_csrf_token())
+    # 2026-10-24: dispatch More sheet carries the same user header as the
+    # Route Board sheet (injected here — parser.html is static).
+    try:
+        _uconn = get_db()
+        _urow = _uconn.execute("SELECT username, role FROM users WHERE id=?", (session.get("user_id"),)).fetchone()
+        _uconn.close()
+        _more_user_div = f'<div class="haul-more-user">{e(_urow["username"])} &middot; {e(_urow["role"])}</div>' if _urow else ""
+    except Exception:
+        _more_user_div = ""
+    html = html.replace('__MORE_USER_DIV__', _more_user_div)
     html = html.replace('<!--ASSIGN_SLOT-->', assign_html)
     html = html.replace('<!--ROUTE_SEQ_SLOT-->', route_seq_html)
     # 2026-10-17: command-center header meta — live day + driver count.
