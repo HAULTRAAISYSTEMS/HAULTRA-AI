@@ -30983,6 +30983,84 @@ def _rule_stop_to_llm_shape(s):
     }
 
 
+# "return <place> to end the day" — the end-of-day return destination.
+_END_DAY_RETURN_RE = re.compile(
+    r"\breturn\s+(?:it\s+)?(?:to\s+)?([A-Za-z0-9][^.,;\n]{0,60}?)\s+to\s+end\s+(?:the\s+|of\s+)?day\b",
+    re.I)
+
+
+def _ensure_end_of_day_return(raw_text, stops, company_id):
+    """Deterministic guard for the AI parse path (2026-10-24): the model keeps
+    folding 'then return <place> to end the day' into the previous stop's
+    return_leg (or notes) instead of emitting the final Delivery stop the
+    fallback parser creates — prompt rules alone don't hold against that
+    habit, so enforce it in code. If the text names an end-of-day return
+    destination and no D stop already serves it, append the D (address-book
+    resolved, size from the last sized stop) and clear a matching return_leg
+    on the last stop so the return isn't double-counted. Named place only —
+    'the yard' stays a return leg, never a D stop. Never raises; on any doubt
+    returns stops unchanged."""
+    try:
+        m = _END_DAY_RETURN_RE.search(raw_text or "")
+        if not m:
+            return stops
+        dest = (m.group(1) or "").strip().strip(".").strip()
+        if not dest:
+            return stops
+        dl = dest.lower()
+        if dl in ("the yard", "yard", "it", "the shop", "shop"):
+            return stops
+        for s in stops:
+            if (s.get("action") or "").upper() == "D" and dl and dl in (s.get("address") or "").lower():
+                return stops
+        addr, city, cust = dest.title(), "", ""
+        try:
+            conn = get_db()
+            try:
+                rows = conn.execute(
+                    "SELECT address, city, customer_name FROM saved_addresses "
+                    "WHERE company_id=? ORDER BY times_used DESC, last_used_at DESC",
+                    (company_id,)).fetchall()
+            finally:
+                conn.close()
+            for r in rows:
+                if dl and dl in (r["address"] or "").lower():
+                    addr = r["address"] or addr
+                    city = r["city"] or ""
+                    cust = r["customer_name"] or ""
+                    break
+        except Exception:
+            pass
+        if stops:
+            last = stops[-1]
+            rl = (last.get("return_leg") or "").strip().lower()
+            if rl and (dl in rl or rl in dl):
+                last["return_leg"] = ""
+        size = ""
+        for s in reversed(stops):
+            if s.get("container_size"):
+                size = s["container_size"]
+                break
+        out = list(stops)
+        out.append({
+            "action": "D",
+            "address": addr + (f", {city}" if city and city.lower() not in addr.lower() else ""),
+            "customer": cust,
+            "container_size": size or "30yd",
+            "dump_leg": "",
+            "return_leg": "",
+            "empty_can_plan": None,
+            "raw": f"return {dest} to end the day",
+            "confidence": "high",
+            "notes": "end of day",
+            "chain_hint": None,
+            "source": "ai-guard",
+        })
+        return out
+    except Exception:
+        return stops
+
+
 @app.route("/api/parse", methods=["POST"])
 @roles_required("dispatcher", api=True)
 def api_parse_dispatch():
@@ -31082,6 +31160,11 @@ def api_parse_dispatch():
         if isinstance(s, dict):
             s["source"] = "ai"
             ai_stops.append(s)
+
+    # 2026-10-24: code-level guard — the model folds end-of-day returns into a
+    # leg/note instead of a D stop; force the D here so the preview shows it
+    # no matter what the model did (prompt-only guidance proved insufficient).
+    ai_stops = _ensure_end_of_day_return(text, ai_stops, cid())
 
     return jsonify({"stops": manual_stops + ai_stops})
 
