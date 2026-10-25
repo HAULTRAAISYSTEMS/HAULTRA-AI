@@ -31464,6 +31464,7 @@ def onboarding_parser_page():
     <div style="max-width:760px;margin-top:8px;">
         {_parse_vocab_section_html(back="/onboarding/parser#parse-vocab")}
         {_parse_intent_section_html()}
+        {_parse_lessons_section_html()}
     </div>
     <script>
     (function() {{
@@ -36305,6 +36306,57 @@ def _parse_intent_section_html():
     """
 
 
+def _parse_lessons_section_html():
+    """What the parser has learned: every correction the boss made in the
+    preview before dispatching, with its status. Active (2+ observations)
+    lessons already rewrite future parses; Learning (1) ones need one more
+    identical fix. Delete forgets a lesson — the parser must relearn it."""
+    conn = get_db()
+    _ensure_parse_lesson_tables(conn)
+    conn.commit()
+    rows_db = conn.execute(
+        "SELECT id, kind, addr_key, input_value, output_value, count, last_seen_at FROM parse_lessons"
+        " WHERE company_id=? ORDER BY last_seen_at DESC, id DESC",
+        (cid(),)
+    ).fetchall()
+    conn.close()
+    _csrf = get_csrf_token()
+    _KIND_LABELS = {"customer": "Customer", "action": "Action",
+                    "size": "Container size", "dump": "Dump site"}
+    rows = ""
+    for v in rows_db:
+        active = (v["count"] or 0) >= _LESSON_THRESHOLD
+        status = ('<span style="color:#3DDC84;font-weight:800;">Active</span>' if active
+                  else '<span style="color:#fbbf24;font-weight:800;">Learning</span>')
+        addr = (v["addr_key"] or "").title()
+        rows += (f'<tr><td><strong>{e(addr)}</strong><br><span class="muted small">{e(_KIND_LABELS.get(v["kind"], v["kind"]))}</span></td>'
+                 f'<td>{e(v["input_value"])} <span class="muted">&rarr;</span> <strong>{e(v["output_value"])}</strong></td>'
+                 f'<td class="muted small">{v["count"]}&times;<br>{status}</td>'
+                 f'<td style="text-align:right;">'
+                 f'<form method="POST" action="{url_for("delete_parse_lesson", lesson_id=v["id"])}" style="display:inline;" '
+                 f'onSubmit="return confirm(\'Forget this lesson? The parser will have to relearn it.\');">'
+                 f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
+                 f'<button type="submit" style="background:transparent;color:#f87171;border:1px solid rgba(248,113,113,0.4);'
+                 f'border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;">Forget</button></form></td></tr>')
+    return f"""
+    <div class="card" id="parse-lessons" style="margin-top:16px;">
+        <div class="row between" style="margin-bottom:16px;">
+            <h2 style="margin:0;">&#9998; What the parser has learned</h2>
+        </div>
+        <p class="muted small" style="margin-bottom:14px;">Every fix you make in the preview before dispatching
+        is remembered here. After the <b>same fix twice</b>, the parser applies it on its own and tags
+        the card green. <b>Learning</b> means one more identical fix will activate it.
+        Forgetting a lesson makes the parser relearn it from scratch.</p>
+        <div class="table-wrap">
+            <table>
+                <thead><tr><th>Address / field</th><th>Lesson</th><th>Times</th><th></th></tr></thead>
+                <tbody>{rows or '<tr><td colspan="4" class="muted">Nothing learned yet — correct the same parse twice and the lesson shows up here.</td></tr>'}</tbody>
+            </table>
+        </div>
+    </div>
+    """
+
+
 @app.route("/parse-intent/add", methods=["POST"])
 @boss_required
 def add_parse_intent():
@@ -36345,6 +36397,18 @@ def delete_parse_intent(vocab_id):
     conn.close()
     flash("Intent phrase removed.", "success")
     return redirect(url_for("onboarding_parser_page") + "#parse-intent")
+
+
+@app.route("/parse-lesson/<int:lesson_id>/delete", methods=["POST"])
+@boss_required
+def delete_parse_lesson(lesson_id):
+    conn = get_db()
+    _ensure_parse_lesson_tables(conn)
+    conn.execute("DELETE FROM parse_lessons WHERE id=? AND company_id=?", (lesson_id, cid()))
+    conn.commit()
+    conn.close()
+    flash("Lesson forgotten — the parser will have to relearn it.", "success")
+    return redirect(url_for("onboarding_parser_page") + "#parse-lessons")
 
 
 def _address_book_section_html():
