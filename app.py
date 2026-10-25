@@ -13969,6 +13969,14 @@ def team_page():
             (cid(), now_ts())).fetchall()}
     except Exception:
         _live_inv = {}
+    try:
+        _any_inv = {}
+        for r in conn.execute(
+                "SELECT user_id, id, revoked_at, expires_at, accepted_at FROM driver_invites"
+                " WHERE company_id=? ORDER BY id DESC", (cid(),)).fetchall():
+            _any_inv.setdefault(r["user_id"], dict(r))
+    except Exception:
+        _any_inv = {}
     conn.close()
 
     current_uid = session["user_id"]
@@ -13982,6 +13990,10 @@ def team_page():
         is_deleted   = not bool(u["is_active"])
         _pend        = _live_inv.get(u["id"])
         is_pending   = bool(_pend) and is_deleted
+        _stale_row   = _any_inv.get(u["id"]) if (is_deleted and not _pend) else None
+        if _stale_row and _stale_row.get("accepted_at"):
+            _stale_row = None
+        is_stale     = bool(_stale_row)
 
         _del_td_style = 'style="text-align:right;white-space:nowrap;width:170px;"'
         if is_pending:
@@ -13999,6 +14011,15 @@ def team_page():
                 f'style="background:transparent;color:#f87171;border:1px solid rgba(248,113,113,0.4);'
                 f'border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;line-height:1.4;">'
                 f'Revoke</button></form>'
+            )
+        elif is_stale:
+            _resend_action = url_for("resend_invite", invite_id=_stale_row["id"])
+            delete_cell = (
+                f'<form method="POST" action="{_resend_action}" style="margin:0;display:inline;">'
+                f'<button type="submit" '
+                f'style="background:transparent;color:#FF9D5C;border:1px solid rgba(255,157,92,0.4);'
+                f'border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;line-height:1.4;">'
+                f'Resend</button></form>'
             )
         elif is_deleted:
             delete_cell = '<span class="muted small">Inactive tombstone</span>'
@@ -14028,6 +14049,8 @@ def team_page():
         role_badge = (
             '<span class="badge" style="background:#fbbf2433;color:#fbbf24;">Invite pending</span>'
             if is_pending else
+            f'<span class="badge" style="background:#fbbf2433;color:#fbbf24;">{"Invite revoked" if _stale_row.get("revoked_at") else "Invite expired"}</span>'
+            if is_stale else
             '<span class="badge">Inactive</span>'
             if is_deleted else
             '<span class="badge completed">Boss</span>'
@@ -35485,14 +35508,30 @@ def _onboarding_steps(conn, company_id, user_id):
     # Yard: dumps AND fleet — one step for the whole yard, not two.
     _yard_done = (_count("SELECT COUNT(*) FROM dump_locations WHERE company_id=?", company_id) > 0
                   and _count("SELECT COUNT(*) FROM containers WHERE company_id=?", company_id) > 0)
+    # Drivers: ready beats invited — a pending invite can't work a route.
+    _drivers_active = _count("SELECT COUNT(*) FROM users WHERE company_id=? AND role='driver' AND is_active=1",
+                             company_id)
+    try:
+        _drivers_pending = conn.execute(
+            "SELECT COUNT(*) n FROM driver_invites WHERE company_id=? AND accepted_at IS NULL"
+            " AND revoked_at IS NULL AND expires_at > ?", (company_id, now_ts())).fetchone()["n"] or 0
+    except Exception:
+        _drivers_pending = 0
+    if _drivers_active > 0 and _drivers_pending > 0:
+        _drivers_desc = f"{_drivers_active} driver(s) ready, {_drivers_pending} invite(s) still out."
+    elif _drivers_active == 0 and _drivers_pending > 0:
+        _drivers_desc = ("Name + phone — they get a text invite to download the app. "
+                         f"{_drivers_pending} invite(s) sent — waiting on acceptance.")
+    else:
+        _drivers_desc = "Name + phone — they get a text invite to download the app."
     steps = [
         {"key": "base", "title": "Company base",
          "desc": "Company name, yard address, rate card, work hours, and notifications — all on one Settings page, one save.",
          "done": _base_done and _ratecard_done, "url": url_for("settings_page") + "#yard",
          "essential": True},
         {"key": "drivers", "title": "Add drivers",
-         "desc": "Name + phone — they get a text invite to download the app.",
-         "done": _count("SELECT COUNT(*) FROM users WHERE company_id=? AND role='driver'", company_id) > 0,
+         "desc": _drivers_desc,
+         "done": _drivers_active > 0,
          "url": url_for("team_page"),
          "essential": True},
         {"key": "customers", "title": "Import customers",
@@ -35503,6 +35542,16 @@ def _onboarding_steps(conn, company_id, user_id):
         {"key": "yard", "title": "Yard setup",
          "desc": "Dump locations + container fleet — where cans live and where they get dumped.",
          "done": _yard_done, "url": url_for("yard_setup_page"),
+         "essential": True},
+        {"key": "trucks", "title": "Add your trucks",
+         "desc": "Your fleet — so routes, boards, and truck bars show the right truck.",
+         "done": _count("SELECT COUNT(*) FROM trucks WHERE company_id=? AND is_active=1", company_id) > 0,
+         "url": url_for("trucks_page"),
+         "essential": True},
+        {"key": "first_route", "title": "Run your first dispatch",
+         "desc": "Send your first route to a driver — that's when setup turns into the app working.",
+         "done": _count("SELECT COUNT(*) FROM routes WHERE company_id=?", company_id) > 0,
+         "url": url_for("parser_view"),
          "essential": True},
         {"key": "garbage", "title": "Garbage routes",
          "desc": "Scan each day's paper route — five photos and your week is set.",
