@@ -35549,7 +35549,9 @@ def onboarding_setup():
 
     def _card(s):
         _icon = "✅" if s["done"] else "⭕"
-        _btn = ("<span class='ob-done'>Done</span>" if s["done"]
+        # Done steps stay tappable: the green check + dimmed card say "done",
+        # the button says "you can still go back in and change it."
+        _btn = (f"<a class='btn secondary' href='{s['url']}'>Update →</a>" if s["done"]
                 else f"<a class='btn' href='{s['url']}'>Set up →</a>")
         return f"""
         <div class="ob-step{' done' if s['done'] else ''}">
