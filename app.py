@@ -35476,24 +35476,19 @@ def _onboarding_steps(conn, company_id, user_id):
         _base_done = bool(_co and (_co["yard_address"] or "").strip())
     except Exception:
         _base_done = False
-    # Push: boss has a registered device?
-    _push_done = _count("SELECT COUNT(*) FROM push_tokens WHERE company_id=?", company_id) > 0
-    # Payroll: work-hours fields are NULL until the boss saves them once
-    # (registration never sets them), so any non-empty field means saved.
-    try:
-        _wh = conn.execute("SELECT timezone, workweek_start_day, pay_period_type, payday"
-                           " FROM companies WHERE id=?", (company_id,)).fetchone()
-        _payroll_done = bool(_wh and any((_wh[k] or "").strip() for k in
-                             ("timezone", "workweek_start_day", "pay_period_type", "payday")))
-    except Exception:
-        _payroll_done = False
+    # One Settings page, one step: the rate card, work hours, and
+    # notifications all live on Settings, so they are not separate steps.
+    # Done = the two operational must-haves: a yard address and at least
+    # one price. Work hours and notifications ride along on the same page
+    # but never block the check (a desktop boss can't earn a push token).
+    _ratecard_done = _count("SELECT COUNT(*) FROM rate_cards WHERE company_id=?", company_id) > 0
     # Yard: dumps AND fleet — one step for the whole yard, not two.
     _yard_done = (_count("SELECT COUNT(*) FROM dump_locations WHERE company_id=?", company_id) > 0
                   and _count("SELECT COUNT(*) FROM containers WHERE company_id=?", company_id) > 0)
     steps = [
         {"key": "base", "title": "Company base",
-         "desc": "Company name + yard address — unlocks route optimize and navigate-to-yard.",
-         "done": _base_done, "url": url_for("settings_page") + "#yard",
+         "desc": "Company name, yard address, rate card, work hours, and notifications — all on one Settings page, one save.",
+         "done": _base_done and _ratecard_done, "url": url_for("settings_page") + "#yard",
          "essential": True},
         {"key": "drivers", "title": "Add drivers",
          "desc": "Name + phone — they get a text invite to download the app.",
@@ -35509,19 +35504,6 @@ def _onboarding_steps(conn, company_id, user_id):
          "desc": "Dump locations + container fleet — where cans live and where they get dumped.",
          "done": _yard_done, "url": url_for("yard_setup_page"),
          "essential": True},
-        {"key": "ratecard", "title": "Rate card",
-         "desc": "Per-size pricing, fees, and surcharge markup for invoices.",
-         "done": _count("SELECT COUNT(*) FROM rate_cards WHERE company_id=?", company_id) > 0,
-         "url": url_for("settings_page") + "#rate-card",
-         "essential": True},
-        {"key": "push", "title": "Turn on notifications",
-         "desc": "Dispatch alerts and route pushes to your phone.",
-         "done": _push_done, "url": url_for("settings_page") + "#notifications",
-         "essential": False},
-        {"key": "payroll", "title": "Work hours & pay cycle",
-         "desc": "Clock-in rules and pay periods for the team.",
-         "done": _payroll_done, "url": url_for("settings_page") + "#work-hours",
-         "essential": False},
         {"key": "garbage", "title": "Garbage routes",
          "desc": "Scan each day's paper route — five photos and your week is set.",
          "done": _count("SELECT COUNT(*) FROM garbage_templates WHERE company_id=?", company_id) > 0,
