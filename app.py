@@ -31061,6 +31061,172 @@ def _ensure_end_of_day_return(raw_text, stops, company_id):
         return stops
 
 
+# =========================================================
+# PARSER CORRECTION LEARNING (2026-10-24)
+# The loop the boss asked for: what he fixes in the confirm sheet
+# before dispatching becomes a lesson, and after the same lesson is
+# observed twice it applies itself to the next parse. Scope is
+# deliberately narrow — four fields only (customer, action, size,
+# dump), keyed by normalized address. Lessons never add, remove, or
+# move stops, never change addresses, and never touch chain signals.
+# Chaining follows strictly INCREASING last_seen_at so contradictory
+# lessons resolve toward the boss's most recent correction instead
+# of looping. The boss can always override in the sheet, and that
+# override itself becomes the counter-lesson. Every helper here never
+# raises: learning must never break a parse or a dispatch.
+# =========================================================
+_LESSON_THRESHOLD = 2
+_LESSON_FIELDS = (("customer", "customer"), ("action", "action"),
+                  ("size", "container_size"), ("dump", "dump_leg"))
+
+
+def _ensure_parse_lesson_tables(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS parse_sessions (
+        id TEXT PRIMARY KEY, company_id INTEGER NOT NULL, raw_text TEXT,
+        stops_json TEXT, created_at TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS parse_lessons (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER NOT NULL,
+        kind TEXT NOT NULL, addr_key TEXT NOT NULL,
+        input_value TEXT NOT NULL, output_value TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 1, last_seen_at TEXT, created_at TEXT,
+        UNIQUE(company_id, kind, addr_key, input_value, output_value))""")
+
+
+def _store_parse_session(company_id, raw_text, stops):
+    """Persist a /api/parse response (exactly what the boss saw) so the
+    later dispatch can diff it against what he actually sent. Own
+    connection: never interferes with the caller's transaction.
+    Returns the parse_id, or None on any failure."""
+    try:
+        import uuid as _uuid
+        pid = _uuid.uuid4().hex
+        conn = get_db()
+        try:
+            _ensure_parse_lesson_tables(conn)
+            conn.execute(
+                "INSERT INTO parse_sessions (id, company_id, raw_text, stops_json, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (pid, company_id, raw_text or "", json.dumps(stops or []), now_ts()))
+            # Sessions are only useful until the batch is dispatched; a
+            # week is generous (the tray lives minutes, not days).
+            conn.execute("DELETE FROM parse_sessions WHERE created_at < datetime('now', '-7 days')")
+            conn.commit()
+        finally:
+            conn.close()
+        return pid
+    except Exception:
+        return None
+
+
+def _apply_parse_lessons(stops, company_id):
+    """Rewrite stop fields from learned lessons (count >= threshold).
+    Tags adjusted stops with lesson_applied=[kinds] so the confirm
+    sheet can show the boss what the parser did on its own."""
+    if not stops or not company_id:
+        return stops
+    try:
+        conn = get_db()
+        try:
+            _ensure_parse_lesson_tables(conn)
+            rows = conn.execute(
+                "SELECT id, kind, addr_key, input_value, output_value, last_seen_at FROM parse_lessons"
+                " WHERE company_id=? AND count>=? ORDER BY last_seen_at ASC, id ASC",
+                (company_id, _LESSON_THRESHOLD)).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return stops
+    # One output per (kind, address, input): when the boss corrected the
+    # same input two ways, the MOST RECENTLY seen lesson wins (later rows
+    # overwrite earlier ones in this recency order).
+    lessons = {}
+    for r in rows:
+        lessons[(r["kind"], r["addr_key"], r["input_value"])] = (r["output_value"], r["last_seen_at"] or "")
+    for s in stops:
+        if not isinstance(s, dict):
+            continue
+        addr_key = _midday_norm(s.get("address") or "")
+        if not addr_key:
+            continue
+        applied = []
+        for kind, field in _LESSON_FIELDS:
+            cur0 = (s.get(field) or "")
+            if not cur0:
+                continue
+            cur, last_ts = cur0, None
+            for _ in range(10):
+                row = lessons.get((kind, addr_key, cur))
+                if row is None:
+                    break
+                out, ts = row
+                if last_ts is not None and not (ts > last_ts):
+                    break
+                last_ts, cur = ts, out
+            if cur != cur0:
+                s[field] = cur
+                applied.append(kind)
+        if applied:
+            s["lesson_applied"] = applied
+    return stops
+
+
+def _record_parse_lessons(company_id, parse_ids, dispatched_stops):
+    """Diff what the boss dispatched against the stored parse sessions
+    and record per-field lessons. Matches by normalized address,
+    consuming each parsed stop once, so boss-added stops (no match)
+    are never mistaken for corrections. Own connection; never raises."""
+    try:
+        if not company_id or not parse_ids or not dispatched_stops:
+            return 0
+        conn = get_db()
+        try:
+            _ensure_parse_lesson_tables(conn)
+            ph = ",".join("?" for _ in parse_ids)
+            rows = conn.execute(
+                "SELECT stops_json FROM parse_sessions WHERE id IN (%s) AND company_id=?" % ph,
+                (*parse_ids, company_id)).fetchall()
+            pool = []
+            for r in rows:
+                try:
+                    pool.extend(json.loads(r["stops_json"] or "[]"))
+                except Exception:
+                    continue
+            recorded = 0
+            for d in dispatched_stops:
+                if not isinstance(d, dict):
+                    continue
+                daddr = _midday_norm(d.get("address") or "")
+                if not daddr:
+                    continue
+                idx = None
+                for i, p in enumerate(pool):
+                    if isinstance(p, dict) and _midday_norm(p.get("address") or "") == daddr:
+                        idx = i
+                        break
+                if idx is None:
+                    continue  # boss-added stop, not a correction
+                p = pool.pop(idx)
+                for kind, field in _LESSON_FIELDS:
+                    pv = (p.get(field) or "").strip()
+                    dv = (d.get(field) or "").strip()
+                    if not pv or not dv or pv == dv or pv.lower() == dv.lower():
+                        continue
+                    conn.execute(
+                        "INSERT INTO parse_lessons (company_id, kind, addr_key, input_value, output_value,"
+                        " count, last_seen_at, created_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?)"
+                        " ON CONFLICT(company_id, kind, addr_key, input_value, output_value)"
+                        " DO UPDATE SET count=count+1, last_seen_at=excluded.last_seen_at",
+                        (company_id, kind, daddr, pv, dv, now_ts(), now_ts()))
+                    recorded += 1
+            conn.commit()
+            return recorded
+        finally:
+            conn.close()
+    except Exception:
+        app.logger.exception("parse lesson recording failed")
+        return 0
+
+
 @app.route("/api/parse", methods=["POST"])
 @roles_required("dispatcher", api=True)
 def api_parse_dispatch():
@@ -31146,8 +31312,11 @@ def api_parse_dispatch():
         # the return into the customer field) — run the same guard as the AI
         # path so the batch still ends with the Delivery the synth needs.
         mapped = _ensure_end_of_day_return(text, mapped, cid())
+        mapped = _apply_parse_lessons(mapped, cid())
+        _pid = _store_parse_session(cid(), text, manual_stops + mapped)
         if mapped:
             return jsonify({
+                "parse_id": _pid,
                 "stops": manual_stops + mapped,
                 "partial_failure": True,
                 "fallback": "rule-based",
@@ -31169,8 +31338,10 @@ def api_parse_dispatch():
     # leg/note instead of a D stop; force the D here so the preview shows it
     # no matter what the model did (prompt-only guidance proved insufficient).
     ai_stops = _ensure_end_of_day_return(text, ai_stops, cid())
+    ai_stops = _apply_parse_lessons(ai_stops, cid())
+    _pid = _store_parse_session(cid(), text, manual_stops + ai_stops)
 
-    return jsonify({"stops": manual_stops + ai_stops})
+    return jsonify({"parse_id": _pid, "stops": manual_stops + ai_stops})
 
 
 # =========================================================
@@ -40304,6 +40475,8 @@ def api_dispatch():
     _persist_manual_delivery(conn, clean_stops,
                              [nid for nid, _fl in zip(_new_ids, _new_ids_is_synth) if not _fl])
     conn.commit()
+    # Correction learning: what the boss changed in the sheet vs the parse.
+    _record_parse_lessons(cid(), data.get("parse_ids"), data.get("stops"))
     if route_type == "garbage":
         # No containers, no chains on a garbage route — dispatch is done.
         # 2026-10-21: buzz the driver's phone.
@@ -40501,6 +40674,8 @@ def api_insert_stops(route_id):
         cur.execute("UPDATE stops SET stop_order=? WHERE id=?", (pos, sid))
 
     conn.commit()
+    # Correction learning: what the boss changed in the sheet vs the parse.
+    _record_parse_lessons(cid(), data.get("parse_ids"), data.get("stops"))
     if is_garbage:
         conn.close()
         return jsonify({
