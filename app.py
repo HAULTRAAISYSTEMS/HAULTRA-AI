@@ -13725,6 +13725,228 @@ def _ago(ts):
     return "%dd ago" % (secs // 86400)
 
 
+# =========================================================
+# DRIVER INVITES (2026-10-25)
+# Boss enters name + phone; the driver finishes their own account via a
+# single-use, 7-day invite link. Pending drivers (is_active=0) are locked
+# out by gates that already exist: login rejects inactive users, and
+# dispatch dropdowns + validation only accept is_active=1 drivers.
+# Sending is tap-to-send through the boss's own Messages app (the same
+# sms: pattern customer invites already use) — no SMS vendor yet.
+# =========================================================
+def _ensure_driver_invite_tables(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS driver_invites (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL, token TEXT UNIQUE NOT NULL, phone TEXT,
+        created_at TEXT, expires_at TEXT, accepted_at TEXT, revoked_at TEXT)""")
+
+
+def _suggest_username(conn, full_name):
+    base = re.sub(r"[^a-z0-9]", "", (full_name or "").lower())[:30] or "driver"
+    cand, n = base, 2
+    while conn.execute("SELECT id FROM users WHERE username=? COLLATE NOCASE", (cand,)).fetchone():
+        cand, n = f"{base}{n}", n + 1
+    return cand
+
+
+def _invite_expires_at():
+    return (_eastern_now() + timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+@app.route("/team/invite-driver", methods=["POST"])
+@boss_required
+def invite_driver():
+    full_name = (request.form.get("full_name", "") or "").strip()[:100]
+    digits = re.sub(r"\D", "", request.form.get("phone", "") or "")
+    if digits.startswith("1") and len(digits) == 11:
+        digits = digits[1:]
+    if not full_name or len(digits) != 10:
+        flash("Enter the driver's full name and a 10-digit phone number.", "error")
+        return redirect(url_for("team_page"))
+    conn = get_db()
+    _ensure_driver_invite_tables(conn)
+    # Seat reservation: active drivers + live pending invites count, so a
+    # boss can't invite past the plan and strand a driver at acceptance.
+    co = conn.execute("SELECT max_drivers FROM companies WHERE id=?", (cid(),)).fetchone()
+    max_d = co["max_drivers"] if co else 5
+    active_n = conn.execute("SELECT COUNT(*) n FROM users WHERE role='driver' AND company_id=? AND is_active=1",
+                            (cid(),)).fetchone()["n"]
+    pending_n = conn.execute("SELECT COUNT(*) n FROM driver_invites WHERE company_id=? AND accepted_at IS NULL"
+                             " AND revoked_at IS NULL AND expires_at > ?", (cid(), now_ts())).fetchone()["n"]
+    if active_n + pending_n >= max_d:
+        conn.close()
+        msg = f"Driver limit reached ({max_d})."
+        if not is_native_app():
+            msg += " Upgrade your plan to add more."
+        flash(msg, "error")
+        return redirect(url_for("team_page"))
+    username = _suggest_username(conn, full_name)
+    conn.execute(
+        "INSERT INTO users (username, password_hash, role, full_name, phone, email, company_id, is_active, created_at)"
+        " VALUES (?,?, 'driver', ?, ?, NULL, ?, 0, ?)",
+        (username, generate_password_hash(secrets.token_urlsafe(32)), full_name, digits, cid(), now_ts()))
+    user_id = conn.execute("SELECT id FROM users WHERE username=? AND company_id=?",
+                           (username, cid())).fetchone()["id"]
+    token = secrets.token_urlsafe(32)
+    conn.execute(
+        "INSERT INTO driver_invites (company_id, user_id, token, phone, created_at, expires_at)"
+        " VALUES (?,?,?,?,?,?)",
+        (cid(), user_id, token, digits, now_ts(), _invite_expires_at()))
+    invite_id = conn.execute("SELECT id FROM driver_invites WHERE token=?", (token,)).fetchone()["id"]
+    conn.commit()
+    conn.close()
+    return redirect(url_for("team_page") + f"?show_invite={invite_id}")
+
+
+@app.route("/team/invite/<int:invite_id>/resend", methods=["POST"])
+@boss_required
+def resend_invite(invite_id):
+    conn = get_db()
+    _ensure_driver_invite_tables(conn)
+    inv = conn.execute("SELECT * FROM driver_invites WHERE id=? AND company_id=?",
+                       (invite_id, cid())).fetchone()
+    if not inv:
+        conn.close()
+        flash("Invite not found.", "error")
+        return redirect(url_for("team_page"))
+    user = conn.execute("SELECT is_active FROM users WHERE id=? AND company_id=?",
+                        (inv["user_id"], cid())).fetchone()
+    if inv["accepted_at"] or (user and user["is_active"]):
+        conn.close()
+        flash("That driver already accepted — no need to resend.", "success")
+        return redirect(url_for("team_page"))
+    conn.execute("UPDATE driver_invites SET revoked_at=? WHERE user_id=? AND company_id=?"
+                 " AND accepted_at IS NULL AND revoked_at IS NULL",
+                 (now_ts(), inv["user_id"], cid()))
+    token = secrets.token_urlsafe(32)
+    conn.execute(
+        "INSERT INTO driver_invites (company_id, user_id, token, phone, created_at, expires_at)"
+        " VALUES (?,?,?,?,?,?)",
+        (cid(), inv["user_id"], token, inv["phone"], now_ts(), _invite_expires_at()))
+    nid = conn.execute("SELECT id FROM driver_invites WHERE token=?", (token,)).fetchone()["id"]
+    conn.commit()
+    conn.close()
+    return redirect(url_for("team_page") + f"?show_invite={nid}")
+
+
+@app.route("/team/invite/<int:invite_id>/revoke", methods=["POST"])
+@boss_required
+def revoke_invite(invite_id):
+    conn = get_db()
+    _ensure_driver_invite_tables(conn)
+    inv = conn.execute("SELECT * FROM driver_invites WHERE id=? AND company_id=?",
+                       (invite_id, cid())).fetchone()
+    if not inv:
+        conn.close()
+        flash("Invite not found.", "error")
+        return redirect(url_for("team_page"))
+    uid = inv["user_id"]
+    conn.execute("UPDATE driver_invites SET revoked_at=? WHERE user_id=? AND company_id=?"
+                 " AND accepted_at IS NULL AND revoked_at IS NULL",
+                 (now_ts(), uid, cid()))
+    used = conn.execute("SELECT COUNT(*) n FROM routes WHERE assigned_to=?", (uid,)).fetchone()["n"]
+    u = conn.execute("SELECT is_active FROM users WHERE id=? AND company_id=?", (uid, cid())).fetchone()
+    if used == 0 and u and not u["is_active"]:
+        conn.execute("DELETE FROM users WHERE id=?", (uid,))
+        msg = "Invite revoked and pending driver removed."
+    else:
+        msg = "Invite revoked."
+    conn.commit()
+    conn.close()
+    flash(msg, "success")
+    return redirect(url_for("team_page"))
+
+
+@app.route("/invite/<token>", methods=["GET", "POST"])
+def accept_invite(token):
+    """Public invite acceptance: the driver picks their username + password.
+    The token is the credential — single-use, 7-day expiry, unguessable."""
+    conn = get_db()
+    _ensure_driver_invite_tables(conn)
+    inv = conn.execute("SELECT * FROM driver_invites WHERE token=?", (token,)).fetchone()
+    user = None
+    co_name = "HAULTRA"
+    if inv:
+        user = conn.execute("SELECT * FROM users WHERE id=?", (inv["user_id"],)).fetchone()
+        co = conn.execute("SELECT name FROM companies WHERE id=?", (inv["company_id"],)).fetchone()
+        co_name = (co["name"] if co else "") or "HAULTRA"
+    state = "ok"
+    if not inv or inv["revoked_at"] or (inv["expires_at"] or "") <= now_ts():
+        state = "invalid"
+    elif inv["accepted_at"] or (user and user["is_active"]):
+        state = "accepted"
+    elif not user:
+        state = "invalid"
+
+    def _page(err="", username_pref=""):
+        err_html = f'<p style="color:#f87171;font-weight:700;">{e(err)}</p>' if err else ""
+        if state == "invalid":
+            inner = ('<p class="muted">This invite link is no longer valid — it may have expired, '
+                     'been revoked, or already been used. Ask your boss to send a fresh invite.</p>')
+        elif state == "accepted":
+            inner = (f'<p class="muted">This account is already set up. '
+                     f'<a href="{url_for("login")}">Log in</a> with your username and password.</p>')
+        else:
+            inner = f"""
+            <form method="POST">
+                <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+                <label>Username</label>
+                <input name="username" value="{e(username_pref or user['username'])}" required
+                       style="width:100%;min-height:48px;">
+                <p class="muted small">This is how you'll log in. Change it if you like.</p>
+                <label>Password</label>
+                <input type="password" name="password" required style="width:100%;min-height:48px;">
+                <label>Confirm password</label>
+                <input type="password" name="password_confirm" required style="width:100%;min-height:48px;">
+                <div style="margin-top:14px;">
+                    <button class="btn" type="submit" style="min-height:48px;">Create my account →</button>
+                </div>
+            </form>"""
+        return render_template_string(shell_page("You're invited", f"""
+        <div class="hero">
+            <h1>You're invited to {e(co_name)}</h1>
+            <p>Set up your driver account for HAULTRA — pick a username and password, then log in to the app.</p>
+        </div>
+        <div class="card" style="max-width:520px;">
+            {err_html}
+            {inner}
+        </div>
+        """))
+
+    if request.method != "POST" or state != "ok":
+        conn.close()
+        return _page()
+    username = (request.form.get("username", "") or "").strip()
+    password = request.form.get("password", "") or ""
+    confirm = request.form.get("password_confirm", "") or ""
+    err = ""
+    if not username:
+        err = "Pick a username."
+    elif conn.execute("SELECT id FROM users WHERE username=? COLLATE NOCASE AND id!=?",
+                      (username, user["id"])).fetchone():
+        err = "Username already exists — try another."
+    elif password != confirm:
+        err = "Passwords do not match — please re-enter them."
+    else:
+        err = password_policy_error(password) or ""
+    if not err:
+        co = conn.execute("SELECT max_drivers FROM companies WHERE id=?", (inv["company_id"],)).fetchone()
+        active_n = conn.execute("SELECT COUNT(*) n FROM users WHERE role='driver' AND company_id=? AND is_active=1",
+                                (inv["company_id"],)).fetchone()["n"]
+        if co and active_n >= co["max_drivers"]:
+            err = "Driver seats are full — ask your boss to upgrade the plan, then use the link again."
+    if err:
+        conn.close()
+        return _page(err=err, username_pref=username)
+    conn.execute("UPDATE users SET username=?, password_hash=?, is_active=1 WHERE id=?",
+                 (username, generate_password_hash(password), user["id"]))
+    conn.execute("UPDATE driver_invites SET accepted_at=? WHERE id=?", (now_ts(), inv["id"]))
+    conn.commit()
+    conn.close()
+    flash("Account ready — log in with your new username.", "success")
+    return redirect(url_for("login"))
+
+
 @app.route("/team")
 @boss_required
 def team_page():
@@ -13739,6 +13961,14 @@ def team_page():
         GROUP BY u.id
         ORDER BY u.role, u.username
     """, (cid(), cid())).fetchall()
+    _ensure_driver_invite_tables(conn)
+    try:
+        _live_inv = {r["user_id"]: dict(r) for r in conn.execute(
+            "SELECT * FROM driver_invites WHERE company_id=? AND accepted_at IS NULL"
+            " AND revoked_at IS NULL AND expires_at > ?",
+            (cid(), now_ts())).fetchall()}
+    except Exception:
+        _live_inv = {}
     conn.close()
 
     current_uid = session["user_id"]
@@ -13750,9 +13980,27 @@ def team_page():
         is_driver    = u["role"] == "driver"
         is_last_boss = u["role"] == "boss" and boss_count <= 1
         is_deleted   = not bool(u["is_active"])
+        _pend        = _live_inv.get(u["id"])
+        is_pending   = bool(_pend) and is_deleted
 
         _del_td_style = 'style="text-align:right;white-space:nowrap;width:170px;"'
-        if is_deleted:
+        if is_pending:
+            _resend_action = url_for("resend_invite", invite_id=_pend["id"])
+            _revoke_action = url_for("revoke_invite", invite_id=_pend["id"])
+            delete_cell = (
+                f'<form method="POST" action="{_resend_action}" style="margin:0;display:inline;">'
+                f'<button type="submit" '
+                f'style="background:transparent;color:#FF9D5C;border:1px solid rgba(255,157,92,0.4);'
+                f'border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;line-height:1.4;">'
+                f'Resend</button></form> '
+                f'<form method="POST" action="{_revoke_action}" style="margin:0;display:inline;" '
+                f'onSubmit="return confirm(\'Revoke this invite? The driver will not be able to use the link.\');">'
+                f'<button type="submit" '
+                f'style="background:transparent;color:#f87171;border:1px solid rgba(248,113,113,0.4);'
+                f'border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;line-height:1.4;">'
+                f'Revoke</button></form>'
+            )
+        elif is_deleted:
             delete_cell = '<span class="muted small">Inactive tombstone</span>'
         elif is_self:
             delete_cell = f'<span class="muted small">You</span>'
@@ -13778,6 +14026,8 @@ def team_page():
         )
 
         role_badge = (
+            '<span class="badge" style="background:#fbbf2433;color:#fbbf24;">Invite pending</span>'
+            if is_pending else
             '<span class="badge">Inactive</span>'
             if is_deleted else
             '<span class="badge completed">Boss</span>'
@@ -13847,12 +14097,64 @@ def team_page():
         </tr>
         """
 
+    _invite_banner = ""
+    _show_raw = (request.args.get("show_invite", "") or "").strip()
+    if _show_raw.isdigit():
+        _sc = get_db()
+        _ensure_driver_invite_tables(_sc)
+        _srow = _sc.execute(
+            "SELECT di.*, u.full_name FROM driver_invites di JOIN users u ON u.id=di.user_id"
+            " WHERE di.id=? AND di.company_id=? AND di.accepted_at IS NULL"
+            " AND di.revoked_at IS NULL AND di.expires_at > ?",
+            (int(_show_raw), cid(), now_ts())).fetchone()
+        _co_name = ""
+        if _srow:
+            _crow = _sc.execute("SELECT name FROM companies WHERE id=?", (cid(),)).fetchone()
+            _co_name = (_crow["name"] if _crow else "") or "HAULTRA"
+        _sc.close()
+        if _srow:
+            _link = request.host_url.rstrip("/") + "/invite/" + _srow["token"]
+            _first = (_srow["full_name"] or "there").split()[0]
+            _sms_body = (f"Hi {_first}, {_co_name} invited you to HAULTRA — "
+                         f"tap here to set up your driver account: {_link}")
+            _sms_href = "sms:" + (_srow["phone"] or "") + "?&body=" + urllib.parse.quote(_sms_body)
+            _invite_banner = f"""
+    <div class="card" style="border-color:rgba(61,220,132,.4);">
+        <h2 style="margin:0 0 4px;">✅ Invite ready for {e(_srow["full_name"])}</h2>
+        <p class="muted small" style="margin-bottom:10px;">Send this link — it expires in 7 days and
+        works once. The driver picks their username and password.</p>
+        <input value="{e(_link)}" readonly onclick="this.select();"
+               style="width:100%;min-height:44px;padding:8px 12px;background:var(--bg-0);
+                      border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);margin-bottom:10px;">
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+            <a class="btn" href="{_sms_href}">📩 Send text</a>
+            <span class="muted small">Opens your Messages app with the invite ready to send.</span>
+        </div>
+    </div>
+    """
+
     body = f"""
     <div class="hero">
         <h1>Team</h1>
         <p>Everyone who can work inside this HAULTRA system &mdash; bosses and drivers, one roster.</p>
     </div>
 
+    {_onboarding_back_banner()}
+    {_invite_banner}
+    <div class="card">
+        <h2 style="margin:0 0 4px;">📩 Invite a driver</h2>
+        <p class="muted small" style="margin-bottom:12px;">Name + phone is all you need — they get a text
+        link to set up their own username and password. No email, no password for you to invent.</p>
+        <form method="POST" action="{url_for('invite_driver')}" style="display:flex;gap:8px;flex-wrap:wrap;">
+            <input name="full_name" placeholder="Driver's full name" required
+                   style="flex:2;min-width:160px;min-height:48px;padding:8px 12px;background:var(--bg-0);
+                          border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);">
+            <input name="phone" type="tel" placeholder="Phone (10 digits)" required
+                   style="flex:1;min-width:140px;min-height:48px;padding:8px 12px;background:var(--bg-0);
+                          border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);">
+            <button class="btn" type="submit" style="min-height:48px;">Create invite →</button>
+        </form>
+    </div>
     <div class="card">
         <div class="row between">
             <h2 style="margin:0;">All Team Members</h2>
@@ -31826,142 +32128,169 @@ def settings_page():
     conn = get_db()
     company = conn.execute("SELECT * FROM companies WHERE id=?", (cid(),)).fetchone()
 
+    # ── Settings save helpers: one section each, no commits inside.
+    # Single-section posts call one helper (same flashes as before); the
+    # merged "Save settings" form calls all five, then commits once, so
+    # the page either saves completely or not at all.
+    def _sv_dollars(raw):
+        raw = (raw or "").strip().replace("$", "").replace(",", "")
+        if not raw:
+            return None
+        try:
+            v = int(round(float(raw) * 100))
+        except (TypeError, ValueError):
+            return "invalid"
+        return v if 0 <= v <= 10000000 else "invalid"
+
+    def _sv_tons(raw):
+        raw = (raw or "").strip()
+        if not raw:
+            return None
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            return "invalid"
+        return v if 0 <= v <= 999 else "invalid"
+
+    def _sv_profile(form):
+        new_name = (form.get("company_name", "") or "").strip()
+        new_email = (form.get("email", "") or "").strip()
+        if new_name:
+            conn.execute("UPDATE companies SET name=? WHERE id=?", (new_name, cid()))
+        conn.execute("UPDATE users SET email=? WHERE id=?", (new_email or None, session["user_id"]))
+
+    def _sv_yard(form):
+        conn.execute(
+            """UPDATE companies SET
+                   yard_address=?, yard_city=?, yard_state=?, yard_zip=?
+               WHERE id=?""",
+            (
+                (form.get("yard_address", "") or "").strip(),
+                (form.get("yard_city", "") or "").strip(),
+                (form.get("yard_state", "") or "").strip(),
+                (form.get("yard_zip", "") or "").strip(),
+                cid(),
+            ))
+
+    def _sv_work_hours(form):
+        conn.execute(
+            """UPDATE companies SET
+                   timezone=?, workweek_start_day=?, workweek_reset_day=?,
+                   pay_period_type=?, pay_period_end_day=?, payday=?,
+                   driver_day_start_rule=?, driver_day_end_rule=?
+               WHERE id=?""",
+            (
+                (form.get("timezone", "America/New_York") or "").strip(),
+                (form.get("workweek_start_day", "monday") or "").strip(),
+                (form.get("workweek_reset_day", "friday") or "").strip(),
+                (form.get("pay_period_type", "weekly") or "").strip(),
+                (form.get("pay_period_end_day", "thursday") or "").strip(),
+                (form.get("payday", "friday") or "").strip(),
+                (form.get("driver_day_start_rule", "first_action") or "").strip(),
+                (form.get("driver_day_end_rule", "last_action") or "").strip(),
+                cid(),
+            ))
+
+    def _sv_photo_proof(form):
+        mode = (form.get("photo_proof_mode", "encouraged") or "").strip()
+        if mode not in ("off", "encouraged", "required"):
+            mode = "encouraged"
+        conn.execute("UPDATE companies SET photo_proof_mode=? WHERE id=?", (mode, cid()))
+
+    def _sv_rate_card(form):
+        """Returns an error string on bad amounts, else None. Writes rows
+        (and clears blanked rates) but never commits — the caller does."""
+        _rc_errors = []
+        _rc_rows = []
+        for svc in ("delivery", "pull", "swap"):
+            for tier in ("standard", "40yd"):
+                cents = _sv_dollars(form.get(f"rate_{svc}_{tier}"))
+                if cents == "invalid":
+                    _rc_errors.append(svc)
+                elif cents is not None:
+                    _rc_rows.append((cid(), svc, tier, cents, None))
+        _ed_cents = _sv_dollars(form.get("rate_extra_day"))
+        if _ed_cents == "invalid":
+            _rc_errors.append("extra_day")
+        elif _ed_cents is not None:
+            _rc_rows.append((cid(), "extra_day", "*", _ed_cents, None))
+        for tier, field in (("standard", "tons_allow_standard"), ("40yd", "tons_allow_40yd")):
+            t = _sv_tons(form.get(field))
+            if t == "invalid":
+                _rc_errors.append(field)
+            elif t is not None:
+                _rc_rows.append((cid(), "tonnage_allow", tier, 0, t))
+        _ov_cents = _sv_dollars(form.get("rate_tonnage_overage"))
+        if _ov_cents == "invalid":
+            _rc_errors.append("tonnage_overage")
+        elif _ov_cents is not None:
+            _rc_rows.append((cid(), "tonnage_overage", "*", _ov_cents, None))
+        for kind, _label, _default in _FEE_KINDS:
+            if kind == "custom":
+                continue
+            fc = _sv_dollars(form.get(f"fee_{kind}"))
+            if fc == "invalid":
+                _rc_errors.append(f"fee_{kind}")
+            elif fc is not None:
+                _rc_rows.append((cid(), f"fee_{kind}", "*", fc, None))
+        _sm_cents = _sv_dollars(form.get("surcharge_markup"))
+        if _sm_cents == "invalid":
+            _rc_errors.append("surcharge_markup")
+        elif _sm_cents is not None:
+            _rc_rows.append((cid(), "surcharge_markup", "*", _sm_cents, None))
+        if _rc_errors:
+            return "rate"
+        for _r in _rc_rows:
+            conn.execute(
+                "INSERT INTO rate_cards (company_id, service, tier, cents, qty)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(company_id, service, tier) DO UPDATE SET cents=excluded.cents, qty=excluded.qty",
+                _r)
+        _want = {(svc, tier) for svc in ("delivery", "pull", "swap")
+                 for tier in ("standard", "40yd")} | {("extra_day", "*")} | \
+                {("tonnage_allow", "standard"), ("tonnage_allow", "40yd"), ("tonnage_overage", "*")} | \
+                {(f"fee_{k}", "*") for k, _, _ in _FEE_KINDS if k != "custom"} | \
+                {("surcharge_markup", "*")}
+        _have = {(r[1], r[2]) for r in _rc_rows}
+        for svc, tier in _want - _have:
+            conn.execute(
+                "DELETE FROM rate_cards WHERE company_id=? AND service=? AND tier=?",
+                (cid(), svc, tier))
+        return None
+
     if request.method == "POST":
         action = request.form.get("_action", "profile")
-
-        if action == "yard":
-            conn.execute(
-                """UPDATE companies SET
-                       yard_address=?, yard_city=?, yard_state=?, yard_zip=?
-                   WHERE id=?""",
-                (
-                    request.form.get("yard_address", "").strip(),
-                    request.form.get("yard_city",    "").strip(),
-                    request.form.get("yard_state",   "").strip(),
-                    request.form.get("yard_zip",     "").strip(),
-                    cid(),
-                )
-            )
+        if action == "all":
+            _err = None
+            for _fn in (_sv_profile, _sv_yard, _sv_work_hours, _sv_photo_proof, _sv_rate_card):
+                _err = _fn(request.form)
+                if _err:
+                    break
+            if _err:
+                flash("Settings not saved — check the dollar amounts in the rate card.", "error")
+            else:
+                conn.commit()
+                flash("Settings saved.", "success")
+        elif action == "yard":
+            _sv_yard(request.form)
             conn.commit()
             flash("Yard / base location saved.", "success")
         elif action == "work_hours":
-            conn.execute(
-                """UPDATE companies SET
-                       timezone=?, workweek_start_day=?, workweek_reset_day=?,
-                       pay_period_type=?, pay_period_end_day=?, payday=?,
-                       driver_day_start_rule=?, driver_day_end_rule=?
-                   WHERE id=?""",
-                (
-                    request.form.get("timezone",              "America/New_York").strip(),
-                    request.form.get("workweek_start_day",    "monday").strip(),
-                    request.form.get("workweek_reset_day",    "friday").strip(),
-                    request.form.get("pay_period_type",       "weekly").strip(),
-                    request.form.get("pay_period_end_day",    "thursday").strip(),
-                    request.form.get("payday",                "friday").strip(),
-                    request.form.get("driver_day_start_rule", "first_action").strip(),
-                    request.form.get("driver_day_end_rule",   "last_action").strip(),
-                    cid(),
-                )
-            )
+            _sv_work_hours(request.form)
             conn.commit()
             flash("Work hours & pay cycle settings saved.", "success")
         elif action == "photo_proof":
-            mode = request.form.get("photo_proof_mode", "encouraged").strip()
-            if mode not in ("off", "encouraged", "required"):
-                mode = "encouraged"
-            conn.execute("UPDATE companies SET photo_proof_mode=? WHERE id=?", (mode, cid()))
+            _sv_photo_proof(request.form)
             conn.commit()
             flash("Photo proof setting saved.", "success")
         elif action == "rate_card":
-            # 2026-10-16: company rate card — dollars in, integer cents stored.
-            # Tiers: standard (10/20/30yd share one price), 40yd.
-            def _dollars_to_cents(raw):
-                raw = (raw or "").strip().replace("$", "").replace(",", "")
-                if not raw:
-                    return None
-                try:
-                    v = int(round(float(raw) * 100))
-                except (TypeError, ValueError):
-                    return "invalid"
-                return v if 0 <= v <= 10000000 else "invalid"
-            _rc_errors = []
-            _rc_rows = []
-            for svc in ("delivery", "pull", "swap"):
-                for tier in ("standard", "40yd"):
-                    cents = _dollars_to_cents(request.form.get(f"rate_{svc}_{tier}"))
-                    if cents == "invalid":
-                        _rc_errors.append(svc)
-                    elif cents is not None:
-                        _rc_rows.append((cid(), svc, tier, cents, None))
-            _ed_cents = _dollars_to_cents(request.form.get("rate_extra_day"))
-            if _ed_cents == "invalid":
-                _rc_errors.append("extra_day")
-            elif _ed_cents is not None:
-                _rc_rows.append((cid(), "extra_day", "*", _ed_cents, None))
-            # 2026-10-16: tonnage — included tons per tier + $/ton overage.
-            def _tons(raw):
-                raw = (raw or "").strip()
-                if not raw:
-                    return None
-                try:
-                    v = float(raw)
-                except (TypeError, ValueError):
-                    return "invalid"
-                return v if 0 <= v <= 999 else "invalid"
-            for tier, field in (("standard", "tons_allow_standard"), ("40yd", "tons_allow_40yd")):
-                t = _tons(request.form.get(field))
-                if t == "invalid":
-                    _rc_errors.append(field)
-                elif t is not None:
-                    _rc_rows.append((cid(), "tonnage_allow", tier, 0, t))
-            _ov_cents = _dollars_to_cents(request.form.get("rate_tonnage_overage"))
-            if _ov_cents == "invalid":
-                _rc_errors.append("tonnage_overage")
-            elif _ov_cents is not None:
-                _rc_rows.append((cid(), "tonnage_overage", "*", _ov_cents, None))
-            # 2026-10-16: field fee presets (driver one-tap fees).
-            for kind, _label, _default in _FEE_KINDS:
-                if kind == "custom":
-                    continue
-                fc = _dollars_to_cents(request.form.get(f"fee_{kind}"))
-                if fc == "invalid":
-                    _rc_errors.append(f"fee_{kind}")
-                elif fc is not None:
-                    _rc_rows.append((cid(), f"fee_{kind}", "*", fc, None))
-            # 2026-10-23: landfill surcharge handling markup ($ per surcharge).
-            _sm_cents = _dollars_to_cents(request.form.get("surcharge_markup"))
-            if _sm_cents == "invalid":
-                _rc_errors.append("surcharge_markup")
-            elif _sm_cents is not None:
-                _rc_rows.append((cid(), "surcharge_markup", "*", _sm_cents, None))
-            if _rc_errors:
+            if _sv_rate_card(request.form):
                 flash("Rate card not saved — check the dollar amounts.", "error")
             else:
-                for _r in _rc_rows:
-                    conn.execute(
-                        "INSERT INTO rate_cards (company_id, service, tier, cents, qty)"
-                        " VALUES (?, ?, ?, ?, ?)"
-                        " ON CONFLICT(company_id, service, tier) DO UPDATE SET cents=excluded.cents, qty=excluded.qty",
-                        _r)
-                # Blank fields clear the rate (delete the row).
-                _want = {(svc, tier) for svc in ("delivery", "pull", "swap")
-                         for tier in ("standard", "40yd")} | {("extra_day", "*")} | \
-                        {("tonnage_allow", "standard"), ("tonnage_allow", "40yd"), ("tonnage_overage", "*")} | \
-                        {(f"fee_{k}", "*") for k, _, _ in _FEE_KINDS if k != "custom"} | \
-                        {("surcharge_markup", "*")}
-                _have = {(r[1], r[2]) for r in _rc_rows}
-                for svc, tier in _want - _have:
-                    conn.execute(
-                        "DELETE FROM rate_cards WHERE company_id=? AND service=? AND tier=?",
-                        (cid(), svc, tier))
                 conn.commit()
                 flash("Rate card saved.", "success")
         else:
-            new_name = request.form.get("company_name", "").strip()
-            new_email = request.form.get("email", "").strip()
-            if new_name:
-                conn.execute("UPDATE companies SET name=? WHERE id=?", (new_name, cid()))
-            conn.execute("UPDATE users SET email=? WHERE id=?", (new_email or None, session["user_id"]))
+            _sv_profile(request.form)
             conn.commit()
             flash("Profile updated.", "success")
 
@@ -32049,18 +32378,16 @@ def settings_page():
     )
 
     settings_body = f"""
+    <form method="POST" id="settings-form">
+    <input type="hidden" name="_action" value="all">
     <div class="card" id="profile">
         <h2>Profile</h2>
-        <form method="POST">
-            <input type="hidden" name="_action" value="profile">
+
             <label>Company Name</label>
             <input name="company_name" value="{e(co_name)}" required>
             <label>Your Email</label>
             <input type="email" name="email" value="{e(my_email)}" placeholder="for password reset / recovery">
-            <div style="margin-top:10px;">
-                <button type="submit" class="btn">Save</button>
-            </div>
-        </form>
+
         <p class="muted small" style="margin-top:10px;">Slug: <code>{e(co_slug)}</code></p>
     </div>
 
@@ -32072,8 +32399,7 @@ def settings_page():
             pinned to the end of the optimized route.
         </p>
         <p style="margin-bottom:14px;">{_yard_status}</p>
-        <form method="POST">
-            <input type="hidden" name="_action" value="yard">
+
             <div class="grid" style="grid-template-columns:1fr 1fr;gap:12px 16px;">
                 <div style="grid-column:1/-1;">
                     <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Yard / Base Address</label>
@@ -32092,10 +32418,7 @@ def settings_page():
                     <input name="yard_zip" value="{e(yard_zip)}" placeholder="23434" style="max-width:140px;">
                 </div>
             </div>
-            <div style="margin-top:14px;">
-                <button type="submit" class="btn gold">Save Yard Location</button>
-            </div>
-        </form>
+
     </div>
 
     <div class="card" id="work-hours">
@@ -32104,8 +32427,7 @@ def settings_page():
             Configure your company&rsquo;s pay schedule and how driver day hours are measured.
             These settings apply to all drivers in your company.
         </p>
-        <form method="POST">
-            <input type="hidden" name="_action" value="work_hours">
+
             <div class="grid" style="grid-template-columns:1fr 1fr;gap:12px 16px;">
 
                 <div style="grid-column:1/-1;">
@@ -32171,10 +32493,7 @@ def settings_page():
                 </div>
 
             </div>
-            <div style="margin-top:16px;">
-                <button type="submit" class="btn gold">Save Work Hours Settings</button>
-            </div>
-        </form>
+
     </div>
 
     <div class="card" id="photo-proof">
@@ -32182,8 +32501,7 @@ def settings_page():
         <p style="color:#B8B8AE;font-size:13px;margin-bottom:16px;">
             Controls whether drivers must attach a photo before completing a stop in Cab View.
         </p>
-        <form method="POST">
-            <input type="hidden" name="_action" value="photo_proof">
+
             <div style="display:flex;flex-direction:column;gap:10px;">
                 <label style="display:flex;align-items:flex-start;gap:10px;min-height:48px;cursor:pointer;">
                     <input type="radio" name="photo_proof_mode" value="off" {"checked" if photo_mode == "off" else ""} style="margin-top:4px;width:18px;height:18px;">
@@ -32198,10 +32516,7 @@ def settings_page():
                     <span><strong>Required</strong><br><span class="muted small">Complete Stop stays locked until at least one photo is attached — for companies that bill with photo evidence.</span></span>
                 </label>
             </div>
-            <div style="margin-top:16px;">
-                <button type="submit" class="btn gold">Save Photo Proof Setting</button>
-            </div>
-        </form>
+
     </div>
 
     <div class="card" id="rate-card">
@@ -32223,8 +32538,7 @@ def settings_page():
             </div>
             <div id="rc-rate-results"></div>
         </div>
-        <form method="POST">
-            <input type="hidden" name="_action" value="rate_card">
+
             <div style="overflow-x:auto;">
             <table style="width:100%;border-collapse:collapse;min-width:320px;">
                 <thead><tr>
@@ -32294,10 +32608,27 @@ def settings_page():
                 </div>
             </div>
             <div style="margin-top:16px;">
-                <button type="submit" class="btn gold">Save Rate Card</button>
-            </div>
-        </form>
+                <div style="margin-top:20px;padding:14px;background:rgba(255,107,26,.08);border:1px solid rgba(255,107,26,.35);border-radius:12px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+                    <button type="submit" class="btn gold" style="min-height:48px;flex:1;">Save settings</button>
+                    <span class="muted small" id="settings-dirty" hidden>Unsaved changes</span>
+                </div>
     </div>
+    </form>
+    <script>
+    (function() {{
+        var f = document.getElementById('settings-form');
+        if (!f) return;
+        var tag = document.getElementById('settings-dirty');
+        var dirty = false;
+        function mark() {{ dirty = true; if (tag) tag.hidden = false; }}
+        f.addEventListener('input', mark);
+        f.addEventListener('change', mark);
+        f.addEventListener('submit', function() {{ dirty = false; }});
+        window.addEventListener('beforeunload', function(e) {{
+            if (dirty) {{ e.preventDefault(); e.returnValue = ''; }}
+        }});
+    }})();
+    </script>
     """
 
     # ── Subscription (GET render, folded in as its own section) ─────────────
@@ -32544,7 +32875,7 @@ def settings_page():
     # card as the Alerts page. Plain string section; the card unhides itself
     # when push is configured and this is the native app or a capable browser.
     _phone_section = (
-        '<div style="margin-top:20px;">'
+        '<div id="notifications" style="margin-top:20px;">'
         '<h2>\U0001F514 Notifications and Alerts</h2>'
         + _push_settings_toggle()
         + '</div>'
@@ -32614,7 +32945,7 @@ def settings_page():
                     return;
                 }}
                 var n = d.rates.length + d.fees.length;
-                rateStatus.textContent = 'Found ' + n + ' prices. Review, edit, then Save Rate Card below to apply.';
+                rateStatus.textContent = 'Found ' + n + ' prices. Review, edit, then Save settings below to apply.';
                 var h = '';
                 d.rates.forEach(function(r){{
                     h += '<div style="border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:10px;margin:6px 0;display:flex;justify-content:space-between;align-items:center;">'
@@ -35147,49 +35478,54 @@ def _onboarding_steps(conn, company_id, user_id):
         _base_done = False
     # Push: boss has a registered device?
     _push_done = _count("SELECT COUNT(*) FROM push_tokens WHERE company_id=?", company_id) > 0
+    # Payroll: work-hours fields are NULL until the boss saves them once
+    # (registration never sets them), so any non-empty field means saved.
+    try:
+        _wh = conn.execute("SELECT timezone, workweek_start_day, pay_period_type, payday"
+                           " FROM companies WHERE id=?", (company_id,)).fetchone()
+        _payroll_done = bool(_wh and any((_wh[k] or "").strip() for k in
+                             ("timezone", "workweek_start_day", "pay_period_type", "payday")))
+    except Exception:
+        _payroll_done = False
+    # Yard: dumps AND fleet — one step for the whole yard, not two.
+    _yard_done = (_count("SELECT COUNT(*) FROM dump_locations WHERE company_id=?", company_id) > 0
+                  and _count("SELECT COUNT(*) FROM containers WHERE company_id=?", company_id) > 0)
     steps = [
         {"key": "base", "title": "Company base",
-         "desc": "Yard address — unlocks route optimize and navigate-to-yard.",
-         "done": _base_done, "url": url_for("settings_page") + "#company",
-         "essential": True},
-        {"key": "customers", "title": "Import customers",
-         "desc": "Photo, spreadsheet, or paste dispatch texts — the parser learns them.",
-         "done": _count("SELECT COUNT(*) FROM saved_addresses WHERE company_id=? AND kind='customer'", company_id) > 0,
-         "url": url_for("onboarding_import_customers"),
-         "essential": True},
-        {"key": "dumps", "title": "Dump locations",
-         "desc": "Confirm sites, add addresses, set the ticket toggle per site.",
-         "done": _count("SELECT COUNT(*) FROM dump_locations WHERE company_id=?", company_id) > 0,
-         "url": url_for("yard_setup_page") + "#dump-locations",
+         "desc": "Company name + yard address — unlocks route optimize and navigate-to-yard.",
+         "done": _base_done, "url": url_for("settings_page") + "#yard",
          "essential": True},
         {"key": "drivers", "title": "Add drivers",
          "desc": "Name + phone — they get a text invite to download the app.",
          "done": _count("SELECT COUNT(*) FROM users WHERE company_id=? AND role='driver'", company_id) > 0,
          "url": url_for("team_page"),
          "essential": True},
-        {"key": "push", "title": "Turn on notifications",
-         "desc": "Dispatch alerts and route pushes to your phone.",
-         "done": _push_done, "url": url_for("settings_page") + "#notifications",
-         "essential": False},
+        {"key": "customers", "title": "Import customers",
+         "desc": "Photo, spreadsheet, or paste dispatch texts — the parser learns them.",
+         "done": _count("SELECT COUNT(*) FROM saved_addresses WHERE company_id=? AND kind='customer'", company_id) > 0,
+         "url": url_for("onboarding_import_customers"),
+         "essential": True},
+        {"key": "yard", "title": "Yard setup",
+         "desc": "Dump locations + container fleet — where cans live and where they get dumped.",
+         "done": _yard_done, "url": url_for("yard_setup_page"),
+         "essential": True},
         {"key": "ratecard", "title": "Rate card",
          "desc": "Per-size pricing, fees, and surcharge markup for invoices.",
          "done": _count("SELECT COUNT(*) FROM rate_cards WHERE company_id=?", company_id) > 0,
          "url": url_for("settings_page") + "#rate-card",
+         "essential": True},
+        {"key": "push", "title": "Turn on notifications",
+         "desc": "Dispatch alerts and route pushes to your phone.",
+         "done": _push_done, "url": url_for("settings_page") + "#notifications",
          "essential": False},
-        {"key": "fleet", "title": "Container fleet",
-         "desc": "Range-add, scan, or upload — 200 cans in minutes, not hours.",
-         "done": _count("SELECT COUNT(*) FROM containers WHERE company_id=?", company_id) > 0,
-         "url": url_for("onboarding_import_containers"),
+        {"key": "payroll", "title": "Work hours & pay cycle",
+         "desc": "Clock-in rules and pay periods for the team.",
+         "done": _payroll_done, "url": url_for("settings_page") + "#work-hours",
          "essential": False},
         {"key": "garbage", "title": "Garbage routes",
          "desc": "Scan each day's paper route — five photos and your week is set.",
          "done": _count("SELECT COUNT(*) FROM garbage_templates WHERE company_id=?", company_id) > 0,
          "url": url_for("onboarding_import_garbage"),
-         "essential": False},
-        {"key": "payroll", "title": "Work hours & pay cycle",
-         "desc": "Clock-in rules and pay periods for the team.",
-         "done": False,  # TODO: wire to company settings when payroll ships
-         "url": url_for("settings_page") + "#payroll",
          "essential": False},
     ]
     return steps
@@ -36067,6 +36403,7 @@ def yard_setup_page():
         <h1 class="ai-title" style="font-size:2rem;">Yard Setup</h1>
         <p class="ai-sub" style="margin:0;">Dump locations and your container fleet, in one place — taught to the AI as you go.</p>
     </div>
+    {_onboarding_back_banner()}
     <style>
     .ys-tabs{{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px;}}
     .ys-tab{{padding:10px 18px;border-radius:999px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.04);color:#A6A69E;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;}}
