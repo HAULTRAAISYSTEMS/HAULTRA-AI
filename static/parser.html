@@ -505,6 +505,11 @@
     color: var(--orange); text-transform: uppercase;
     background: var(--orange-dim); border-radius: 4px; padding: 2px 6px;
   }
+  .lesson-tag {
+    font-size: 0.68rem; font-weight: 800; letter-spacing: 0.6px;
+    color: #3DDC84; text-transform: uppercase;
+    background: rgba(61, 220, 132, 0.15); border-radius: 4px; padding: 2px 6px;
+  }
 
   .stop-card-body { display: flex; gap: 12px; align-items: flex-start; }
 
@@ -1307,7 +1312,7 @@
         if (!res.ok || !res.data || !Array.isArray(res.data.stops)) {
           throw new Error((res.data && res.data.error) || 'Parser returned an unexpected response — try again.');
         }
-        mergeAiBatch(res.data.stops);
+        mergeAiBatch(res.data.stops, res.data.parse_id);
         if (res.data.partial_failure) {
           showError(res.data.warning || 'AI parsing is unavailable right now — the stops already in the tray are kept. Try re-parsing the dispatch text again.');
         }
@@ -1329,10 +1334,12 @@
   // reusing its seq window so every surrounding stop stays put. Emptying the box
   // seals the batch (currentRawBatchId=null), so a genuinely new dispatch pasted
   // next becomes its own batch rather than overwriting the previous one.
-  function mergeAiBatch(stops) {
+  function mergeAiBatch(stops, parseId) {
     var incoming = (stops || []).map(function (raw) {
       var s = normalizeStop(raw);
       s.source = 'ai';
+      s.parse_id = parseId || null;
+      if (raw && raw.lesson_applied) s.lesson_applied = raw.lesson_applied;
       return s;
     });
     if (currentRawBatchId === null) {
@@ -1510,6 +1517,12 @@
       reviewTag.className = 'review-tag';
       reviewTag.textContent = 'NEEDS REVIEW';
       top.appendChild(reviewTag);
+    }
+    if (stop.lesson_applied && stop.lesson_applied.length) {
+      var lessonTag = document.createElement('span');
+      lessonTag.className = 'lesson-tag';
+      lessonTag.textContent = '✏️ ADJUSTED FROM YOUR CORRECTIONS';
+      top.appendChild(lessonTag);
     }
     // Remove this stop from the draft before dispatch (✕ or long-press the card).
     var rm = document.createElement('button');
@@ -1776,6 +1789,16 @@
   }
   window.toggleEditMode = toggleEditMode;
 
+  // Distinct parse sessions behind the tray's parsed stops — the server
+  // diffs these against what the boss actually sends to learn corrections.
+  function collectParseIds() {
+    var ids = [];
+    (currentStops || []).forEach(function (s) {
+      if (s.parse_id && ids.indexOf(s.parse_id) === -1) ids.push(s.parse_id);
+    });
+    return ids;
+  }
+
   function confirmDispatch() {
     var btn = el('confirm-btn');
     if (btn.disabled) return;
@@ -1786,6 +1809,7 @@
       url = '/api/route/' + ROUTE_MODE.route_id + '/insert-stops';
       payload = {
         raw_text: (el('raw-text') ? el('raw-text').value : ''),
+        parse_ids: collectParseIds(),
         stops: TraySeq.sortBySeq(currentStops).map(function (s) {
           return {
             action: s.action,
@@ -1816,6 +1840,7 @@
         route_date: dateEl && dateEl.value ? dateEl.value : '',
         truck_id: truckSelect ? truckSelect.value : '',
         raw_text: (el('raw-text') ? el('raw-text').value : ''),
+        parse_ids: collectParseIds(),
         stops: TraySeq.sortBySeq(currentStops).map(function (s) {
           return {
             action: s.action,
