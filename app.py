@@ -30990,11 +30990,11 @@ _END_DAY_RETURN_RE = re.compile(
 
 
 def _ensure_end_of_day_return(raw_text, stops, company_id):
-    """Deterministic guard for the AI parse path (2026-10-24): the model keeps
-    folding 'then return <place> to end the day' into the previous stop's
-    return_leg (or notes) instead of emitting the final Delivery stop the
-    fallback parser creates — prompt rules alone don't hold against that
-    habit, so enforce it in code. If the text names an end-of-day return
+    """Deterministic guard for the /api/parse boundary (2026-10-24): the AI
+    model keeps folding 'then return <place> to end the day' into the
+    previous stop's return_leg (or notes) instead of emitting the final
+    Delivery stop — and the rule-based fallback folds it into the customer
+    field and never emits one either — so enforce it in code on both paths. If the text names an end-of-day return
     destination and no D stop already serves it, append the D (address-book
     resolved, size from the last sized stop) and clear a matching return_leg
     on the last stop so the return isn't double-counted. Named place only —
@@ -31142,6 +31142,10 @@ def api_parse_dispatch():
         finally:
             _fb.close()
         mapped = [m for m in (_rule_stop_to_llm_shape(s) for s in fb_stops) if m]
+        # 2026-10-24: the rule parser never emits the end-of-day D (it folds
+        # the return into the customer field) — run the same guard as the AI
+        # path so the batch still ends with the Delivery the synth needs.
+        mapped = _ensure_end_of_day_return(text, mapped, cid())
         if mapped:
             return jsonify({
                 "stops": manual_stops + mapped,
