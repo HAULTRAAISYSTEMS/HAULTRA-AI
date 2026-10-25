@@ -22405,6 +22405,20 @@ def learn_location(conn, company_id, address, city="", state="", zip_code="",
                    VALUES (?,?,?,?,1,?)""",
                 (sa_id, act, cs, dl, ts)
             )
+        # 2026-10-25: let the most-used value per field become the default,
+        # so the preselected action/size/dump follows what this place usually
+        # does — not whatever the first text happened to say.
+        for _field, _col in (("action", "default_action"),
+                             ("container_size", "default_container_size"),
+                             ("dump_location", "default_dump_location")):
+            _top = conn.execute(
+                "SELECT " + _field + " AS v, SUM(times_used) AS n FROM saved_address_details"
+                " WHERE saved_address_id=? AND TRIM(COALESCE(" + _field + ",'')) != ''"
+                " GROUP BY " + _field + " ORDER BY n DESC, MAX(last_used_at) DESC LIMIT 1",
+                (sa_id,)).fetchone()
+            if _top and _top["v"]:
+                conn.execute(
+                    "UPDATE saved_addresses SET " + _col + "=? WHERE id=?", (_top["v"], sa_id))
     except Exception as e:
         app.logger.warning("learn_location failed for %r: %s", addr, e)
 
@@ -36048,6 +36062,327 @@ def onboarding_import_containers():
     return render_template_string(shell_page("Container Fleet", body))
 
 
+# ── Smarter "Learn from these texts" (2026-10-25) ─────────────────────
+# The paste flow used to save straight into the address book with no review,
+# froze each place's defaults at whatever the first text said, and never
+# actually learned shorthand (despite the page promising it). Now: the paste
+# is parsed (AI when available, rules otherwise), aggregated into one
+# reviewable row per place, dump nicknames are matched to existing sites,
+# and the boss confirms before anything saves. Defaults follow frequency
+# (see the promotion loop in learn_location).
+
+def _learn_normalize_stop(sd):
+    """One learnable shape for rule + AI stops. Returns None when the stop
+    has no address (nothing learnable — counted as skipped, never saved)."""
+    if not isinstance(sd, dict):
+        return None
+    raw_action = (sd.get("action") or "").strip()
+    action = _PARSER_ACTION_MAP.get(raw_action, raw_action)
+    addr = (sd.get("address") or "").strip()
+    if not addr:
+        return None
+    return {
+        "customer": (sd.get("customer_name") or sd.get("customer") or "").strip(),
+        "address": addr,
+        "city": expand_abbrev(sd.get("city") or ""),
+        "action": action,
+        "size": (sd.get("container_size") or "").strip(),
+        "dump": expand_abbrev(sd.get("dump_location") or sd.get("dump_leg") or ""),
+    }
+
+
+def _learn_match_dump(conn, company_id, name):
+    """Match a dump nickname to an existing dump/yard site.
+    Returns (canonical_name, match) where match is 'exact', 'nick', or None.
+    'nick' = one substring candidate — the preview offers it as shorthand
+    to remember. Several candidates or none -> no match (boss judges)."""
+    nm = (name or "").strip()
+    if not nm:
+        return ("", None)
+    key = _normalize_name(nm)
+    if not key:
+        return (nm, None)
+    try:
+        sites = conn.execute(
+            "SELECT customer_name, label FROM saved_addresses"
+            " WHERE company_id=? AND kind IN ('dump','yard')",
+            (company_id,)).fetchall()
+    except Exception:
+        return (nm, None)
+    for r in sites:
+        cand = (r["label"] or "").strip() or (r["customer_name"] or "").strip()
+        if cand and _normalize_name(cand) == key:
+            return (cand, "exact")
+    if len(key) >= 3:
+        subs = []
+        for r in sites:
+            cand = (r["label"] or "").strip() or (r["customer_name"] or "").strip()
+            ck = _normalize_name(cand)
+            if ck and (key in ck or ck in key) and cand not in subs:
+                subs.append(cand)
+        if len(subs) == 1:
+            return (subs[0], "nick")
+    return (nm, None)
+
+
+def _learn_preview_rows(conn, company_id, stops):
+    """Aggregate parsed stops into one review row per place.
+    Each field shows its most frequent non-empty value across that place's
+    mentions, so the row is the place's usual pattern, not one random text.
+    Returns (rows, skipped, vocab_proposals)."""
+    from collections import Counter
+    groups = {}
+    order = []
+    skipped = 0
+    for sd in stops:
+        n = _learn_normalize_stop(sd)
+        if not n:
+            skipped += 1
+            continue
+        try:
+            cname, _ = _clean_customer_name(n["customer"])
+        except Exception:
+            cname = n["customer"]
+        key = _address_book_key(cname, n["address"])
+        if key not in groups:
+            groups[key] = {"customer": cname, "address": n["address"],
+                           "cities": Counter(), "actions": Counter(),
+                           "sizes": Counter(), "dumps": Counter(), "seen": 0}
+            order.append(key)
+        g = groups[key]
+        g["seen"] += 1
+        for field, counter in (("city", g["cities"]), ("action", g["actions"]),
+                               ("size", g["sizes"]), ("dump", g["dumps"])):
+            if n[field]:
+                counter[n[field]] += 1
+    rows = []
+    vocab = []
+    for key in order:
+        g = groups[key]
+        city = g["cities"].most_common(1)[0][0] if g["cities"] else ""
+        action = g["actions"].most_common(1)[0][0] if g["actions"] else ""
+        size = g["sizes"].most_common(1)[0][0] if g["sizes"] else ""
+        dump_raw = g["dumps"].most_common(1)[0][0] if g["dumps"] else ""
+        dump, match = _learn_match_dump(conn, company_id, dump_raw)
+        rows.append({"customer": g["customer"], "address": g["address"], "city": city,
+                     "action": action, "size": size, "dump": dump, "dump_raw": dump_raw,
+                     "dump_match": match, "seen": g["seen"]})
+        if match == "nick" and all(v["term"] != dump_raw.lower() for v in vocab):
+            vocab.append({"term": dump_raw.lower(), "expansion": dump})
+    return rows, skipped, vocab
+
+
+def _upsert_intent_phrase(conn, company_id, phrase, intent):
+    """Same store as the Teach page's add_parse_intent: dedupes on
+    (company, kind='intent', lower term), bumps times_used on a repeat."""
+    ts = now_ts()
+    existing = conn.execute(
+        "SELECT id FROM parse_vocab WHERE company_id=? AND kind='intent'"
+        " AND LOWER(TRIM(term))=? ORDER BY id LIMIT 1",
+        (company_id, phrase)).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE parse_vocab SET intent=?, expansion=?,"
+            " times_used=COALESCE(times_used,1)+1, last_used_at=? WHERE id=?",
+            (intent, _INTENT_TYPES[intent], ts, existing["id"]))
+        conn.execute(
+            "DELETE FROM parse_vocab WHERE company_id=? AND kind='intent'"
+            " AND LOWER(TRIM(term))=? AND id!=?",
+            (company_id, phrase, existing["id"]))
+    else:
+        conn.execute(
+            "INSERT INTO parse_vocab (company_id, term, expansion, kind, intent,"
+            " times_used, last_used_at, created_at)"
+            " VALUES (?,?,?,'intent',?,1,?,?)",
+            (company_id, phrase, _INTENT_TYPES[intent], intent, ts, ts))
+
+
+def _ai_learn_from_texts(text, company_id):
+    """One AI call over the whole paste: stops + intent-phrase candidates.
+    Returns (stops, intent_candidates) or None when AI is unavailable or
+    unusable — the caller falls back to the rule parser. Never raises."""
+    try:
+        import os as _os
+        api_key = _os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            return None
+        try:
+            import anthropic
+        except ImportError:
+            return None
+        conn = get_db()
+        try:
+            sites = [(r["label"] or r["customer_name"] or "").strip()
+                     for r in conn.execute(
+                         "SELECT customer_name, label FROM saved_addresses"
+                         " WHERE company_id=? AND kind IN ('dump','yard')",
+                         (company_id,)).fetchall()]
+            sites = [s for s in sites if s]
+            shorthand = [(r["term"], r["expansion"])
+                         for r in conn.execute(
+                             "SELECT term, expansion FROM parse_vocab"
+                             " WHERE company_id=? AND kind='shorthand'",
+                             (company_id,)).fetchall()]
+        finally:
+            conn.close()
+        intent_desc = "; ".join("%s: %s" % (k, v) for k, v in _INTENT_TYPES.items())
+        system = (
+            "You read old roll-off dispatch texts and extract what a new company needs to learn from them. "
+            "Return ONLY JSON: {\"stops\": [{\"action\": \"PR|P|D|S|R|LL|YARD\", \"address\": str, \"customer\": str, "
+            "\"container_size\": str, \"dump_leg\": str}], "
+            "\"intent_candidates\": [{\"phrase\": str, \"type\": str}]}. "
+            "Action codes: PR pickup-and-return, P pull, D delivery, S swap, R relocate, LL live load, YARD yard. "
+            "dump_leg is the dump site as written, or the canonical name when you recognize a nickname. "
+            "intent_candidates are recurring dispatcher instruction phrases (never addresses or names) that signal: "
+            + intent_desc + ". "
+            "Only include a phrase if it appears as an instruction in the texts. "
+            "Known dump sites: " + (", ".join(sites) if sites else "none yet") + ". "
+            "Known shorthand: " + (", ".join("%s=%s" % (t, ex) for t, ex in shorthand) if shorthand else "none") + "."
+        )
+        client = anthropic.Anthropic(api_key=api_key, timeout=20.0)
+        resp = client.messages.create(
+            model="claude-sonnet-4-6", max_tokens=4096,
+            system=system, messages=[{"role": "user", "content": text}])
+        raw_reply = "".join(
+            block.text for block in resp.content if getattr(block, "type", None) == "text").strip()
+        parsed = None
+        cleaned = raw_reply
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+            cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+        try:
+            parsed = json.loads(cleaned)
+        except (json.JSONDecodeError, ValueError):
+            parsed = None
+        stops = None
+        cands = []
+        if isinstance(parsed, dict):
+            if isinstance(parsed.get("stops"), list):
+                stops = parsed["stops"]
+            if isinstance(parsed.get("intent_candidates"), list):
+                cands = parsed["intent_candidates"]
+        if stops is None:
+            salvaged = _salvage_parse_response(raw_reply)
+            if salvaged is None:
+                return None
+            stops = salvaged
+        out_cands = []
+        for cand in cands:
+            if not isinstance(cand, dict):
+                continue
+            phrase = (cand.get("phrase") or "").strip().lower()[:80]
+            typ = (cand.get("type") or "").strip()
+            if phrase and typ in _INTENT_TYPES and all(c["phrase"] != phrase for c in out_cands):
+                out_cands.append({"phrase": phrase, "type": typ})
+        return ([s for s in stops if isinstance(s, dict)], out_cands)
+    except Exception as ex:
+        app.logger.warning("ai learn from texts failed: %s", ex)
+        return None
+
+
+def _learn_preview_page(rows, skipped, vocab_props, intent_cands, engine, csrf):
+    """Review-before-save page: one editable card per place, shorthand and
+    intent proposals as opt-out checkboxes, sticky confirm bar."""
+    inp = ("min-height:44px;padding:8px 10px;background:var(--bg-0);"
+           "border:1px solid rgba(255,255,255,.12);border-radius:8px;"
+           "color:var(--text);font-size:.9rem;width:100%;box-sizing:border-box;")
+    grid = "display:grid;grid-template-columns:1fr 1fr;gap:8px;"
+    card = ("border:1px solid rgba(255,255,255,.12);border-radius:12px;"
+            "padding:12px;margin:10px 0;background:rgba(255,255,255,.02);")
+    if engine == "AI":
+        engine_note = "Parsed with AI — it read the whole paste at once."
+    else:
+        engine_note = "Parsed with the built-in rules (AI wasn't available) — give the rows an extra look."
+    skipped_note = ""
+    if skipped:
+        skipped_note = ", %d line(s) had no usable address and were skipped" % skipped
+    parts = []
+    parts.append("""
+    <div class="hero">
+        <h1>🧠 Review what we learned</h1>
+        <p class="muted small">""" + engine_note + " "
+        + str(len(rows)) + " place(s) found" + skipped_note
+        + """. Fix anything, uncheck what you don't want, then save.</p>
+    </div>""")
+    parts.append("""
+    <form method="POST">
+        <input type="hidden" name="_csrf_token" value=\"""" + csrf + """\">
+        <input type="hidden" name="mode" value="dispatch_confirm">""")
+    for i, r in enumerate(rows):
+        if r["customer"]:
+            head = e(r["customer"])
+        else:
+            head = "<span class='muted'>Unnamed stop — add a name</span>"
+        note = ""
+        if r["dump_match"] == "nick":
+            note = ("<p class='muted small' style='margin:6px 0 0;'>🔗 '" + e(r["dump_raw"])
+                    + "' matched to an existing site, " + e(r["dump"]) + ".</p>")
+        parts.append("""
+        <div style=\"""" + card + """\">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;">
+                <strong>""" + head + """</strong>
+                <label class="muted small" style="display:flex;align-items:center;gap:6px;white-space:nowrap;">
+                    <input type="checkbox" name="rows[""" + str(i) + """][keep]" checked> Learn · seen """ + str(r["seen"]) + """×
+                </label>
+            </div>
+            <div style=\"""" + grid + """\">
+                <input name="rows[""" + str(i) + """][customer]" value=\"""" + e(r["customer"]) + """\" placeholder="Customer name" style=\"""" + inp + """\">
+                <input name="rows[""" + str(i) + """][city]" value=\"""" + e(r["city"]) + """\" placeholder="City" style=\"""" + inp + """\">
+                <input name="rows[""" + str(i) + """][address]" value=\"""" + e(r["address"]) + """\" placeholder="Street address" style=\"""" + inp + """;grid-column:1 / -1;">
+                <input name="rows[""" + str(i) + """][action]" value=\"""" + e(r["action"]) + """\" placeholder="Action (Pull, Delivery…)" style=\"""" + inp + """\">
+                <input name="rows[""" + str(i) + """][size]" value=\"""" + e(r["size"]) + """\" placeholder="Size (30yd…)" style=\"""" + inp + """\">
+                <input name="rows[""" + str(i) + """][dump]" value=\"""" + e(r["dump"]) + """\" placeholder="Dump site" style=\"""" + inp + """;grid-column:1 / -1;">
+            </div>
+            """ + note + """
+        </div>""")
+    if vocab_props:
+        vrows = ""
+        for j, v in enumerate(vocab_props):
+            vrows += """
+            <label style="display:flex;gap:8px;align-items:flex-start;margin:8px 0;">
+                <input type="checkbox" name="vocab[""" + str(j) + """][keep]" checked style="margin-top:3px;">
+                <span>Remember <strong>'""" + e(v["term"]) + """'</strong> = <strong>""" + e(v["expansion"]) + """</strong> — future texts expand it automatically.</span>
+                <input type="hidden" name="vocab[""" + str(j) + """][term]" value=\"""" + e(v["term"]) + """\">
+                <input type="hidden" name="vocab[""" + str(j) + """][expansion]" value=\"""" + e(v["expansion"]) + """\">
+            </label>"""
+        parts.append("""
+        <div style=\"""" + card + """\">
+            <h2 style="margin-top:0;">💬 Shorthand to remember</h2>
+            <p class="muted small">These nicknames matched sites you already have. Keep them checked and the parser learns them.</p>
+            """ + vrows + """
+        </div>""")
+    if intent_cands:
+        irows = ""
+        for k, c in enumerate(intent_cands):
+            irows += """
+            <label style="display:flex;gap:8px;align-items:flex-start;margin:8px 0;">
+                <input type="checkbox" name="intent[""" + str(k) + """][keep]" checked style="margin-top:3px;">
+                <span><strong>'""" + e(c["phrase"]) + """'</strong> → """ + _INTENT_TYPES[c["type"]] + """</span>
+                <input type="hidden" name="intent[""" + str(k) + """][phrase]" value=\"""" + e(c["phrase"]) + """\">
+                <input type="hidden" name="intent[""" + str(k) + """][type]" value=\"""" + e(c["type"]) + """\">
+            </label>"""
+        parts.append("""
+        <div style=\"""" + card + """\">
+            <h2 style="margin-top:0;">🎓 Phrases to teach the parser</h2>
+            <p class="muted small">Your texts use these instructions repeatedly. Keep them checked and the parser honors them like its built-in rules.</p>
+            """ + irows + """
+        </div>""")
+    if rows or vocab_props or intent_cands:
+        parts.append("""
+        <div style="position:sticky;bottom:0;padding:12px;background:rgba(20,20,20,.95);border-top:1px solid rgba(255,107,26,.3);display:flex;gap:10px;justify-content:center;margin:16px -16px -16px;border-radius:0 0 12px 12px;">
+            <button class="btn" type="submit" style="min-height:48px;">✅ Save """ + str(len(rows)) + """ place(s)</button>
+            <a class="btn secondary" href=\"""" + url_for("onboarding_import_customers") + """\" style="min-height:48px;display:inline-flex;align-items:center;">← Back</a>
+        </div>""")
+    else:
+        parts.append("""
+        <div style=\"""" + card + """\">
+            <p>Nothing to learn from these texts — no usable addresses came out of them. Try pasting the dispatch lines as your dispatcher wrote them.</p>
+            <a class="btn secondary" href=\"""" + url_for("onboarding_import_customers") + """\" style="min-height:48px;display:inline-flex;align-items:center;">← Back</a>
+        </div>""")
+    parts.append("</form>")
+    return render_template_string(shell_page("Review what we learned", "".join(parts)))
+
+
 @app.route("/onboarding/import-customers", methods=["GET", "POST"])
 @login_required
 def onboarding_import_customers():
@@ -36095,29 +36430,63 @@ def onboarding_import_customers():
                     msg = f"<p class='ob-ok'>✅ Imported {n} customers from CSV</p>"
                 else:
                     msg = "<p class='ob-err'>Choose a CSV file.</p>"
-            elif mode == "dispatch":
+            elif mode in ("dispatch_preview", "dispatch"):
+                # Smarter learn: parse (AI first, rules on fallback), aggregate
+                # into review rows, and show the preview page. Nothing saves
+                # until the boss confirms — the old mode="dispatch" alias keeps
+                # cached copies of this page working.
                 raw = request.form.get("dispatch_text", "").strip()
-                if raw:
-                    # Run the rule-based parser to extract stops, then learn
-                    # each customer/address/dump site into the address book.
-                    # parse_boss_text returns (stops_list, dump_site_str).
+                if not raw:
+                    msg = "<p class='ob-err'>Paste some dispatch text first.</p>"
+                else:
+                    ai_result = None
+                    allowed, _retry = rate_limit_allow("learn_preview_ai", str(cid()), 20, 86400)
+                    if allowed:
+                        ai_result = _ai_learn_from_texts(raw, cid())
+                    if ai_result is not None:
+                        _raw_stops, _intent_cands = ai_result
+                        _engine = "AI"
+                    else:
+                        try:
+                            _parsed = parse_boss_text(raw)
+                            _raw_stops = _parsed[0] if isinstance(_parsed, (list, tuple)) else []
+                        except Exception:
+                            _raw_stops = []
+                        _intent_cands = []
+                        _engine = "rules"
+                    rows, skipped, vocab_props = _learn_preview_rows(conn, cid(), _raw_stops)
                     try:
-                        _parsed = parse_boss_text(raw)
-                        stops = _parsed[0] if isinstance(_parsed, (list, tuple)) else []
+                        _have_intents = {(r[0] or "").strip().lower()
+                            for r in conn.execute(
+                                "SELECT term FROM parse_vocab WHERE company_id=? AND kind='intent'",
+                                (cid(),)).fetchall()}
                     except Exception:
-                        stops = []
-                    n_cust, n_dump = 0, 0
-                    for st in stops:
-                        sd = dict(st) if not isinstance(st, dict) else st
-                        cn = (sd.get("customer_name") or "").strip()
-                        ad = (sd.get("address") or "").strip()
-                        ct = (sd.get("city") or "").strip()
-                        dl = (sd.get("dump_location") or "").strip()
-                        if cn or ad:
+                        _have_intents = set()
+                    try:
+                        _have_vocab = {(r[0] or "").strip().lower()
+                            for r in conn.execute(
+                                "SELECT term FROM parse_vocab WHERE company_id=? AND kind='shorthand'",
+                                (cid(),)).fetchall()}
+                    except Exception:
+                        _have_vocab = set()
+                    _intent_cands = [c for c in _intent_cands if c["phrase"] not in _have_intents]
+                    vocab_props = [v for v in vocab_props if v["term"] not in _have_vocab]
+                    return _learn_preview_page(rows, skipped, vocab_props, _intent_cands, _engine, _csrf)
+            elif mode == "dispatch_confirm":
+                # The boss reviewed: save exactly what they kept, nothing more.
+                n_cust, n_dump, n_vocab, n_intent = 0, 0, 0, 0
+                i = 0
+                while f"rows[{i}][address]" in request.form:
+                    if request.form.get(f"rows[{i}][keep]") == "on":
+                        cn = request.form.get(f"rows[{i}][customer]", "").strip()
+                        ad = request.form.get(f"rows[{i}][address]", "").strip()
+                        ct = request.form.get(f"rows[{i}][city]", "").strip()
+                        ac = request.form.get(f"rows[{i}][action]", "").strip()
+                        sz = request.form.get(f"rows[{i}][size]", "").strip()
+                        dl = request.form.get(f"rows[{i}][dump]", "").strip()
+                        if ad:
                             learn_location(conn, cid(), ad, city=ct, customer_name=cn,
-                                           action=sd.get("action", ""),
-                                           container_size=sd.get("container_size", ""),
-                                           dump_location=dl)
+                                           action=ac, container_size=sz, dump_location=dl)
                             n_cust += 1
                         if dl:
                             try:
@@ -36125,11 +36494,42 @@ def onboarding_import_customers():
                                 n_dump += 1
                             except Exception:
                                 pass
-                    conn.commit()
-                    msg = (f"<p class='ob-ok'>✅ Learned {n_cust} customers"
-                           f"{f' and {n_dump} dump sites' if n_dump else ''} from your dispatch text</p>")
-                else:
-                    msg = "<p class='ob-err'>Paste some dispatch text first.</p>"
+                    i += 1
+                j = 0
+                while f"vocab[{j}][term]" in request.form:
+                    if request.form.get(f"vocab[{j}][keep]") == "on":
+                        term = (request.form.get(f"vocab[{j}][term]", "") or "").strip().lower()[:80]
+                        exp = (request.form.get(f"vocab[{j}][expansion]", "") or "").strip()
+                        if term and exp:
+                            try:
+                                ex = conn.execute(
+                                    "SELECT id FROM parse_vocab WHERE company_id=? AND kind='shorthand'"
+                                    " AND LOWER(TRIM(term))=?", (cid(), term)).fetchone()
+                                if not ex:
+                                    conn.execute(
+                                        "INSERT INTO parse_vocab (company_id, term, expansion, kind, created_at)"
+                                        " VALUES (?,?,?,'shorthand',?)", (cid(), term, exp, now_ts()))
+                                    n_vocab += 1
+                            except Exception:
+                                pass
+                    j += 1
+                k = 0
+                while f"intent[{k}][phrase]" in request.form:
+                    if request.form.get(f"intent[{k}][keep]") == "on":
+                        phrase = (request.form.get(f"intent[{k}][phrase]", "") or "").strip().lower()[:80]
+                        typ = (request.form.get(f"intent[{k}][type]", "") or "").strip()
+                        if phrase and typ in _INTENT_TYPES:
+                            try:
+                                _upsert_intent_phrase(conn, cid(), phrase, typ)
+                                n_intent += 1
+                            except Exception:
+                                pass
+                    k += 1
+                conn.commit()
+                msg = (f"<p class='ob-ok'>✅ Learned {n_cust} place(s)"
+                       f"{f' and {n_dump} dump site(s)' if n_dump else ''}"
+                       f"{f', remembered {n_vocab} shorthand' if n_vocab else ''}"
+                       f"{f', taught {n_intent} intent phrase(s)' if n_intent else ''}</p>")
         except Exception as ex:
             conn.rollback()
             msg = f"<p class='ob-err'>Import failed: {e(str(ex)[:120])}</p>"
@@ -36187,10 +36587,10 @@ def onboarding_import_customers():
     </div>
     <div class="card">
         <h2 style="margin-top:0;">📋 Paste dispatch texts</h2>
-        <p class="muted small">Paste 5–10 old dispatch texts. The parser pulls out every customer, address, and dump site — and learns your shorthand too.</p>
+        <p class="muted small">Paste 5–10 old dispatch texts. You'll review every customer, address, and dump site before anything saves — and the parser learns your shorthand too.</p>
         <form method="POST">
             <input type="hidden" name="_csrf_token" value="{_csrf}">
-            <input type="hidden" name="mode" value="dispatch">
+            <input type="hidden" name="mode" value="dispatch_preview">
             <textarea name="dispatch_text" rows="8" placeholder="Pr 697 independence pkwy, ches, Marlyn 30yd dump dominion&#10;Pull 4512 elm st 30yd&#10;..." style="width:100%;padding:10px 12px;background:var(--bg-0);border:1px solid rgba(255,255,255,.12);border-radius:8px;color:var(--text);font-family:monospace;"></textarea>
             <div style="margin-top:10px;display:flex;gap:8px;">
                 <button class="btn" type="submit" style="min-height:48px;">🧠 Learn from these texts</button>
