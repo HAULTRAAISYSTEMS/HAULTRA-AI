@@ -17287,6 +17287,13 @@ def _build_route_board_html(user, day=None):
             _takes = bool(dict(s).get("chain_takes_from_stop_id"))
             _returning = (stop_status == "completed" and bool(dict(s).get("chain_group_id")) and not _takes
                           and (dict(s).get("chain_group_id"), (dict(s).get("chain_seq") or 0)) in _chain_returning)
+            # 2026-10-26: an open head past its Deliver tap (box_in) is
+            # likewise Returning — its empty is out and only comes back
+            # when the chain ends — not En Route.
+            if (not _returning and stop_status != "completed"
+                    and bool(dict(s).get("chain_group_id")) and not _takes
+                    and driver_status == "box_in"):
+                _returning = True
             # 2026-10-26: a receiver leg reads Done once its swap is done —
             # the driver tapped "Set Off Empty & Box Out Full" (driver_status
             # box_out or later), i.e. the prior empty is placed and this
@@ -19372,6 +19379,33 @@ def driver_route_detail(route_id):
 
     current_stop = None
     current_stop_num = None
+    # 2026-10-26: a chain head waiting on its return is not the current
+    # work — the in-flight leg is. Only once the head has sent its empty
+    # onward (driver_status box_in, i.e. past its Deliver tap) AND a
+    # downstream chain member is still open is it skipped here (and from
+    # reordering below); before its Deliver tap the head IS the live work
+    # (arrive, box out, dump, deliver). Once the chain is otherwise done,
+    # the head IS the remaining work (the return) and becomes current.
+    def _is_waiting_head(_s):
+        try:
+            _sk = _s.keys()
+        except Exception:
+            return False
+        if not ("chain_group_id" in _sk and _s["chain_group_id"]):
+            return False
+        if "chain_takes_from_stop_id" in _sk and _s["chain_takes_from_stop_id"]:
+            return False
+        if not ("driver_status" in _sk and _s["driver_status"] == "box_in"):
+            return False
+        for _o in stops:
+            try:
+                _ok = _o.keys()
+            except Exception:
+                continue
+            if ("chain_group_id" in _ok and _o["chain_group_id"] == _s["chain_group_id"]
+                    and _o["id"] != _s["id"] and stop_is_open(_o)):
+                return True
+        return False
     # 2026-10-10: show_stop param overrides — display a specific stop's card
     # (e.g., after tapping "Return Empty to X", show X's card).
     _show_stop_id = request.args.get("show_stop", "").strip()
@@ -19384,7 +19418,7 @@ def driver_route_detail(route_id):
                 break
     if not current_stop:
         for i, s in enumerate(stops, start=1):
-            if stop_is_open(s):
+            if stop_is_open(s) and not _is_waiting_head(s):
                 current_stop = s
                 current_stop_num = i
                 break
@@ -19395,7 +19429,7 @@ def driver_route_detail(route_id):
     if current_stop is not None:
         for s in stops:
             if (stop_is_open(s) and s["id"] != current_stop["id"]
-                    and not s["held_at"]):
+                    and not s["held_at"] and not _is_waiting_head(s)):
                 _reorderable.append({
                     "id": s["id"],
                     "name": (s["customer_name"] or s["address"] or "Stop").strip(),
@@ -20842,6 +20876,8 @@ def driver_route_detail(route_id):
         {_cab_fee_block}
         {photo_gallery_html}
         <div class="cab-workzone">
+            {_predeliver_nav_html}
+            {_next_handoff_html}
             {workflow_btn_html}
             {empty_can_picker_html}
             {after_dump_summary_html}
@@ -28332,11 +28368,23 @@ def stop_driver_action(stop_id):
             _has_photo = bool(load_stop_photos(conn, [stop_id]).get(stop_id))
             if not (_pmode == "required" and not _has_photo):
                 _handoff_stop_id = _deliver_handoff_dest_id(conn, stop, route_id)
+                # 2026-10-26: a chain HEAD is not done when its empty leaves
+                # for the next leg — it is done only when the final empty
+                # returns to its address. The tail's Return tap lands the
+                # driver back on the head's card, where Complete finishes
+                # it. So the head advances WITHOUT completing; middles
+                # and tails complete here as before.
+                _is_chain_head = _chained and not (
+                    stop["chain_takes_from_stop_id"] if "chain_takes_from_stop_id" in _skeys else None)
+                if _handoff_stop_id and _handoff_stop_id != stop_id and _is_chain_head:
+                    # Head stays open; _handoff_stop_id is kept so the
+                    # redirect below lands on the dest card.
+                    pass
                 # 2026-10-10: When the empty goes to a DIFFERENT stop, tapping
                 # "Return/Deliver Empty to X" means the driver is DONE with this
                 # stop's work. Complete it here, then jump to X's card so they
                 # can finish the route there.
-                if _handoff_stop_id and _handoff_stop_id != stop_id:
+                elif _handoff_stop_id and _handoff_stop_id != stop_id:
                     conn.execute(
                         "UPDATE stops SET status='completed', completed_at=?, "
                         "driver_status='completed', driver_status_before_complete=? "
