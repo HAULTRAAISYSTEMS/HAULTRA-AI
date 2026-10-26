@@ -50,6 +50,7 @@ conn.execute("UPDATE stops SET chain_group_id='cg', chain_seq=0, chain_gives_to_
 conn.execute("UPDATE stops SET chain_group_id='cg', chain_seq=1, chain_takes_from_stop_id=?, chain_gives_to_stop_id=? WHERE id=?", (ah, bt, mid))
 conn.execute("UPDATE stops SET chain_group_id='cg', chain_seq=2, chain_takes_from_stop_id=?, chain_terminal='head' WHERE id=?", (mid, bt))
 conn.execute("INSERT INTO dump_tickets (route_id, stop_id, dump_site, arrival_time, departure_time, can_number, net_tons, ticket_number, created_at) VALUES (?, ?, 'Dominion', '2026-10-26 08:55:00', '2026-10-26 09:10:00', '3016', 1.67, 'T1', ?)", (r, ah, TS))
+conn.execute("INSERT INTO dump_tickets (route_id, stop_id, dump_site, arrival_time, departure_time, can_number, net_tons, ticket_number, created_at) VALUES (?, ?, 'Dominion', NULL, NULL, '3050', NULL, 'T3', ?)", (r, mid, TS))
 conn.execute("INSERT INTO dump_tickets (route_id, stop_id, dump_site, arrival_time, departure_time, can_number, net_tons, ticket_number, created_at) VALUES (?, ?, 'Dominion', '2026-10-26 11:50:00', '2026-10-26 12:04:00', '3063', 3.53, 'T2', ?)", (r, bt, TS))
 conn.commit()
 conn.close()
@@ -80,18 +81,22 @@ ok(tail is not None, "tail row found")
 if tail:
     ok(cell_text(tail[9]) == "12:04 pm", "tail Finish is its landfill depart (12:04 pm), got %r" % cell_text(tail[9]))
     ok(cell_text(tail[8]) == "12:04 pm", "tail Depart still 12:04 pm")
+    ok(cell_text(tail[10]) == "3050", "tail Box In is its giver's ticket can, got %r" % cell_text(tail[10]))
 head = row_cells("5366 Virginia Beach Blvd")
 ok(head is not None, "head row found")
 if head:
     ok(cell_text(head[9]) == "", "open head Finish stays blank, got %r" % cell_text(head[9]))
+    ok(cell_text(head[10]) == "3063", "closed chain head Box In is the returned tail can, got %r" % cell_text(head[10]))
 midrow = row_cells("100 Midway Rd")
 ok(midrow is not None, "middle row found")
 if midrow:
     ok(cell_text(midrow[9]) == "11:00 am", "receiver with no ticket falls back to completion time, got %r" % cell_text(midrow[9]))
+    ok(cell_text(midrow[10]) == "3016", "middle Box In is its giver's ticket can, got %r" % cell_text(midrow[10]))
 plainrow = row_cells("800 Independence Blvd")
 ok(plainrow is not None, "plain row found")
 if plainrow:
     ok(cell_text(plainrow[9]) == "1:00 pm", "non-chain stop keeps its completion time, got %r" % cell_text(plainrow[9]))
+    ok(cell_text(plainrow[10]) == "—", "post-chain stop Box In is blank (chain empty went to the head), got %r" % cell_text(plainrow[10]))
 
 print()
 if FAILURES:
