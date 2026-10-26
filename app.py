@@ -25820,8 +25820,9 @@ def _route_on_truck(conn, route_id):
 
     Returns None for finished routes (or on any read failure). Otherwise:
       can / size / step / customer / dest / stop_id / has_can / unknown_can
-    - unknown_can: a can IS aboard (a receiver past its Set Off tap) but no
-      ticket or route can names it yet — renderers must not call this "empty".
+    - unknown_can: a can IS aboard but no ticket or route can names it yet
+      (a receiver past its Set Off tap, or a boxed-out stop pre-ticket) —
+      renderers must not call this "empty".
     - Live stop: a Pull/PR the driver has boxed out / is hauling / is
       returning empty, or an active Delivery the driver has arrived at — the
       can is that stop's dump-ticket can, route can, or yard can.
@@ -25890,6 +25891,19 @@ def _route_on_truck(conn, route_id):
                         "step": _step, "customer": _who(_s),
                         "dest": _dest or _who(_s), "stop_id": _s.get("id"),
                         "has_can": True}
+            # 2026-10-26: boxed out but no ticket yet — the driver IS
+            # hauling the site's full to the dump. Report the load with an
+            # unknown number, never "empty": the boss card must flip the
+            # moment the driver taps Box Out, not only once the ticket
+            # lands. Renderers already show unknown cans as "?".
+            _step = {"box_out": "Can on truck — to the dump",
+                     "going_to_dump": "Heading to the dump",
+                     "need_box_in": "Returning the empty"}[_drv]
+            _dest = (_s.get("dump_location") or "").strip()
+            return {"can": "", "size": _s.get("container_size") or "",
+                    "step": _step, "customer": _who(_s),
+                    "dest": _dest or _who(_s), "stop_id": _s.get("id"),
+                    "has_can": False, "unknown_can": True}
     # 2026-10-26: a receiver leg past its Set Off tap has already left the
     # completed-stops carried bin at its site — the fallback below must not
     # report that bin as still on the truck (same tap the board pill and
