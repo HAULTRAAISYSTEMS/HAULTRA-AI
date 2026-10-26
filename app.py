@@ -26636,6 +26636,27 @@ def delete_order(order_id):
 # INVOICING — HAULTRA builds the invoice from the job.
 # QuickBooks stays the books (sync = phase 2).
 # =========================================================
+def _invoice_card_html(d, line_count):
+    """One invoice card (gold spine + big total). Shared by the board
+    Invoices tab and the /invoices Invoices tab so they never drift."""
+    _status_badge = {"draft": "", "sent": "in_progress", "paid": "completed", "void": "cancelled"}
+    _route_link = ""
+    if d.get("route_id") and d.get("route_name"):
+        _route_link = f"""<div style="margin-top:8px;"><a class="muted small" href="{url_for('view_route', route_id=d['route_id'])}">Route: {e(d['route_name'])} &#8250;</a></div>"""
+    return f"""
+        <a class="card" style="display:block;text-decoration:none;margin-bottom:12px;border-left:4px solid #FFB84D;" href="{url_for('invoice_detail', invoice_id=d['id'])}">
+            <div class="row between">
+                <div><span style="font-weight:800;">&#x1F9FE; {e(d['invoice_number'])}</span> &middot; {e(d['customer_name'] or '—')}</div>
+                <span class="badge {_status_badge.get(d['status'], '')}">{e(d['status'].title())}</span>
+            </div>
+            <div class="row between" style="margin-top:10px;align-items:flex-end;">
+                <span class="muted small">{e(d['issued_at'] or '')} &middot; {_invoice_terms_label(d['terms'])} &middot; {line_count} line{'s' if line_count != 1 else ''}</span>
+                <strong style="font-size:22px;color:#FFD08A;">{_fmt_money(d['total_cents'])}</strong>
+            </div>
+            {_route_link}
+        </a>"""
+
+
 def _invoice_section_html(conn, company_id):
     """Shared invoice list content for /invoices and the routes-page Invoices
     tab: money meta strip + redesigned cards. Returns (meta_html, cards_html).
@@ -26661,7 +26682,6 @@ def _invoice_section_html(conn, company_id):
             _line_counts[_lc["invoice_id"]] = _lc["n"]
     except Exception:
         pass
-    _status_badge = {"draft": "", "sent": "in_progress", "paid": "completed", "void": "cancelled"}
     _open = [dict(d) for d in rows if d["status"] in ("draft", "sent")]
     _owed_cents = sum(d["total_cents"] or 0 for d in _open)
     _meta = (f"<span>{len(_open)} open</span><span class=\"cmd-sep\"></span>"
@@ -26674,23 +26694,94 @@ def _invoice_section_html(conn, company_id):
     cards = ""
     for inv in rows:
         d = dict(inv)
-        _route_link = ""
-        if d.get("route_id") and d.get("route_name"):
-            _route_link = f"""<div style="margin-top:8px;"><a class="muted small" href="{url_for('view_route', route_id=d['route_id'])}">Route: {e(d['route_name'])} &#8250;</a></div>"""
-        _lines = _line_counts.get(d["id"], 0)
-        cards += f"""
-        <a class="card" style="display:block;text-decoration:none;margin-bottom:12px;border-left:4px solid #FFB84D;" href="{url_for('invoice_detail', invoice_id=d['id'])}">
-            <div class="row between">
-                <div><span style="font-weight:800;">&#x1F9FE; {e(d['invoice_number'])}</span> &middot; {e(d['customer_name'] or '—')}</div>
-                <span class="badge {_status_badge.get(d['status'], '')}">{e(d['status'].title())}</span>
-            </div>
-            <div class="row between" style="margin-top:10px;align-items:flex-end;">
-                <span class="muted small">{e(d['issued_at'] or '')} &middot; {_invoice_terms_label(d['terms'])} &middot; {_lines} line{'s' if _lines != 1 else ''}</span>
-                <strong style="font-size:22px;color:#FFD08A;">{_fmt_money(d['total_cents'])}</strong>
-            </div>
-            {_route_link}
-        </a>"""
+        cards += _invoice_card_html(d, _line_counts.get(d["id"], 0))
     return _meta, cards
+
+
+def _ready_tab_html(groups):
+    """Ready-to-bill tab: customer accordion + live search + bill-all.
+    Groups arrive sorted by total desc; customers roll up to their total."""
+    if not groups:
+        return f"""<div class="card"><p class="muted">All caught up — nothing unbilled. <a href="{url_for('invoice_list', tab='invoices')}">View invoices</a></p></div>"""
+    _by_cust = {}
+    for g in groups:
+        _by_cust.setdefault(g["customer"], []).append(g)
+    _custs = sorted(_by_cust.items(), key=lambda kv: -sum(g["total"] for g in kv[1]))
+    _blocks = ""
+    for _ci, (cust, gsites) in enumerate(_custs):
+        _ctotal = sum(g["total"] for g in gsites)
+        _cjobs = sum(g["n_stops"] for g in gsites)
+        _rows = ""
+        for g in gsites:
+            _rows += f"""
+            <div class="site-row row between" data-site="{e(g['site'])}" style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.06);flex-wrap:wrap;gap:8px;">
+                <div><div style="font-weight:600;">{e(g['site'])}</div>
+                <div class="muted small">{g['n_stops']} unbilled job{'s' if g['n_stops'] != 1 else ''}</div></div>
+                <div style="display:flex;gap:12px;align-items:center;">
+                    <strong>{_fmt_money(g['total'])}</strong>
+                    <a class="btn secondary" href="{url_for('invoice_new', customer=g['raw_customer'], site=g['raw_site'], group=1)}">Create invoice</a>
+                </div>
+            </div>"""
+        _blocks += f"""
+        <div class="cust-block card" data-customer="{e(cust)}" style="margin-bottom:12px;">
+            <div onclick="toggleCust('cust-{_ci}')" style="cursor:pointer;">
+                <div class="row between">
+                    <div><span style="font-weight:800;">{e(cust)}</span> <span class="muted small">&middot; {len(gsites)} site{'s' if len(gsites) != 1 else ''} &middot; {_cjobs} job{'s' if _cjobs != 1 else ''}</span></div>
+                    <strong style="font-size:20px;color:#FFD08A;">{_fmt_money(_ctotal)}</strong>
+                </div>
+            </div>
+            <div id="cust-{_ci}" class="cust-body" style="display:none;margin-top:8px;">{_rows}</div>
+        </div>"""
+    _grand = sum(g["total"] for g in groups)
+    return f"""
+    <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center;">
+        <a class="btn gold" href="{url_for('bill_all_review')}">Bill all ({len(groups)} groups — {_fmt_money(_grand)})</a>
+        <span class="muted small">Creates drafts — nothing is sent.</span>
+        <span style="margin-left:auto;"><a class="muted small" href="javascript:void(0)" onclick="setAllCust(true)">Expand all</a> &middot; <a class="muted small" href="javascript:void(0)" onclick="setAllCust(false)">Collapse all</a></span>
+    </div>
+    <input id="readySearch" placeholder="Search customer or site…" oninput="filterReady()" style="width:100%;margin-bottom:12px;">
+    {_blocks}
+    <script>
+    function toggleCust(id){{ var b = document.getElementById(id); b.style.display = (b.style.display === 'none' ? 'block' : 'none'); }}
+    function setAllCust(show){{ document.querySelectorAll('.cust-body').forEach(function(b){{ b.style.display = show ? 'block' : 'none'; }}); }}
+    function filterReady(){{
+      var q = document.getElementById('readySearch').value.toLowerCase();
+      document.querySelectorAll('.cust-block').forEach(function(block){{
+        var cname = block.getAttribute('data-customer').toLowerCase();
+        var any = false;
+        block.querySelectorAll('.site-row').forEach(function(row){{
+          var match = !q || cname.indexOf(q) !== -1 || row.getAttribute('data-site').toLowerCase().indexOf(q) !== -1;
+          row.style.display = match ? '' : 'none';
+          if (match) any = true;
+        }});
+        block.style.display = any ? '' : 'none';
+        if (q && any) {{ block.querySelector('.cust-body').style.display = 'block'; }}
+        if (!q) {{ block.querySelector('.cust-body').style.display = 'none'; }}
+      }});
+    }}
+    </script>
+    """
+
+
+def _invoices_tab_html(rows, line_counts, status):
+    """Invoices tab: status chips + cards (shared card markup)."""
+    if status == "open":
+        shown = [r for r in rows if r["status"] in ("draft", "sent")]
+    elif status == "paid":
+        shown = [r for r in rows if r["status"] == "paid"]
+    elif status == "void":
+        shown = [r for r in rows if r["status"] == "void"]
+    else:
+        shown = rows
+    _chips = ""
+    for _val, _label in (("all", "All"), ("open", "Open"), ("paid", "Paid"), ("void", "Void")):
+        _active = "gold" if status == _val else "secondary"
+        _chips += f"""<a class="btn {_active}" href="{url_for('invoice_list', tab='invoices', status=_val)}">{_label}</a> """
+    _cards = "".join(_invoice_card_html(r, line_counts.get(r["id"], 0)) for r in shown)
+    if not _cards:
+        _nolabel = "" if status == "all" else status + " "
+        _cards = f"""<div class="card"><p class="muted">No {_nolabel}invoices.</p></div>"""
+    return f"""<div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;">{_chips}</div>{_cards}"""
 
 
 @app.route("/invoices")
@@ -26698,35 +26789,142 @@ def _invoice_section_html(conn, company_id):
 def invoice_list():
     conn = get_db()
     try:
-        _inv_meta, cards = _invoice_section_html(conn, cid())
-        _groups = _unbilled_stop_groups(conn, cid())
+        tab = request.args.get("tab", "ready").strip()
+        if tab not in ("ready", "invoices"):
+            tab = "ready"
+        status = request.args.get("status", "all").strip()
+        if status not in ("all", "open", "paid", "void"):
+            status = "all"
+        groups = _unbilled_stop_groups(conn, cid())
+        inv_rows = conn.execute(
+            """SELECT i.*, r.route_name AS route_name FROM invoices i
+               LEFT JOIN routes r ON r.id = i.route_id
+               WHERE i.company_id=? ORDER BY i.id DESC""",
+            (cid(),)).fetchall()
+        inv_rows = [dict(r) for r in inv_rows]
+        _line_counts = {}
+        try:
+            for _lc in conn.execute(
+                "SELECT invoice_id, COUNT(*) n FROM invoice_line_items GROUP BY invoice_id").fetchall():
+                _line_counts[_lc["invoice_id"]] = _lc["n"]
+        except Exception:
+            pass
+        try:
+            _unbilled = conn.execute(
+                """SELECT COUNT(*), COALESCE(SUM(amount_cents),0) FROM ticket_surcharges
+                   WHERE company_id=? AND billed=0""",
+                (cid(),)).fetchone()
+            _unbilled_n, _unbilled_cents = (_unbilled[0] or 0), (_unbilled[1] or 0)
+        except Exception:
+            _unbilled_n, _unbilled_cents = 0, 0
     finally:
         conn.close()
-    _ready = ""
-    if _groups:
-        _rows = ""
-        for g in _groups:
-            _rows += f"""
-            <div class="row between" style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.06);">
-                <div><div style="font-weight:700;">{e(g['customer'])} <span class="muted">— {e(g['site'])}</span></div>
-                <div class="muted small">{g['n_stops']} unbilled job{'s' if g['n_stops'] != 1 else ''}</div></div>
-                <div style="display:flex;gap:12px;align-items:center;">
-                    <strong>{_fmt_money(g['total'])}</strong>
-                    <a class="btn secondary" href="{url_for('invoice_new', customer=g['raw_customer'], site=g['raw_site'], group=1)}">Create invoice</a>
-                </div>
-            </div>"""
-        _ready = f"""
+
+    # Summary strip (whole company, unfiltered).
+    _ready_total = sum(g["total"] for g in groups)
+    _ready_jobs = sum(g["n_stops"] for g in groups)
+    _open_rows = [r for r in inv_rows if r["status"] in ("draft", "sent")]
+    _open_total = sum(r["total_cents"] or 0 for r in _open_rows)
+    _today = date.today().strftime("%Y-%m-%d")
+    _overdue = [r for r in _open_rows if r.get("due_at") and r["due_at"] < _today]
+    _overdue_total = sum(r["total_cents"] or 0 for r in _overdue)
+    _surcharge_stat = ""
+    if _unbilled_n:
+        _surcharge_stat = f"""<div><div class="muted small">UNBILLED SURCHARGES</div><strong style="font-size:20px;color:#FF9D5C;">{_fmt_money(_unbilled_cents)}</strong><div class="muted small">{_unbilled_n} ticket{'s' if _unbilled_n != 1 else ''}</div></div>"""
+    _summary = f"""
     <div class="card" style="margin-bottom:16px;">
-        <h2 style="margin:0 0 4px;">Ready to bill</h2>
-        <p class="muted small" style="margin:0 0 8px;">Unbilled work grouped by customer + job site, across all routes. Each invoice covers one customer at one site.</p>
-        {_rows}
+        <div class="row" style="gap:24px;flex-wrap:wrap;">
+            <div><div class="muted small">READY TO BILL</div><strong style="font-size:22px;color:#FFD08A;">{_fmt_money(_ready_total)}</strong><div class="muted small">{len(groups)} group{'s' if len(groups) != 1 else ''} &middot; {_ready_jobs} job{'s' if _ready_jobs != 1 else ''}</div></div>
+            <div><div class="muted small">OPEN</div><strong style="font-size:22px;">{_fmt_money(_open_total)}</strong><div class="muted small">{len(_open_rows)} invoice{'s' if len(_open_rows) != 1 else ''}</div></div>
+            <div><div class="muted small">OVERDUE</div><strong style="font-size:22px;color:#FF6B6B;">{_fmt_money(_overdue_total)}</strong><div class="muted small">{len(_overdue)} invoice{'s' if len(_overdue) != 1 else ''}</div></div>
+            {_surcharge_stat}
+        </div>
     </div>"""
+    _tabs = f"""
+    <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;">
+        <a class="btn {'gold' if tab == 'ready' else 'secondary'}" href="{url_for('invoice_list', tab='ready')}">Ready to bill ({len(groups)})</a>
+        <a class="btn {'gold' if tab == 'invoices' else 'secondary'}" href="{url_for('invoice_list', tab='invoices')}">Invoices ({len(inv_rows)})</a>
+    </div>"""
+    if tab == "ready":
+        _content = _ready_tab_html(groups)
+    else:
+        _content = _invoices_tab_html(inv_rows, _line_counts, status)
     body = f"""
-    {_cmd_header("Invoices", _inv_meta)}
-    {_ready}
-    {cards or '<div class="card"><p class="muted">No invoices yet. Open a completed route and tap <strong>Create Invoice</strong>.</p></div>'}
+    {_cmd_header("Invoices", "")}
+    {_summary}
+    {_tabs}
+    {_content}
     """
     return render_template_string(shell_page("Invoices", body))
+
+
+@app.route("/invoices/bill-all")
+@boss_required
+def bill_all_review():
+    conn = get_db()
+    try:
+        groups = _unbilled_stop_groups(conn, cid())
+    finally:
+        conn.close()
+    named = [g for g in groups if g["raw_customer"]]
+    skipped = [g for g in groups if not g["raw_customer"]]
+    if not named:
+        _why = ("only unassigned work remains — name each invoice from Ready to bill."
+                if skipped else "all caught up.")
+        body = f"""
+    <div class="hero"><h1>Bill all</h1></div>
+    <div class="card"><p class="muted">Nothing to bill — {_why} <a href="{url_for('invoice_list')}">Back to invoices</a></p></div>
+    """
+        return render_template_string(shell_page("Bill all", body))
+    _rows = ""
+    for g in named:
+        _rows += f"""
+            <div class="row between" style="padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.06);">
+                <div><div style="font-weight:600;">{e(g['customer'])} <span class="muted">— {e(g['site'])}</span></div>
+                <div class="muted small">{g['n_stops']} job{'s' if g['n_stops'] != 1 else ''}</div></div>
+                <strong>{_fmt_money(g['total'])}</strong>
+            </div>"""
+    _grand = sum(g["total"] for g in named)
+    _skip_note = ""
+    if skipped:
+        _skip_note = f"""<p class="muted small" style="margin-top:12px;">{len(skipped)} unassigned group{'s' if len(skipped) != 1 else ''} skipped — name those invoices from Ready to bill.</p>"""
+    body = f"""
+    <div class="hero"><h1>Bill all</h1>
+    <p>{len(named)} invoice{'s' if len(named) != 1 else ''} — {_fmt_money(_grand)} total</p></div>
+    <div class="card">
+        {_rows}
+        <div class="row between" style="margin:12px 0 20px;">
+            <strong>Total</strong><strong style="font-size:20px;">{_fmt_money(_grand)}</strong>
+        </div>
+        <p class="muted small">Each invoice is created as a <strong>draft</strong> with terms Due on receipt, issued today. Nothing is sent — review and send each one. Unassigned work is skipped.</p>
+        {_skip_note}
+        <form method="POST" action="{url_for('bill_all_create')}">
+            <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+            <button class="btn gold" type="submit" style="width:100%;min-height:52px;">Create {len(named)} draft invoice{'s' if len(named) != 1 else ''}</button>
+        </form>
+    </div>
+    """
+    return render_template_string(shell_page("Bill all", body))
+
+
+@app.route("/invoices/bill-all", methods=["POST"])
+@boss_required
+def bill_all_create():
+    conn = get_db()
+    groups = _unbilled_stop_groups(conn, cid())
+    named = [g for g in groups if g["raw_customer"]]
+    made = 0
+    total = 0
+    for g in named:
+        _inv_id, _number, _t = _create_invoice_with_lines(
+            conn, cid(), g["raw_customer"], None, g["lines"],
+            "due_on_receipt", date.today().strftime("%Y-%m-%d"), "")
+        made += 1
+        total += _t
+    conn.commit()
+    conn.close()
+    flash(f"{made} draft invoice{'s' if made != 1 else ''} created ({_fmt_money(total)}). Nothing sent — review and send each one.", "success")
+    return redirect(url_for("invoice_list", tab="invoices"))
 
 
 def _invoice_terms_label(terms):
@@ -26878,6 +27076,34 @@ def invoice_new():
     return render_template_string(shell_page("New Invoice", body))
 
 
+def _create_invoice_with_lines(conn, company_id, customer_name, route_id, lines, terms, issued, notes):
+    """Insert a draft invoice + its lines; mark surcharges billed. Returns
+    (inv_id, number, total_cents). Caller commits. Shared by single create
+    and bill-all so they never drift."""
+    number = _next_invoice_number(conn, company_id)
+    due = _invoice_due_date(terms, issued)
+    cur = conn.execute(
+        """INSERT INTO invoices (company_id, invoice_number, customer_name, route_id,
+                                 status, terms, issued_at, due_at, notes, created_by, created_at)
+           VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?)""",
+        (company_id, number, customer_name, route_id,
+         terms, issued, due, notes, session["user_id"], now_ts()))
+    inv_id = cur.lastrowid
+    for i, ln in enumerate(lines):
+        conn.execute(
+            """INSERT INTO invoice_line_items
+               (invoice_id, kind, description, qty, unit_cents, amount_cents, stop_id, sort_order)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (inv_id, ln["kind"], ln["description"], ln["qty"], ln["unit_cents"],
+             ln["amount_cents"], ln["stop_id"], i))
+        # 2026-10-23: surcharge billed — mark it so it never double-invoices.
+        if ln.get("kind") == "surcharge" and ln.get("surcharge_id"):
+            conn.execute("UPDATE ticket_surcharges SET billed=1 WHERE id=?",
+                         (ln["surcharge_id"],))
+    total = _invoice_recalc_totals(conn, inv_id)
+    return inv_id, number, total
+
+
 @app.route("/invoices", methods=["POST"])
 @boss_required
 def invoice_create():
@@ -26899,16 +27125,6 @@ def invoice_create():
             return redirect(url_for("invoice_new", route_id=route_id, customer=g_customer, site=g_site, group=1))
         return redirect(url_for("invoice_new", route_id=route_id))
 
-    number = _next_invoice_number(conn, cid())
-    due = _invoice_due_date(terms, issued)
-    cur = conn.execute(
-        """INSERT INTO invoices (company_id, invoice_number, customer_name, route_id,
-                                 status, terms, issued_at, due_at, notes, created_by, created_at)
-           VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?)""",
-        (cid(), number, customer_name,
-         int(route_id) if route_id.isdigit() else None,
-         terms, issued, due, notes, session["user_id"], now_ts()))
-    inv_id = cur.lastrowid
     if route_id.isdigit():
         key = _group_key(g_customer, g_site) if group_sel else None
         lines = _build_invoice_lines_for_route(conn, cid(), int(route_id), group=key)
@@ -26919,18 +27135,10 @@ def invoice_create():
         lines = match["lines"] if match else []
     else:
         lines = []
-    for i, ln in enumerate(lines):
-        conn.execute(
-            """INSERT INTO invoice_line_items
-               (invoice_id, kind, description, qty, unit_cents, amount_cents, stop_id, sort_order)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (inv_id, ln["kind"], ln["description"], ln["qty"], ln["unit_cents"],
-             ln["amount_cents"], ln["stop_id"], i))
-        # 2026-10-23: surcharge billed — mark it so it never double-invoices.
-        if ln.get("kind") == "surcharge" and ln.get("surcharge_id"):
-            conn.execute("UPDATE ticket_surcharges SET billed=1 WHERE id=?",
-                         (ln["surcharge_id"],))
-    _invoice_recalc_totals(conn, inv_id)
+    inv_id, number, _total = _create_invoice_with_lines(
+        conn, cid(), customer_name,
+        int(route_id) if route_id.isdigit() else None,
+        lines, terms, issued, notes)
     conn.commit()
     conn.close()
     flash(f"Invoice {number} created.", "success")
