@@ -49930,7 +49930,10 @@ def apple_app_site_association():
                     "appID": f"{APPLE_TEAM_ID}.com.rockkstaar.haultra",
                     # 2026-10-12: Customer portal links (/c/*) must open in Safari,
                     # not the app. Customers don't have the app or a login.
-                    "paths": ["*", "NOT /c/*"],
+                    # 2026-10-26: QuickBooks connect returns from Intuit to Safari,
+                    # so /quickbooks/* must open in Safari too. Exclusions go first:
+                    # Apple applies the first pattern that matches.
+                    "paths": ["NOT /c/*", "NOT /quickbooks/*", "*"],
                 }
             ],
         }

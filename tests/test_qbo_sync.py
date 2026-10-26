@@ -463,6 +463,15 @@ def conn_count():
 ok(b"Intuit opens in your browser" in cl.get("/quickbooks", headers=APP_UA).data,
    "app shows browser-handoff note")
 ok(b"Intuit opens in your browser" not in cl.get("/quickbooks").data, "web page has no app note")
+_app_page = cl.get("/quickbooks", headers=APP_UA).data
+ok(b"appUrlOpen" in _app_page and b"'/quickbooks/'" in _app_page,
+   "app page loads a /quickbooks/ link that reopened the app")
+ok(b"{{" not in _app_page and b"{%" not in _app_page, "app script has no template syntax")
+os.environ["APPLE_TEAM_ID"] = "TEAMID1234"
+app.APPLE_TEAM_ID = "TEAMID1234"
+_paths = json.loads(cl.get("/.well-known/apple-app-site-association").data)["applinks"]["details"][0]["paths"]
+ok(_paths.index("NOT /quickbooks/*") < _paths.index("*") and _paths.index("NOT /c/*") < _paths.index("*"),
+   "universal links exclude /quickbooks/* and /c/* before the catch-all")
 
 state_a = app_connect()
 ok(state_a.startswith("h."), "app connect uses a handoff state")
