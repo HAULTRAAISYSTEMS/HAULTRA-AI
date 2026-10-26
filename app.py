@@ -37,7 +37,6 @@ from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 import chain_resolver
-import qbo  # QuickBooks Online invoice sync (also loads a local .env)
 
 # Optional PDF export
 PDF_ENABLED = True
@@ -4390,7 +4389,6 @@ def init_db():
     )
     """)
     safe_add_column(conn, "companies", "invoice_seq INTEGER DEFAULT 0")
-    qbo.init_tables(conn)  # QuickBooks sync tables + invoices.qb_* columns
 
     # 2026-10-16: field fees — driver one-tap fee log (dry run, restricted
     # item, relocation…). Flows straight onto the invoice.
@@ -16966,6 +16964,20 @@ def _build_route_board_html(user, day=None):
             continue
         _live_rows.append(_r)
     board_rows = _live_rows
+    # 2026-10-26: one invoice lookup for the whole board — a lane invoice
+    # button links to the existing invoice instead of starting a duplicate.
+    _inv_by_route = {}
+    try:
+        _lane_rids = {r["route_id"] for r in board_rows}
+        if _lane_rids:
+            _q = ",".join("?" * len(_lane_rids))
+            for _iv in conn.execute(
+                f"SELECT route_id, id, invoice_number, status FROM invoices "
+                f"WHERE company_id=? AND route_id IN ({_q}) AND status != 'void' ORDER BY id DESC",
+                (company_id, *tuple(_lane_rids))).fetchall():
+                _inv_by_route.setdefault(_iv["route_id"], dict(_iv))
+    except Exception:
+        _inv_by_route = {}
     # Short label per stop (so a chain card can name its neighbor without another
     # query) and the size of each chain group (for the "SWAP n of m" badge).
     _chain_label_by_id = {}
@@ -17166,6 +17178,17 @@ def _build_route_board_html(user, day=None):
             _util_items.append(
                 f'<a class="lane-util-link" href="/route/{_lane_route_id}/daily-log">Daily Log</a>',
             )
+            if user["role"] == "boss":
+                _lane_done = sum(1 for x in stops if dict(x).get("stop_status") == "completed")
+                _lane_inv = _inv_by_route.get(_lane_route_id)
+                if _lane_inv:
+                    _util_items.append(
+                        f'<a class="lane-util-link" style="color:#FF9D5C;" href="{url_for("invoice_detail", invoice_id=_lane_inv["id"])}">&#x1F9FE; Invoice &middot; {_lane_inv["status"].title()}</a>',
+                    )
+                elif _lane_done > 0:
+                    _util_items.append(
+                        f'<a class="lane-util-link" style="color:#FF9D5C;" href="{url_for("invoice_new", route_id=_lane_route_id)}">&#x1F9FE; Invoice</a>',
+                    )
             if len(stops) >= 2:
                 _util_items.append(
                     f'<form class="inline" method="POST" '
@@ -17497,7 +17520,10 @@ def routes_page():
     user = get_current_user()
     q = request.args.get("q", "").strip()
     status = request.args.get("status", "").strip()
-    active_tab = "history" if request.args.get("tab") == "history" else "board"
+    _tab_param = (request.args.get("tab") or "").strip()
+    if _tab_param == "invoices" and user["role"] != "boss":
+        _tab_param = ""
+    active_tab = _tab_param if _tab_param in ("history", "invoices") else "board"
 
     today = today_str()
     # 2026-10-16: the board is day-navigable — ?day=YYYY-MM-DD, default today.
@@ -17571,12 +17597,16 @@ def routes_page():
         history_params["status"] = status
     history_tab_href = url_for("routes_page") + "?" + urllib.parse.urlencode(history_params)
 
+    _invoices_tab = ""
+    if user["role"] == "boss":
+        _invoices_tab = f"""<a class="route-tab {'active' if active_tab == 'invoices' else ''}" href="{url_for('routes_page')}?tab=invoices" style="min-height:48px;display:inline-flex;align-items:center;">Invoices</a>"""
     tabs_html = f"""
     <div class="route-tabs">
         <a class="route-tab {'active' if active_tab == 'board' else ''}" href="{url_for('routes_page')}"
            style="min-height:48px;display:inline-flex;align-items:center;">Board</a>
         <a class="route-tab {'active' if active_tab == 'history' else ''}" href="{history_tab_href}"
            style="min-height:48px;display:inline-flex;align-items:center;">History</a>
+        {_invoices_tab}
     </div>
     """
 
@@ -17616,6 +17646,15 @@ def routes_page():
     </div>
     """
 
+    _inv_section = None
+    if active_tab == "invoices":
+        _ic = get_db()
+        try:
+            _inv_section = _invoice_section_html(_ic, cid())
+        finally:
+            _ic.close()
+        if _inv_section:
+            header_html = _cmd_header("Invoices", _inv_section[0])
     if active_tab == "board":
         board_inner = _build_route_board_html(user, _board_day)
         # Boss-only: press-and-hold a route lane and drag to reorder the board.
@@ -17688,6 +17727,9 @@ def routes_page():
         </script>
         """
         main_panel = f'<div id="lane-container">{board_inner}</div>{lane_sort_assets}{poll_script}'
+    elif active_tab == "invoices":
+        _inv_cards = _inv_section[1] if _inv_section else ""
+        main_panel = _inv_cards or '<div class="card"><p class="muted">No invoices yet. Open a completed route and tap <strong>Create Invoice</strong>.</p></div>'
     else:
         conn = get_db()
         params = [cid()]
@@ -17744,6 +17786,19 @@ def routes_page():
                 except Exception:
                     pass
                 _rev_by_route[_rid] = _rev
+        # 2026-10-26: same existing-invoice map as the board — a route card
+        # links to its live invoice instead of starting a duplicate.
+        _inv_by_route_h = {}
+        try:
+            if _route_ids:
+                _q = ",".join("?" * len(_route_ids))
+                for _iv in conn.execute(
+                    f"SELECT route_id, id, invoice_number, status FROM invoices "
+                    f"WHERE company_id=? AND route_id IN ({_q}) AND status != 'void' ORDER BY id DESC",
+                    (cid(), *tuple(_route_ids))).fetchall():
+                    _inv_by_route_h.setdefault(_iv["route_id"], dict(_iv))
+        except Exception:
+            _inv_by_route_h = {}
         conn.close()
 
         rows = ""
@@ -17793,9 +17848,17 @@ def routes_page():
                 </form>''' if user['role'] == 'boss' else '')
             # 2026-10-23: one-tap invoice from the route card — no more digging
             # for the button inside the route detail page.
-            _inv_btn = (f'''
+            # 2026-10-26: a route with a live invoice links to it instead of
+            # starting a duplicate.
+            _inv_h = _inv_by_route_h.get(r["id"])
+            if user["role"] == "boss" and _inv_h:
+                _inv_btn = f'''
+                <a class="hist-ghost-btn" style="color:#FF9D5C;border-color:rgba(255,157,92,.4);" href="{url_for('invoice_detail', invoice_id=_inv_h['id'])}">&#x1F9FE; Invoice &middot; {_inv_h['status'].title()}</a>'''
+            elif user["role"] == "boss" and _done > 0:
+                _inv_btn = f'''
                 <a class="hist-ghost-btn" style="color:#FF9D5C;border-color:rgba(255,157,92,.4);" href="{url_for('invoice_new', route_id=r['id'])}">&#x1F9FE; Invoice</a>'''
-                if user['role'] == 'boss' and _done > 0 else '')
+            else:
+                _inv_btn = ''
             return f"""
             <div class="drv-lane hist-lane">
                 <div class="drv-lane-head">
@@ -26572,49 +26635,71 @@ def delete_order(order_id):
 # INVOICING — HAULTRA builds the invoice from the job.
 # QuickBooks stays the books (sync = phase 2).
 # =========================================================
-@app.route("/invoices")
-@boss_required
-def invoice_list():
-    conn = get_db()
+def _invoice_section_html(conn, company_id):
+    """Shared invoice list content for /invoices and the routes-page Invoices
+    tab: money meta strip + redesigned cards. Returns (meta_html, cards_html).
+    Cards carry a gold spine + a big gold total so money reads at a glance;
+    each card links to its route when it was built from one."""
     rows = conn.execute(
-        """SELECT * FROM invoices WHERE company_id=? ORDER BY id DESC""",
-        (cid(),)).fetchall()
-    # 2026-10-23: unbilled landfill surcharges — money the drivers logged that
-    # hasn't hit an invoice yet. Boss-visible so nothing slips through.
+        """SELECT i.*, r.route_name AS route_name FROM invoices i
+           LEFT JOIN routes r ON r.id = i.route_id
+           WHERE i.company_id=? ORDER BY i.id DESC""",
+        (company_id,)).fetchall()
     try:
         _unbilled = conn.execute(
             """SELECT COUNT(*), COALESCE(SUM(amount_cents),0) FROM ticket_surcharges
                WHERE company_id=? AND billed=0""",
-            (cid(),)).fetchone()
+            (company_id,)).fetchone()
         _unbilled_n, _unbilled_cents = (_unbilled[0] or 0), (_unbilled[1] or 0)
     except Exception:
         _unbilled_n, _unbilled_cents = 0, 0
-    conn.close()
+    _line_counts = {}
+    try:
+        for _lc in conn.execute(
+            "SELECT invoice_id, COUNT(*) n FROM invoice_line_items GROUP BY invoice_id").fetchall():
+            _line_counts[_lc["invoice_id"]] = _lc["n"]
+    except Exception:
+        pass
     _status_badge = {"draft": "", "sent": "in_progress", "paid": "completed", "void": "cancelled"}
-    # 2026-10-17: command header meta — open count + outstanding.
-    _open = [d for d in rows if d["status"] in ("draft", "sent")]
+    _open = [dict(d) for d in rows if d["status"] in ("draft", "sent")]
     _owed_cents = sum(d["total_cents"] or 0 for d in _open)
-    _inv_meta = (f"<span>{len(_open)} open</span><span class=\"cmd-sep\"></span>"
-                 f"<span>{_fmt_money(_owed_cents)} outstanding</span>" if _open
-                 else "<span>All paid up</span>")
+    _meta = (f"<span>{len(_open)} open</span><span class=\"cmd-sep\"></span>"
+             f"<span>{_fmt_money(_owed_cents)} outstanding</span>" if _open
+             else "<span>All paid up</span>")
     if _unbilled_n:
-        _inv_meta += (f"<span class=\"cmd-sep\"></span>"
-                      f"<span style=\"color:#FF9D5C;font-weight:700;\">&#x1F9FE; {_unbilled_n} unbilled surcharge"
-                      f"{'s' if _unbilled_n != 1 else ''} ({_fmt_money(_unbilled_cents)})</span>")
+        _meta += (f"<span class=\"cmd-sep\"></span>"
+                  f"<span style=\"color:#FF9D5C;font-weight:700;\">&#x1F9FE; {_unbilled_n} unbilled surcharge"
+                  f"{'s' if _unbilled_n != 1 else ''} ({_fmt_money(_unbilled_cents)})</span>")
     cards = ""
     for inv in rows:
         d = dict(inv)
+        _route_link = ""
+        if d.get("route_id") and d.get("route_name"):
+            _route_link = f"""<div style="margin-top:8px;"><a class="muted small" href="{url_for('view_route', route_id=d['route_id'])}">Route: {e(d['route_name'])} &#8250;</a></div>"""
+        _lines = _line_counts.get(d["id"], 0)
         cards += f"""
-        <a class="card" style="display:block;text-decoration:none;margin-bottom:12px;" href="{url_for('invoice_detail', invoice_id=d['id'])}">
+        <a class="card" style="display:block;text-decoration:none;margin-bottom:12px;border-left:4px solid #FFB84D;" href="{url_for('invoice_detail', invoice_id=d['id'])}">
             <div class="row between">
-                <div><strong>{e(d['invoice_number'])}</strong> &middot; {e(d['customer_name'] or '—')}</div>
+                <div><span style="font-weight:800;">&#x1F9FE; {e(d['invoice_number'])}</span> &middot; {e(d['customer_name'] or '—')}</div>
                 <span class="badge {_status_badge.get(d['status'], '')}">{e(d['status'].title())}</span>
             </div>
-            <div class="row between" style="margin-top:8px;">
-                <span class="muted small">{e(d['issued_at'] or '')} &middot; {_invoice_terms_label(d['terms'])}</span>
-                <strong style="font-size:18px;">{_fmt_money(d['total_cents'])}</strong>
+            <div class="row between" style="margin-top:10px;align-items:flex-end;">
+                <span class="muted small">{e(d['issued_at'] or '')} &middot; {_invoice_terms_label(d['terms'])} &middot; {_lines} line{'s' if _lines != 1 else ''}</span>
+                <strong style="font-size:22px;color:#FFD08A;">{_fmt_money(d['total_cents'])}</strong>
             </div>
+            {_route_link}
         </a>"""
+    return _meta, cards
+
+
+@app.route("/invoices")
+@boss_required
+def invoice_list():
+    conn = get_db()
+    try:
+        _inv_meta, cards = _invoice_section_html(conn, cid())
+    finally:
+        conn.close()
     body = f"""
     {_cmd_header("Invoices", _inv_meta)}
     {cards or '<div class="card"><p class="muted">No invoices yet. Open a completed route and tap <strong>Create Invoice</strong>.</p></div>'}
@@ -26819,7 +26904,7 @@ def invoice_detail(invoice_id):
         </div>
         {f'<div style="margin-bottom:16px;"><div class="muted small" style="margin-bottom:6px;">Evidence from the job</div><div class="row" style="gap:8px;flex-wrap:wrap;">{_photos}</div></div>' if _photos else ''}
         <div class="row" style="gap:8px;flex-wrap:wrap;">{_actions}</div>
-        {qbo.invoice_panel(d)}
+        <p class="muted small" style="margin-top:12px;">QuickBooks sync: {e(d['qb_sync_status'].replace('_', ' '))} — sync arrives in phase 2.</p>
     </div>
     <div class="card">
         <h3 style="margin:0 0 8px;">Add a line</h3>
@@ -32926,7 +33011,6 @@ def settings_page():
     </div>
     {_onboarding_back_banner()}
     {settings_body}
-    {qbo.settings_card()}
     {_phone_section}
     {subscription_body}
     {delete_account_body}
@@ -49930,10 +50014,7 @@ def apple_app_site_association():
                     "appID": f"{APPLE_TEAM_ID}.com.rockkstaar.haultra",
                     # 2026-10-12: Customer portal links (/c/*) must open in Safari,
                     # not the app. Customers don't have the app or a login.
-                    # 2026-10-26: QuickBooks connect returns from Intuit to Safari,
-                    # so /quickbooks/* must open in Safari too. Exclusions go first:
-                    # Apple applies the first pattern that matches.
-                    "paths": ["NOT /c/*", "NOT /quickbooks/*", "*"],
+                    "paths": ["*", "NOT /c/*"],
                 }
             ],
         }
@@ -49957,9 +50038,6 @@ def android_asset_links():
 
 
 init_db()
-qbo.init_app(app, get_db=get_db, cid=cid, boss_required=boss_required, shell_page=shell_page,
-             csrf_token=get_csrf_token, e=e, fmt_money=_fmt_money,
-             is_native=is_native_app, csrf_exempt=_CSRF_EXEMPT_ENDPOINTS)
 _review_demo_status = verify_app_review_demo(repair=True)
 if not _review_demo_status["ready"]:
     app.logger.error("App Review demo is not ready; check required Render environment variables")
