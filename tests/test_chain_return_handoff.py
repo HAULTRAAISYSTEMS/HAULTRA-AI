@@ -88,12 +88,12 @@ ok("Return Empty to" in h and "543 Central Dr" in h,
 ok("Deliver Empty to the next stop" not in h,
    "unterminated tail card never says 'the next stop'")
 
-# Fix 1 (tail return): after the return tap, the handoff points back to the head.
+# Fix 1 (tail return): the return tap redirects to the head's card (see the
+# driver-action redirect), so no stale "Next stop" strip may point at the
+# already-completed head from the tail's card — that navigation is dead.
 set_stop(s2, driver_status="box_in", arrived_at=_TS)
 h = cab()
-ok('cab-next-handoff' in h, "handoff strip renders after the deliver tap")
-ok("543 Central Dr" in h and "Navigate" in h, "handoff names the head address with Navigate")
-ok("openNavStop" in h, "handoff Navigate uses the nav-preference helper")
+ok('class="cab-next-handoff"' not in h, "no stale next-stop strip when the handoff dest is completed")
 
 # Fix 1 (middle): after delivering to the next stop, the handoff names it.
 set_stop(s1, status="open", driver_status="box_in", arrived_at=_TS)
