@@ -24437,6 +24437,7 @@ def view_route(route_id):
     # ticket's net tons for the Scale Weight fallback.
     _route_ticket_by_stop = {}
     _route_ticket_tons = {}
+    _route_ticket_no = {}
     # 2026-10-26: fleet cans by customer+site, for the site-can fallback
     # ("whatever can that's on the site") when a stop's own records name
     # no can. A standalone PR returns the same can, so the site can IS
@@ -24447,12 +24448,14 @@ def view_route(route_id):
     try:
         _tk_conn = get_db()
         for _tk in _tk_conn.execute(
-                "SELECT stop_id, can_number, net_tons FROM dump_tickets WHERE route_id=? ORDER BY id ASC",
+                "SELECT stop_id, can_number, net_tons, ticket_number FROM dump_tickets WHERE route_id=? ORDER BY id ASC",
                 (route_id,)).fetchall():
             if (_tk["can_number"] or "").strip():
                 _route_ticket_by_stop[_tk["stop_id"]] = (_tk["can_number"] or "").strip()
             if _tk["net_tons"] is not None:
                 _route_ticket_tons[_tk["stop_id"]] = _tk["net_tons"]
+            if (_tk["ticket_number"] or "").strip():
+                _route_ticket_no[_tk["stop_id"]] = (_tk["ticket_number"] or "").strip()
         try:
             _cust_map, _nc, _ns = _fleet_site_groups(_tk_conn, cid())
             _site_aliases = _customer_alias_map(_tk_conn, cid())
@@ -25015,7 +25018,7 @@ def view_route(route_id):
             <p><strong>Container:</strong> {e(s['container_size'] or '')}</p>
             {_down_can_html}{_can_html}{_site_can_html}
             {('<p><strong>Yard Can:</strong> <span style="color:#3DDC84;font-weight:800;">🏗️ #' + e(_effective_can(s)) + (' <span class="muted" style="font-weight:400;">(from notes)</span>' if not (dict(s).get('assigned_can') or '').strip() else '') + '</span></p>') if _effective_can(s) else (('<p><strong>Yard Can:</strong> <span class="muted">Not assigned — Edit to set it</span></p>') if (session.get('role') == 'boss' and 'delivery' in (dict(s).get('action') or '').lower()) else '')}
-            <p><strong>Ticket:</strong> {e(s['ticket_number'] or '')}</p>
+            <p><strong>Ticket:</strong> {e(s['ticket_number'] or _route_ticket_no.get(s['id'], '') or '')}</p>
             {_weight_row_html(s)}
             {_fee_row_html(s)}
             <p><strong>Reference:</strong> {e(s['reference_number'] or '')}</p>
