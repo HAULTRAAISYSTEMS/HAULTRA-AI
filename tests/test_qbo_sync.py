@@ -437,6 +437,86 @@ os.environ["QB_ENVIRONMENT"] = "sandbox"
 cl.post("/quickbooks/disconnect", data={"_csrf_token": "tok"})
 c = db(); ok(c.execute("SELECT COUNT(*) FROM qb_connections").fetchone()[0] == 0, "disconnect removes tokens"); c.close()
 
+# ── Connect from the native app (finished in the system browser) ────────────
+import re  # noqa: E402
+
+qbo.requests.get = lambda url, params=None, timeout=None, headers=None: FAKE.request(
+    "GET", url, params=params, headers=headers)
+FAKE.valid_refresh = None
+APP_UA = {"User-Agent": "Mozilla/5.0 (iPhone) HaultraNativeApp"}
+
+
+def app_connect():
+    r = cl.post("/quickbooks/connect", data={"_csrf_token": "tok"}, headers=APP_UA)
+    q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(r.headers.get("Location", "")).query))
+    return q.get("state", "")
+
+
+def conn_count():
+    c = db()
+    try:
+        return c.execute("SELECT COUNT(*) FROM qb_connections WHERE company_id=?", (co,)).fetchone()[0]
+    finally:
+        c.close()
+
+
+ok(b"Intuit opens in your browser" in cl.get("/quickbooks", headers=APP_UA).data,
+   "app shows browser-handoff note")
+ok(b"Intuit opens in your browser" not in cl.get("/quickbooks").data, "web page has no app note")
+
+state_a = app_connect()
+ok(state_a.startswith("h."), "app connect uses a handoff state")
+with cl.session_transaction() as s:
+    ok("qbo_oauth" not in s, "app connect doesn't rely on the WebView session")
+
+browser = app.app.test_client()         # Safari: no HAULTRA login, no cookies
+r = browser.get(f"/quickbooks/callback?code=AUTH-CODE&realmId=REALM1&state={state_a}")
+page = r.data.decode()
+ok(r.status_code == 200 and "Connect QuickBooks?" in page, "browser callback shows confirm page without login")
+ok("QBCo" in page and "Sandbox Hauling Co" in page, "confirm page names both companies")
+ok(conn_count() == 0, "nothing saved before confirm")
+ok(not any(t in page for t in FAKE.issued), "no token in confirm page")
+ok(browser.get(f"/quickbooks/callback?code=AUTH-CODE&realmId=REALM1&state={state_a}").status_code == 400,
+   "handoff callback is single-use")
+token_a = state_a[2:]
+nonce_a = re.search(r'name="nonce" value="([^"]+)"', page).group(1)
+attacker = app.app.test_client()
+ok(attacker.post(f"/quickbooks/handoff/{token_a}", data={"action": "confirm"}).status_code == 400,
+   "confirm without the browser's secret is refused")
+ok(attacker.post(f"/quickbooks/handoff/{token_a}", data={"action": "confirm", "nonce": "x" * 32}).status_code == 400,
+   "confirm with a wrong secret is refused")
+ok(conn_count() == 0, "refused confirms saved nothing")
+
+revokes = FAKE.revoke_calls
+r = browser.post(f"/quickbooks/handoff/{token_a}", data={"action": "cancel", "nonce": nonce_a})
+ok(r.status_code == 200 and b"wasn't connected" in r.data and conn_count() == 0, "cancel saves nothing")
+ok(FAKE.revoke_calls == revokes + 1, "cancel revokes the tokens at Intuit")
+
+state_b = app_connect()
+page = browser.get(f"/quickbooks/callback?code=AUTH-CODE&realmId=REALM1&state={state_b}").data.decode()
+nonce_b = re.search(r'name="nonce" value="([^"]+)"', page).group(1)
+r = browser.post(f"/quickbooks/handoff/{state_b[2:]}", data={"action": "confirm", "nonce": nonce_b})
+ok(r.status_code == 200 and b"QuickBooks connected" in r.data, "confirm (no CSRF cookie) connects")
+c = db()
+row = dict(c.execute("SELECT * FROM qb_connections WHERE company_id=?", (co,)).fetchone())
+left = c.execute("SELECT COUNT(*) FROM qb_oauth_handoff WHERE tokens_enc IS NOT NULL").fetchone()[0]
+c.close()
+ok(row["status"] == "connected" and row["connected_by"] == boss and row["company_name"] == "Sandbox Hauling Co",
+   "app-started connection saved to the right company + user")
+ok(left == 0, "no tokens left behind in handoff rows")
+ok(browser.post(f"/quickbooks/handoff/{state_b[2:]}", data={"action": "confirm", "nonce": nonce_b}).status_code == 400,
+   "confirm is single-use")
+ok(b"Sandbox Hauling Co" in cl.get("/quickbooks", headers=APP_UA).data, "app page shows connected after return")
+
+state_c = app_connect()
+c = db(); c.execute("UPDATE qb_oauth_handoff SET expires_at=0 WHERE stage='started'"); c.commit(); c.close()
+ok(browser.get(f"/quickbooks/callback?code=AUTH-CODE&realmId=REALM1&state={state_c}").status_code == 400,
+   "expired handoff refused")
+ok(browser.get("/quickbooks/callback?code=AUTH-CODE&realmId=REALM1&state=h.made-up").status_code == 400,
+   "unknown handoff refused")
+r = browser.get("/quickbooks/callback?code=AUTH-CODE&realmId=REALM1&state=web-state")
+ok(r.status_code == 302 and "login" in r.headers.get("Location", ""), "web callback still requires login")
+
 # ── Secrets never leak ──────────────────────────────────────────────────────
 logs = LOG.getvalue()
 ok(not any(t in logs for t in FAKE.issued), "no token value in any log line")

@@ -49955,7 +49955,8 @@ def android_asset_links():
 
 init_db()
 qbo.init_app(app, get_db=get_db, cid=cid, boss_required=boss_required, shell_page=shell_page,
-             csrf_token=get_csrf_token, e=e, fmt_money=_fmt_money)
+             csrf_token=get_csrf_token, e=e, fmt_money=_fmt_money,
+             is_native=is_native_app, csrf_exempt=_CSRF_EXEMPT_ENDPOINTS)
 _review_demo_status = verify_app_review_demo(repair=True)
 if not _review_demo_status["ready"]:
     app.logger.error("App Review demo is not ready; check required Render environment variables")
