@@ -17025,6 +17025,23 @@ def _build_route_board_html(user, day=None):
     # FK-derived flow lines (both sides, or a data-integrity notice for a half-link).
     _chain_flows_by_id = chain_resolver.render_flows(_chain_stops_for_flows)
 
+    # 2026-10-26: a completed chain leg whose chain still has a later leg
+    # pending is RETURNING, not done — the driver is still carrying the
+    # empty back. (The giver leg used to read Done the moment it was
+    # marked complete, even with the return leg outstanding.)
+    _chain_returning = set()
+    _chain_members = {}
+    for _r in board_rows:
+        _d2 = dict(_r)
+        _cg2 = _d2.get("chain_group_id")
+        if _cg2:
+            _chain_members.setdefault(_cg2, []).append(
+                ((_d2.get("chain_seq") or 0), _d2.get("stop_status") == "completed"))
+    for _cg2, _members in _chain_members.items():
+        for _seq, _done in _members:
+            if _done and any((not _d3) and (_s3 > _seq) for _s3, _d3 in _members):
+                _chain_returning.add((_cg2, _seq))
+
     # Real, derived "urgent" signal: a pending Pull/PR stop whose container has
     # already been sitting overdue at that address (from compute_containers_out,
     # the same replay used for the Owner Dashboard / Bin Tracker overdue counts).
@@ -17240,7 +17257,11 @@ def _build_route_board_html(user, day=None):
             # in progress (current/en-route/at-vendor), or held at a vendor. Only
             # pending stops can be lifted and reordered.
             locked = (stop_status == "completed") or held or (driver_status != "pending")
-            if stop_status == "completed":
+            _returning = (stop_status == "completed" and bool(dict(s).get("chain_group_id"))
+                          and (dict(s).get("chain_group_id"), (dict(s).get("chain_seq") or 0)) in _chain_returning)
+            if _returning:
+                pill_label, pill_cls, card_cls = "Returning", "enroute", "st-enroute"
+            elif stop_status == "completed":
                 pill_label, pill_cls, card_cls = "Done", "done", "st-done"
             elif held:
                 pill_label, pill_cls, card_cls = "Held", "held", "st-held"
@@ -17252,7 +17273,7 @@ def _build_route_board_html(user, day=None):
             hold_icon = '<span class="stop-mini-hold" title="Held — truck at vendor">&#9208;</span>' if held else ""
 
             addr_text = ", ".join(p for p in [s["address"] or "", s["city"] or ""] if p) or (s["customer_name"] or "Stop")
-            addr_cls = "stop-mini-addr done" if stop_status == "completed" else "stop-mini-addr"
+            addr_cls = "stop-mini-addr done" if (stop_status == "completed" and not _returning) else "stop-mini-addr"
             size_label = size_bucket(s["container_size"]) or (s["container_size"] or "")
             # Garbage stops (2026-10-10): show the can/bag count or tons instead
             # of a container size.
@@ -25292,7 +25313,12 @@ def _sync_fleet_from_history(conn, company_id):
             _tcan_old = bool(tcan and bulk_dates.get(tcan) and rdate and rdate < bulk_dates[tcan])
             if tcan and not _tcan_old and "delivery" not in act and done:
                 is_pr = "pickup and return" in act or "return" in act
-                is_swap = bool(d.get("swap_with_prev_pull")) or bool(d.get("chain_takes_from_stop_id"))
+                # 2026-10-26: giver legs (chain_gives_to_stop_id) are swap
+                # legs too — their ticket bin stays on the truck, it does
+                # NOT go back to the pickup address as a non-swap PR would.
+                is_swap = (bool(d.get("swap_with_prev_pull"))
+                           or bool(d.get("chain_takes_from_stop_id"))
+                           or bool(d.get("chain_gives_to_stop_id")))
                 if is_pr and not is_swap:
                     ins, ch = _fleet_upsert(conn, company_id, tcan, size, "deployed",
                                             f"Returned {rdate} — {who}, {where}" if who or where else f"Returned {rdate}")
@@ -25336,7 +25362,11 @@ def _sync_fleet_from_history(conn, company_id):
                 # evidence (tcan) so an un-evidenced completion never
                 # invents a drop, and it must differ from the hauled bin.
                 _sd_pr = "pickup and return" in act or "return" in act
-                _sd_swap = bool(d.get("swap_with_prev_pull")) or bool(d.get("chain_takes_from_stop_id"))
+                # 2026-10-26: giver legs count as swap legs here too, so the
+                # carried-bin advance mirrors _route_final_bin_detail.
+                _sd_swap = (bool(d.get("swap_with_prev_pull"))
+                            or bool(d.get("chain_takes_from_stop_id"))
+                            or bool(d.get("chain_gives_to_stop_id")))
                 if _sd_pr and _sd_swap and tcan and _carried and _carried != tcan:
                     _drop_old = bool(bulk_dates.get(_carried) and rdate and rdate < bulk_dates[_carried])
                     if not _drop_old:
@@ -25434,6 +25464,13 @@ def _route_final_bin_detail(conn, route_id):
             takes_from = {r["id"] for r in takes_rows}
         except Exception:
             takes_from = set()
+        try:
+            gives_rows = conn.execute(
+                "SELECT id FROM stops WHERE route_id=? AND chain_gives_to_stop_id IS NOT NULL",
+                (route_id,)).fetchall()
+            gives_to = {r["id"] for r in gives_rows}
+        except Exception:
+            gives_to = set()
         # 2026-10-24 ROOT CAUSE: the old helper selected
         # s.swap_with_previous_empty, a column that does not exist (the real
         # column is swap_with_prev_pull). The query failed, the except
@@ -25443,6 +25480,7 @@ def _route_final_bin_detail(conn, route_id):
         try:
             stops = conn.execute(
                 """SELECT s.id, s.action, s.swap_with_prev_pull AS swap_flag, s.container_size,
+                          s.chain_gives_to_stop_id AS gives_to, s.assigned_can, s.notes, s.placement_note,
                           dt.can_number AS ticket_can
                    FROM stops s LEFT JOIN dump_tickets dt ON dt.stop_id = s.id
                    WHERE s.route_id=? AND s.status='completed' AND s.cancelled_at IS NULL
@@ -25451,6 +25489,7 @@ def _route_final_bin_detail(conn, route_id):
         except Exception:
             stops = conn.execute(
                 """SELECT s.id, s.action, s.container_size,
+                          s.chain_gives_to_stop_id AS gives_to, s.assigned_can, s.notes, s.placement_note,
                           dt.can_number AS ticket_can
                    FROM stops s LEFT JOIN dump_tickets dt ON dt.stop_id = s.id
                    WHERE s.route_id=? AND s.status='completed' AND s.cancelled_at IS NULL
@@ -25462,7 +25501,13 @@ def _route_final_bin_detail(conn, route_id):
             size = (sd.get("container_size") or "").strip()
             act = (sd.get("action") or "").lower()
             is_pr = "pickup and return" in act
-            is_swap = bool(sd.get("swap_flag")) or sd.get("id") in takes_from
+            # 2026-10-26: a chain leg is a swap leg whether it takes from
+            # (receiver) or gives to (giver) the next leg. The giver used to
+            # fall through as a non-swap PR, which emptied the truck the
+            # moment leg 1 was marked done — even though the driver was
+            # still carrying the empty back to the return leg.
+            is_swap = (bool(sd.get("swap_flag")) or sd.get("id") in takes_from
+                       or sd.get("id") in gives_to)
             if is_pr and not is_swap:
                 if ticket_can and prev and prev != ticket_can:
                     prev = ticket_can
@@ -25473,9 +25518,10 @@ def _route_final_bin_detail(conn, route_id):
                 # incomplete PR: prev stays (still carrying incoming)
             else:
                 # Pull / swap / Delivery / other: Box Out is the ticket bin
-                # (empty when there is no ticket, e.g. a Delivery).
-                prev = ticket_can
-                prev_size = size if ticket_can else ""
+                # (empty when there is no ticket, e.g. a Delivery). A swap
+                # leg with no ticket yet still carries its pickup can.
+                prev = ticket_can or (_pickup_can(sd) if is_swap else "")
+                prev_size = size if prev else ""
     except Exception:
         pass
     return prev, prev_size
