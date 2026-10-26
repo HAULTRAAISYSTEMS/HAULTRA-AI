@@ -24437,6 +24437,13 @@ def view_route(route_id):
     # ticket's net tons for the Scale Weight fallback.
     _route_ticket_by_stop = {}
     _route_ticket_tons = {}
+    # 2026-10-26: fleet cans by customer+site, for the site-can fallback
+    # ("whatever can that's on the site") when a stop's own records name
+    # no can. A standalone PR returns the same can, so the site can IS
+    # the job's can even with no chain.
+    _site_can_map = {}
+    _site_aliases = {}
+    _site_street_custs = {}
     try:
         _tk_conn = get_db()
         for _tk in _tk_conn.execute(
@@ -24446,6 +24453,22 @@ def view_route(route_id):
                 _route_ticket_by_stop[_tk["stop_id"]] = (_tk["can_number"] or "").strip()
             if _tk["net_tons"] is not None:
                 _route_ticket_tons[_tk["stop_id"]] = _tk["net_tons"]
+        try:
+            _cust_map, _nc, _ns = _fleet_site_groups(_tk_conn, cid())
+            _site_aliases = _customer_alias_map(_tk_conn, cid())
+            for _disp, _groups in _cust_map.items():
+                for _g in _groups:
+                    _gsite = (_g["site"] or "").strip()
+                    if not _gsite:
+                        continue
+                    _gsk = _gsite.split(",")[0].strip().casefold()
+                    for (_num, _lab, _cd, _since) in _g["cans"]:
+                        if _lab:
+                            _site_can_map.setdefault((_norm_cust_key(_disp), _gsk), []).append(_lab)
+            for (_ck, _sk) in _site_can_map:
+                _site_street_custs.setdefault(_sk, set()).add(_ck)
+        except Exception:
+            pass
         _tk_conn.close()
     except Exception:
         pass
@@ -24697,6 +24720,35 @@ def view_route(route_id):
             if _giver is not None:
                 _down_can = _route_ticket_by_stop.get(_takes) or _pickup_can(dict(_giver)) or ""
         _down_can_html = (f'<p><strong>Can down here:</strong> <a href="/yard-setup?can={e(_down_can)}" style="color:#7FB8FF;font-weight:800;text-decoration:none;">#{e(_down_can)}</a></p>') if _down_can else ""
+        # 2026-10-26: every stop shows its container number when known —
+        # the ticket's can first (the hauled record), else the notes/
+        # assigned can. If it is the same can already shown as down here,
+        # the down line already says it — don't print it twice.
+        _handled_can = _route_ticket_by_stop.get(s["id"]) or _pickup_can(dict(s)) or ""
+        if _down_can and _down_can == _handled_can:
+            _handled_can = ""
+        _can_html = (f'<p><strong>Can:</strong> <a href="/yard-setup?can={e(_handled_can)}" style="color:#7FB8FF;font-weight:800;text-decoration:none;">#{e(_handled_can)}</a></p>') if _handled_can else ""
+        # 2026-10-26: site-can fallback — when the stop's own records name
+        # no can, show whatever can the fleet has at this job site.
+        # Customer+street match, else a street match that is unique
+        # across the fleet (the address is the site's identity).
+        _site_can_html = ""
+        if not _down_can and not _handled_can:
+            _sck = _norm_cust_key(s["customer_name"] or "")
+            if _sck in _site_aliases:
+                _sck = _norm_cust_key(_site_aliases[_sck])
+            _ssk = (s["address"] or "").split(",")[0].strip().casefold()
+            _sc = _site_can_map.get((_sck, _ssk), [])
+            if not _sc and len(_site_street_custs.get(_ssk, ())) == 1:
+                _only = next(iter(_site_street_custs[_ssk]))
+                _sc = _site_can_map.get((_only, _ssk), [])
+            if _sc:
+                _uniq = sorted(set(_sc))
+                if len(_uniq) == 1:
+                    _site_can_html = (f'<p><strong>Can on site:</strong> <a href="/yard-setup?can={e(_uniq[0])}" style="color:#7FB8FF;font-weight:800;text-decoration:none;">#{e(_uniq[0])}</a></p>')
+                else:
+                    _links = ", ".join(f'<a href="/yard-setup?can={e(_c)}" style="color:#7FB8FF;font-weight:800;text-decoration:none;">#{e(_c)}</a>' for _c in _uniq)
+                    _site_can_html = f'<p><strong>Cans on site:</strong> {_links}</p>'
         photo_html = build_photo_gallery_html(photos_by_stop.get(s["id"], []))
 
         edit_button = f'<a class="btn secondary" href="{url_for("edit_stop", stop_id=s["id"])}">Edit</a>' if session.get("role") == "boss" else ''
@@ -24887,7 +24939,7 @@ def view_route(route_id):
             <p><strong>Action:</strong> {e(s['action'] or '')}{_can_pill}{_swap_badge}</p>
             {_swap_warning}
             <p><strong>Container:</strong> {e(s['container_size'] or '')}</p>
-            {_down_can_html}
+            {_down_can_html}{_can_html}{_site_can_html}
             {('<p><strong>Yard Can:</strong> <span style="color:#3DDC84;font-weight:800;">🏗️ #' + e(_effective_can(s)) + (' <span class="muted" style="font-weight:400;">(from notes)</span>' if not (dict(s).get('assigned_can') or '').strip() else '') + '</span></p>') if _effective_can(s) else (('<p><strong>Yard Can:</strong> <span class="muted">Not assigned — Edit to set it</span></p>') if (session.get('role') == 'boss' and 'delivery' in (dict(s).get('action') or '').lower()) else '')}
             <p><strong>Ticket:</strong> {e(s['ticket_number'] or '')}</p>
             {_weight_row_html(s)}
@@ -36225,8 +36277,9 @@ def _fleet_site_of(notes):
     The fleet sync writes notes as 'Returned YYYY-MM-DD — Customer, Address',
     'Hauled YYYY-MM-DD — Customer', or 'On site at ADDR (Bin Tracker)'.
     A boss assignment writes 'Placed YYYY-MM-DD — Site' (site known, no
-    customer yet). Anything else (e.g. 'Bulk deployed … — via Deploy all')
-    names no site and returns ('', '', '')."""
+    customer yet). A swap drop writes 'Dropped YYYY-MM-DD — Customer, Address'.
+    Anything else (e.g. 'Bulk deployed … — via Deploy all') names no site
+    and returns ('', '', '')."""
     n = (notes or "").strip()
     for _verb in ("Returned", "Hauled"):
         if n.startswith(_verb + " "):
@@ -36245,6 +36298,16 @@ def _fleet_site_of(notes):
             _head = _rest[0].split(" ")
             _date = _head[1] if len(_head) == 2 else ""
             return "", _rest[1].strip(), _date
+    if n.startswith("Dropped "):
+        _rest = n.split(" — ", 1)
+        if len(_rest) == 2:
+            _head = _rest[0].split(" ")
+            _date = _head[1] if len(_head) == 2 else ""
+            _who = _rest[1].strip()
+            if ", " in _who:
+                _c, _s = _who.split(", ", 1)
+                return _c.strip(), _s.strip(), _date
+            return _who, "", _date
     if n.startswith("On site at ") and n.endswith(" (Bin Tracker)"):
         return "", n[len("On site at "):-len(" (Bin Tracker)")].strip(), ""
     return "", "", ""
