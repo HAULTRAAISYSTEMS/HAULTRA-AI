@@ -6,6 +6,8 @@ reportlab==4.4.10
 anthropic==0.117.0
 requests==2.33.1
 stripe==15.3.1
+# QuickBooks sync: loads a local .env for development (no-op on Render).
+python-dotenv==1.2.1
 boto3==1.43.51
 # Web Push (VAPID) for boss alerts. Only imported when push is configured.
 pywebpush==2.5.0

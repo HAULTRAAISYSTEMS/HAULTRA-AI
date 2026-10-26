@@ -24,3 +24,6 @@ scripts/backups/
 
 # Driver avatar uploads (media on disk; DB stores the path only)
 static/uploads/avatars/
+
+# Local secrets — never commit
+.env

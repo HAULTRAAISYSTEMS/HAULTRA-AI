@@ -57,6 +57,16 @@ services:
         sync: false
       - key: AWS_SECRET_ACCESS_KEY
         sync: false
+      - key: QB_CLIENT_ID
+        sync: false   # QuickBooks sync — Intuit app Client ID (Production keys on the live service). Never commit.
+      - key: QB_CLIENT_SECRET
+        sync: false   # QuickBooks sync — Intuit app Client Secret. Never commit.
+      - key: QB_REDIRECT_URI
+        sync: false   # e.g. https://haultra-systems.com/quickbooks/callback — must match the Intuit portal exactly
+      - key: QB_ENVIRONMENT
+        value: production   # "sandbox" or "production"
+      - key: QB_TOKEN_KEY
+        sync: false   # optional Fernet key for encrypting QB tokens; derived from SECRET_KEY when unset
     disk:
       name: haultra-data
       mountPath: /opt/render/project/src
