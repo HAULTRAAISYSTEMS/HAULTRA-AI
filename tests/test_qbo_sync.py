@@ -518,6 +518,10 @@ ok(left == 0, "no tokens left behind in handoff rows")
 ok(browser.post(f"/quickbooks/handoff/{state_b[2:]}", data={"action": "confirm", "nonce": nonce_b}).status_code == 400,
    "confirm is single-use")
 ok(b"Sandbox Hauling Co" in cl.get("/quickbooks", headers=APP_UA).data, "app page shows connected after return")
+ok(b"appUrlOpen" in cl.get("/quickbooks", headers=APP_UA).data,
+   "connected app page (Reconnect) also handles the link back from Intuit")
+c = db(); c.execute("UPDATE qb_connections SET company_name='No company name' WHERE company_id=?", (co,)); c.commit(); c.close()
+ok(b"Sandbox Hauling Co" in cl.get("/quickbooks").data, "settings page refreshes a stale company name")
 
 state_c = app_connect()
 c = db(); c.execute("UPDATE qb_oauth_handoff SET expires_at=0 WHERE stage='started'"); c.commit(); c.close()

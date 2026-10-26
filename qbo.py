@@ -1215,6 +1215,22 @@ def _settings_page_body(get_db, company_id):
             {app_note}
             {connect_form.format(label="Connect QuickBooks" if not raw else "Reconnect QuickBooks")}</div>{app_script}"""
 
+    # Keep the shown company name current (e.g. renamed in QuickBooks after
+    # connecting) without making the boss reconnect.
+    try:
+        fresh = _nobraces(QBClient(get_db, company_id).company_info(c["realm_id"]).get("CompanyName") or "")
+        if fresh and fresh != c["company_name"]:
+            conn = get_db()
+            try:
+                conn.execute("UPDATE qb_connections SET company_name=? WHERE company_id=?", (fresh, company_id))
+                conn.commit()
+            finally:
+                conn.close()
+            c["company_name"] = fresh
+    except Exception as ex:
+        log.warning("qbo company name refresh failed: %s", type(ex).__name__)
+
+    reconnect_script = _APP_RETURN_SCRIPT if _deps.get("is_native", lambda: False)() else ""
     status = f"""<div class="card">
         <p>{env_badge} Connected to <strong>{_esc(c['company_name'] or c['realm_id'])}</strong></p>
         <div class="row" style="gap:8px;flex-wrap:wrap;">
@@ -1222,7 +1238,7 @@ def _settings_page_body(get_db, company_id):
             <form class="inline" method="POST" action="{url_for('qbo.disconnect')}"
                   onsubmit="return confirm('Disconnect QuickBooks? Invoices already sent stay in QuickBooks.')">
                 {_csrf_field()}<button class="btn red" type="submit">Disconnect</button></form>
-        </div></div>"""
+        </div></div>{reconnect_script}"""
 
     try:
         items = list_items(QBClient(get_db, company_id))
