@@ -24467,7 +24467,7 @@ def view_route(route_id):
                     _gsk = _gsite.split(",")[0].strip().casefold()
                     for (_num, _lab, _cd, _since) in _g["cans"]:
                         if _lab:
-                            _site_can_map.setdefault((_norm_cust_key(_disp), _gsk), []).append(_lab)
+                            _site_can_map.setdefault((_norm_cust_key(_disp), _gsk), []).append((_lab, _since, _num))
             for (_ck, _sk) in _site_can_map:
                 _site_street_custs.setdefault(_sk, set()).add(_ck)
         except Exception:
@@ -24806,9 +24806,12 @@ def view_route(route_id):
             _handled_can = ""
         _can_html = (f'<p><strong>Can:</strong> <a href="/yard-setup?can={e(_handled_can)}" style="color:#7FB8FF;font-weight:800;text-decoration:none;">#{e(_handled_can)}</a></p>') if _handled_can else ""
         # 2026-10-26: site-can fallback — when the stop's own records name
-        # no can, show whatever can the fleet has at this job site.
-        # Customer+street match, else a street match that is unique
-        # across the fleet (the address is the site's identity).
+        # no can, show ONE can: the site's most recent fleet can (latest
+        # move date; undated cans sort first, ties break to the highest
+        # number). Never the whole site inventory — that list lives on
+        # the Fleet page. Customer+street match, else a street match
+        # that is unique across the fleet (the address is the site's
+        # identity).
         _site_can_html = ""
         if not _down_can and not _handled_can:
             _sck = _norm_cust_key(s["customer_name"] or "")
@@ -24820,12 +24823,8 @@ def view_route(route_id):
                 _only = next(iter(_site_street_custs[_ssk]))
                 _sc = _site_can_map.get((_only, _ssk), [])
             if _sc:
-                _uniq = sorted(set(_sc))
-                if len(_uniq) == 1:
-                    _site_can_html = (f'<p><strong>Can on site:</strong> <a href="/yard-setup?can={e(_uniq[0])}" style="color:#7FB8FF;font-weight:800;text-decoration:none;">#{e(_uniq[0])}</a></p>')
-                else:
-                    _links = ", ".join(f'<a href="/yard-setup?can={e(_c)}" style="color:#7FB8FF;font-weight:800;text-decoration:none;">#{e(_c)}</a>' for _c in _uniq)
-                    _site_can_html = f'<p><strong>Cans on site:</strong> {_links}</p>'
+                _best = max(_sc, key=lambda t: (t[1] or "", t[2]))
+                _site_can_html = (f'<p><strong>Can on site:</strong> <a href="/yard-setup?can={e(_best[0])}" style="color:#7FB8FF;font-weight:800;text-decoration:none;">#{e(_best[0])}</a></p>')
         photo_html = build_photo_gallery_html(photos_by_stop.get(s["id"], []))
 
         edit_button = f'<a class="btn secondary" href="{url_for("edit_stop", stop_id=s["id"])}">Edit</a>' if session.get("role") == "boss" else ''
@@ -25311,19 +25310,24 @@ def mark_route_in_progress(route_id):
 
 import re as _re_for_can_notes
 _CAN_WORD_RE = _re_for_can_notes.compile(r'\b(?:can|container|bin)s?\s*#?\s*(\d{3,5})\b', _re_for_can_notes.IGNORECASE)
+_CAN_REF_RE = _re_for_can_notes.compile(r'\bcan\s+ref(?:erence)?\s*#?\s*(\d{3,5})\b', _re_for_can_notes.IGNORECASE)
 _CAN_HASH_RE = _re_for_can_notes.compile(r'#\s*(\d{3,5})\b')
 
 
 def _can_from_notes(text):
     """Can number written in free text, or '' if none can be read safely.
 
-    Matches 'Can 3117', 'container #3117', 'bin 3117', '#3117', and a
-    number next to the word 'yard' ('3117 at yard'). It deliberately does
-    NOT match bare numbers on their own — 'place at lot 20', '30yd', and
-    street numbers like 11496 must never be mistaken for a can.
+    Matches 'Can 3117', 'container #3117', 'bin 3117', '#3117', 'can ref
+    3002', and a number next to the word 'yard' ('3117 at yard'). It
+    deliberately does NOT match bare numbers on their own — 'place at
+    lot 20', '30yd', and street numbers like 11496 must never be
+    mistaken for a can.
     """
     if not text:
         return ""
+    m = _CAN_REF_RE.search(text)
+    if m:
+        return m.group(1)
     m = _CAN_WORD_RE.search(text)
     if m:
         return m.group(1)
