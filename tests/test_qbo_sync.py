@@ -467,6 +467,8 @@ _app_page = cl.get("/quickbooks", headers=APP_UA).data
 ok(b"appUrlOpen" in _app_page and b"'/quickbooks/'" in _app_page,
    "app page loads a /quickbooks/ link that reopened the app")
 ok(b"{{" not in _app_page and b"{%" not in _app_page, "app script has no template syntax")
+ok(b"going = true" in _app_page and b"if (!going)" in _app_page,
+   "return-reload can't override a link that reopened the app")
 os.environ["APPLE_TEAM_ID"] = "TEAMID1234"
 app.APPLE_TEAM_ID = "TEAMID1234"
 _paths = json.loads(cl.get("/.well-known/apple-app-site-association").data)["applinks"]["details"][0]["paths"]

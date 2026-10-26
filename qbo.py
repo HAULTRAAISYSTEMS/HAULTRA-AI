@@ -1034,21 +1034,26 @@ _BACK_TO_APP = ('<p class="muted">If this page is in Safari, go back to the HAUL
 # No doubled braces: this text goes through render_template_string.
 _APP_RETURN_SCRIPT = """<script>
 (function () {
-  var t = null;
+  var t = null, going = false;
   var cap = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.App;
   if (cap && cap.addListener) {
     cap.addListener('appUrlOpen', function (ev) {
       try {
         var u = new URL(ev && ev.url);
         if (u.host === location.host && u.pathname.indexOf('/quickbooks/') === 0) {
+          // The link can arrive before or after the page becomes visible;
+          // either way, never let the return-reload replace it.
+          going = true;
           if (t) { clearTimeout(t); t = null; }
-          location.href = u.pathname + u.search;
+          location.replace(u.pathname + u.search);
         }
       } catch (e) {}
     });
   }
   document.addEventListener('visibilitychange', function () {
-    if (!document.hidden) { t = setTimeout(function () { location.reload(); }, 1200); }
+    if (document.hidden || going) { return; }
+    if (t) { clearTimeout(t); }
+    t = setTimeout(function () { if (!going) { location.reload(); } }, 2500);
   });
 })();
 </script>"""
@@ -1076,12 +1081,15 @@ def _handoff_callback(get_db, token):
     try:
         row = _handoff_row(conn, token) if token else None
         if not row or row["expires_at"] < _now():
+            log.warning("qbo handoff callback: unknown or expired handoff")
             return expired
+        log.info("qbo handoff callback reached for company %s (stage %s)", row["company_id"], row["stage"])
         claimed = conn.execute(
             "UPDATE qb_oauth_handoff SET stage='authorizing' WHERE token_hash=? AND stage='started'",
             (_hash(token),)).rowcount
         conn.commit()
         if not claimed:
+            log.warning("qbo handoff callback: already used (stage %s)", row["stage"])
             return expired
         if request.args.get("error"):
             conn.execute("UPDATE qb_oauth_handoff SET stage='cancelled' WHERE token_hash=?", (_hash(token),))
@@ -1112,6 +1120,7 @@ def _handoff_callback(get_db, token):
                 "access_token", "refresh_token", "expires_in", "x_refresh_token_expires_in") if k in tok})),
              _hash(nonce), _now() + HANDOFF_CONFIRM_TTL_S, _hash(token)))
         conn.commit()
+        log.info("qbo handoff authorized for company %s; waiting for confirm", row["company_id"])
         haultra_name = _company_label(conn, row["company_id"])
     finally:
         conn.close()
@@ -1165,6 +1174,7 @@ def _handoff_finish(get_db, token):
     finally:
         conn.close()
     name = _save_connection(get_db, company_id, realm, tok, user_id)
+    log.info("qbo handoff confirmed for company %s", company_id)
     return _browser_page("Connected", f"<h1>&#10003; QuickBooks connected</h1>"
                          f"<p>{_esc(name or 'Your QuickBooks company')} is connected to HAULTRA.</p>"
                          + _BACK_TO_APP)
