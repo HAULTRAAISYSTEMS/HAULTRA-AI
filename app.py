@@ -20207,34 +20207,9 @@ def driver_route_detail(route_id):
                 )
 
     # ── Pre-tap handoff navigation ──────────────────────────────────────
-    # A chained stop sitting at need_box_in shows the deliver-step button
-    # ("Return Empty to X"), which both names the destination AND completes
-    # the stop on tap — but the driver has to DRIVE there first. Surface the
-    # destination with its own Navigate button before the confirming tap, so
-    # the tap stays a confirmation and the driver isn't advanced to the next
-    # stop while still holding an empty for the handoff stop. (2026-10-09)
-    _predeliver_nav_html = ""
-    if driver_status == "need_box_in" and _chained:
-        _pcarry_id = _chain_carry_dest_id(
-            _chained, _c_gives, _c_takes is not None, _c_term, _c_head_id)
-        _pdest = (next((_nr for _nr in stops if _nr["id"] == _pcarry_id), None)
-                  if _pcarry_id else None)
-        if _pdest is not None:
-            _pdfull = " ".join(filter(None, [
-                _pdest["address"] or "", _pdest["city"] or "",
-                _pdest["state"] or "", _pdest["zip_code"] or ""])).strip()
-            if _pdfull:
-                _pdname = (_pdest["customer_name"] or "").strip() or _pdfull
-                _predeliver_nav_html = (
-                    '<div class="cab-next-handoff">'
-                    '<div class="cab-next-handoff-label">&#9650; Empty goes to</div>'
-                    '<div class="cab-next-handoff-addr">' + e(_pdname) + '</div>'
-                    '<a class="cab-primary cab-next-handoff-nav" href="#" '
-                    'onclick="return openNavStop(event, ' + _nav_pref_js + ', '
-                    + e(json.dumps(_pdfull)) + ')">'
-                    '&#128205; Navigate</a>'
-                    '</div>'
-                )
+    # 2026-10-26: the "Empty goes to + Navigate" strip is REMOVED — user
+    # wants the Return/Deliver Empty button alone to carry him to the
+    # destination card; the button already names where the empty goes.
 
     # ── Next-stop fallback ──────────────────────────────────────────────
     # 2026-10-10: REMOVED — user wants the "Return/Deliver Empty to X" button
@@ -20881,7 +20856,6 @@ def driver_route_detail(route_id):
         {_cab_fee_block}
         {photo_gallery_html}
         <div class="cab-workzone">
-            {_predeliver_nav_html}
             {_next_handoff_html}
             {workflow_btn_html}
             {empty_can_picker_html}
