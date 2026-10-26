@@ -30593,9 +30593,14 @@ def route_daily_log(route_id):
         _prev_dump_departure = s['dump_departure'] or ""
         # Chain head finish: blank while the tail is still open; once the
         # tail completes, the head's finish is the tail's completion —
-        # the return time. Other legs keep their own completion time.
+        # the return time. A finished RECEIVER's finish is its landfill
+        # depart (2026-10-26, user's call): the dump work ended when the
+        # truck left the landfill, not when the Return tap landed later.
+        # Other legs keep their own completion time.
         if _is_chain_head and s["status"] == "completed":
             _finish_ts = _ctf_finish.get(_raw_group, "") or ""
+        elif _is_chain_receiver and s["status"] == "completed":
+            _finish_ts = s['dump_departure'] or s['completed_at'] or ""
         else:
             _finish_ts = s['completed_at'] or ""
         weight_display, tons = _log_weight(
