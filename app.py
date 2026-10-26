@@ -30159,6 +30159,22 @@ def route_daily_log(route_id):
 
     can_by_stop, takes_from = _log_chain_maps(stops)
 
+    # 2026-10-26: chain-tail finish map for the head-finish rule — the tail
+    # is the highest-seq member of each chain group; its completion is the
+    # chain's end (the driver returns to the first route).
+    def _ctf_seq(_x):
+        _sq = _x["chain_seq"] if "chain_seq" in _x.keys() else None
+        return _sq if isinstance(_sq, int) else 0
+    _ctf_members = {}
+    for _m in stops:
+        _mk = _m.keys()
+        _mg = _m["chain_group_id"] if "chain_group_id" in _mk else None
+        if _mg:
+            _ctf_members.setdefault(_mg, []).append(_m)
+    _ctf_finish = {}
+    for _mg, _mm in _ctf_members.items():
+        _ctf_finish[_mg] = max(_mm, key=_ctf_seq)["completed_at"] or ""
+
     dash = '<span style="color:#777;">\u2014</span>'
     rows = ""
     total_tons = 0.0
@@ -30175,6 +30191,7 @@ def route_daily_log(route_id):
     # 2026-10-21: start time for a stop = finish time of the PREVIOUS stop
     # (the driver rolls straight from one job to the next).
     _prev_finish = ""
+    _prev_dump_departure = ""
     for _pos, s in enumerate(stops, start=1):
         if s["status"] == "completed":
             done_count += 1
@@ -30246,14 +30263,34 @@ def route_daily_log(route_id):
                 _prev_box_out = "" if box_out else _prev_box_out
         else:
             _prev_box_out = box_out
+        # 2026-10-26: chain legs — the head isn't finished until the chain
+        # ends (the driver returns to the first route), and a receiver leg
+        # starts when the driver leaves the landfill toward it, not at the
+        # previous leg's finish tap. Raw chain columns here, never the log
+        # map's takes_from (it synthetically maps a head-terminal head to
+        # its tail for Box In purposes).
+        _raw_takes = s["chain_takes_from_stop_id"] if "chain_takes_from_stop_id" in s.keys() else None
+        _raw_group = s["chain_group_id"] if "chain_group_id" in s.keys() else None
+        _is_chain_receiver = bool(_raw_takes)
+        _is_chain_head = bool(_raw_group) and not _raw_takes
         # 2026-10-21: Start = previous stop's finish (driver rolls job to
         # job). First stop = when the driver hit start on the route.
         # Stops not yet reached show NO start time (not the route start).
         if _pos == 1:
             _start_ts = route['started_at'] or s['arrived_at'] or ""
+        elif _is_chain_receiver:
+            _start_ts = _prev_dump_departure or _prev_finish
         else:
             _start_ts = _prev_finish
         _prev_finish = s['completed_at'] or ""
+        _prev_dump_departure = s['dump_departure'] or ""
+        # Chain head finish: blank while the tail is still open; once the
+        # tail completes, the head's finish is the tail's completion —
+        # the return time. Other legs keep their own completion time.
+        if _is_chain_head and s["status"] == "completed":
+            _finish_ts = _ctf_finish.get(_raw_group, "") or ""
+        else:
+            _finish_ts = s['completed_at'] or ""
         weight_display, tons = _log_weight(
             s["net_tons"],
             s["material"] if has_ticket else None,
@@ -30291,7 +30328,7 @@ def route_daily_log(route_id):
             <td class="col-time">{_log_fmt_time(_start_ts)}</td>
             <td class="col-time">{_log_fmt_time(s['dump_arrival'])}</td>
             <td class="col-time">{_log_fmt_time(s['dump_departure'])}</td>
-            <td class="col-time">{_log_fmt_time(s['completed_at'])}</td>
+            <td class="col-time">{_log_fmt_time(_finish_ts)}</td>
             <td class="col-center">{e(box_in) or dash}</td>
             <td class="col-center">{e(box_out) or dash}</td>
             <td class="col-num">{weight_display or dash}</td>
