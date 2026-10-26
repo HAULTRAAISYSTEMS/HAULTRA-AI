@@ -5091,6 +5091,12 @@ def init_db():
             flush=True
         )
 
+    # 2026-10-26: QuickBooks tables (connections, customer/item maps, OAuth
+    # handoff, qb_* invoice columns). qbo.init_tables is idempotent; skipped
+    # only if the qbo module is absent (a checkout without it still boots).
+    if _QBO_AVAILABLE:
+        qbo.init_tables(conn)
+
     conn.close()
 
 
@@ -17942,6 +17948,7 @@ def routes_page():
                 {rows if rows else '<div class="empty">No routes found.</div>'}
             </div>
         </div>
+        </div>
         <style>
         /* 2026-10-16: history cards mirror the driver dashboard cards */
         .drv-lane.hist-lane {{ display:block; background:var(--card-bg,#171717);
@@ -27230,7 +27237,7 @@ def invoice_detail(invoice_id):
         </div>
         {f'<div style="margin-bottom:16px;"><div class="muted small" style="margin-bottom:6px;">Evidence from the job</div><div class="row" style="gap:8px;flex-wrap:wrap;">{_photos}</div></div>' if _photos else ''}
         <div class="row" style="gap:8px;flex-wrap:wrap;">{_actions}</div>
-        <p class="muted small" style="margin-top:12px;">QuickBooks sync: {e(d['qb_sync_status'].replace('_', ' '))} — sync arrives in phase 2.</p>
+        {qbo.invoice_panel(d) if _QBO_AVAILABLE else ''}
     </div>
     <div class="card">
         <h3 style="margin:0 0 8px;">Add a line</h3>
@@ -33402,6 +33409,7 @@ def settings_page():
         + _push_settings_toggle()
         + '</div>'
     )
+    _qb_card = qbo.settings_card() if _QBO_AVAILABLE else ""
     body = f"""
     <div class="hero">
         <h1>Settings</h1>
@@ -33411,6 +33419,7 @@ def settings_page():
     {settings_body}
     {_phone_section}
     {subscription_body}
+    {_qb_card}
     {delete_account_body}
     <script>
     (function(){{
@@ -35954,6 +35963,30 @@ def _fleet_is_stale(cd):
     return (_today - _ev).days > _STALE_AFTER_DAYS
 
 
+def _fleet_site_of(notes):
+    """Parse a fleet note into (customer, site, since_date).
+
+    The fleet sync writes notes as 'Returned YYYY-MM-DD — Customer, Address',
+    'Hauled YYYY-MM-DD — Customer', or 'On site at ADDR (Bin Tracker)'.
+    Anything else (e.g. 'Bulk deployed … — via Deploy all') names no site
+    and returns ('', '', '')."""
+    n = (notes or "").strip()
+    for _verb in ("Returned", "Hauled"):
+        if n.startswith(_verb + " "):
+            _rest = n.split(" — ", 1)
+            if len(_rest) == 2:
+                _head = _rest[0].split(" ")
+                _date = _head[1] if len(_head) == 2 else ""
+                _who = _rest[1].strip()
+                if _verb == "Returned" and ", " in _who:
+                    _c, _s = _who.split(", ", 1)
+                    return _c.strip(), _s.strip(), _date
+                return _who, "", _date
+    if n.startswith("On site at ") and n.endswith(" (Bin Tracker)"):
+        return "", n[len("On site at "):-len(" (Bin Tracker)")].strip(), ""
+    return "", "", ""
+
+
 def _containers_section_html():
     conn = get_db()
     # 2026-10-24: fleet is grouped by status (yard → on truck → deployed
@@ -36017,6 +36050,47 @@ def _containers_section_html():
     _group_counts = {}
     for _t in _disp_rows:
         _group_counts[_t[3]] = _group_counts.get(_t[3], 0) + 1
+    # 2026-10-26: By-site view — deployed cans grouped by customer + site,
+    # parsed from each can's fleet note. Cans whose note names no site land
+    # under "Site not recorded" until a route or an Edit gives them one.
+    _site_groups = {}
+    for _go, _num, _lab, _disp, _cd in _disp_rows:
+        if _disp != "deployed":
+            continue
+        _cust, _site, _since = _fleet_site_of(_cd["notes"])
+        _key = (_cust.casefold().strip(), _site.casefold().strip())
+        _site_groups.setdefault(_key, {"customer": _cust, "site": _site, "cans": []})
+        _site_groups[_key]["cans"].append((_num, _lab, _cd, _since))
+    _site_custs = {}
+    for _g in _site_groups.values():
+        _site_custs.setdefault(_g["customer"], []).append(_g)
+    _n_site_cans = sum(len(_g["cans"]) for _g in _site_groups.values())
+    _n_site_sites = len(_site_groups)
+    if not _site_groups:
+        _site_html = '<div class="card"><p class="muted">Nothing deployed — cans show here once they are dropped at a customer.</p></div>'
+    else:
+        _site_html = ""
+        for _cust in sorted(_site_custs, key=lambda c: (not c, c.casefold())):
+            _gsites = sorted(_site_custs[_cust], key=lambda g: (not g["site"], g["site"].casefold()))
+            _ctotal = sum(len(_g["cans"]) for _g in _gsites)
+            _srows = ""
+            for _g in _gsites:
+                _can_rows = ""
+                for _num, _lab, _cd, _since in sorted(_g["cans"], key=lambda t: (t[0], t[1])):
+                    _since_txt = f" &middot; since {_since}" if _since else ""
+                    _can_rows += (f'<div class="row between" style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.06);">'
+                                  f'<span><strong>{e(_cd["size"])}</strong> {e(_lab or "(no #)")}<span class="muted small">{_since_txt}</span></span>'
+                                  f'<a href="{url_for("edit_container", c_id=_cd["id"])}" style="color:#FF9D5C;font-size:12px;">Edit</a></div>')
+                _site_name = _g["site"] or "Site not recorded"
+                _row_search = " ".join([_site_name] + [f'{_c[2]["size"]} {_c[1]}' for _c in _g["cans"]]).lower()
+                _srows += (f'<div class="site-row" data-search="{e(_row_search)}" style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.08);">'
+                           f'<div style="font-weight:600;">{e(_site_name)} <span class="muted small">&middot; {len(_g["cans"])} can{"s" if len(_g["cans"]) != 1 else ""}</span></div>'
+                           f'{_can_rows}</div>')
+            _cust_name = _cust or "Unknown customer"
+            _site_html += (f'<details class="site-cust card" data-customer="{e(_cust_name.lower())}" style="margin-bottom:12px;">'
+                           f'<summary style="cursor:pointer;"><div class="row between"><div><span style="font-weight:800;">{e(_cust_name)}</span> '
+                           f'<span class="muted small">&middot; {len(_gsites)} site{"s" if len(_gsites) != 1 else ""} &middot; {_ctotal} can{"s" if _ctotal != 1 else ""}</span></div></div></summary>'
+                           f'<div style="margin-top:8px;">{_srows}</div></details>')
     rows_html = ""
     _cur_group = None
     for _go, _num, _lab, _disp, _cd in _disp_rows:
@@ -36117,6 +36191,11 @@ def _containers_section_html():
         }}
         </script>
         <p class="ai-sub" style="margin-top:10px;">🟡 At Yard = sitting in the yard, ready to assign &nbsp;·&nbsp; 🔵 On Truck = on a truck right now — picked up from a job and heading to the dump, the yard, or back to that job; not sitting at a customer yet &nbsp;·&nbsp; ⚠️ Needs review = was on a truck more than 2 days ago with no next move recorded — confirm where it is (Edit to fix) &nbsp;·&nbsp; 🟢 Deployed = dropped at a customer.</p>
+        <div id="fl-view-toggle" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;">
+            <button type="button" class="fl-chip active" onclick="flSetView('can', this)">By can</button>
+            <button type="button" class="fl-chip" onclick="flSetView('site', this)">🟢 By site ({_n_site_sites} sites)</button>
+        </div>
+        <div id="fl-by-can">
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;" id="fl-chips">
             <button type="button" class="fl-chip active" data-fl-status="all" onclick="flSetStatus('all', this)">All ({len(containers)})</button>
             <button type="button" class="fl-chip fl-sign-glow" style="--glow:#fbbf24;" data-fl-status="yard" onclick="flSetStatus('yard', this)">🟡 At Yard ({_group_counts.get("yard", 0)})</button>
@@ -36140,6 +36219,36 @@ def _containers_section_html():
                 </tbody>
             </table>
         </div>
+        </div>
+        <div id="fl-by-site" style="display:none;">
+            <input id="fl-site-filter" type="text" placeholder="Search customer, site, or can&hellip;"
+                   oninput="flSiteFilter(this.value)"
+                   style="width:100%;min-height:48px;padding:10px 14px;margin-bottom:14px;background:rgba(255,255,255,.04);
+                          border:1px solid rgba(255,255,255,0.12);border-radius:12px;color:var(--text);">
+            <p class="muted small" style="margin-bottom:12px;">{_n_site_cans} deployed cans at {_n_site_sites} sites. Tap a customer to see its sites and cans.</p>
+            {_site_html}
+        </div>
+        <script>
+        function flSetView(v, btn) {{
+            document.getElementById('fl-by-can').style.display = v === 'can' ? '' : 'none';
+            document.getElementById('fl-by-site').style.display = v === 'site' ? '' : 'none';
+            document.querySelectorAll('#fl-view-toggle .fl-chip').forEach(function(b) {{ b.classList.toggle('active', b === btn); }});
+        }}
+        function flSiteFilter(q) {{
+            q = q.toLowerCase();
+            document.querySelectorAll('#fl-by-site details.site-cust').forEach(function(block) {{
+                var cname = block.getAttribute('data-customer');
+                var any = false;
+                block.querySelectorAll('.site-row').forEach(function(row) {{
+                    var match = !q || cname.indexOf(q) !== -1 || row.getAttribute('data-search').indexOf(q) !== -1;
+                    row.style.display = match ? '' : 'none';
+                    if (match) any = true;
+                }});
+                block.style.display = any ? '' : 'none';
+                block.open = !!(q && any);
+            }});
+        }}
+        </script>
         <style>
         .fl-chip{{padding:8px 16px;border-radius:999px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.04);color:#A6A69E;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;}}
         .fl-chip.active{{background:linear-gradient(135deg,#FF6B1A,#FF9D5C);color:#fff;border-color:transparent;}}
@@ -50680,6 +50789,22 @@ def android_asset_links():
         }
     ])
 
+
+# 2026-10-26: QuickBooks wiring (qbo.py ships the module; this plugs it in).
+# Guarded so a checkout without qbo.py still boots (card/panel degrade to
+# empty). Production always has qbo.py (requirements include requests +
+# cryptography), so the guard never trips there.
+try:
+    import qbo as _qbo_module
+    _QBO_AVAILABLE = True
+except ImportError:
+    _qbo_module = None
+    _QBO_AVAILABLE = False
+if _QBO_AVAILABLE:
+    _qbo_module.init_app(app, get_db=get_db, cid=cid, boss_required=boss_required,
+                         shell_page=shell_page, csrf_token=get_csrf_token, e=e,
+                         fmt_money=_fmt_money, csrf_exempt=_CSRF_EXEMPT_ENDPOINTS)
+    qbo = _qbo_module
 
 init_db()
 _review_demo_status = verify_app_review_demo(repair=True)
