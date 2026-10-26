@@ -35279,6 +35279,56 @@ def _group_display(customer, site):
     return (c or "Unassigned", s or "No address")
 
 
+def _site_kind_map(conn, company_id):
+    """{(normalized name, normalized street-or-full): {kinds}} for the
+    company's address book. Both the street and the full address are keyed,
+    because stop addresses arrive with and without city/state. Never raises."""
+    m = {}
+    try:
+        for r in conn.execute(
+                "SELECT customer_name, address, full_address, kind FROM saved_addresses WHERE company_id=?",
+                (company_id,)).fetchall():
+            d = dict(r)
+            name = _normalize_name(d.get("customer_name"))
+            if not name:
+                continue
+            kind = (d.get("kind") or "customer").strip().lower()
+            street = _normalize_addr(d.get("address"))
+            if street:
+                m.setdefault((name, street), set()).add(kind)
+            full = _normalize_addr(d.get("full_address") or d.get("address"))
+            if full and full != street:
+                m.setdefault((name, full), set()).add(kind)
+    except Exception:
+        pass
+    return m
+
+
+def _lookup_site_kind(kind_map, customer_name, address):
+    """Kind of the place a stop belongs to: 'customer' by default. A
+    customer match beats a non-customer match on collision, so a real
+    customer is never hidden by a same-name vendor. Never raises."""
+    try:
+        name = _normalize_name(customer_name)
+        if not name:
+            return "customer"
+        street = _normalize_addr((address or "").split(",")[0])
+        full = _normalize_addr(address)
+        found = set()
+        if street:
+            found |= kind_map.get((name, street), set())
+        if full:
+            found |= kind_map.get((name, full), set())
+        if not found or "customer" in found:
+            return "customer"
+        for k in ("vendor", "yard", "dump"):
+            if k in found:
+                return k
+        return "customer"
+    except Exception:
+        return "customer"
+
+
 def _invoiced_stop_ids(conn, company_id):
     """Stop ids already on a live (non-void) invoice. Void invoices release
     their stops back to unbilled. Never raises."""
@@ -35317,9 +35367,12 @@ def _unbilled_stop_groups(conn, company_id, route_id=None):
                    WHERE r.company_id=? AND s.status='completed' ORDER BY s.id""",
                 (company_id,)).fetchall()
         billed = _invoiced_stop_ids(conn, company_id)
+        kind_map = _site_kind_map(conn, company_id)
         for s in stops:
             sd = dict(s)
             if sd["id"] in billed or not sd.get("route_id"):
+                continue
+            if _lookup_site_kind(kind_map, sd.get("customer_name"), sd.get("address")) != "customer":
                 continue
             key = _group_key(sd.get("customer_name"), sd.get("address"))
             g = groups.get(key)
@@ -35370,9 +35423,12 @@ def _build_invoice_lines_for_route(conn, company_id, route_id, group=None):
                FROM stops WHERE route_id=? AND status='completed'
                ORDER BY stop_order, id""", (route_id,)).fetchall()
         billed = _invoiced_stop_ids(conn, company_id)
+        kind_map = _site_kind_map(conn, company_id)
         for s in stops:
             sd = dict(s)
             if sd["id"] in billed:
+                continue
+            if _lookup_site_kind(kind_map, sd.get("customer_name"), sd.get("address")) != "customer":
                 continue
             if group is not None and _group_key(sd.get("customer_name"), sd.get("address")) != group:
                 continue
@@ -37821,14 +37877,15 @@ def delete_parse_lesson(lesson_id):
 def _address_book_section_html():
     """Boss-editable address book: the self-built list of learned locations that
     powers quick-add and autocomplete. Light-touch edits only — set a display
-    label (overrides the learned customer name in suggestions) and hide a
-    location from suggestions without deleting its history. Type-ahead filters
+    label (overrides the learned customer name in suggestions), set the
+    location type (Vendor/Yard/Dump places never bill), and hide a location
+    from suggestions without deleting its history. Type-ahead filters
     the list client-side."""
     conn = get_db()
     _ensure_address_book(conn, cid())
     rows_db = conn.execute(
         """SELECT id, customer_name, label, address, city, state, full_address,
-                  hidden, times_used, last_used_at
+                  hidden, times_used, last_used_at, kind
              FROM saved_addresses
             WHERE company_id=? AND TRIM(COALESCE(address,'')) != ''
             ORDER BY hidden ASC, times_used DESC, last_used_at DESC
@@ -37857,6 +37914,14 @@ def _address_book_section_html():
                            else '<span class="muted small">(no name)</span>'))
         hidden_badge = ('<span class="badge" style="opacity:.6;">hidden</span>'
                         if is_hidden else '')
+        _kind = (_a.get("kind") or "customer").strip().lower()
+        _kind_badge = ""
+        if _kind in ("vendor", "yard", "dump"):
+            _kind_badge = (f'<span class="badge" style="background:rgba(255,157,92,0.15);color:#FF9D5C;'
+                           f'border:1px solid rgba(255,157,92,0.4);">{e(_kind.title())}</span>')
+        _kind_opts = "".join(
+            f'<option value="{k}"{" selected" if _kind == k else ""}>{lbl}</option>'
+            for k, lbl in (("customer", "Customer"), ("vendor", "Vendor"), ("yard", "Yard"), ("dump", "Dump")))
         hide_label = "Unhide" if is_hidden else "Hide"
         row_style = ' style="opacity:.55;"' if is_hidden else ''
         # Confirm only when hiding (removing from quick-add), not when unhiding.
@@ -37867,7 +37932,7 @@ def _address_book_section_html():
         _hide_btn_label = "Unhide" if is_hidden else "&#10005; Remove"
         rows += (
             f'<tr data-search="{e(search)}"{row_style}{_aextra}>'
-            f'<td>{name_cell} {hidden_badge}'
+            f'<td>{name_cell} {hidden_badge} {_kind_badge}'
             f'<div class="muted small">{e(addr)}</div></td>'
             f'<td class="muted small" style="text-align:center;">{_a["times_used"]}</td>'
             f'<td>'
@@ -37878,6 +37943,17 @@ def _address_book_section_html():
             f'<input name="label" value="{e(_a["label"] or "")}" placeholder="{e(_a["customer_name"] or "display name")}" '
             f'style="flex:1;min-width:120px;min-height:40px;padding:6px 10px;background:var(--bg-0);'
             f'border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);font-size:13px;">'
+            f'<button type="submit" style="min-height:40px;background:transparent;color:#FF9D5C;'
+            f'border:1px solid rgba(255,157,92,0.4);border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer;">Save</button>'
+            f'</form>'
+            f'<form method="POST" action="{url_for("update_address_book", sa_id=_a["id"])}" '
+            f'style="display:flex;gap:6px;align-items:center;margin-top:6px;">'
+            f'<input type="hidden" name="_csrf_token" value="{_csrf}">'
+            f'<input type="hidden" name="action" value="kind">'
+            f'<select name="kind" style="flex:1;min-width:120px;min-height:40px;padding:6px 10px;background:var(--bg-0);'
+            f'border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);font-size:13px;">'
+            f'{_kind_opts}'
+            f'</select>'
             f'<button type="submit" style="min-height:40px;background:transparent;color:#FF9D5C;'
             f'border:1px solid rgba(255,157,92,0.4);border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer;">Save</button>'
             f'</form></td>'
@@ -38170,12 +38246,13 @@ def _site_locations_section_html():
 @app.route("/address-book/<int:sa_id>/update", methods=["POST"])
 @boss_required
 def update_address_book(sa_id):
-    """Light boss edits to a learned location: set a display label or toggle its
-    hidden flag. Company-scoped — a boss can only touch their own rows."""
+    """Light boss edits to a learned location: set a display label, set its
+    type (customer/vendor/yard/dump — only customers ever bill), or toggle
+    its hidden flag. Company-scoped — a boss can only touch their own rows."""
     action = (request.form.get("action") or "").strip()
     conn = get_db()
     owned = conn.execute(
-        "SELECT id, hidden, customer_name, label, kind FROM saved_addresses WHERE id=? AND company_id=?",
+        "SELECT id, hidden, customer_name, label, kind, address FROM saved_addresses WHERE id=? AND company_id=?",
         (sa_id, cid())
     ).fetchone()
     if not owned:
@@ -38232,6 +38309,22 @@ def update_address_book(sa_id):
               "success")
         conn.close()
         return redirect(url_for("yard_setup_page") + "#site-locations")
+    elif action == "kind":
+        new_kind = (request.form.get("kind") or "").strip().lower()
+        if new_kind not in ("customer", "vendor", "yard", "dump"):
+            flash("Unknown location type.", "error")
+        else:
+            _nm = (owned["label"] or "").strip() or (owned["customer_name"] or "").strip()
+            _nk = _address_book_key(_nm, owned["address"] or "", new_kind)
+            try:
+                conn.execute(
+                    "UPDATE saved_addresses SET kind=?, norm_key=? WHERE id=? AND company_id=?",
+                    (new_kind, _nk, sa_id, cid()))
+                conn.commit()
+                flash(f"Location type set to {new_kind.title()}.", "success")
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                flash("A location with that name and address already exists.", "error")
     conn.close()
     return redirect(url_for("yard_setup_page") + "#address-book")
 
