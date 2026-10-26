@@ -25903,6 +25903,24 @@ def _route_on_truck(conn, route_id):
     except Exception:
         _b, _bs = "", ""
     _nxt = next((s for s in _stops if (s.get("status") or "") != "completed"), None)
+    # 2026-10-26: a CLOSED head-terminal chain's final bin is not on the
+    # truck — it was dropped at the head when the head completed (Marlyn
+    # kept showing 3063 on the yard card after the driver had already
+    # dropped it there and reached Katchmark). Suppress the fallback bin
+    # only in that case: while the head is still open the driver really is
+    # carrying the bin back to it, and the fallback below correctly names
+    # the head as the destination.
+    _done = [s for s in _stops if (s.get("status") or "") == "completed"]
+    if _b and _done:
+        _last = _done[-1]
+        _lterm = (_last.get("chain_terminal") or "").strip()
+        if _lterm == "head":
+            _lgroup = _last.get("chain_group_id")
+            _lhead = next((s for s in _stops
+                           if s.get("chain_group_id") == _lgroup
+                           and not s.get("chain_takes_from_stop_id")), None)
+            if _lhead is not None and (_lhead.get("status") or "") == "completed":
+                _b, _bs = "", ""
     if _b and not _setoff_done:
         _who_n = _who(_nxt) if _nxt else ""
         return {"can": _b, "size": _bs or "",
