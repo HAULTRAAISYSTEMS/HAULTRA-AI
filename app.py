@@ -24704,21 +24704,92 @@ def view_route(route_id):
         return f'<p><strong>Fees:</strong></p><div style="margin:-6px 0 6px;">{_items}</div>'
     # Stop numbers are DISPLAY POSITION (1..N in current order), never the stored
     # stop_order — so a deleted/reordered stop always renumbers cleanly.
+    # 2026-10-26: the card's cans come from the Daily Log's own Box In/Out
+    # derivation (same chain maps, same sequential carry), so the card and
+    # the log can never disagree about a stop's containers. Box Out is the
+    # ticket can; Box In is the bin dropped here.
+    _log_box_in = {}
+    try:
+        _l_can_by_stop, _l_takes_from = _log_chain_maps(stops)
+        _l_prev = ""
+        for _ls in stops:
+            _lk = _ls.keys()
+            _lsid = _ls["id"] if "id" in _lk else None
+            _l_box_out = _route_ticket_by_stop.get(_lsid) or ""
+            _l_act = ((_ls["action"] if "action" in _lk else None) or "").lower()
+            _l_is_pr = "pickup and return" in _l_act
+            _l_swap_flag = _ls["swap_with_previous_empty"] if "swap_with_previous_empty" in _lk else None
+            _l_is_swap = bool(_l_swap_flag) or (_lsid in (_l_takes_from or {}))
+            _l_giver = (_l_takes_from or {}).get(_lsid)
+            _l_is_deliv = "delivery" in _l_act
+            _l_deliv_can = _effective_can(_ls) if _l_is_deliv else ""
+            if _l_giver and _l_can_by_stop.get(_l_giver):
+                _l_box_in = _l_can_by_stop.get(_l_giver)
+            elif _l_deliv_can:
+                _l_box_in = _l_deliv_can
+            elif _l_is_pr and not _l_is_swap:
+                if _l_box_out and _l_prev and _l_prev != _l_box_out:
+                    _l_box_in = _l_prev
+                else:
+                    _l_box_in = _l_box_out if _l_box_out else _l_prev
+            else:
+                _l_box_in = _l_prev
+            if _lsid is not None:
+                _log_box_in[_lsid] = _l_box_in
+            if _l_is_deliv:
+                if (_ls["status"] or "") == "completed":
+                    _l_prev = ""
+            elif _l_is_pr and not _l_is_swap:
+                if _l_box_out and _l_prev and _l_prev != _l_box_out:
+                    _l_prev = _l_box_out
+                else:
+                    _l_prev = "" if _l_box_out else _l_prev
+            else:
+                _l_prev = _l_box_out
+    except Exception:
+        _log_box_in = {}
+    # Closed head-terminal chains: the tail's ticket can is the empty
+    # returned to the head's address once the tail completes.
+    _head_return = {}
+    try:
+        _h_groups = {}
+        for _hm in stops:
+            _hmg = _hm["chain_group_id"] if "chain_group_id" in _hm.keys() else None
+            if _hmg:
+                _h_groups.setdefault(_hmg, []).append(_hm)
+        for _hmg, _hmm in _h_groups.items():
+            _h_tail = max(_hmm, key=lambda _x: (_x["chain_seq"] if "chain_seq" in _x.keys() and isinstance(_x["chain_seq"], int) else 0))
+            _h_head = next((h for h in _hmm if not (h["chain_takes_from_stop_id"] if "chain_takes_from_stop_id" in h.keys() else None)), None)
+            if _h_head is not None and (_h_tail["chain_terminal"] if "chain_terminal" in _h_tail.keys() else "") == "head" and (_h_tail["status"] or "") == "completed":
+                _h_tt = _route_ticket_by_stop.get(_h_tail["id"]) or ""
+                if _h_tt:
+                    _head_return[_h_head["id"]] = _h_tt
+    except Exception:
+        _head_return = {}
     for _pos, s in enumerate(stops, start=1):
         if next_open_stop_id is None and stop_is_open(s):
          next_open_stop_id = s["stop_order"]
         _cancelled = stop_is_cancelled(s)
         _disp_status = _disp_status_of(s)
-        # 2026-10-26: a receiver past its Set Off tap has a can DOWN at this
-        # site (the carried-in empty) — show it on the card instead of
-        # leaving the stop looking can-less. Gated on the tap: before the
-        # swap the can is still on the truck, not down here.
+        # 2026-10-26: the down can comes from the Daily Log's own Box In
+        # (same math, so card and log can never disagree): the bin dropped
+        # here — the chain carry for swap legs, the returned empty for a
+        # closed head-terminal chain's head. Gated on the Set Off tap
+        # (before it, the can is still on the truck, not down here); the
+        # giver's ticket/notes stay as a fallback when the log's carry
+        # is blank. Deliveries already have their Yard Can line.
         _down_can = ""
         _takes = s["chain_takes_from_stop_id"] if "chain_takes_from_stop_id" in s.keys() else None
-        if _takes and ((s["driver_status"] or "") in ("box_out", "going_to_dump", "need_box_in", "box_in") or (s["status"] or "") == "completed"):
-            _giver = next((g for g in stops if g["id"] == _takes), None)
-            if _giver is not None:
-                _down_can = _route_ticket_by_stop.get(_takes) or _pickup_can(dict(_giver)) or ""
+        _past_setoff = ((s["driver_status"] or "") in ("box_out", "going_to_dump", "need_box_in", "box_in") or (s["status"] or "") == "completed")
+        _is_deliv_card = "delivery" in (s["action"] or "").lower()
+        if _takes and _past_setoff and not _is_deliv_card:
+            _down_can = _log_box_in.get(s["id"], "")
+            if not _down_can:
+                _giver = next((g for g in stops if g["id"] == _takes), None)
+                if _giver is not None:
+                    _down_can = _route_ticket_by_stop.get(_takes) or _pickup_can(dict(_giver)) or ""
+        elif s["id"] in _head_return:
+            _down_can = _log_box_in.get(s["id"], "") or _head_return[s["id"]]
         _down_can_html = (f'<p><strong>Can down here:</strong> <a href="/yard-setup?can={e(_down_can)}" style="color:#7FB8FF;font-weight:800;text-decoration:none;">#{e(_down_can)}</a></p>') if _down_can else ""
         # 2026-10-26: every stop shows its container number when known —
         # the ticket's can first (the hauled record), else the notes/
