@@ -77,7 +77,36 @@ if res:
     ok(res.get("can") == "3063" and res.get("has_can"), "open chain: still carrying 3063 back, got %r" % res.get("can"))
     ok("Marlyn" in res.get("step", ""), "open chain: heading back to Marlyn, got %r" % res.get("step"))
 
-# State 3 — BASELINE: plain completed pull, next stop pending (unchanged).
+# State 4 — BOXED OUT, NO TICKET YET: standalone PR at going_to_dump.
+# The driver IS hauling the site's full — the card must flip to on-truck
+# (unknown number), never "empty".
+r4 = mkroute("BOXED")
+b4 = mkstop(r4, 1, "Katchmark", "5444 Bainbridge Blvd", "open", "going_to_dump")
+conn.execute("UPDATE stops SET dump_location='Dominion' WHERE id=?", (b4,))
+conn.commit()
+res = A._route_on_truck(conn, r4)
+ok(res is not None, "boxed-out no-ticket: truck card renders")
+if res:
+    ok(res.get("unknown_can") and not res.get("has_can") and res.get("can") in ("", None), "boxed-out no-ticket: unknown can, not empty, got %r" % res.get("can"))
+    ok(res.get("step") == "Heading to the dump", "boxed-out no-ticket: step is Heading to the dump, got %r" % res.get("step"))
+
+# State 5 — same stop, one step earlier (box_out tap just landed).
+conn.execute("UPDATE stops SET driver_status='box_out' WHERE id=?", (b4,))
+conn.commit()
+res = A._route_on_truck(conn, r4)
+ok(res is not None, "box_out tap: truck card renders")
+if res:
+    ok(res.get("unknown_can"), "box_out tap: unknown can, not empty")
+    ok(res.get("step") == "Can on truck — to the dump", "box_out tap: step is Can on truck, got %r" % res.get("step"))
+
+# State 6 — same stop WITH a ticket: known can, unchanged behavior.
+mkticket(r4, b4, "3125")
+conn.execute("UPDATE stops SET driver_status='going_to_dump' WHERE id=?", (b4,))
+conn.commit()
+res = A._route_on_truck(conn, r4)
+ok(res is not None, "boxed-out with ticket: truck card renders")
+if res:
+    ok(res.get("can") == "3125" and res.get("has_can"), "boxed-out with ticket: known can 3125, got %r" % res.get("can"))
 r3 = mkroute("PLAIN")
 p3 = mkstop(r3, 1, "Solo", "1 Solo Way", "completed", "completed", act='Pull')
 n3 = mkstop(r3, 2, "Next", "2 Next Way", "open", "pending")
