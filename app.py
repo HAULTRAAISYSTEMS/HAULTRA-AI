@@ -26699,10 +26699,31 @@ def invoice_list():
     conn = get_db()
     try:
         _inv_meta, cards = _invoice_section_html(conn, cid())
+        _groups = _unbilled_stop_groups(conn, cid())
     finally:
         conn.close()
+    _ready = ""
+    if _groups:
+        _rows = ""
+        for g in _groups:
+            _rows += f"""
+            <div class="row between" style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.06);">
+                <div><div style="font-weight:700;">{e(g['customer'])} <span class="muted">— {e(g['site'])}</span></div>
+                <div class="muted small">{g['n_stops']} unbilled job{'s' if g['n_stops'] != 1 else ''}</div></div>
+                <div style="display:flex;gap:12px;align-items:center;">
+                    <strong>{_fmt_money(g['total'])}</strong>
+                    <a class="btn secondary" href="{url_for('invoice_new', customer=g['raw_customer'], site=g['raw_site'], group=1)}">Create invoice</a>
+                </div>
+            </div>"""
+        _ready = f"""
+    <div class="card" style="margin-bottom:16px;">
+        <h2 style="margin:0 0 4px;">Ready to bill</h2>
+        <p class="muted small" style="margin:0 0 8px;">Unbilled work grouped by customer + job site, across all routes. Each invoice covers one customer at one site.</p>
+        {_rows}
+    </div>"""
     body = f"""
     {_cmd_header("Invoices", _inv_meta)}
+    {_ready}
     {cards or '<div class="card"><p class="muted">No invoices yet. Open a completed route and tap <strong>Create Invoice</strong>.</p></div>'}
     """
     return render_template_string(shell_page("Invoices", body))
@@ -26712,30 +26733,12 @@ def _invoice_terms_label(terms):
     return dict(_INVOICE_TERMS).get(terms, "Due on receipt")
 
 
-@app.route("/invoices/new")
-@boss_required
-def invoice_new():
-    conn = get_db()
-    route_id = request.args.get("route_id", "").strip()
-    route = None
-    pre_lines = []
-    suggest_customer = ""
-    if route_id.isdigit():
-        route = conn.execute(
-            "SELECT * FROM routes WHERE id=? AND company_id=?", (route_id, cid())).fetchone()
-        if route:
-            pre_lines = _build_invoice_lines_for_route(conn, cid(), int(route_id))
-            names = conn.execute(
-                "SELECT customer_name, COUNT(*) n FROM stops WHERE route_id=? AND status='completed' "
-                "AND customer_name IS NOT NULL AND customer_name != '' GROUP BY customer_name ORDER BY n DESC LIMIT 1",
-                (route_id,)).fetchone()
-            if names:
-                suggest_customer = names["customer_name"]
-    conn.close()
-    if route_id and not route:
-        flash("Route not found.", "error")
-        return redirect(url_for("invoice_list"))
-
+def _invoice_form_body(route, bill_to, pre_lines, group_customer, group_site, subtitle, empty_note):
+    """Single-invoice form HTML shared by manual, single-group, and
+    group-selected creation. subtitle must already be escaped. group_* are
+    the raw billing-group values (possibly blank) used to filter lines at
+    create time; None means no group (manual invoice). bill_to is the
+    editable customer name shown in the form."""
     _lines_preview = ""
     for ln in pre_lines:
         _lines_preview += f"""
@@ -26745,15 +26748,22 @@ def invoice_new():
             <strong>{_fmt_money(ln['amount_cents'])}</strong>
         </div>"""
     _pre_total = sum(ln["amount_cents"] for ln in pre_lines)
-    body = f"""
+    _group_fields = ""
+    if group_customer is not None:
+        _group_fields = f"""
+            <input type="hidden" name="group" value="1">
+            <input type="hidden" name="group_customer" value="{e(group_customer)}">
+            <input type="hidden" name="group_site" value="{e(group_site)}">"""
+    return f"""
     <div class="hero"><h1>New Invoice</h1>
-    <p>{'From route: ' + e(route['route_name']) if route else 'Manual invoice'}</p></div>
+    <p>{subtitle}</p></div>
     <div class="card">
         <form method="POST" action="{url_for('invoice_create')}">
             <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
-            <input type="hidden" name="route_id" value="{e(route_id)}">
+            <input type="hidden" name="route_id" value="{route['id'] if route else ''}">
+            {_group_fields}
             <label>Bill to</label>
-            <input name="customer_name" value="{e(suggest_customer)}" placeholder="Customer name" required style="width:100%;margin-bottom:12px;">
+            <input name="customer_name" value="{e(bill_to)}" placeholder="Customer name" required style="width:100%;margin-bottom:12px;">
             <div class="grid" style="grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">
                 <div><label>Terms</label>
                 <select name="terms" style="width:100%;">
@@ -26765,7 +26775,7 @@ def invoice_new():
             <label>Notes (optional)</label>
             <input name="notes" placeholder="Thank you for your business" style="width:100%;margin-bottom:16px;">
             <h3 style="margin:0 0 8px;">Line items ({len(pre_lines)})</h3>
-            {_lines_preview or '<p class="muted">No priced stops on this route — add lines manually after creating.</p>'}
+            {_lines_preview or f'<p class="muted">{empty_note}</p>'}
             <div class="row between" style="margin:12px 0 20px;">
                 <strong>Total</strong><strong style="font-size:20px;">{_fmt_money(_pre_total)}</strong>
             </div>
@@ -26773,6 +26783,98 @@ def invoice_new():
         </form>
     </div>
     """
+
+
+@app.route("/invoices/new")
+@boss_required
+def invoice_new():
+    conn = get_db()
+    route_id = request.args.get("route_id", "").strip()
+    group_sel = request.args.get("group", "").strip() == "1"
+    g_customer = request.args.get("customer", "").strip()
+    g_site = request.args.get("site", "").strip()
+    route = None
+    if route_id.isdigit():
+        route = conn.execute(
+            "SELECT * FROM routes WHERE id=? AND company_id=?", (route_id, cid())).fetchone()
+        if not route:
+            conn.close()
+            flash("Route not found.", "error")
+            return redirect(url_for("invoice_list"))
+
+    # Group-selected form (from the route chooser or ready-to-bill).
+    if group_sel:
+        key = _group_key(g_customer, g_site)
+        if route:
+            lines = _build_invoice_lines_for_route(conn, cid(), int(route_id), group=key)
+            subtitle = f"From route: {e(route['route_name'])}"
+        else:
+            groups = _unbilled_stop_groups(conn, cid())
+            match = next((g for g in groups if g["key"] == key), None)
+            lines = match["lines"] if match else []
+            subtitle = "Ready to bill"
+        cust, site = _group_display(g_customer, g_site)
+        subtitle += f" — {e(cust)} — {e(site)}"
+        body = _invoice_form_body(route, g_customer, lines, g_customer, g_site, subtitle,
+                                  "No priced stops in this group — add lines manually after creating.")
+        conn.close()
+        return render_template_string(shell_page("New Invoice", body))
+
+    # Route flow: split into billing groups (customer + site).
+    if route:
+        groups = _unbilled_stop_groups(conn, cid(), route_id=int(route_id))
+        if len(groups) == 1:
+            g = groups[0]
+            body = _invoice_form_body(route, g["raw_customer"], g["lines"],
+                                      g["raw_customer"], g["raw_site"],
+                                      f"From route: {e(route['route_name'])} — {e(g['customer'])} — {e(g['site'])}",
+                                      "No priced stops in this group — add lines manually after creating.")
+            conn.close()
+            return render_template_string(shell_page("New Invoice", body))
+        if len(groups) > 1:
+            _cards = ""
+            for g in groups:
+                _cards += f"""
+            <a class="card" style="display:block;text-decoration:none;margin-bottom:12px;" href="{url_for('invoice_new', route_id=route_id, customer=g['raw_customer'], site=g['raw_site'], group=1)}">
+                <div class="row between">
+                    <div><div style="font-weight:700;">{e(g['customer'])} <span class="muted">— {e(g['site'])}</span></div>
+                    <div class="muted small">{g['n_stops']} unbilled job{'s' if g['n_stops'] != 1 else ''}</div></div>
+                    <div style="text-align:right;"><strong style="font-size:20px;">{_fmt_money(g['total'])}</strong>
+                    <div class="muted small">Create invoice &#8250;</div></div>
+                </div>
+            </a>"""
+            body = f"""
+    <div class="hero"><h1>New Invoice</h1>
+    <p>From route: {e(route['route_name'])}</p></div>
+    <div class="card">
+        <p style="margin:0 0 12px;">This route has work for {len(groups)} customers/sites. Each invoice covers only one customer at one site — pick one to bill:</p>
+        {_cards}
+    </div>
+    """
+            conn.close()
+            return render_template_string(shell_page("New Invoice", body))
+        # No unbilled groups: everything already invoiced, or no completed stops.
+        _n_completed = conn.execute(
+            "SELECT COUNT(*) FROM stops WHERE route_id=? AND status='completed'",
+            (route_id,)).fetchone()[0]
+        if _n_completed:
+            body = f"""
+    <div class="hero"><h1>New Invoice</h1>
+    <p>From route: {e(route['route_name'])}</p></div>
+    <div class="card"><p class="muted">Everything on this route is already invoiced. <a href="{url_for('invoice_list')}">View invoices</a></p></div>
+    """
+            conn.close()
+            return render_template_string(shell_page("New Invoice", body))
+        body = _invoice_form_body(route, "", [], None, None,
+                                  f"From route: {e(route['route_name'])}",
+                                  "No completed stops on this route — add lines manually after creating.")
+        conn.close()
+        return render_template_string(shell_page("New Invoice", body))
+
+    # Manual invoice (no route, no group).
+    body = _invoice_form_body(None, "", [], None, None, "Manual invoice",
+                              "Add lines manually after creating.")
+    conn.close()
     return render_template_string(shell_page("New Invoice", body))
 
 
@@ -26781,6 +26883,9 @@ def invoice_new():
 def invoice_create():
     conn = get_db()
     route_id = request.form.get("route_id", "").strip()
+    group_sel = request.form.get("group", "").strip() == "1"
+    g_customer = request.form.get("group_customer", "").strip()
+    g_site = request.form.get("group_site", "").strip()
     customer_name = request.form.get("customer_name", "").strip()
     terms = request.form.get("terms", "due_on_receipt").strip()
     if terms not in dict(_INVOICE_TERMS):
@@ -26790,6 +26895,8 @@ def invoice_create():
     if not customer_name:
         conn.close()
         flash("Enter who this invoice is for.", "error")
+        if group_sel:
+            return redirect(url_for("invoice_new", route_id=route_id, customer=g_customer, site=g_site, group=1))
         return redirect(url_for("invoice_new", route_id=route_id))
 
     number = _next_invoice_number(conn, cid())
@@ -26803,17 +26910,26 @@ def invoice_create():
          terms, issued, due, notes, session["user_id"], now_ts()))
     inv_id = cur.lastrowid
     if route_id.isdigit():
-        for i, ln in enumerate(_build_invoice_lines_for_route(conn, cid(), int(route_id))):
-            conn.execute(
-                """INSERT INTO invoice_line_items
-                   (invoice_id, kind, description, qty, unit_cents, amount_cents, stop_id, sort_order)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (inv_id, ln["kind"], ln["description"], ln["qty"], ln["unit_cents"],
-                 ln["amount_cents"], ln["stop_id"], i))
-            # 2026-10-23: surcharge billed — mark it so it never double-invoices.
-            if ln.get("kind") == "surcharge" and ln.get("surcharge_id"):
-                conn.execute("UPDATE ticket_surcharges SET billed=1 WHERE id=?",
-                             (ln["surcharge_id"],))
+        key = _group_key(g_customer, g_site) if group_sel else None
+        lines = _build_invoice_lines_for_route(conn, cid(), int(route_id), group=key)
+    elif group_sel:
+        key = _group_key(g_customer, g_site)
+        groups = _unbilled_stop_groups(conn, cid())
+        match = next((g for g in groups if g["key"] == key), None)
+        lines = match["lines"] if match else []
+    else:
+        lines = []
+    for i, ln in enumerate(lines):
+        conn.execute(
+            """INSERT INTO invoice_line_items
+               (invoice_id, kind, description, qty, unit_cents, amount_cents, stop_id, sort_order)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (inv_id, ln["kind"], ln["description"], ln["qty"], ln["unit_cents"],
+             ln["amount_cents"], ln["stop_id"], i))
+        # 2026-10-23: surcharge billed — mark it so it never double-invoices.
+        if ln.get("kind") == "surcharge" and ln.get("surcharge_id"):
+            conn.execute("UPDATE ticket_surcharges SET billed=1 WHERE id=?",
+                         (ln["surcharge_id"],))
     _invoice_recalc_totals(conn, inv_id)
     conn.commit()
     conn.close()
@@ -34939,12 +35055,101 @@ def _invoice_due_date(terms, issued_day):
     return (d + timedelta(days=days)).strftime("%Y-%m-%d")
 
 
-def _build_invoice_lines_for_route(conn, company_id, route_id):
+def _group_key(customer, site):
+    """Normalized (customer, site) billing key. Blank customer → 'unassigned',
+    blank site → 'no address'. Case/space-insensitive so the same site typed
+    two ways still groups together."""
+    c = (customer or "").strip()
+    s = (site or "").strip()
+    return (c.casefold() or "unassigned", s.casefold() or "no address")
+
+
+def _group_display(customer, site):
+    """Display (customer, site) for a billing group."""
+    c = (customer or "").strip()
+    s = (site or "").strip()
+    return (c or "Unassigned", s or "No address")
+
+
+def _invoiced_stop_ids(conn, company_id):
+    """Stop ids already on a live (non-void) invoice. Void invoices release
+    their stops back to unbilled. Never raises."""
+    try:
+        rows = conn.execute(
+            """SELECT DISTINCT ili.stop_id FROM invoice_line_items ili
+               JOIN invoices i ON i.id = ili.invoice_id
+               WHERE i.company_id=? AND i.status != 'void' AND ili.stop_id IS NOT NULL""",
+            (company_id,)).fetchall()
+        return {r["stop_id"] for r in rows}
+    except Exception:
+        return set()
+
+
+def _unbilled_stop_groups(conn, company_id, route_id=None):
+    """Unbilled completed stops grouped by (customer, site).
+
+    route_id limits to one route; None = whole company (ready-to-bill).
+    Returns [{key, customer, site, n_stops, lines, total}] sorted by total
+    desc. Line building reuses the route builder per route, so preview
+    totals always match what Create produces. Never raises ([] on error).
+    """
+    groups = {}
+    try:
+        if route_id is not None:
+            stops = conn.execute(
+                """SELECT id, route_id, action, container_size, weight_tons, address,
+                          customer_name
+                   FROM stops WHERE route_id=? AND status='completed'
+                   ORDER BY stop_order, id""", (route_id,)).fetchall()
+        else:
+            stops = conn.execute(
+                """SELECT s.id, s.route_id, s.action, s.container_size, s.weight_tons,
+                          s.address, s.customer_name
+                   FROM stops s JOIN routes r ON r.id = s.route_id
+                   WHERE r.company_id=? AND s.status='completed' ORDER BY s.id""",
+                (company_id,)).fetchall()
+        billed = _invoiced_stop_ids(conn, company_id)
+        for s in stops:
+            sd = dict(s)
+            if sd["id"] in billed or not sd.get("route_id"):
+                continue
+            key = _group_key(sd.get("customer_name"), sd.get("address"))
+            g = groups.get(key)
+            if g is None:
+                cust, site = _group_display(sd.get("customer_name"), sd.get("address"))
+                g = groups[key] = {"key": key, "customer": cust, "site": site,
+                                   "raw_customer": (sd.get("customer_name") or "").strip(),
+                                   "raw_site": (sd.get("address") or "").strip(),
+                                   "route_ids": set(), "stop_ids": set()}
+            g["route_ids"].add(sd["route_id"])
+            g["stop_ids"].add(sd["id"])
+        out = []
+        for g in groups.values():
+            lines = []
+            for rid in g["route_ids"]:
+                lines.extend(_build_invoice_lines_for_route(conn, company_id, rid, group=g["key"]))
+            # Builder with a group key already filters to the group, but keep
+            # only this group's stop ids as a belt-and-suspenders guard.
+            lines = [ln for ln in lines if ln.get("stop_id") in g["stop_ids"]]
+            out.append({"key": g["key"], "customer": g["customer"], "site": g["site"],
+                        "raw_customer": g["raw_customer"], "raw_site": g["raw_site"],
+                        "n_stops": len(g["stop_ids"]), "lines": lines,
+                        "total": sum(ln["amount_cents"] for ln in lines)})
+        out.sort(key=lambda g: -g["total"])
+        return out
+    except Exception:
+        return []
+
+
+def _build_invoice_lines_for_route(conn, company_id, route_id, group=None):
     """Auto line items from a route's completed stops.
 
     One haul line per priced stop + one overage line per overweight
-    pull/swap. Returns [dict(kind, description, qty, unit_cents,
-    amount_cents, stop_id)]. Never raises.
+    pull/swap. Skips stops already on a live invoice, so a job can never
+    be billed twice. group=(customer, site) limits lines to one billing
+    group (normalized match); None = all unbilled stops. Returns
+    [dict(kind, description, qty, unit_cents, amount_cents, stop_id)].
+    Never raises.
     """
     lines = []
     try:
@@ -34956,8 +35161,13 @@ def _build_invoice_lines_for_route(conn, company_id, route_id):
                       customer_name
                FROM stops WHERE route_id=? AND status='completed'
                ORDER BY stop_order, id""", (route_id,)).fetchall()
+        billed = _invoiced_stop_ids(conn, company_id)
         for s in stops:
             sd = dict(s)
+            if sd["id"] in billed:
+                continue
+            if group is not None and _group_key(sd.get("customer_name"), sd.get("address")) != group:
+                continue
             action, size = sd.get("action"), sd.get("container_size")
             svc = _classify_service(action)
             haul = _stop_revenue_cents(rate_card, action, size)
