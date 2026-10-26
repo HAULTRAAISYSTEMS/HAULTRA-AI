@@ -4701,6 +4701,19 @@ def init_db():
     safe_add_column(conn, "stops", "started_at TEXT")
     safe_add_column(conn, "stops", "departed_at TEXT")
     safe_add_column(conn, "stops", "weight_tons REAL")
+    # 2026-10-26: backfill stop weights from dump tickets saved before the
+    # ticket→stop carry existed. Blank-only: never overwrites a manually
+    # entered weight. Idempotent — later runs find nothing to fill.
+    try:
+        conn.execute("""UPDATE stops SET weight_tons = (
+            SELECT dt.net_tons FROM dump_tickets dt
+            WHERE dt.stop_id = stops.id AND dt.net_tons IS NOT NULL
+            ORDER BY dt.id DESC LIMIT 1)
+            WHERE weight_tons IS NULL AND EXISTS (
+            SELECT 1 FROM dump_tickets dt2
+            WHERE dt2.stop_id = stops.id AND dt2.net_tons IS NOT NULL)""")
+    except Exception:
+        pass
     safe_add_column(conn, "stops", "not_before TEXT")
     # Site access (2026-10-10): gate codes, lockbox combos, "call ahead" —
     # shown to the driver on the stop so "what's the code?" texts die.
@@ -24420,15 +24433,19 @@ def view_route(route_id):
     completed_count = sum(1 for s in _live_stops if _disp_status_of(s) == "completed")
 
     # 2026-10-26: dump-ticket can by stop, for the "can down here" line on
-    # receiver cards (the carried-in empty set off at that site).
+    # receiver cards (the carried-in empty set off at that site), plus the
+    # ticket's net tons for the Scale Weight fallback.
     _route_ticket_by_stop = {}
+    _route_ticket_tons = {}
     try:
         _tk_conn = get_db()
         for _tk in _tk_conn.execute(
-                "SELECT stop_id, can_number FROM dump_tickets WHERE route_id=? ORDER BY id ASC",
+                "SELECT stop_id, can_number, net_tons FROM dump_tickets WHERE route_id=? ORDER BY id ASC",
                 (route_id,)).fetchall():
             if (_tk["can_number"] or "").strip():
                 _route_ticket_by_stop[_tk["stop_id"]] = (_tk["can_number"] or "").strip()
+            if _tk["net_tons"] is not None:
+                _route_ticket_tons[_tk["stop_id"]] = _tk["net_tons"]
         _tk_conn.close()
     except Exception:
         pass
@@ -24617,7 +24634,11 @@ def view_route(route_id):
         _sd = dict(s)
         if _classify_service(_sd.get("action")) not in ("pull", "swap"):
             return ""
+        # 2026-10-26: fall back to the dump ticket's net tons when no weight
+        # was typed on the stop — the ticket is the scale record.
         _tons = _sd.get("weight_tons")
+        if _tons is None:
+            _tons = _route_ticket_tons.get(s["id"])
         _over = _stop_overage_cents(_tn_rates, _sd.get("action"), _sd.get("container_size"), _tons)
         _over_txt = ""
         if _tons:
@@ -29468,7 +29489,7 @@ def dump_ticket(stop_id):
         conn.execute("UPDATE stops SET ticket_source=? WHERE id=?", (_ticket_source, stop_id))
 
         existing = conn.execute(
-            "SELECT id FROM dump_tickets WHERE stop_id=?", (stop_id,)
+            "SELECT id, net_tons FROM dump_tickets WHERE stop_id=?", (stop_id,)
         ).fetchone()
         if existing:
             conn.execute(
@@ -29492,6 +29513,23 @@ def dump_ticket(stop_id):
                  material_type, cash_received, container_scrapped,
                  ticket_number, notes, needs_review, now_ts(), session["user_id"])
             )
+
+        # 2026-10-26: the ticket IS the scale record — carry its net tons
+        # onto the stop, so the card's Scale Weight, overage, revenue and
+        # the board's tons label all read the same number instead of
+        # staying blank until someone retypes it. Follow the ticket when
+        # the stop has no weight yet or still carries this ticket's old
+        # value; a manual weight that differs from the old ticket is a
+        # deliberate correction and is left alone.
+        if net_tons is not None:
+            try:
+                _old_net = existing["net_tons"] if existing is not None else None
+                _cur_w = conn.execute("SELECT weight_tons FROM stops WHERE id=?", (stop_id,)).fetchone()
+                _cur_w = _cur_w["weight_tons"] if _cur_w is not None else None
+                if _cur_w is None or (_old_net is not None and float(_cur_w) == float(_old_net)):
+                    conn.execute("UPDATE stops SET weight_tons=? WHERE id=?", (net_tons, stop_id))
+            except Exception:
+                pass
 
         # Optional ticket photo
         photo = request.files.get("ticket_photo")
