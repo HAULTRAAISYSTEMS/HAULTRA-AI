@@ -17257,14 +17257,22 @@ def _build_route_board_html(user, day=None):
             # in progress (current/en-route/at-vendor), or held at a vendor. Only
             # pending stops can be lifted and reordered.
             locked = (stop_status == "completed") or held or (driver_status != "pending")
-            _returning = (stop_status == "completed" and bool(dict(s).get("chain_group_id"))
+            _takes = bool(dict(s).get("chain_takes_from_stop_id"))
+            _returning = (stop_status == "completed" and bool(dict(s).get("chain_group_id")) and not _takes
                           and (dict(s).get("chain_group_id"), (dict(s).get("chain_seq") or 0)) in _chain_returning)
+            # 2026-10-26: a receiver leg reads Done once its swap is done —
+            # the driver tapped "Set Off Empty & Box Out Full" (driver_status
+            # box_out or later), i.e. the prior empty is placed and this
+            # leg's full is picked up — even before its dump ticket and
+            # even while a later leg is still pending. Only the head leg
+            # (no incoming empty) stays Returning until the chain ends.
+            _swap_done = _takes and driver_status in ("box_out", "going_to_dump", "need_box_in", "box_in", "completed")
             if _returning:
                 pill_label, pill_cls, card_cls = "Returning", "enroute", "st-enroute"
-            elif stop_status == "completed":
-                pill_label, pill_cls, card_cls = "Done", "done", "st-done"
             elif held:
                 pill_label, pill_cls, card_cls = "Held", "held", "st-held"
+            elif _swap_done or stop_status == "completed":
+                pill_label, pill_cls, card_cls = "Done", "done", "st-done"
             elif driver_status != "pending":
                 pill_label, pill_cls, card_cls = "En Route", "enroute", "st-enroute"
             else:
@@ -17273,7 +17281,7 @@ def _build_route_board_html(user, day=None):
             hold_icon = '<span class="stop-mini-hold" title="Held — truck at vendor">&#9208;</span>' if held else ""
 
             addr_text = ", ".join(p for p in [s["address"] or "", s["city"] or ""] if p) or (s["customer_name"] or "Stop")
-            addr_cls = "stop-mini-addr done" if (stop_status == "completed" and not _returning) else "stop-mini-addr"
+            addr_cls = "stop-mini-addr done" if (_swap_done or (stop_status == "completed" and not _returning)) else "stop-mini-addr"
             size_label = size_bucket(s["container_size"]) or (s["container_size"] or "")
             # Garbage stops (2026-10-10): show the can/bag count or tons instead
             # of a container size.
