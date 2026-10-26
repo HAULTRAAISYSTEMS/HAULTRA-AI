@@ -37,6 +37,7 @@ from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 import chain_resolver
+import qbo  # QuickBooks Online invoice sync (also loads a local .env)
 
 # Optional PDF export
 PDF_ENABLED = True
@@ -4389,6 +4390,7 @@ def init_db():
     )
     """)
     safe_add_column(conn, "companies", "invoice_seq INTEGER DEFAULT 0")
+    qbo.init_tables(conn)  # QuickBooks sync tables + invoices.qb_* columns
 
     # 2026-10-16: field fees — driver one-tap fee log (dry run, restricted
     # item, relocation…). Flows straight onto the invoice.
@@ -26817,7 +26819,7 @@ def invoice_detail(invoice_id):
         </div>
         {f'<div style="margin-bottom:16px;"><div class="muted small" style="margin-bottom:6px;">Evidence from the job</div><div class="row" style="gap:8px;flex-wrap:wrap;">{_photos}</div></div>' if _photos else ''}
         <div class="row" style="gap:8px;flex-wrap:wrap;">{_actions}</div>
-        <p class="muted small" style="margin-top:12px;">QuickBooks sync: {e(d['qb_sync_status'].replace('_', ' '))} — sync arrives in phase 2.</p>
+        {qbo.invoice_panel(d)}
     </div>
     <div class="card">
         <h3 style="margin:0 0 8px;">Add a line</h3>
@@ -32924,6 +32926,7 @@ def settings_page():
     </div>
     {_onboarding_back_banner()}
     {settings_body}
+    {qbo.settings_card()}
     {_phone_section}
     {subscription_body}
     {delete_account_body}
@@ -49951,6 +49954,8 @@ def android_asset_links():
 
 
 init_db()
+qbo.init_app(app, get_db=get_db, cid=cid, boss_required=boss_required, shell_page=shell_page,
+             csrf_token=get_csrf_token, e=e, fmt_money=_fmt_money)
 _review_demo_status = verify_app_review_demo(repair=True)
 if not _review_demo_status["ready"]:
     app.logger.error("App Review demo is not ready; check required Render environment variables")
