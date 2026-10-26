@@ -223,6 +223,26 @@ def init_tables(conn):
         item_name  TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (company_id, realm_id, kind)
     )""")
+    # Connect-from-the-app handoff. The native app's WebView holds the HAULTRA
+    # login, but Intuit's sign-in opens in the system browser, which doesn't.
+    # A single-use, short-lived handoff (stored hashed) carries "which company
+    # started this" to the callback, and the person who approved at Intuit must
+    # confirm the HAULTRA company name in that same browser before tokens are
+    # saved (the confirm secret only ever appears in that browser).
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS qb_oauth_handoff (
+        token_hash      TEXT PRIMARY KEY,
+        company_id      INTEGER NOT NULL,
+        user_id         INTEGER,
+        stage           TEXT NOT NULL DEFAULT 'started',
+        created_at      INTEGER NOT NULL,
+        expires_at      INTEGER NOT NULL,
+        realm_id        TEXT,
+        qb_company_name TEXT NOT NULL DEFAULT '',
+        tokens_enc      TEXT,
+        nonce_hash      TEXT,
+        auth_expires_at INTEGER
+    )""")
     have = {r[1] for r in conn.execute("PRAGMA table_info(invoices)").fetchall()}
     for col, ddl in _INVOICE_QB_COLUMNS:
         if col not in have:
@@ -329,6 +349,71 @@ def get_access_token(get_db, company_id):
         return tok["access_token"], c["realm_id"], c["environment"]
     finally:
         conn.close()
+
+
+def _save_connection(get_db, company_id, realm, tok, user_id):
+    """Store a fresh connection + tokens, then look up the QB company name.
+    Returns the company name ('' if the lookup failed)."""
+    conn = get_db()
+    try:
+        conn.execute(
+            """INSERT INTO qb_connections (company_id, realm_id, environment, status,
+                   connected_by, connected_at, updated_at)
+               VALUES (?, ?, ?, 'connected', ?, ?, ?)
+               ON CONFLICT(company_id) DO UPDATE SET realm_id=excluded.realm_id,
+                   environment=excluded.environment, status='connected', company_name='',
+                   connected_by=excluded.connected_by, connected_at=excluded.connected_at,
+                   updated_at=excluded.updated_at""",
+            (company_id, realm, environment(), user_id, _now(), _now()))
+        _write_tokens(conn, company_id, tok)
+        conn.commit()
+    finally:
+        conn.close()
+    name = ""
+    try:
+        name = QBClient(get_db, company_id).company_info(realm).get("CompanyName") or ""
+        conn = get_db()
+        try:
+            conn.execute("UPDATE qb_connections SET company_name=? WHERE company_id=?",
+                         (_nobraces(name), company_id))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as ex:
+        log.warning("qbo companyinfo lookup failed: %s", type(ex).__name__)
+    log.info("qbo connected company %s to realm %s (%s)", company_id, realm, environment())
+    return name
+
+
+def _company_name_with_token(access_token, realm):
+    """CompanyInfo lookup before a connection row exists (handoff confirm page)."""
+    try:
+        resp = requests.get(
+            f"{API_BASE[environment()]}/v3/company/{realm}/companyinfo/{realm}",
+            params={"minorversion": MINOR_VERSION}, timeout=HTTP_TIMEOUT,
+            headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"})
+        if resp.status_code == 200:
+            return ((_safe_json(resp).get("CompanyInfo") or {}).get("CompanyName") or "")
+    except Exception as ex:
+        log.warning("qbo companyinfo (handoff) failed: %s", type(ex).__name__)
+    return ""
+
+
+def _revoke(refresh_token):
+    try:
+        requests.post(REVOKE_URL, json={"token": refresh_token}, auth=_client_auth(),
+                      headers={"Accept": "application/json"}, timeout=HTTP_TIMEOUT)
+    except Exception as ex:   # best effort
+        log.warning("qbo revoke failed: %s", type(ex).__name__)
+
+
+def _hash(value):
+    return hashlib.sha256((value or "").encode()).hexdigest()
+
+
+HANDOFF_PREFIX = "h."
+HANDOFF_TTL_S = 900        # app tap → Intuit approval
+HANDOFF_CONFIRM_TTL_S = 600  # Intuit approval → confirm tap
 
 
 def _expire_access_token(get_db, company_id):
@@ -763,9 +848,15 @@ def settings_card():
 # ─────────────────────────────────────────────────────────────────────────────
 # Routes
 # ─────────────────────────────────────────────────────────────────────────────
-def init_app(app, *, get_db, cid, boss_required, shell_page, csrf_token, e, fmt_money):
+def init_app(app, *, get_db, cid, boss_required, shell_page, csrf_token, e, fmt_money,
+             is_native=None, csrf_exempt=None):
+    is_native = is_native or (lambda: False)
     _deps.update(get_db=get_db, cid=cid, boss_required=boss_required, shell_page=shell_page,
-                 csrf_token=csrf_token, e=e, fmt_money=fmt_money)
+                 csrf_token=csrf_token, e=e, fmt_money=fmt_money, is_native=is_native)
+    if csrf_exempt is not None:
+        # Finished in the system browser, which has no HAULTRA session/CSRF
+        # cookie; it's protected by the single-use handoff + confirm secret.
+        csrf_exempt.add("qbo.handoff_finish")
     bp = Blueprint("qbo", __name__)
 
     def boss(fn):
@@ -787,16 +878,36 @@ def init_app(app, *, get_db, cid, boss_required, shell_page, csrf_token, e, fmt_
         if not is_configured():
             flash("QuickBooks isn't set up on this server yet.", "error")
             return redirect(url_for("qbo.settings"))
-        state = secrets.token_urlsafe(24)
-        session["qbo_oauth"] = {"state": state, "company_id": cid(), "ts": _now()}
+        if is_native():
+            # Intuit opens in the system browser, outside the app's login.
+            token = secrets.token_urlsafe(32)
+            conn = get_db()
+            try:
+                conn.execute("DELETE FROM qb_oauth_handoff WHERE expires_at < ?", (_now() - 86400,))
+                conn.execute(
+                    """INSERT INTO qb_oauth_handoff (token_hash, company_id, user_id, stage,
+                           created_at, expires_at) VALUES (?, ?, ?, 'started', ?, ?)""",
+                    (_hash(token), cid(), session.get("user_id"), _now(), _now() + HANDOFF_TTL_S))
+                conn.commit()
+            finally:
+                conn.close()
+            state = HANDOFF_PREFIX + token
+        else:
+            state = secrets.token_urlsafe(24)
+            session["qbo_oauth"] = {"state": state, "company_id": cid(), "ts": _now()}
         q = urllib.parse.urlencode({
             "client_id": _env("QB_CLIENT_ID"), "response_type": "code", "scope": SCOPE,
             "redirect_uri": _env("QB_REDIRECT_URI"), "state": state})
         return redirect(f"{AUTH_URL}?{q}")
 
     @bp.route("/quickbooks/callback")
-    @boss
     def callback():
+        state = request.args.get("state", "")
+        if state.startswith(HANDOFF_PREFIX):
+            return _handoff_callback(get_db, state[len(HANDOFF_PREFIX):])
+        return boss_required(_session_callback)()
+
+    def _session_callback():
         pending = session.pop("qbo_oauth", None) or {}
         state = request.args.get("state", "")
         if (not pending or not state or not secrets.compare_digest(state, pending.get("state", ""))
@@ -816,37 +927,14 @@ def init_app(app, *, get_db, cid, boss_required, shell_page, csrf_token, e, fmt_
         except QBError as ex:
             flash(f"QuickBooks connection failed: {ex}", "error")
             return redirect(url_for("qbo.settings"))
-        conn = get_db()
-        try:
-            conn.execute(
-                """INSERT INTO qb_connections (company_id, realm_id, environment, status,
-                       connected_by, connected_at, updated_at)
-                   VALUES (?, ?, ?, 'connected', ?, ?, ?)
-                   ON CONFLICT(company_id) DO UPDATE SET realm_id=excluded.realm_id,
-                       environment=excluded.environment, status='connected', company_name='',
-                       connected_by=excluded.connected_by, connected_at=excluded.connected_at,
-                       updated_at=excluded.updated_at""",
-                (cid(), realm, environment(), session.get("user_id"), _now(), _now()))
-            _write_tokens(conn, cid(), tok)
-            conn.commit()
-        finally:
-            conn.close()
-        name = ""
-        try:
-            name = QBClient(get_db, cid()).company_info(realm).get("CompanyName") or ""
-            conn = get_db()
-            try:
-                conn.execute("UPDATE qb_connections SET company_name=? WHERE company_id=?",
-                             (_nobraces(name), cid()))
-                conn.commit()
-            finally:
-                conn.close()
-        except Exception as ex:
-            log.warning("qbo companyinfo lookup failed: %s", type(ex).__name__)
-        log.info("qbo connected company %s to realm %s (%s)", cid(), realm, environment())
+        name = _save_connection(get_db, cid(), realm, tok, session.get("user_id"))
         flash(f"QuickBooks connected{(' to ' + name) if name else ''}. "
               "Next: pick the product/service invoice lines should use.", "success")
         return redirect(url_for("qbo.settings"))
+
+    @bp.route("/quickbooks/handoff/<token>", methods=["POST"])
+    def handoff_finish(token):
+        return _handoff_finish(get_db, token)
 
     @bp.route("/quickbooks/disconnect", methods=["POST"])
     @boss
@@ -910,6 +998,149 @@ def init_app(app, *, get_db, cid, boss_required, shell_page, csrf_token, e, fmt_
     return bp
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Connect from the native app (finished in the system browser)
+# ─────────────────────────────────────────────────────────────────────────────
+def _browser_page(title, body_html, status=200):
+    """Standalone page for the system browser (no HAULTRA session there).
+    Plain HTML response, never rendered as a template."""
+    from flask import Response
+    html = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{_esc(title)} · HAULTRA</title>
+<style>
+ body{{margin:0;background:#121212;color:#F2F2EC;font:16px/1.5 -apple-system,system-ui,sans-serif;}}
+ main{{max-width:460px;margin:0 auto;padding:40px 20px;}}
+ h1{{font-size:24px;margin:0 0 12px;}} p{{color:#C9C9BF;}} strong{{color:#fff;}}
+ .card{{background:#1E1E1E;border:1px solid #3a2a1e;border-radius:16px;padding:20px;margin-top:16px;}}
+ button{{width:100%;min-height:52px;border-radius:12px;border:0;font-size:17px;font-weight:700;margin-top:12px;}}
+ .go{{background:#C8692F;color:#111;}} .no{{background:#2a2a2a;color:#eee;}}
+ .muted{{color:#8f8f86;font-size:14px;}}
+</style></head><body><main>{body_html}</main></body></html>"""
+    return Response(html, status=status, mimetype="text/html",
+                    headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+
+_BACK_TO_APP = ('<p class="muted">You can close this page and go back to the HAULTRA app '
+                '(tap <strong>&#9664; HAULTRA</strong> at the top left).</p>')
+
+
+def _handoff_row(conn, token):
+    row = conn.execute("SELECT * FROM qb_oauth_handoff WHERE token_hash=?", (_hash(token),)).fetchone()
+    return dict(row) if row else None
+
+
+def _company_label(conn, company_id):
+    try:
+        r = conn.execute("SELECT name FROM companies WHERE id=?", (company_id,)).fetchone()
+        return (r[0] if r else "") or f"company #{company_id}"
+    except Exception:
+        return f"company #{company_id}"
+
+
+def _handoff_callback(get_db, token):
+    """Intuit redirected the system browser back. Exchange the code, hold the
+    tokens encrypted, and ask this browser to confirm the HAULTRA company."""
+    expired = _browser_page("Link expired", "<h1>That link expired</h1><p>Open the HAULTRA app and "
+                            "tap <strong>Connect QuickBooks</strong> again.</p>", 400)
+    conn = get_db()
+    try:
+        row = _handoff_row(conn, token) if token else None
+        if not row or row["expires_at"] < _now():
+            return expired
+        claimed = conn.execute(
+            "UPDATE qb_oauth_handoff SET stage='authorizing' WHERE token_hash=? AND stage='started'",
+            (_hash(token),)).rowcount
+        conn.commit()
+        if not claimed:
+            return expired
+        if request.args.get("error"):
+            conn.execute("UPDATE qb_oauth_handoff SET stage='cancelled' WHERE token_hash=?", (_hash(token),))
+            conn.commit()
+            return _browser_page("Cancelled", "<h1>QuickBooks wasn't connected</h1>"
+                                 "<p>You cancelled on Intuit's page.</p>" + _BACK_TO_APP)
+        code, realm = request.args.get("code", ""), request.args.get("realmId", "")
+        if not code or not realm:
+            conn.execute("UPDATE qb_oauth_handoff SET stage='failed' WHERE token_hash=?", (_hash(token),))
+            conn.commit()
+            return _browser_page("Try again", "<h1>QuickBooks didn't return a company</h1>"
+                                 "<p>Go back to the app and tap Connect QuickBooks again.</p>", 400)
+        try:
+            tok = _token_request({"grant_type": "authorization_code", "code": code,
+                                  "redirect_uri": _env("QB_REDIRECT_URI")})
+        except QBError as ex:
+            conn.execute("UPDATE qb_oauth_handoff SET stage='failed' WHERE token_hash=?", (_hash(token),))
+            conn.commit()
+            return _browser_page("Connection failed", f"<h1>QuickBooks connection failed</h1>"
+                                 f"<p>{_esc(ex)}</p>" + _BACK_TO_APP, 400)
+        import json
+        qb_name = _nobraces(_company_name_with_token(tok["access_token"], realm))
+        nonce = secrets.token_urlsafe(24)
+        conn.execute(
+            """UPDATE qb_oauth_handoff SET stage='authorized', realm_id=?, qb_company_name=?,
+                   tokens_enc=?, nonce_hash=?, auth_expires_at=? WHERE token_hash=?""",
+            (realm, qb_name, _enc(json.dumps({k: tok[k] for k in (
+                "access_token", "refresh_token", "expires_in", "x_refresh_token_expires_in") if k in tok})),
+             _hash(nonce), _now() + HANDOFF_CONFIRM_TTL_S, _hash(token)))
+        conn.commit()
+        haultra_name = _company_label(conn, row["company_id"])
+    finally:
+        conn.close()
+
+    action = url_for("qbo.handoff_finish", token=token)
+    hidden = f'<input type="hidden" name="nonce" value="{_esc(nonce)}">'
+    body = f"""<h1>Connect QuickBooks?</h1>
+<div class="card">
+ <p>QuickBooks company<br><strong>{_esc(qb_name or 'Your QuickBooks company')}</strong></p>
+ <p>will send invoices from HAULTRA account<br><strong>{_esc(haultra_name)}</strong></p>
+</div>
+<p class="muted">Only continue if this is your HAULTRA company. If you didn't start this from your
+own HAULTRA app, tap Cancel.</p>
+<form method="POST" action="{action}">{hidden}<input type="hidden" name="action" value="confirm">
+ <button class="go" type="submit">Connect</button></form>
+<form method="POST" action="{action}">{hidden}<input type="hidden" name="action" value="cancel">
+ <button class="no" type="submit">Cancel</button></form>"""
+    return _browser_page("Connect QuickBooks", body)
+
+
+def _handoff_finish(get_db, token):
+    """Confirm or cancel in the system browser. Needs the confirm secret that
+    was only shown on the page Intuit redirected this browser to."""
+    import json
+    expired = _browser_page("Link expired", "<h1>That link expired</h1><p>Open the HAULTRA app and "
+                            "tap <strong>Connect QuickBooks</strong> again.</p>", 400)
+    nonce = request.form.get("nonce", "")
+    conn = get_db()
+    try:
+        row = _handoff_row(conn, token)
+        if (not row or row["stage"] != "authorized" or (row["auth_expires_at"] or 0) < _now()
+                or not nonce or not secrets.compare_digest(_hash(nonce), row["nonce_hash"] or "")):
+            return expired
+        claimed = conn.execute(
+            "UPDATE qb_oauth_handoff SET stage='finishing' WHERE token_hash=? AND stage='authorized'",
+            (_hash(token),)).rowcount
+        conn.commit()
+        if not claimed:
+            return expired
+        tok = json.loads(_dec(row["tokens_enc"]))
+        if request.form.get("action") != "confirm":
+            _revoke(tok.get("refresh_token", ""))
+            conn.execute("UPDATE qb_oauth_handoff SET stage='cancelled', tokens_enc=NULL WHERE token_hash=?",
+                         (_hash(token),))
+            conn.commit()
+            return _browser_page("Cancelled", "<h1>QuickBooks wasn't connected</h1>" + _BACK_TO_APP)
+        conn.execute("UPDATE qb_oauth_handoff SET stage='done', tokens_enc=NULL WHERE token_hash=?",
+                     (_hash(token),))
+        conn.commit()
+        company_id, user_id, realm = row["company_id"], row["user_id"], row["realm_id"]
+    finally:
+        conn.close()
+    name = _save_connection(get_db, company_id, realm, tok, user_id)
+    return _browser_page("Connected", f"<h1>&#10003; QuickBooks connected</h1>"
+                         f"<p>{_esc(name or 'Your QuickBooks company')} is connected to HAULTRA.</p>"
+                         + _BACK_TO_APP)
+
+
 def _settings_page_body(get_db, company_id):
     hero = """<div class="hero"><h1>QuickBooks</h1>
     <p>Send finished HAULTRA invoices to QuickBooks Online. QuickBooks stays your official books.</p></div>"""
@@ -934,10 +1165,18 @@ def _settings_page_body(get_db, company_id):
             msg = "The QuickBooks connection expired or was revoked."
         elif raw and raw["environment"] != environment():
             msg = f"Connected to {raw['environment']}, but this server is set to {environment()}."
+        app_note, app_script = "", ""
+        if _deps.get("is_native", lambda: False)():
+            app_note = ('<p class="muted small">Intuit opens in your browser. Approve there, tap '
+                        '<strong>Connect</strong> on the HAULTRA confirm page, then come back here.</p>')
+            # Back from the browser → reload so the page shows "Connected".
+            app_script = ("<script>document.addEventListener('visibilitychange',function(){"
+                          "if(!document.hidden){location.reload();}});</script>")
         return hero + f"""<div class="card"><p>{env_badge} {msg}</p>
             <p class="muted small">You'll sign in to Intuit and choose which QuickBooks company to connect.
             HAULTRA asks for accounting access only — it never collects payments.</p>
-            {connect_form.format(label="Connect QuickBooks" if not raw else "Reconnect QuickBooks")}</div>"""
+            {app_note}
+            {connect_form.format(label="Connect QuickBooks" if not raw else "Reconnect QuickBooks")}</div>{app_script}"""
 
     status = f"""<div class="card">
         <p>{env_badge} Connected to <strong>{_esc(c['company_name'] or c['realm_id'])}</strong></p>
