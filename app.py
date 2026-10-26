@@ -26700,7 +26700,10 @@ def _invoice_section_html(conn, company_id):
 
 def _ready_tab_html(groups):
     """Ready-to-bill tab: customer accordion + live search + bill-all.
-    Groups arrive sorted by total desc; customers roll up to their total."""
+    Groups arrive sorted by total desc; customers roll up to their total.
+    The accordion uses native <details>/<summary> (no JavaScript needed to
+    open one customer) and real <button> controls for expand/collapse-all,
+    because javascript: links do not fire reliably in the iPad app."""
     if not groups:
         return f"""<div class="card"><p class="muted">All caught up — nothing unbilled. <a href="{url_for('invoice_list', tab='invoices')}">View invoices</a></p></div>"""
     _by_cust = {}
@@ -26708,7 +26711,7 @@ def _ready_tab_html(groups):
         _by_cust.setdefault(g["customer"], []).append(g)
     _custs = sorted(_by_cust.items(), key=lambda kv: -sum(g["total"] for g in kv[1]))
     _blocks = ""
-    for _ci, (cust, gsites) in enumerate(_custs):
+    for cust, gsites in _custs:
         _ctotal = sum(g["total"] for g in gsites)
         _cjobs = sum(g["n_stops"] for g in gsites)
         _rows = ""
@@ -26723,30 +26726,29 @@ def _ready_tab_html(groups):
                 </div>
             </div>"""
         _blocks += f"""
-        <div class="cust-block card" data-customer="{e(cust)}" style="margin-bottom:12px;">
-            <div onclick="toggleCust('cust-{_ci}')" style="cursor:pointer;">
+        <details class="cust-block card" data-customer="{e(cust)}" style="margin-bottom:12px;">
+            <summary style="cursor:pointer;">
                 <div class="row between">
                     <div><span style="font-weight:800;">{e(cust)}</span> <span class="muted small">&middot; {len(gsites)} site{'s' if len(gsites) != 1 else ''} &middot; {_cjobs} job{'s' if _cjobs != 1 else ''}</span></div>
                     <strong style="font-size:20px;color:#FFD08A;">{_fmt_money(_ctotal)}</strong>
                 </div>
-            </div>
-            <div id="cust-{_ci}" class="cust-body" style="display:none;margin-top:8px;">{_rows}</div>
-        </div>"""
+            </summary>
+            <div style="margin-top:8px;">{_rows}</div>
+        </details>"""
     _grand = sum(g["total"] for g in groups)
     return f"""
     <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center;">
         <a class="btn gold" href="{url_for('bill_all_review')}">Bill all ({len(groups)} groups — {_fmt_money(_grand)})</a>
         <span class="muted small">Creates drafts — nothing is sent.</span>
-        <span style="margin-left:auto;"><a class="muted small" href="javascript:void(0)" onclick="setAllCust(true)">Expand all</a> &middot; <a class="muted small" href="javascript:void(0)" onclick="setAllCust(false)">Collapse all</a></span>
+        <span style="margin-left:auto;"><button type="button" class="muted small" onclick="setAllCust(true)" style="background:none;border:0;color:var(--text-muted);text-decoration:underline;cursor:pointer;padding:12px 8px;min-height:44px;">Expand all</button> &middot; <button type="button" class="muted small" onclick="setAllCust(false)" style="background:none;border:0;color:var(--text-muted);text-decoration:underline;cursor:pointer;padding:12px 8px;min-height:44px;">Collapse all</button></span>
     </div>
     <input id="readySearch" placeholder="Search customer or site…" oninput="filterReady()" style="width:100%;margin-bottom:12px;">
-    {_blocks}
+    <div id="readyAcc">{_blocks}</div>
     <script>
-    function toggleCust(id){{ var b = document.getElementById(id); b.style.display = (b.style.display === 'none' ? 'block' : 'none'); }}
-    function setAllCust(show){{ document.querySelectorAll('.cust-body').forEach(function(b){{ b.style.display = show ? 'block' : 'none'; }}); }}
+    function setAllCust(show){{ document.querySelectorAll('#readyAcc details').forEach(function(d){{ d.open = show; }}); }}
     function filterReady(){{
       var q = document.getElementById('readySearch').value.toLowerCase();
-      document.querySelectorAll('.cust-block').forEach(function(block){{
+      document.querySelectorAll('#readyAcc details').forEach(function(block){{
         var cname = block.getAttribute('data-customer').toLowerCase();
         var any = false;
         block.querySelectorAll('.site-row').forEach(function(row){{
@@ -26755,8 +26757,7 @@ def _ready_tab_html(groups):
           if (match) any = true;
         }});
         block.style.display = any ? '' : 'none';
-        if (q && any) {{ block.querySelector('.cust-body').style.display = 'block'; }}
-        if (!q) {{ block.querySelector('.cust-body').style.display = 'none'; }}
+        block.open = !!(q && any);
       }});
     }}
     </script>
