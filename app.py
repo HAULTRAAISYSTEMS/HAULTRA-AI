@@ -12577,6 +12577,11 @@ def dashboard():
                 _can_html = (f'<a href="/yard-setup?can={e(_ot["can"])}" '
                              f'style="color:#7FB8FF;font-weight:800;text-decoration:none;">&#128666; #{e(_ot["can"])}'
                              f'{(" " + e(_ot["size"])) if _ot["size"] else ""}</a>')
+            elif _ot.get("unknown_can"):
+                # 2026-10-26: a can is aboard, its number just isn't recorded
+                # yet — never "empty".
+                _can_html = (f'<span style="color:#7FB8FF;font-weight:800;">&#128666; ?'
+                             f'{(" " + e(_ot["size"])) if _ot["size"] else ""}</span>')
             else:
                 _can_html = '<span style="color:#8C8C82;">&#128666; empty</span>'
             _dest_txt = ""
@@ -17483,13 +17488,14 @@ def _build_route_board_html(user, day=None):
                     _seen_rids.append(_s["route_id"])
             for _rid in _seen_rids:
                 _ot = _route_on_truck(_pill_conn, _rid)
-                if _ot and _ot.get("has_can"):
+                if _ot and (_ot.get("has_can") or _ot.get("unknown_can")):
+                    _pill_txt = f"#{e(_ot['can'])}" if _ot.get("has_can") else "?"
                     _ontruck_pill = (
                         f'<span title="{e(_ot["step"])}" style="display:inline-block;margin-left:8px;'
                         'padding:2px 9px;border-radius:999px;font-size:11px;font-weight:800;'
                         'color:#7FB8FF;background:rgba(127,184,255,0.12);'
                         'border:1px solid rgba(127,184,255,0.5);'
-                        f'box-shadow:0 0 10px rgba(127,184,255,0.25);">&#128666; #{e(_ot["can"])}</span>')
+                        f'box-shadow:0 0 10px rgba(127,184,255,0.25);">&#128666; {_pill_txt}</span>')
                     break
         except Exception:
             app.logger.warning("on-truck pill failed for lane %s", lane.get("driver_username"), exc_info=True)
@@ -24413,6 +24419,20 @@ def view_route(route_id):
     _raw_completed_count = completed_count
     completed_count = sum(1 for s in _live_stops if _disp_status_of(s) == "completed")
 
+    # 2026-10-26: dump-ticket can by stop, for the "can down here" line on
+    # receiver cards (the carried-in empty set off at that site).
+    _route_ticket_by_stop = {}
+    try:
+        _tk_conn = get_db()
+        for _tk in _tk_conn.execute(
+                "SELECT stop_id, can_number FROM dump_tickets WHERE route_id=? ORDER BY id ASC",
+                (route_id,)).fetchall():
+            if (_tk["can_number"] or "").strip():
+                _route_ticket_by_stop[_tk["stop_id"]] = (_tk["can_number"] or "").strip()
+        _tk_conn.close()
+    except Exception:
+        pass
+
     # Options for the per-load "Move to route" picker (boss only).
     move_options_html = "".join(
         '<option value="%d">%s</option>' % (
@@ -24645,6 +24665,17 @@ def view_route(route_id):
          next_open_stop_id = s["stop_order"]
         _cancelled = stop_is_cancelled(s)
         _disp_status = _disp_status_of(s)
+        # 2026-10-26: a receiver past its Set Off tap has a can DOWN at this
+        # site (the carried-in empty) — show it on the card instead of
+        # leaving the stop looking can-less. Gated on the tap: before the
+        # swap the can is still on the truck, not down here.
+        _down_can = ""
+        _takes = s["chain_takes_from_stop_id"] if "chain_takes_from_stop_id" in s.keys() else None
+        if _takes and ((s["driver_status"] or "") in ("box_out", "going_to_dump", "need_box_in", "box_in") or (s["status"] or "") == "completed"):
+            _giver = next((g for g in stops if g["id"] == _takes), None)
+            if _giver is not None:
+                _down_can = _route_ticket_by_stop.get(_takes) or _pickup_can(dict(_giver)) or ""
+        _down_can_html = (f'<p><strong>Can down here:</strong> <a href="/yard-setup?can={e(_down_can)}" style="color:#7FB8FF;font-weight:800;text-decoration:none;">#{e(_down_can)}</a></p>') if _down_can else ""
         photo_html = build_photo_gallery_html(photos_by_stop.get(s["id"], []))
 
         edit_button = f'<a class="btn secondary" href="{url_for("edit_stop", stop_id=s["id"])}">Edit</a>' if session.get("role") == "boss" else ''
@@ -24835,6 +24866,7 @@ def view_route(route_id):
             <p><strong>Action:</strong> {e(s['action'] or '')}{_can_pill}{_swap_badge}</p>
             {_swap_warning}
             <p><strong>Container:</strong> {e(s['container_size'] or '')}</p>
+            {_down_can_html}
             {('<p><strong>Yard Can:</strong> <span style="color:#3DDC84;font-weight:800;">🏗️ #' + e(_effective_can(s)) + (' <span class="muted" style="font-weight:400;">(from notes)</span>' if not (dict(s).get('assigned_can') or '').strip() else '') + '</span></p>') if _effective_can(s) else (('<p><strong>Yard Can:</strong> <span class="muted">Not assigned — Edit to set it</span></p>') if (session.get('role') == 'boss' and 'delivery' in (dict(s).get('action') or '').lower()) else '')}
             <p><strong>Ticket:</strong> {e(s['ticket_number'] or '')}</p>
             {_weight_row_html(s)}
@@ -25596,7 +25628,9 @@ def _route_on_truck(conn, route_id):
     """Live state of a route's truck: what's on it + the step the driver is on.
 
     Returns None for finished routes (or on any read failure). Otherwise:
-      can / size / step / customer / dest / stop_id / has_can
+      can / size / step / customer / dest / stop_id / has_can / unknown_can
+    - unknown_can: a can IS aboard (a receiver past its Set Off tap) but no
+      ticket or route can names it yet — renderers must not call this "empty".
     - Live stop: a Pull/PR the driver has boxed out / is hauling / is
       returning empty, or an active Delivery the driver has arrived at — the
       can is that stop's dump-ticket can, route can, or yard can.
@@ -25684,6 +25718,21 @@ def _route_on_truck(conn, route_id):
                 "step": ("On truck — heading to " + _who_n) if _who_n else "On truck — end of route",
                 "customer": _who_n, "dest": _who_n,
                 "stop_id": _nxt.get("id") if _nxt else None, "has_can": True}
+    # 2026-10-26: carrying an unknown can — the next stop is a receiver past
+    # its Set Off tap, so the truck holds that stop's full, but no ticket
+    # or route can names it yet. That is NOT an empty truck: report the
+    # load (unknown number) instead of "empty / en route", which was wrong
+    # on both counts — the driver already swapped there and is heading to
+    # the dump (or back with the empty), not en route to the stop.
+    if _nxt and _nxt.get("chain_takes_from_stop_id") and (_nxt.get("driver_status") or "") in ("box_out", "going_to_dump", "need_box_in"):
+        _drv = _nxt.get("driver_status") or ""
+        _step = {"box_out": "Can on truck — to the dump",
+                 "going_to_dump": "Heading to the dump",
+                 "need_box_in": "Returning the empty"}[_drv]
+        _dest = ((_nxt.get("dump_location") or "").strip() or _who(_nxt)) if _drv != "need_box_in" else _who(_nxt)
+        return {"can": "", "size": _nxt.get("container_size") or "",
+                "step": _step, "customer": _who(_nxt), "dest": _dest,
+                "stop_id": _nxt.get("id"), "has_can": False, "unknown_can": True}
     if _nxt:
         _drv = (_nxt.get("driver_status") or "pending")
         return {"can": "", "size": "",
