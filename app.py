@@ -32352,6 +32352,11 @@ def settings_page():
             _rc_errors.append("tonnage_overage")
         elif _ov_cents is not None:
             _rc_rows.append((cid(), "tonnage_overage", "*", _ov_cents, None))
+        _dp_cents = _sv_dollars(form.get("rate_disposal"))
+        if _dp_cents == "invalid":
+            _rc_errors.append("disposal")
+        elif _dp_cents is not None:
+            _rc_rows.append((cid(), "disposal", "*", _dp_cents, None))
         for kind, _label, _default in _FEE_KINDS:
             if kind == "custom":
                 continue
@@ -32376,7 +32381,8 @@ def settings_page():
         _want = {(svc, tier) for svc in ("delivery", "pull", "swap")
                  for tier in ("10yd", "20yd", "30yd", "40yd", "standard")} | {("extra_day", "*")} | \
                 {("tonnage_allow", "10yd"), ("tonnage_allow", "20yd"), ("tonnage_allow", "30yd"),
-                 ("tonnage_allow", "40yd"), ("tonnage_allow", "standard"), ("tonnage_overage", "*")} | \
+                 ("tonnage_allow", "40yd"), ("tonnage_allow", "standard"), ("tonnage_overage", "*"),
+                 ("disposal", "*")} | \
                 {(f"fee_{k}", "*") for k, _, _ in _FEE_KINDS if k != "custom"} | \
                 {("surcharge_markup", "*")}
         _have = {(r[1], r[2]) for r in _rc_rows}
@@ -32494,14 +32500,18 @@ def settings_page():
     _rc_tons_20  = _rc_tons("tonnage_allow", "20yd")
     _rc_tons_30  = _rc_tons("tonnage_allow", "30yd")
     _rc_tonnage_over = _rc_dollars("tonnage_overage", "*")
+    _rc_disposal = _rc_dollars("disposal", "*")
     # 2026-10-16: field fee presets for the form.
     _fee_presets = _get_fee_presets(conn, cid())
     def _fee_dollars(kind):
         v = _fee_presets.get(kind, 0)
         return "" if not v else (_fmt_money(v).lstrip("$"))
+    # 2026-10-26: Relocation has its own row above (flat price, any size);
+    # it is not repeated in the field-fee grid.
+    _relocate_val = _fee_dollars("relocation")
     _fee_inputs = ""
     for kind, label, _d in _FEE_KINDS:
-        if kind == "custom":
+        if kind in ("custom", "relocation"):
             continue
         _fee_inputs += f"""
                 <div>
@@ -32704,7 +32714,7 @@ def settings_page():
                     <td style="padding:6px;"><input name="rate_pull_40yd" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_pull_40}" style="width:100%;"></td>
                 </tr>
                 <tr>
-                    <td style="padding:6px;font-weight:600;">Swap <span class="muted small">(pickup &amp; return)</span></td>
+                    <td style="padding:6px;font-weight:600;">Pickup &amp; Return</td>
                     <td style="padding:6px;"><input name="rate_swap_10yd" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_swap_10}" style="width:100%;"></td>
                     <td style="padding:6px;"><input name="rate_swap_20yd" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_swap_20}" style="width:100%;"></td>
                     <td style="padding:6px;"><input name="rate_swap_30yd" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_swap_30}" style="width:100%;"></td>
@@ -32729,6 +32739,11 @@ def settings_page():
                         <input name="rate_swap_standard" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_swap_std}" style="width:100%;">
                     </div>
                 </div>
+            </div>
+            <div style="margin-top:12px;max-width:280px;">
+                <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Relocate — flat price per job ($)</label>
+                <input name="fee_relocation" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_relocate_val}" style="width:100%;">
+                <p class="muted small" style="margin-top:6px;">One flat price, any size. The driver logs it with one tap in the cab and it lands on the invoice.</p>
             </div>
             <div style="margin-top:12px;max-width:280px;">
                 <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Extra-day default ($/day)</label>
@@ -32765,6 +32780,11 @@ def settings_page():
                     <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Overage ($/ton)</label>
                     <input name="rate_tonnage_overage" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_tonnage_over}" style="width:100%;">
                 </div>
+            </div>
+            <div style="margin-top:12px;max-width:280px;">
+                <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Disposal ($/ton)</label>
+                <input name="rate_disposal" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_disposal}" style="width:100%;">
+                <p class="muted small" style="margin-top:6px;">Bills every recorded ton on pulls and swaps as its own Disposal line. Leave $0 if disposal is already included in the pull price — otherwise it bills twice. Overage still applies on top unless you set it to $0.</p>
             </div>
             <h3 style="margin:20px 0 8px;font-size:14px;">&#x1F4CB; Field Fees</h3>
             <p style="color:#B8B8AE;font-size:13px;margin-bottom:12px;">
@@ -34752,7 +34772,7 @@ def _stop_revenue_cents(rate_card, action, size):
 
 
 def _route_revenue_cents(conn, company_id, route_id, rate_card=None, tonnage_rates=None):
-    """Sum of priced COMPLETED stops on a route (haul + tonnage overage)."""
+    """Sum of priced COMPLETED stops on a route (haul + tonnage overage + disposal)."""
     if rate_card is None:
         rate_card = _get_rate_card(conn, company_id)
     if tonnage_rates is None:
@@ -34763,6 +34783,7 @@ def _route_revenue_cents(conn, company_id, route_id, rate_card=None, tonnage_rat
             (route_id,)).fetchall():
         total += _stop_revenue_cents(rate_card, s["action"], s["container_size"])
         total += _stop_overage_cents(tonnage_rates, s["action"], s["container_size"], s["weight_tons"])
+        total += _stop_disposal_cents(rate_card, s["action"], s["weight_tons"])
     return total
 
 
@@ -34854,6 +34875,24 @@ def _stop_overage_cents(tonnage_rates, action, size, tons):
         return 0
 
 
+def _stop_disposal_cents(rate_card, action, tons):
+    """Disposal charge for one pull/swap stop: recorded tons × disposal $/ton.
+
+    The disposal rate is 0/off by default (disposal bundled in the pull
+    price). Delivery stops never dispose. Never raises.
+    """
+    try:
+        if _classify_service(action) not in ("pull", "swap"):
+            return 0
+        tons = float(tons or 0)
+        rate = int(rate_card.get(("disposal", "*"), 0) or 0)
+        if tons <= 0 or rate <= 0:
+            return 0
+        return int(round(tons * rate))
+    except Exception:
+        return 0
+
+
 def _fmt_tons(tons):
     """6.2 → '6.2t'; 6.0 → '6t'."""
     try:
@@ -34923,7 +34962,7 @@ def _build_invoice_lines_for_route(conn, company_id, route_id):
             svc = _classify_service(action)
             haul = _stop_revenue_cents(rate_card, action, size)
             if haul > 0 and svc in ("delivery", "pull", "swap"):
-                label = {"delivery": "Delivery", "pull": "Pull", "swap": "Swap (pickup & return)"}[svc]
+                label = {"delivery": "Delivery", "pull": "Pull", "swap": "Pickup & Return"}[svc]
                 bucket = size_bucket(size)
                 desc = f"{label} — {bucket or 'container'}"
                 if sd.get("address"):
@@ -34939,6 +34978,14 @@ def _build_invoice_lines_for_route(conn, company_id, route_id):
                         f"({_fmt_tons(tons)} at {_fmt_money(tn_rates[2])}/ton)")
                 lines.append({"kind": "overage", "description": desc, "qty": 1,
                               "unit_cents": over, "amount_cents": over,
+                              "stop_id": sd["id"]})
+            disp = _stop_disposal_cents(rate_card, action, sd.get("weight_tons"))
+            if disp > 0:
+                tons = float(sd.get("weight_tons") or 0)
+                drate = int(rate_card.get(("disposal", "*"), 0) or 0)
+                desc = (f"Disposal — {_fmt_tons(tons)} at {_fmt_money(drate)}/ton")
+                lines.append({"kind": "disposal", "description": desc, "qty": 1,
+                              "unit_cents": disp, "amount_cents": disp,
                               "stop_id": sd["id"]})
             for fee in _stop_fees(conn, sd["id"]):
                 fd = dict(fee)
