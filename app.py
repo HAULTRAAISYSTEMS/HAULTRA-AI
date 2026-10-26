@@ -4332,6 +4332,19 @@ def init_db():
     safe_add_column(conn, "customers", "rental_days INTEGER")
     safe_add_column(conn, "customers", "extra_day_rate_cents INTEGER")
 
+    # 2026-10-26: merged-away customer names -> survivor (Merge action on
+    # the customer detail page). Lets "Marlyn LLC" collapse into "Marlyn"
+    # in the fleet grouping without rewriting route history.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS customer_aliases (
+        company_id    INTEGER NOT NULL,
+        alias_key     TEXT NOT NULL,
+        survivor_id   INTEGER NOT NULL,
+        survivor_name TEXT NOT NULL,
+        created_at    TEXT NOT NULL,
+        PRIMARY KEY (company_id, alias_key)
+    )""")
+
     # 2026-10-16: company rate card — what the boss charges per service.
     # Tiers: 'standard' (10/20/30yd share one price) and '40yd'.
     # service 'extra_day' uses tier '*' (flat per-day default; per-customer
@@ -12552,8 +12565,9 @@ def dashboard():
                     _urow = _trk_conn.execute("SELECT name FROM trucks WHERE id=?", (_ut,)).fetchone()
                     _tname = _urow["name"] if _urow else None
             if _ot["has_can"]:
-                _can_html = (f'<span style="color:#7FB8FF;font-weight:800;">&#128666; #{e(_ot["can"])}'
-                             f'{(" " + e(_ot["size"])) if _ot["size"] else ""}</span>')
+                _can_html = (f'<a href="/yard-setup?can={e(_ot["can"])}" '
+                             f'style="color:#7FB8FF;font-weight:800;text-decoration:none;">&#128666; #{e(_ot["can"])}'
+                             f'{(" " + e(_ot["size"])) if _ot["size"] else ""}</a>')
             else:
                 _can_html = '<span style="color:#8C8C82;">&#128666; empty</span>'
             _dest_txt = ""
@@ -35623,6 +35637,10 @@ def bin_tracker():
                 f'onclick="event.stopPropagation();dispatchPull({c["stop_id"]}, this)">'
                 f'&#128666; Dispatch pull</button>'
             )
+            _fleet_link = ""
+            if c["address"]:
+                _fleet_link = (f' <a href="/yard-setup?site={urllib.parse.quote(c["address"])}" '
+                               f'onclick="event.stopPropagation();" class="bin-fleet-link">View in Fleet</a>')
             rows_html += f"""
             <div class="{card_cls}" id="bin-card-{c['stop_id']}"{card_click}>
                 <div class="bin-card-top">
@@ -35634,7 +35652,7 @@ def bin_tracker():
                 {overdue_tag}
                 {terms_html}
                 {no_map_note}
-                <div class="bin-card-actions">{dispatch_html}</div>
+                <div class="bin-card-actions">{dispatch_html}{_fleet_link}</div>
             </div>
             """
 
@@ -35968,8 +35986,9 @@ def _fleet_site_of(notes):
 
     The fleet sync writes notes as 'Returned YYYY-MM-DD — Customer, Address',
     'Hauled YYYY-MM-DD — Customer', or 'On site at ADDR (Bin Tracker)'.
-    Anything else (e.g. 'Bulk deployed … — via Deploy all') names no site
-    and returns ('', '', '')."""
+    A boss assignment writes 'Placed YYYY-MM-DD — Site' (site known, no
+    customer yet). Anything else (e.g. 'Bulk deployed … — via Deploy all')
+    names no site and returns ('', '', '')."""
     n = (notes or "").strip()
     for _verb in ("Returned", "Hauled"):
         if n.startswith(_verb + " "):
@@ -35982,9 +36001,91 @@ def _fleet_site_of(notes):
                     _c, _s = _who.split(", ", 1)
                     return _c.strip(), _s.strip(), _date
                 return _who, "", _date
+    if n.startswith("Placed "):
+        _rest = n.split(" — ", 1)
+        if len(_rest) == 2:
+            _head = _rest[0].split(" ")
+            _date = _head[1] if len(_head) == 2 else ""
+            return "", _rest[1].strip(), _date
     if n.startswith("On site at ") and n.endswith(" (Bin Tracker)"):
         return "", n[len("On site at "):-len(" (Bin Tracker)")].strip(), ""
     return "", "", ""
+
+
+def _norm_cust_key(name):
+    """Customer dedup key: case, whitespace, and trailing punctuation
+    insensitive, so 'ashdon' and 'ASHDON' are one customer."""
+    return " ".join((name or "").split()).casefold().strip(" .,")
+
+
+def _customer_alias_map(conn, company_id):
+    """Merged-away normalized names -> survivor display name."""
+    try:
+        rows = conn.execute(
+            "SELECT alias_key, survivor_name FROM customer_aliases WHERE company_id=?",
+            (company_id,)).fetchall()
+        return {r["alias_key"]: r["survivor_name"] for r in rows}
+    except Exception:
+        return {}
+
+
+def _fleet_site_groups(conn, company_id):
+    """Deployed fleet cans grouped by customer + site. THE shared grouping
+    behind the Fleet By-site view, the customer detail page, and the
+    address-book can counts, so every page agrees. Returns
+    (cust_map, n_cans, n_sites) where cust_map is
+    {display_customer: [site_group, ...]} and each site_group is
+    {"customer", "site", "kind", "cans": [(num, label, can_dict, since)]}.
+    kind is 'dump' when the site matches a dump entry in the address book."""
+    aliases = _customer_alias_map(conn, company_id)
+    try:
+        _dump_addrs = set()
+        for _a in conn.execute(
+                "SELECT address, full_address FROM saved_addresses "
+                "WHERE company_id=? AND kind='dump'", (company_id,)).fetchall():
+            for _v in (_a["address"], _a["full_address"]):
+                if _v:
+                    _dump_addrs.add(_v.strip().casefold())
+                    _dump_addrs.add(_v.split(",")[0].strip().casefold())
+    except Exception:
+        _dump_addrs = set()
+    rows = conn.execute(
+        "SELECT * FROM containers WHERE company_id=? AND status='deployed'",
+        (company_id,)).fetchall()
+    _by_key = {}
+    _spellings = {}
+    for r in rows:
+        cd = dict(r)
+        cust, site, since = _fleet_site_of(cd["notes"])
+        key = _norm_cust_key(cust)
+        _spellings.setdefault(key, {})
+        _spellings[key][cust] = _spellings[key].get(cust, 0) + 1
+        skey = (key, site.casefold().strip())
+        g = _by_key.setdefault(skey, {"customer": cust, "site": site, "cans": []})
+        try:
+            num = int(cd.get("label") or "")
+        except Exception:
+            num = 10 ** 9
+        g["cans"].append((num, cd.get("label") or "", cd, since))
+    cust_map = {}
+    for (key, _s), g in _by_key.items():
+        if key in aliases:
+            disp = aliases[key]
+        else:
+            _votes = _spellings.get(key, {})
+            disp = max(_votes.items(), key=lambda kv: (kv[1], kv[0]))[0] if _votes else g["customer"]
+            if not disp:
+                disp = "Unknown customer"
+        g["customer"] = disp
+        site_fold = (g["site"] or "").strip().casefold()
+        site_street = site_fold.split(",")[0].strip()
+        g["kind"] = "dump" if (site_fold in _dump_addrs or site_street in _dump_addrs) else "customer"
+        g["cans"].sort(key=lambda t: (t[0], t[1]))
+        cust_map.setdefault(disp, []).append(g)
+    for gs in cust_map.values():
+        gs.sort(key=lambda g: (not g["site"], g["site"].casefold()))
+    n_cans = sum(len(g["cans"]) for g in _by_key.values())
+    return cust_map, n_cans, len(_by_key)
 
 
 def _containers_section_html():
@@ -36050,45 +36151,43 @@ def _containers_section_html():
     _group_counts = {}
     for _t in _disp_rows:
         _group_counts[_t[3]] = _group_counts.get(_t[3], 0) + 1
-    # 2026-10-26: By-site view — deployed cans grouped by customer + site,
-    # parsed from each can's fleet note. Cans whose note names no site land
-    # under "Site not recorded" until a route or an Edit gives them one.
-    _site_groups = {}
-    for _go, _num, _lab, _disp, _cd in _disp_rows:
-        if _disp != "deployed":
-            continue
-        _cust, _site, _since = _fleet_site_of(_cd["notes"])
-        _key = (_cust.casefold().strip(), _site.casefold().strip())
-        _site_groups.setdefault(_key, {"customer": _cust, "site": _site, "cans": []})
-        _site_groups[_key]["cans"].append((_num, _lab, _cd, _since))
-    _site_custs = {}
-    for _g in _site_groups.values():
-        _site_custs.setdefault(_g["customer"], []).append(_g)
-    _n_site_cans = sum(len(_g["cans"]) for _g in _site_groups.values())
-    _n_site_sites = len(_site_groups)
-    if not _site_groups:
+    # 2026-10-26: By-site view — deployed cans grouped by customer + site
+    # via the shared _fleet_site_groups helper (same grouping the customer
+    # detail page and address-book counts use). Cans whose note names no
+    # site land under "Site not recorded" until a route or an Edit gives
+    # them one.
+    _fc = get_db()
+    try:
+        _site_custs, _n_site_cans, _n_site_sites = _fleet_site_groups(_fc, cid())
+        _cust_ids = _sync_customer_records(_fc, cid())
+    finally:
+        _fc.close()
+    if not _site_custs:
         _site_html = '<div class="card"><p class="muted">Nothing deployed — cans show here once they are dropped at a customer.</p></div>'
     else:
         _site_html = ""
-        for _cust in sorted(_site_custs, key=lambda c: (not c, c.casefold())):
-            _gsites = sorted(_site_custs[_cust], key=lambda g: (not g["site"], g["site"].casefold()))
+        for _cust in sorted(_site_custs, key=lambda c: (c == "Unknown customer", c.casefold())):
+            _gsites = _site_custs[_cust]
             _ctotal = sum(len(_g["cans"]) for _g in _gsites)
+            _cid_link = _cust_ids.get(_norm_cust_key(_cust))
+            _cust_head = (f'<a href="{url_for("customer_detail_page", customer_id=_cid_link)}" style="font-weight:800;color:inherit;">{e(_cust)}</a>' if _cid_link else f'<span style="font-weight:800;">{e(_cust)}</span>')
             _srows = ""
             for _g in _gsites:
                 _can_rows = ""
-                for _num, _lab, _cd, _since in sorted(_g["cans"], key=lambda t: (t[0], t[1])):
+                for _num, _lab, _cd, _since in _g["cans"]:
                     _since_txt = f" &middot; since {_since}" if _since else ""
                     _can_rows += (f'<div class="row between" style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.06);">'
                                   f'<span><strong>{e(_cd["size"])}</strong> {e(_lab or "(no #)")}<span class="muted small">{_since_txt}</span></span>'
                                   f'<a href="{url_for("edit_container", c_id=_cd["id"])}" style="color:#FF9D5C;font-size:12px;">Edit</a></div>')
                 _site_name = _g["site"] or "Site not recorded"
                 _row_search = " ".join([_site_name] + [f'{_c[2]["size"]} {_c[1]}' for _c in _g["cans"]]).lower()
+                _dump_badge = ' <span class="badge" style="background:rgba(255,157,92,0.15);color:#FF9D5C;">Dump</span>' if _g["kind"] == "dump" else ""
+                _site_head = (f'<a href="{url_for("customer_detail_page", customer_id=_cid_link)}" style="font-weight:600;color:inherit;">{e(_site_name)}</a>' if _cid_link else f'<span style="font-weight:600;">{e(_site_name)}</span>')
                 _srows += (f'<div class="site-row" data-search="{e(_row_search)}" style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.08);">'
-                           f'<div style="font-weight:600;">{e(_site_name)} <span class="muted small">&middot; {len(_g["cans"])} can{"s" if len(_g["cans"]) != 1 else ""}</span></div>'
+                           f'<div>{_site_head} <span class="muted small">&middot; {len(_g["cans"])} can{"s" if len(_g["cans"]) != 1 else ""}</span>{_dump_badge}</div>'
                            f'{_can_rows}</div>')
-            _cust_name = _cust or "Unknown customer"
-            _site_html += (f'<details class="site-cust card" data-customer="{e(_cust_name.lower())}" style="margin-bottom:12px;">'
-                           f'<summary style="cursor:pointer;"><div class="row between"><div><span style="font-weight:800;">{e(_cust_name)}</span> '
+            _site_html += (f'<details class="site-cust card" data-customer="{e(_cust.lower())}" style="margin-bottom:12px;">'
+                           f'<summary style="cursor:pointer;"><div class="row between"><div>{_cust_head} '
                            f'<span class="muted small">&middot; {len(_gsites)} site{"s" if len(_gsites) != 1 else ""} &middot; {_ctotal} can{"s" if _ctotal != 1 else ""}</span></div></div></summary>'
                            f'<div style="margin-top:8px;">{_srows}</div></details>')
     rows_html = ""
@@ -36154,6 +36253,8 @@ def _containers_section_html():
             </td>
         </tr>"""
 
+    _n_unknown = sum(len(_g["cans"]) for _g in _site_custs.get("Unknown customer", []))
+    _unknown_link = (f' <a class="btn secondary" href="{url_for("fix_unknown_containers")}">Fix unknowns ({_n_unknown})</a>' if _n_unknown else "")
     return f"""
     <div class="ai-stage" id="containers">
         <div class="ai-kicker"><span class="ai-dot"></span>Fleet Tracking</div>
@@ -36225,7 +36326,7 @@ def _containers_section_html():
                    oninput="flSiteFilter(this.value)"
                    style="width:100%;min-height:48px;padding:10px 14px;margin-bottom:14px;background:rgba(255,255,255,.04);
                           border:1px solid rgba(255,255,255,0.12);border-radius:12px;color:var(--text);">
-            <p class="muted small" style="margin-bottom:12px;">{_n_site_cans} deployed cans at {_n_site_sites} sites. Tap a customer to see its sites and cans.</p>
+            <p class="muted small" style="margin-bottom:12px;">{_n_site_cans} deployed cans at {_n_site_sites} sites. Tap a customer to see its sites and cans.{_unknown_link}</p>
             {_site_html}
         </div>
         <script>
@@ -37705,6 +37806,29 @@ def yard_setup_page():
         var tab = map[hash] || null;
         if (!tab) {{ try {{ tab = sessionStorage.getItem('ys_tab'); }} catch (e) {{}} }}
         if (tab && tab !== 'overview') {{ ysShow(tab); }}
+        // 2026-10-26: deep links from Bin Tracker / Route Board / Address
+        // Book (?site= / ?can=): open Fleet, pick the view, prefill its
+        // search, and scroll to it.
+        try {{
+            var params = new URLSearchParams(window.location.search);
+            var site = params.get('site');
+            var can = params.get('can');
+            if (site) {{
+                ysShow('fleet');
+                if (typeof flSetView === 'function') {{ flSetView('site', document.querySelector('#fl-view-toggle .fl-chip:last-child')); }}
+                var si = document.getElementById('fl-site-filter');
+                if (si) {{ si.value = site; if (typeof flSiteFilter === 'function') {{ flSiteFilter(site); }} }}
+            }} else if (can) {{
+                ysShow('fleet');
+                if (typeof flSetView === 'function') {{ flSetView('can', document.querySelector('#fl-view-toggle .fl-chip')); }}
+                var fi = document.getElementById('fl-filter');
+                if (fi) {{ fi.value = can; if (typeof flFilter === 'function') {{ flFilter(can); }} }}
+            }}
+            if (site || can) {{
+                var fp = document.getElementById('ys-panel-fleet');
+                if (fp) {{ fp.scrollIntoView(); }}
+            }}
+        }} catch (e) {{}}
     }})();
     </script>
     """
@@ -38003,6 +38127,20 @@ def _address_book_section_html():
         (cid(),)
     ).fetchall()
     conn.close()
+    # 2026-10-26: cans on site per street, so each address-book row links
+    # to its fleet group (same shared grouping as By-site).
+    _ac = get_db()
+    try:
+        _fcusts, _fn, _fs = _fleet_site_groups(_ac, cid())
+    finally:
+        _ac.close()
+    _street_cans = {}
+    for _gs in _fcusts.values():
+        for _g in _gs:
+            if not _g["site"]:
+                continue
+            _sk = _g["site"].split(",")[0].strip().casefold()
+            _street_cans[_sk] = _street_cans.get(_sk, 0) + len(_g["cans"])
     _csrf = get_csrf_token()
     rows = ""
     for _aidx, a in enumerate(rows_db):
@@ -38014,6 +38152,9 @@ def _address_book_section_html():
         # the row's own opacity style for hidden locations.)
         _aextra = ' class="ab-extra"' if _aidx >= 25 else ""
         addr = (_a["full_address"] or _a["address"] or "").strip()
+        _street = addr.split(",")[0].strip().casefold()
+        _nc = _street_cans.get(_street, 0)
+        _cans_link = (f' <a href="/yard-setup?site={urllib.parse.quote(_street)}" style="color:#3DDC84;font-size:12px;">🗑️ {_nc} can{"s" if _nc != 1 else ""}</a>' if _nc else "")
         search = " ".join(p for p in [display, addr, _a["city"] or ""] if p).lower()
         is_hidden = bool(_a["hidden"])
         # No customer name → fall back to the street address as the label
@@ -38043,7 +38184,7 @@ def _address_book_section_html():
         rows += (
             f'<tr data-search="{e(search)}"{row_style}{_aextra}>'
             f'<td>{name_cell} {hidden_badge} {_kind_badge}'
-            f'<div class="muted small">{e(addr)}</div></td>'
+            f'<div class="muted small">{e(addr)}</div>{_cans_link}</td>'
             f'<td class="muted small" style="text-align:center;">{_a["times_used"]}</td>'
             f'<td>'
             f'<form method="POST" action="{url_for("update_address_book", sa_id=_a["id"])}" '
@@ -38504,6 +38645,73 @@ def add_container():
     return render_template_string(shell_page("Add Container", body))
 
 
+def _place_datalist_opts(conn, company_id):
+    """<option> lists for the Where-is-it pickers: address-book names and
+    addresses plus names/addresses already seen on routes, deduped."""
+    custs = []
+    for r in conn.execute(
+            "SELECT DISTINCT label FROM saved_addresses WHERE company_id=? AND kind='customer' "
+            "AND label IS NOT NULL AND TRIM(label) != ''", (company_id,)).fetchall():
+        custs.append(r[0])
+    for r in conn.execute(
+            "SELECT DISTINCT s.customer_name FROM stops s JOIN routes r ON r.id = s.route_id "
+            "WHERE r.company_id=? AND s.customer_name IS NOT NULL AND TRIM(s.customer_name) != ''",
+            (company_id,)).fetchall():
+        custs.append(r[0])
+    seen = set()
+    cust_opts = ""
+    for v in custs:
+        k = _norm_cust_key(v)
+        if k and k not in seen:
+            seen.add(k)
+            cust_opts += f'<option value="{e(v)}"></option>'
+    sites = []
+    for r in conn.execute(
+            "SELECT DISTINCT full_address FROM saved_addresses WHERE company_id=? "
+            "AND full_address IS NOT NULL AND TRIM(full_address) != ''", (company_id,)).fetchall():
+        sites.append(r[0])
+    for r in conn.execute(
+            "SELECT DISTINCT s.address FROM stops s JOIN routes r ON r.id = s.route_id "
+            "WHERE r.company_id=? AND s.address IS NOT NULL AND TRIM(s.address) != ''",
+            (company_id,)).fetchall():
+        sites.append(r[0])
+    seen = set()
+    site_opts = ""
+    for v in sites:
+        k = v.strip().casefold()
+        if k and k not in seen:
+            seen.add(k)
+            site_opts += f'<option value="{e(v)}"></option>'
+    return cust_opts, site_opts
+
+
+def _can_place_note(customer, site):
+    """Boss-assigned location -> fleet note text, in the same formats the
+    sync writes, so _fleet_site_of parses it back."""
+    customer = (customer or "").strip()
+    site = (site or "").strip()
+    if customer and site:
+        return f"Returned {today_str()} — {customer}, {site}"
+    if customer:
+        return f"Hauled {today_str()} — {customer}"
+    if site:
+        return f"Placed {today_str()} — {site}"
+    return None
+
+
+def _apply_can_place(conn, can_id, customer, site):
+    """Rewrite a can's note from a boss-picked customer/site and stamp
+    boss_set_at so the auto-learn sync never reverts it. Caller commits.
+    Returns True if a note was written."""
+    note = _can_place_note(customer, site)
+    if note is None:
+        return False
+    conn.execute(
+        "UPDATE containers SET notes=?, boss_set_at=? WHERE id=?",
+        (note, today_str(), can_id))
+    return True
+
+
 @app.route("/boss/containers/<int:c_id>/edit", methods=["GET", "POST"])
 @boss_required
 def edit_container(c_id):
@@ -38518,6 +38726,14 @@ def edit_container(c_id):
         label  = request.form.get("label", "").strip()
         status = request.form.get("status", "yard").strip()
         notes  = request.form.get("notes", "").strip()
+        # 2026-10-26: "Where is it?" — for a deployed can, a picked
+        # customer/site rewrites the note in sync format, so the By-site
+        # view groups it there (and the boss_set_at stamp below protects
+        # it from sync). Otherwise the typed note stands.
+        _place_cust = request.form.get("customer", "").strip()
+        _place_site = request.form.get("site", "").strip()
+        if status == "deployed" and (_place_cust or _place_site):
+            notes = _can_place_note(_place_cust, _place_site)
         if not size:
             flash("Container size is required.", "error")
             conn.close()
@@ -38540,6 +38756,11 @@ def edit_container(c_id):
         return redirect(url_for("yard_setup_page"))
 
     _c = dict(c)
+    # 2026-10-26: "Where is it?" pickers — address-book names/addresses
+    # plus names/addresses already seen on routes, so the boss picks
+    # instead of retyping (and mistyping) a customer or site.
+    _pc, _ps, _pd = _fleet_site_of(_c["notes"])
+    _dl_cust_opts, _dl_site_opts = _place_datalist_opts(conn, cid())
     conn.close()
 
     def _sel(name, opts, cur_val):
@@ -38561,6 +38782,13 @@ def edit_container(c_id):
             <input name="label" value="{e(_c['label'] or '')}">
             <label>Status</label>
             <select name="status">{status_opts}</select>
+            <label>Where is it? — Customer</label>
+            <input name="customer" list="ec-customers" value="{e(_pc)}" placeholder="Pick or type a customer — blank if unknown">
+            <datalist id="ec-customers">{_dl_cust_opts}</datalist>
+            <label>Where is it? — Site address</label>
+            <input name="site" list="ec-sites" value="{e(_ps)}" placeholder="Pick or type a site — blank if unknown">
+            <datalist id="ec-sites">{_dl_site_opts}</datalist>
+            <p class="muted small">For a deployed can, saving with a customer or site rewrites the note so the By-site view groups it there, and stamps it boss-set so sync never moves it back. Leave both blank to keep the typed note. Yard is a status above, not a place here.</p>
             <label>Notes</label>
             <textarea name="notes">{e(_c['notes'] or '')}</textarea>
             <div style="margin-top:12px;display:flex;gap:10px;">
@@ -38568,8 +38796,91 @@ def edit_container(c_id):
                 <a class="btn secondary" href="{url_for('yard_setup_page')}">Cancel</a>
             </div>
         </form>
+        <form method="POST" action="{url_for('retire_container', c_id=c_id)}" onsubmit="return confirm('Retire this can? It leaves every active view and dispatch, but you can bring it back by editing its status.')" style="margin-top:12px;">
+            <input type="hidden" name="_csrf_token" value="{csrf_tok}">
+            <button class="btn red" type="submit" style="width:100%;">Retire can</button>
+        </form>
     </div>"""
     return render_template_string(shell_page("Edit Container", body))
+
+
+@app.route("/boss/containers/unknown", methods=["GET", "POST"])
+@boss_required
+def fix_unknown_containers():
+    """Bulk-place every deployed can with no customer: one pass, one save.
+    Cans left blank stay unknown (still visible in the Unknown group)."""
+    conn = get_db()
+    if request.method == "POST":
+        n = 0
+        rows = conn.execute(
+            "SELECT * FROM containers WHERE company_id=? AND status='deployed'",
+            (cid(),)).fetchall()
+        for r in rows:
+            cust, _site, _since = _fleet_site_of(r["notes"])
+            if cust:
+                continue
+            c = (request.form.get(f"customer_{r['id']}", "") or "").strip()
+            s = (request.form.get(f"site_{r['id']}", "") or "").strip()
+            if (c or s) and _apply_can_place(conn, r["id"], c, s):
+                n += 1
+        conn.commit()
+        conn.close()
+        flash(f"{n} container{'s' if n != 1 else ''} placed.", "success")
+        return redirect(url_for("fix_unknown_containers"))
+    rows = conn.execute(
+        "SELECT * FROM containers WHERE company_id=? AND status='deployed' ORDER BY CAST(label AS INTEGER) ASC, label ASC",
+        (cid(),)).fetchall()
+    cust_opts, site_opts = _place_datalist_opts(conn, cid())
+    conn.close()
+    _rows_html = ""
+    _n = 0
+    for r in rows:
+        cust, site, since = _fleet_site_of(r["notes"])
+        if cust:
+            continue
+        _n += 1
+        _since_txt = f" &middot; since {since}" if since else ""
+        _rows_html += (f'<div class="row" style="gap:8px;flex-wrap:wrap;padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.08);align-items:center;">'
+                       f'<div style="min-width:120px;"><strong>{e(r["size"])}</strong> {e(r["label"] or "(no #)")}<span class="muted small">{_since_txt}</span>'
+                       f'<div class="muted small">Now: {e(site) if site else "no site recorded"}</div></div>'
+                       f'<input name="customer_{r["id"]}" list="fu-customers" placeholder="Customer" style="flex:1;min-width:140px;">'
+                       f'<input name="site_{r["id"]}" list="fu-sites" placeholder="Site address" style="flex:1;min-width:140px;">'
+                       f'</div>')
+    body = f"""
+    <div class="hero"><h1>Fix unknowns</h1>
+    <p>{_n} deployed can{'s' if _n != 1 else ''} with no customer. Fill in what you know and save once — blanks stay unknown.</p></div>
+    <div class="card" style="max-width:720px;">
+        <form method="POST">
+            <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+            <datalist id="fu-customers">{cust_opts}</datalist>
+            <datalist id="fu-sites">{site_opts}</datalist>
+            {_rows_html or '<p class="muted">Nothing unknown — every deployed can has a customer.</p>'}
+            <button class="btn gold" type="submit" style="width:100%;margin-top:12px;">Save all placements</button>
+        </form>
+        <a class="btn secondary" href="{url_for('yard_setup_page')}" style="display:block;text-align:center;margin-top:8px;">Back to Fleet</a>
+    </div>"""
+    return render_template_string(shell_page("Fix unknowns", body))
+
+
+@app.route("/boss/containers/<int:c_id>/retire", methods=["POST"])
+@boss_required
+def retire_container(c_id):
+    """Retire = the delete that sticks. The row stays (so the boss can
+    bring it back by editing its status), but retired cans are out of
+    every active view and dispatch, and the boss_set_at stamp keeps the
+    auto-learn sync from resurrecting them. A hard delete does NOT stick
+    for history cans — the next sync relearns them from old routes."""
+    conn = get_db()
+    c = conn.execute("SELECT size FROM containers WHERE id=? AND company_id=?", (c_id, cid())).fetchone()
+    if not c:
+        conn.close()
+        abort(404)
+    conn.execute("UPDATE containers SET status='retired', boss_set_at=? WHERE id=?",
+                 (today_str(), c_id))
+    conn.commit()
+    conn.close()
+    flash(f"{c['size']} container retired — out of every active view until you edit its status back.", "success")
+    return redirect(url_for("yard_setup_page"))
 
 
 @app.route("/boss/containers/<int:c_id>/delete", methods=["POST"])
@@ -44063,15 +44374,89 @@ def _rental_terms_label(cust):
     return label
 
 
+def _sync_customer_records(conn, company_id):
+    """Self-healing customer records: every distinct name in the address
+    book (customer kind) and on routes becomes a formal customers record,
+    merged by _norm_cust_key so spelling variants collapse to one record.
+    Idempotent; commits its own inserts. Returns {norm_key: customer_id}
+    for every known name, with merged-away names resolving to survivors."""
+    _place_keys = set()
+    for _r in conn.execute(
+            "SELECT label FROM saved_addresses WHERE company_id=? AND kind IN ('vendor','yard','dump')",
+            (company_id,)).fetchall():
+        if _r[0]:
+            _place_keys.add(_norm_cust_key(_r[0]))
+    _votes = {}
+    _ab_spell = {}
+    for _r in conn.execute(
+            "SELECT label FROM saved_addresses WHERE company_id=? AND kind='customer' "
+            "AND label IS NOT NULL AND TRIM(label) != ''", (company_id,)).fetchall():
+        _k = _norm_cust_key(_r[0])
+        if _k and _k not in _place_keys:
+            _votes.setdefault(_k, {})
+            _votes[_k][_r[0].strip()] = _votes[_k].get(_r[0].strip(), 0) + 2
+            _ab_spell.setdefault(_k, _r[0].strip())
+    for _r in conn.execute(
+            "SELECT DISTINCT s.customer_name FROM stops s JOIN routes r ON r.id = s.route_id "
+            "WHERE r.company_id=? AND s.customer_name IS NOT NULL AND TRIM(s.customer_name) != ''",
+            (company_id,)).fetchall():
+        _k = _norm_cust_key(_r[0])
+        if _k and _k not in _place_keys and _k not in ("the yard", "unassigned"):
+            _votes.setdefault(_k, {})
+            _votes[_k][_r[0].strip()] = _votes[_k].get(_r[0].strip(), 0) + 1
+    for _r in conn.execute(
+            "SELECT notes FROM containers WHERE company_id=? AND notes IS NOT NULL",
+            (company_id,)).fetchall():
+        _nc, _ns, _nd = _fleet_site_of(_r[0])
+        _k = _norm_cust_key(_nc)
+        if _k and _k not in _place_keys and _k not in ("the yard", "unassigned"):
+            _votes.setdefault(_k, {})
+            _votes[_k][_nc.strip()] = _votes[_k].get(_nc.strip(), 0) + 1
+    _existing = {}
+    for _r in conn.execute(
+            "SELECT id, business_name, contact_name FROM customers WHERE company_id=? AND is_active=1",
+            (company_id,)).fetchall():
+        for _nm in (_r["business_name"], _r["contact_name"]):
+            if _nm:
+                _existing.setdefault(_norm_cust_key(_nm), _r["id"])
+    _aliases = {}
+    try:
+        for _r in conn.execute(
+                "SELECT alias_key, survivor_id FROM customer_aliases WHERE company_id=?",
+                (company_id,)).fetchall():
+            _aliases[_r["alias_key"]] = _r["survivor_id"]
+    except Exception:
+        pass
+    _out = dict(_existing)
+    _out.update(_aliases)
+    _new = 0
+    for _k, _spell in _votes.items():
+        if _k in _existing or _k in _aliases:
+            continue
+        _disp = _ab_spell.get(_k) or max(_spell.items(), key=lambda kv: (kv[1], kv[0]))[0]
+        try:
+            _cur = conn.execute(
+                "INSERT INTO customers (company_id, business_name, portal_token, is_active, created_at) "
+                "VALUES (?, ?, ?, 1, ?)",
+                (company_id, _disp, secrets.token_urlsafe(24), now_ts()))
+            _out[_k] = _cur.lastrowid
+            _new += 1
+        except Exception:
+            pass
+    if _new:
+        conn.commit()
+    return _out
+
+
 @app.route("/customers")
 @roles_required("customer_manager")
 def customers_page():
     """Customer_manager/owner: active customers with at-a-glance counts, plus
     an Add Customer form."""
     conn = get_db()
+    _sync_customer_records(conn, cid())
     rows = conn.execute(
         """SELECT c.id, c.business_name, c.contact_name, c.phone,
-                  (SELECT COUNT(*) FROM bins b WHERE b.customer_id = c.id) AS bin_count,
                   (SELECT COUNT(*) FROM requests r
                      WHERE r.customer_id = c.id
                        AND r.status IN ('pending','accepted','approved','scheduled','in_progress')
@@ -44081,6 +44466,10 @@ def customers_page():
             ORDER BY LOWER(COALESCE(c.business_name, c.contact_name, '')), c.id""",
         (cid(),),
     ).fetchall()
+    _fcusts, _fn, _fs = _fleet_site_groups(conn, cid())
+    _fleet_n = {}
+    for _disp, _gs in _fcusts.items():
+        _fleet_n[_norm_cust_key(_disp)] = sum(len(_g["cans"]) for _g in _gs)
     conn.close()
 
     size_opts = "".join(f'<option value="{s}">{s}</option>' for s in REQUEST_SIZES)
@@ -44088,6 +44477,7 @@ def customers_page():
     cards = ""
     for c in rows:
         name = e(c["business_name"] or c["contact_name"] or "Customer")
+        _fleet_cans = _fleet_n.get(_norm_cust_key(c["business_name"] or c["contact_name"] or ""), 0)
         contact = e(c["contact_name"] or "")
         phone = e(c["phone"] or "")
         meta_bits = " · ".join(b for b in [contact, phone] if b)
@@ -44107,7 +44497,7 @@ def customers_page():
             </div>
             {meta_html}
             <div style="color:var(--slate);font-size:12px;margin-top:6px;">
-                🗑️ {c["bin_count"]} active bin{"" if c["bin_count"]==1 else "s"}
+                🗑️ {_fleet_cans} can{"s" if _fleet_cans != 1 else ""} on site
             </div>
         </a>
         """
@@ -44453,6 +44843,40 @@ def customer_detail_page(customer_id):
             WHERE r.customer_id=? ORDER BY r.created_at DESC, r.id DESC""",
         (customer_id,),
     ).fetchall()
+    # 2026-10-26: fleet cans on site (shared grouping) + merge options.
+    _fcusts, _fc_n, _fc_s = _fleet_site_groups(conn, cid())
+    _survivor_folds = set()
+    try:
+        for _ar in conn.execute(
+                "SELECT survivor_name FROM customer_aliases WHERE company_id=? AND survivor_id=?",
+                (cid(), customer_id)).fetchall():
+            if _ar["survivor_name"]:
+                _survivor_folds.add(_norm_cust_key(_ar["survivor_name"]))
+    except Exception:
+        pass
+    _my_keys = {_norm_cust_key(cust["business_name"] or ""), _norm_cust_key(cust["contact_name"] or "")} | _survivor_folds
+    _my_groups = []
+    for _disp, _gs in _fcusts.items():
+        if _norm_cust_key(_disp) in _my_keys:
+            _my_groups.extend(_gs)
+    _fleet_rows = ""
+    for _g in sorted(_my_groups, key=lambda g: (not g["site"], g["site"].casefold())):
+        _can_rows = "".join(
+            f'<div style="padding:4px 0;">🗑️ {e(_cd["size"])} {e(_lab or "(no #)")}'
+            + (f'<span style="color:var(--slate);font-size:12px;"> · since {_since}</span>' if _since else "")
+            + f' <a href="{url_for("edit_container", c_id=_cd["id"])}" style="color:#FF9D5C;font-size:12px;">Edit</a></div>'
+            for _num, _lab, _cd, _since in _g["cans"])
+        _site_name = _g["site"] or "Site not recorded"
+        _dump_badge = ' <span class="badge" style="background:rgba(255,157,92,0.15);color:#FF9D5C;">Dump</span>' if _g["kind"] == "dump" else ""
+        _fleet_rows += (f'<div style="padding:8px 0;border-bottom:1px solid var(--border);">'
+                        f'<div style="font-weight:600;">📍 {e(_site_name)} <span style="color:var(--slate);font-size:12px;">· {len(_g["cans"])} can{"s" if len(_g["cans"]) != 1 else ""}</span>{_dump_badge}</div>'
+                        f'{_can_rows}</div>')
+    _fleet_html = _fleet_rows or '<div style="color:var(--slate);font-size:13px;">No fleet cans on site.</div>'
+    _merge_opts = "".join(
+        f'<option value="{_r["id"]}">{e(_r["business_name"] or _r["contact_name"] or "Customer")}</option>'
+        for _r in conn.execute(
+            "SELECT id, business_name, contact_name FROM customers WHERE company_id=? AND is_active=1 AND id!=? ORDER BY LOWER(COALESCE(business_name, contact_name, ''))",
+            (cid(), customer_id)).fetchall())
     conn.close()
 
     portal_url = _portal_url(cust["portal_token"])
@@ -44611,8 +45035,21 @@ def customer_detail_page(customer_id):
         {add_bin_html}
     </div>
     <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+        <h2 style="font-size:15px;margin:0 0 6px;">Containers on site</h2>
+        {_fleet_html}
+    </div>
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
         <h2 style="font-size:15px;margin:0 0 6px;">Request history</h2>
         {reqs_html}
+    </div>
+    <div class="bin-card" style="padding:16px;max-width:640px;margin-bottom:12px;">
+        <h2 style="font-size:15px;margin:0 0 6px;">Merge another customer into this one</h2>
+        <p style="color:var(--slate);font-size:13px;margin:0 0 10px;">For look-alikes (Marlyn vs Marlyn LLC): their bins, requests, and sites move here, the other record hides, and every spelling of the old name keeps pointing here — including in the fleet view.</p>
+        <form method="POST" action="{url_for('merge_customer', customer_id=customer_id)}" onsubmit="return confirm('Merge the selected customer into this one?')">
+            <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+            <select name="alias_id" style="width:100%;margin-bottom:10px;">{_merge_opts}</select>
+            <button class="btn secondary" type="submit" style="width:100%;">Merge into this customer</button>
+        </form>
     </div>
     <div style="max-width:640px;margin-bottom:24px;">
         <button class="btn red" onclick="deactivate()" style="width:100%;">Deactivate customer</button>
@@ -48516,6 +48953,45 @@ def truck_history_print(truck_id):
     {subtotals_html}"""
     return print_page("Truck Maintenance History", f'Maintenance history — {truck["name"]}',
                       span, body_inner, back_url=url_for("truck_detail_page", truck_id=truck_id))
+
+
+@app.route("/customers/<int:customer_id>/merge", methods=["POST"])
+@boss_required
+def merge_customer(customer_id):
+    """Fold one customer record into another: bins, requests, and sites
+    re-point, the alias record hides, and the alias spellings are recorded
+    so the fleet grouping (and future syncs) keep resolving them here."""
+    conn = get_db()
+    surv = conn.execute("SELECT * FROM customers WHERE id=? AND company_id=? AND is_active=1", (customer_id, cid())).fetchone()
+    alias_id = (request.form.get("alias_id", "") or "").strip()
+    if not surv or not alias_id.isdigit():
+        conn.close()
+        flash("Nothing to merge.", "error")
+        return redirect(url_for("customers_page"))
+    alias = conn.execute("SELECT * FROM customers WHERE id=? AND company_id=? AND is_active=1", (int(alias_id), cid())).fetchone()
+    if not alias or alias["id"] == customer_id:
+        conn.close()
+        flash("Nothing to merge.", "error")
+        return redirect(url_for("customer_detail_page", customer_id=customer_id))
+    for _tbl in ("bins", "requests", "sites"):
+        try:
+            conn.execute(f"UPDATE {_tbl} SET customer_id=? WHERE customer_id=?", (customer_id, alias["id"]))
+        except Exception:
+            pass
+    conn.execute("UPDATE customers SET is_active=0 WHERE id=?", (alias["id"],))
+    _sname = surv["business_name"] or surv["contact_name"] or "Customer"
+    for _nm in (alias["business_name"], alias["contact_name"]):
+        if _nm:
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO customer_aliases (company_id, alias_key, survivor_id, survivor_name, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (cid(), _norm_cust_key(_nm), customer_id, _sname, now_ts()))
+            except Exception:
+                pass
+    conn.commit()
+    conn.close()
+    flash(f"Merged {alias['business_name'] or alias['contact_name']} into {_sname}.", "success")
+    return redirect(url_for("customer_detail_page", customer_id=customer_id))
 
 
 @app.route("/customers/<int:customer_id>/print")
