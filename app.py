@@ -24793,10 +24793,13 @@ def view_route(route_id):
         _down_can_html = (f'<p><strong>Can down here:</strong> <a href="/yard-setup?can={e(_down_can)}" style="color:#7FB8FF;font-weight:800;text-decoration:none;">#{e(_down_can)}</a></p>') if _down_can else ""
         # 2026-10-26: every stop shows its container number when known —
         # the ticket's can first (the hauled record), else the notes/
-        # assigned can. If it is the same can already shown as down here,
-        # the down line already says it — don't print it twice.
+        # assigned can — unless a down can is already shown (one line
+        # per stop; the site can wins, see below).
         _handled_can = _route_ticket_by_stop.get(s["id"]) or _pickup_can(dict(s)) or ""
-        if _down_can and _down_can == _handled_can:
+        # 2026-10-26: one container per stop on the card — the can on the
+        # site wins. When a down can is shown, the picked-up can is not
+        # repeated (it still lives on the Daily Log as Box Out).
+        if _down_can:
             _handled_can = ""
         _can_html = (f'<p><strong>Can:</strong> <a href="/yard-setup?can={e(_handled_can)}" style="color:#7FB8FF;font-weight:800;text-decoration:none;">#{e(_handled_can)}</a></p>') if _handled_can else ""
         # 2026-10-26: site-can fallback — when the stop's own records name
