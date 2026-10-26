@@ -9460,6 +9460,15 @@ tr:hover td {{ background: rgba(255,107,26,0.025); }}
     color: #A6A69E;
 }}
 
+/* 2026-10-26: a chain head that is not done yet — its container has not
+   come back. Amber, like the board's Returning pill: not done (green),
+   not untouched (grey). */
+.badge.returning {{
+    background: rgba(255,193,7,0.14);
+    border: 1px solid rgba(255,193,7,0.45);
+    color: #FFC107;
+}}
+
 .stop-cancelled {{
     opacity: 0.5;
 }}
@@ -24377,6 +24386,33 @@ def view_route(route_id):
     total_count     = len(_live_stops)
     cancelled_count = len(stops) - total_count
 
+    # 2026-10-26: chain-head display — a chain head isn't done until the
+    # chain ends (the container returns to the first route), so a completed
+    # head with an open chain reads RETURNING here, not COMPLETED — the
+    # same rule the board pill and the Daily Log use. Raw status stays
+    # untouched (billing and the Reopen action still key on it), so the
+    # Create Invoice button below keeps the raw count.
+    def _cseq(_x):
+        _sq = _x["chain_seq"] if "chain_seq" in _x.keys() else None
+        return _sq if isinstance(_sq, int) else 0
+    _chain_members = {}
+    for _cs in _live_stops:
+        _cg = _cs["chain_group_id"] if "chain_group_id" in _cs.keys() else None
+        if _cg:
+            _chain_members.setdefault(_cg, []).append(_cs)
+    _chain_tail_done = {}
+    for _cg, _cm in _chain_members.items():
+        _chain_tail_done[_cg] = (max(_cm, key=_cseq)["status"] or "") == "completed"
+    def _disp_status_of(_s):
+        _st = _s["status"]
+        _cg = _s["chain_group_id"] if "chain_group_id" in _s.keys() else None
+        _tk = _s["chain_takes_from_stop_id"] if "chain_takes_from_stop_id" in _s.keys() else None
+        if _st == "completed" and _cg and not _tk and not _chain_tail_done.get(_cg, True):
+            return "returning"
+        return _st
+    _raw_completed_count = completed_count
+    completed_count = sum(1 for s in _live_stops if _disp_status_of(s) == "completed")
+
     # Options for the per-load "Move to route" picker (boss only).
     move_options_html = "".join(
         '<option value="%d">%s</option>' % (
@@ -24608,6 +24644,7 @@ def view_route(route_id):
         if next_open_stop_id is None and stop_is_open(s):
          next_open_stop_id = s["stop_order"]
         _cancelled = stop_is_cancelled(s)
+        _disp_status = _disp_status_of(s)
         photo_html = build_photo_gallery_html(photos_by_stop.get(s["id"], []))
 
         edit_button = f'<a class="btn secondary" href="{url_for("edit_stop", stop_id=s["id"])}">Edit</a>' if session.get("role") == "boss" else ''
@@ -24779,7 +24816,7 @@ def view_route(route_id):
                 <div>
                     {'<span class="stop-handle">☰</span>' if session.get('role') == 'boss' and not _cancelled else ''}
                     <strong class="stop-title">Stop #{_pos}</strong>
-                    {'<span class="badge cancelled">cancelled</span>' if _cancelled else f'<span class="badge {e(s["status"])}">{e(s["status"])}</span>'}
+                    {'<span class="badge cancelled">cancelled</span>' if _cancelled else f'<span class="badge {e(_disp_status)}">{e(_disp_status)}</span>'}
                     {cancel_note_html}
                 </div>
                 <div class="row">
@@ -24989,7 +25026,7 @@ def view_route(route_id):
         <p>Progress: {completed_count}/{total_count} stops completed{f' &middot; {cancelled_count} cancelled' if cancelled_count else ''}{_route_rev_html}</p>
         <div class="row" style="margin-top:12px;">
             {route_action_buttons}
-            {f'<a class="btn gold" href="{url_for("invoice_new", route_id=route_id)}">&#x1F9FE; Create Invoice</a>' if session.get("role") == "boss" and completed_count else ''}
+            {f'<a class="btn gold" href="{url_for("invoice_new", route_id=route_id)}">&#x1F9FE; Create Invoice</a>' if session.get("role") == "boss" and _raw_completed_count else ''}
         </div>
         <div style="margin-top:10px;"><a href="{url_for('routes_page', day=route['route_date'])}" style="color:#8C8C82;font-size:13px;">&larr; Back to {e(route['route_date'])} board</a></div>
     </div>
