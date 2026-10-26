@@ -20153,15 +20153,16 @@ def driver_route_detail(route_id):
     if _cab_svc in ("pull", "swap"):
         try:
             _tn_conn = get_db()
-            _tn_allow_std, _tn_allow_40, _tn_over_cents = _get_tonnage_rates(_tn_conn, session["company_id"])
+            _tn_rates = _get_tonnage_rates(_tn_conn, session["company_id"])
             _tn_conn.close()
         except Exception:
-            _tn_allow_std, _tn_allow_40, _tn_over_cents = 0.0, 0.0, 0
+            _tn_rates = (0.0, 0.0, 0, {})
             try:
                 _tn_conn.close()
             except Exception:
                 pass
-        _tn_allow = _tn_allow_40 if _rate_tier(_cab_svcd.get("container_size")) == "40yd" else _tn_allow_std
+        _tn_allow = _tonnage_allow(_tn_rates, _cab_svcd.get("container_size"))
+        _tn_over_cents = _tn_rates[2]
         if _tn_over_cents > 0:
             _cab_weight_block = f"""
     <div class="cab-weight-block" style="margin-bottom:12px;padding:12px;border:1px solid rgba(255,255,255,0.12);border-radius:10px;background:rgba(255,255,255,0.03);">
@@ -32327,7 +32328,7 @@ def settings_page():
         _rc_errors = []
         _rc_rows = []
         for svc in ("delivery", "pull", "swap"):
-            for tier in ("standard", "40yd"):
+            for tier in ("10yd", "20yd", "30yd", "40yd", "standard"):
                 cents = _sv_dollars(form.get(f"rate_{svc}_{tier}"))
                 if cents == "invalid":
                     _rc_errors.append(svc)
@@ -32338,7 +32339,9 @@ def settings_page():
             _rc_errors.append("extra_day")
         elif _ed_cents is not None:
             _rc_rows.append((cid(), "extra_day", "*", _ed_cents, None))
-        for tier, field in (("standard", "tons_allow_standard"), ("40yd", "tons_allow_40yd")):
+        for tier, field in (("10yd", "tons_allow_10yd"), ("20yd", "tons_allow_20yd"),
+                            ("30yd", "tons_allow_30yd"), ("40yd", "tons_allow_40yd"),
+                            ("standard", "tons_allow_standard")):
             t = _sv_tons(form.get(field))
             if t == "invalid":
                 _rc_errors.append(field)
@@ -32371,8 +32374,9 @@ def settings_page():
                 " ON CONFLICT(company_id, service, tier) DO UPDATE SET cents=excluded.cents, qty=excluded.qty",
                 _r)
         _want = {(svc, tier) for svc in ("delivery", "pull", "swap")
-                 for tier in ("standard", "40yd")} | {("extra_day", "*")} | \
-                {("tonnage_allow", "standard"), ("tonnage_allow", "40yd"), ("tonnage_overage", "*")} | \
+                 for tier in ("10yd", "20yd", "30yd", "40yd", "standard")} | {("extra_day", "*")} | \
+                {("tonnage_allow", "10yd"), ("tonnage_allow", "20yd"), ("tonnage_allow", "30yd"),
+                 ("tonnage_allow", "40yd"), ("tonnage_allow", "standard"), ("tonnage_overage", "*")} | \
                 {(f"fee_{k}", "*") for k, _, _ in _FEE_KINDS if k != "custom"} | \
                 {("surcharge_markup", "*")}
         _have = {(r[1], r[2]) for r in _rc_rows}
@@ -32460,10 +32464,19 @@ def settings_page():
         return "" if not v else (_fmt_money(v).lstrip("$"))
     _rc_delivery_std = _rc_dollars("delivery", "standard")
     _rc_delivery_40  = _rc_dollars("delivery", "40yd")
+    _rc_delivery_10  = _rc_dollars("delivery", "10yd")
+    _rc_delivery_20  = _rc_dollars("delivery", "20yd")
+    _rc_delivery_30  = _rc_dollars("delivery", "30yd")
     _rc_pull_std     = _rc_dollars("pull", "standard")
     _rc_pull_40      = _rc_dollars("pull", "40yd")
+    _rc_pull_10      = _rc_dollars("pull", "10yd")
+    _rc_pull_20      = _rc_dollars("pull", "20yd")
+    _rc_pull_30      = _rc_dollars("pull", "30yd")
     _rc_swap_std     = _rc_dollars("swap", "standard")
     _rc_swap_40      = _rc_dollars("swap", "40yd")
+    _rc_swap_10      = _rc_dollars("swap", "10yd")
+    _rc_swap_20      = _rc_dollars("swap", "20yd")
+    _rc_swap_30      = _rc_dollars("swap", "30yd")
     _rc_extra_day    = _rc_dollars("extra_day", "*")
     # 2026-10-16: tonnage values for the form.
     def _rc_tons(svc, tier):
@@ -32477,6 +32490,9 @@ def settings_page():
         return ""
     _rc_tons_std = _rc_tons("tonnage_allow", "standard")
     _rc_tons_40  = _rc_tons("tonnage_allow", "40yd")
+    _rc_tons_10  = _rc_tons("tonnage_allow", "10yd")
+    _rc_tons_20  = _rc_tons("tonnage_allow", "20yd")
+    _rc_tons_30  = _rc_tons("tonnage_allow", "30yd")
     _rc_tonnage_over = _rc_dollars("tonnage_overage", "*")
     # 2026-10-16: field fee presets for the form.
     _fee_presets = _get_fee_presets(conn, cid())
@@ -32646,9 +32662,9 @@ def settings_page():
     <div class="card" id="rate-card">
         <h2>&#128176; Rate Card</h2>
         <p style="color:#B8B8AE;font-size:13px;margin-bottom:16px;">
-            What you charge per job. 10, 20 and 30-yard cans share one price;
-            40-yard has its own. The app uses these to total revenue per route
-            and per day. Blank = unpriced.
+            What you charge per job, by can size. A size with no price of its
+            own uses the fallback price below. The app uses these to total
+            revenue per route and per day. Blank = unpriced (falls back).
         </p>
         <div style="border:1px solid rgba(255,107,26,.25);border-radius:12px;padding:14px;margin-bottom:16px;background:linear-gradient(135deg,rgba(255,107,26,.05),rgba(255,107,26,.01));">
             <div style="font-weight:800;margin-bottom:4px;">📷 Scan a paper rate sheet</div>
@@ -32667,27 +32683,52 @@ def settings_page():
             <table style="width:100%;border-collapse:collapse;min-width:320px;">
                 <thead><tr>
                     <th style="text-align:left;padding:8px 6px;font-size:12px;color:#B8B8AE;text-transform:uppercase;letter-spacing:.5px;">Service</th>
-                    <th style="padding:8px 6px;font-size:12px;color:#B8B8AE;text-transform:uppercase;letter-spacing:.5px;">10&ndash;30 yd</th>
+                    <th style="padding:8px 6px;font-size:12px;color:#B8B8AE;text-transform:uppercase;letter-spacing:.5px;">10 yd</th>
+                    <th style="padding:8px 6px;font-size:12px;color:#B8B8AE;text-transform:uppercase;letter-spacing:.5px;">20 yd</th>
+                    <th style="padding:8px 6px;font-size:12px;color:#B8B8AE;text-transform:uppercase;letter-spacing:.5px;">30 yd</th>
                     <th style="padding:8px 6px;font-size:12px;color:#B8B8AE;text-transform:uppercase;letter-spacing:.5px;">40 yd</th>
                 </tr></thead>
                 <tbody>
                 <tr>
                     <td style="padding:6px;font-weight:600;">Delivery <span class="muted small">(drop empty)</span></td>
-                    <td style="padding:6px;"><input name="rate_delivery_standard" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_delivery_std}" style="width:100%;"></td>
+                    <td style="padding:6px;"><input name="rate_delivery_10yd" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_delivery_10}" style="width:100%;"></td>
+                    <td style="padding:6px;"><input name="rate_delivery_20yd" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_delivery_20}" style="width:100%;"></td>
+                    <td style="padding:6px;"><input name="rate_delivery_30yd" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_delivery_30}" style="width:100%;"></td>
                     <td style="padding:6px;"><input name="rate_delivery_40yd" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_delivery_40}" style="width:100%;"></td>
                 </tr>
                 <tr>
                     <td style="padding:6px;font-weight:600;">Pull <span class="muted small">(haul full)</span></td>
-                    <td style="padding:6px;"><input name="rate_pull_standard" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_pull_std}" style="width:100%;"></td>
+                    <td style="padding:6px;"><input name="rate_pull_10yd" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_pull_10}" style="width:100%;"></td>
+                    <td style="padding:6px;"><input name="rate_pull_20yd" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_pull_20}" style="width:100%;"></td>
+                    <td style="padding:6px;"><input name="rate_pull_30yd" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_pull_30}" style="width:100%;"></td>
                     <td style="padding:6px;"><input name="rate_pull_40yd" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_pull_40}" style="width:100%;"></td>
                 </tr>
                 <tr>
                     <td style="padding:6px;font-weight:600;">Swap <span class="muted small">(pickup &amp; return)</span></td>
-                    <td style="padding:6px;"><input name="rate_swap_standard" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_swap_std}" style="width:100%;"></td>
+                    <td style="padding:6px;"><input name="rate_swap_10yd" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_swap_10}" style="width:100%;"></td>
+                    <td style="padding:6px;"><input name="rate_swap_20yd" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_swap_20}" style="width:100%;"></td>
+                    <td style="padding:6px;"><input name="rate_swap_30yd" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_swap_30}" style="width:100%;"></td>
                     <td style="padding:6px;"><input name="rate_swap_40yd" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_swap_40}" style="width:100%;"></td>
                 </tr>
                 </tbody>
             </table>
+            </div>
+            <div style="margin-top:12px;">
+                <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Fallback price — used for any size with no price of its own</label>
+                <div class="grid" style="grid-template-columns:1fr 1fr 1fr;gap:12px;max-width:560px;">
+                    <div>
+                        <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;">Delivery ($)</label>
+                        <input name="rate_delivery_standard" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_delivery_std}" style="width:100%;">
+                    </div>
+                    <div>
+                        <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;">Pull ($)</label>
+                        <input name="rate_pull_standard" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_pull_std}" style="width:100%;">
+                    </div>
+                    <div>
+                        <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;">Swap ($)</label>
+                        <input name="rate_swap_standard" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00" value="{_rc_swap_std}" style="width:100%;">
+                    </div>
+                </div>
             </div>
             <div style="margin-top:12px;max-width:280px;">
                 <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Extra-day default ($/day)</label>
@@ -32701,12 +32742,24 @@ def settings_page():
             </p>
             <div class="grid" style="grid-template-columns:1fr 1fr 1fr;gap:12px;max-width:560px;">
                 <div>
-                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">10&ndash;30 yd (tons)</label>
-                    <input name="tons_allow_standard" type="number" min="0" step="0.5" inputmode="decimal" placeholder="0" value="{_rc_tons_std}" style="width:100%;">
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">10 yd (tons)</label>
+                    <input name="tons_allow_10yd" type="number" min="0" step="0.5" inputmode="decimal" placeholder="0" value="{_rc_tons_10}" style="width:100%;">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">20 yd (tons)</label>
+                    <input name="tons_allow_20yd" type="number" min="0" step="0.5" inputmode="decimal" placeholder="0" value="{_rc_tons_20}" style="width:100%;">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">30 yd (tons)</label>
+                    <input name="tons_allow_30yd" type="number" min="0" step="0.5" inputmode="decimal" placeholder="0" value="{_rc_tons_30}" style="width:100%;">
                 </div>
                 <div>
                     <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">40 yd (tons)</label>
                     <input name="tons_allow_40yd" type="number" min="0" step="0.5" inputmode="decimal" placeholder="0" value="{_rc_tons_40}" style="width:100%;">
+                </div>
+                <div>
+                    <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Fallback (tons)</label>
+                    <input name="tons_allow_standard" type="number" min="0" step="0.5" inputmode="decimal" placeholder="0" value="{_rc_tons_std}" style="width:100%;">
                 </div>
                 <div>
                     <label style="display:block;font-size:12px;color:#B8B8AE;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;">Overage ($/ton)</label>
@@ -34666,8 +34719,8 @@ def _classify_service(action):
 
 
 def _rate_tier(size):
-    """'40yd' gets its own tier; everything else (10/20/30/unknown) is standard."""
-    return "40yd" if size_bucket(size) == "40yd" else "standard"
+    """Per-size tier ('10yd'/'20yd'/'30yd'/'40yd'); unknown sizes use 'standard'."""
+    return size_bucket(size) or "standard"
 
 
 def _get_rate_card(conn, company_id):
@@ -34679,12 +34732,21 @@ def _get_rate_card(conn, company_id):
 
 
 def _stop_revenue_cents(rate_card, action, size):
-    """Priced revenue for one stop. Unpriced actions/sizes → 0. Never raises."""
+    """Priced revenue for one stop. Unpriced actions/sizes → 0. Never raises.
+
+    Per-size price wins when set; 10/20/30yd fall back to the 'standard'
+    price, so existing cards keep billing exactly as before until the boss
+    sets a price for a size. 40yd never falls back — it always had its own tier.
+    """
     try:
         svc = _classify_service(action)
         if not svc:
             return 0
-        return int(rate_card.get((svc, _rate_tier(size)), 0) or 0)
+        tier = _rate_tier(size)
+        v = rate_card.get((svc, tier), 0) or 0
+        if not v and tier in ("10yd", "20yd", "30yd"):
+            v = rate_card.get((svc, "standard"), 0) or 0
+        return int(v)
     except Exception:
         return 0
 
@@ -34716,12 +34778,16 @@ def _extra_day_default_cents(conn, company_id):
 
 
 def _get_tonnage_rates(conn, company_id):
-    """(allow_std_tons, allow_40_tons, overage_cents_per_ton).
+    """(allow_std_tons, allow_40_tons, overage_cents_per_ton, allow_by_size).
 
     2026-10-16: included tons per size tier + $/ton overage from the
     rate card. Missing = 0 (no allowance / no overage billing).
+    2026-10-26: allow_by_size maps '10yd'/'20yd'/'30yd'/'40yd' rows to
+    their included tons; sizes without their own row fall back via
+    _tonnage_allow (10/20/30yd → standard, 40yd → its own row).
     """
     allow_std = allow_40 = 0.0
+    allow_by_size = {}
     over_cents = 0
     try:
         for r in conn.execute(
@@ -34733,9 +34799,11 @@ def _get_tonnage_rates(conn, company_id):
                     t = max(0.0, float(r["qty"] or 0))
                 except (TypeError, ValueError):
                     t = 0.0
+                if r["tier"] in ("10yd", "20yd", "30yd", "40yd"):
+                    allow_by_size[r["tier"]] = t
                 if r["tier"] == "40yd":
                     allow_40 = t
-                else:
+                elif r["tier"] == "standard":
                     allow_std = t
             else:
                 try:
@@ -34744,14 +34812,31 @@ def _get_tonnage_rates(conn, company_id):
                     over_cents = 0
     except Exception:
         pass
-    return allow_std, allow_40, over_cents
+    return allow_std, allow_40, over_cents, allow_by_size
+
+
+def _tonnage_allow(tonnage_rates, size):
+    """Included tons for one stop's size. Per-size row wins; 10/20/30yd
+    fall back to the standard allowance, 40yd to its own row. Never raises."""
+    try:
+        allow_std = tonnage_rates[0]
+        allow_40 = tonnage_rates[1]
+        allow_by_size = tonnage_rates[3] if len(tonnage_rates) > 3 else {}
+        tier = _rate_tier(size)
+        v = (allow_by_size or {}).get(tier)
+        if v:
+            return v
+        return allow_40 if tier == "40yd" else allow_std
+    except Exception:
+        return 0
 
 
 def _stop_overage_cents(tonnage_rates, action, size, tons):
     """Tonnage overage charge for one pull/swap stop. Never raises.
 
     tons = scale-ticket weight. Only pull/swap stops can go over; the
-    allowance follows the 40yd/standard tier split like haul pricing.
+    allowance follows the stop's size, falling back to the standard
+    allowance like haul pricing.
     """
     try:
         if _classify_service(action) not in ("pull", "swap"):
@@ -34759,8 +34844,8 @@ def _stop_overage_cents(tonnage_rates, action, size, tons):
         tons = float(tons or 0)
         if tons <= 0:
             return 0
-        allow_std, allow_40, over_cents = tonnage_rates
-        allow = allow_40 if _rate_tier(size) == "40yd" else allow_std
+        over_cents = tonnage_rates[2]
+        allow = _tonnage_allow(tonnage_rates, size)
         over_tons = max(0.0, tons - allow)
         if over_tons <= 0 or over_cents <= 0:
             return 0
@@ -34848,7 +34933,7 @@ def _build_invoice_lines_for_route(conn, company_id, route_id):
                               "stop_id": sd["id"]})
             over = _stop_overage_cents(tn_rates, action, size, sd.get("weight_tons"))
             if over > 0:
-                allow = tn_rates[1] if _rate_tier(size) == "40yd" else tn_rates[0]
+                allow = _tonnage_allow(tn_rates, size)
                 tons = float(sd.get("weight_tons") or 0)
                 desc = (f"Tonnage overage — {_fmt_tons(tons - allow)} over "
                         f"({_fmt_tons(tons)} at {_fmt_money(tn_rates[2])}/ton)")
