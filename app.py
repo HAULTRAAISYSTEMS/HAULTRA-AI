@@ -25364,6 +25364,21 @@ def _sync_fleet_from_history(conn, company_id):
                         elif not tcan:
                             ins, ch = _fleet_upsert(conn, company_id, _pcan, size, "loaded_at_yard",
                                                     f"Picked up {rdate} — {who}" if who else f"Picked up {rdate}")
+            # 2026-10-26: live set-off — a receiver leg past its "Set Off
+            # Empty & Box Out Full" tap has already left the carried-in
+            # empty at this customer, even though the leg isn't complete
+            # yet (its dump comes later). Waiting for completion left the
+            # swapped can reading "on truck" while the driver was already
+            # on the next leg — the board pill already flips to Done at
+            # this tap, so the fleet must flip here too. The tap is the
+            # evidence; the carried bin itself is ticket-backed.
+            if (not done and d.get("chain_takes_from_stop_id")
+                    and (d.get("driver_status") or "") in ("box_out", "going_to_dump", "need_box_in", "box_in")
+                    and _carried and _carried != (tcan or "")):
+                _drop_old = bool(bulk_dates.get(_carried) and rdate and rdate < bulk_dates[_carried])
+                if not _drop_old:
+                    ins, ch = _fleet_upsert(conn, company_id, _carried, _carried_size, "deployed",
+                                            f"Dropped {rdate} — {who}, {where}" if who or where else f"Dropped {rdate}")
             if done:
                 # Swap-drop: on a completed PR swap, the carried-in empty
                 # was left at this customer. It needs its own ticket
@@ -25613,12 +25628,20 @@ def _route_on_truck(conn, route_id):
                         "step": _step, "customer": _who(_s),
                         "dest": _dest or _who(_s), "stop_id": _s.get("id"),
                         "has_can": True}
+    # 2026-10-26: a receiver leg past its Set Off tap has already left the
+    # completed-stops carried bin at its site — the fallback below must not
+    # report that bin as still on the truck (same tap the board pill and
+    # the fleet set-off rule key on).
+    _setoff_done = any(
+        (s.get("chain_takes_from_stop_id")
+         and (s.get("driver_status") or "") in ("box_out", "going_to_dump", "need_box_in", "box_in"))
+        for s in _stops if (s.get("status") or "") != "completed")
     try:
         _b, _bs = _route_final_bin_detail(conn, route_id)
     except Exception:
         _b, _bs = "", ""
     _nxt = next((s for s in _stops if (s.get("status") or "") != "completed"), None)
-    if _b:
+    if _b and not _setoff_done:
         _who_n = _who(_nxt) if _nxt else ""
         return {"can": _b, "size": _bs or "",
                 "step": ("On truck — heading to " + _who_n) if _who_n else "On truck — end of route",
