@@ -20184,7 +20184,12 @@ def driver_route_detail(route_id):
                     if not stop_is_cancelled(_nr):
                         _dest_row = _nr
                         break
-        if _dest_row is not None:
+        # 2026-10-26: no stale pointer — when the handoff destination is
+        # already completed (e.g. the head's card after the tail's return
+        # landed the driver back on it), the strip would point at done
+        # work instead of the finish action. Only live destinations get
+        # a Navigate strip.
+        if _dest_row is not None and stop_is_open(_dest_row):
             _d_full = " ".join(filter(None, [
                 _dest_row["address"] or "", _dest_row["city"] or "",
                 _dest_row["state"] or "", _dest_row["zip_code"] or ""])).strip()
