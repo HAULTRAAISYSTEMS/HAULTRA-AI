@@ -142,9 +142,9 @@ if FAILURES:
 print("ALL CHECKS PASSED")
 
 # ── Fix 3: pre-tap Navigate panel on the chained need_box_in card ────────
-# The driver holds the empty and the deliver-step button both names the
-# destination AND completes the stop — the card must offer navigation to the
-# handoff stop BEFORE the confirming tap.
+# REMOVED 2026-10-26 (user's call): no "Empty goes to + Navigate" strip.
+# The Return/Deliver Empty button alone carries the driver to the
+# destination card, and it already names where the empty goes.
 import app as _app
 
 _app.init_db()
@@ -182,10 +182,9 @@ with _cl.session_transaction() as _s:
 _r = _cl.get("/driver/route/%d" % _nrid)
 _html = _r.get_data(as_text=True)
 ok(_r.status_code == 200, "fix3: driver route page renders (200)")
-ok("Empty goes to" in _html and "3309 Country Mill Run" in _html,
-   "fix3: need_box_in card shows the handoff destination before the tap")
-ok("openNavStop" in _html, "fix3: handoff destination has a Navigate action")
-# The confirming button is still there, unchanged.
+ok("Empty goes to" not in _html,
+   "fix3: no Empty-goes-to strip on the need_box_in card (removed 2026-10-26)")
+# The confirming button is still there, unchanged, and names the destination.
 ok("Deliver Empty to" in _html and "3309 Country Mill Run" in _html,
    "fix3: the confirming deliver-step button still renders")
 
