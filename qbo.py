@@ -1021,8 +1021,37 @@ def _browser_page(title, body_html, status=200):
                     headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
 
-_BACK_TO_APP = ('<p class="muted">You can close this page and go back to the HAULTRA app '
-                '(tap <strong>&#9664; HAULTRA</strong> at the top left).</p>')
+_BACK_TO_APP = ('<p class="muted">If this page is in Safari, go back to the HAULTRA app '
+                '(tap <strong>&#9664; HAULTRA</strong> at the top left).</p>'
+                '<p><a href="/quickbooks" style="color:#E08A4F;font-weight:700;">'
+                'Open QuickBooks settings &rarr;</a></p>')
+
+# In the native app. The app owns every haultra-systems.com link (universal /
+# app links), so Intuit's redirect back to /quickbooks/callback can reopen the
+# app instead of finishing in Safari. Capacitor reports that as appUrlOpen but
+# doesn't load it, so load it here (same-site /quickbooks/ paths only). If the
+# user simply switches back, reload so the page shows the new status.
+# No doubled braces: this text goes through render_template_string.
+_APP_RETURN_SCRIPT = """<script>
+(function () {
+  var t = null;
+  var cap = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.App;
+  if (cap && cap.addListener) {
+    cap.addListener('appUrlOpen', function (ev) {
+      try {
+        var u = new URL(ev && ev.url);
+        if (u.host === location.host && u.pathname.indexOf('/quickbooks/') === 0) {
+          if (t) { clearTimeout(t); t = null; }
+          location.href = u.pathname + u.search;
+        }
+      } catch (e) {}
+    });
+  }
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) { t = setTimeout(function () { location.reload(); }, 1200); }
+  });
+})();
+</script>"""
 
 
 def _handoff_row(conn, token):
@@ -1169,9 +1198,7 @@ def _settings_page_body(get_db, company_id):
         if _deps.get("is_native", lambda: False)():
             app_note = ('<p class="muted small">Intuit opens in your browser. Approve there, tap '
                         '<strong>Connect</strong> on the HAULTRA confirm page, then come back here.</p>')
-            # Back from the browser → reload so the page shows "Connected".
-            app_script = ("<script>document.addEventListener('visibilitychange',function(){"
-                          "if(!document.hidden){location.reload();}});</script>")
+            app_script = _APP_RETURN_SCRIPT
         return hero + f"""<div class="card"><p>{env_badge} {msg}</p>
             <p class="muted small">You'll sign in to Intuit and choose which QuickBooks company to connect.
             HAULTRA asks for accounting access only — it never collects payments.</p>
