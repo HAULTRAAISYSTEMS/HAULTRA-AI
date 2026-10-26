@@ -24156,8 +24156,15 @@ def _log_chain_maps(stop_rows):
     takes_from = {}
     for _s in stop_rows:
         _d = dict(_s)
-        if _d.get("can_number"):
-            can_by_stop[_d["id"]] = _d["can_number"]
+        # 2026-10-26: the picked-up bin is the TICKET can. stops.can_number
+        # is a dead column current code never writes, so the giver branch
+        # below used to resolve to nothing and a closed chain head's Box In
+        # came out blank (Marlyn showed "—" instead of the returned 3063).
+        # Ticket can wins; can_number stays as fallback for callers whose
+        # rows carry no ticket join (detail card).
+        _can = _d.get("ticket_can_number") or _d.get("can_number")
+        if _can:
+            can_by_stop[_d["id"]] = _can
         _sk = _s.keys()
         if "chain_takes_from_stop_id" in _sk and _s["chain_takes_from_stop_id"]:
             takes_from[_s["id"]] = _s["chain_takes_from_stop_id"]
@@ -24729,6 +24736,17 @@ def view_route(route_id):
     _log_box_in = {}
     try:
         _l_can_by_stop, _l_takes_from = _log_chain_maps(stops)
+        # 2026-10-26: tail terminal per chain group, for the carry reset
+        # below (same rule as the Daily Log).
+        _l_tail_term = {}
+        _lt_groups = {}
+        for _lt in stops:
+            _ltg = _lt["chain_group_id"] if "chain_group_id" in _lt.keys() else None
+            if _ltg:
+                _lt_groups.setdefault(_ltg, []).append(_lt)
+        for _ltg, _ltm in _lt_groups.items():
+            _lt_tail = max(_ltm, key=lambda _x: (_x["chain_seq"] if "chain_seq" in _x.keys() and isinstance(_x["chain_seq"], int) else 0))
+            _l_tail_term[_lt_tail["id"]] = (_lt_tail["chain_terminal"] if "chain_terminal" in _lt_tail.keys() else "") or "head"
         _l_prev = ""
         for _ls in stops:
             _lk = _ls.keys()
@@ -24764,6 +24782,10 @@ def view_route(route_id):
                     _l_prev = "" if _l_box_out else _l_prev
             else:
                 _l_prev = _l_box_out
+            # 2026-10-26: a chain's final empty never rides on to later
+            # stops — it goes back to the head (or yard / delivery site).
+            if _lsid in _l_tail_term and _l_tail_term[_lsid] != "none":
+                _l_prev = ""
     except Exception:
         _log_box_in = {}
     # Closed head-terminal chains: the tail's ticket can is the empty
@@ -30570,6 +30592,18 @@ def route_daily_log(route_id):
                 _prev_box_out = "" if box_out else _prev_box_out
         else:
             _prev_box_out = box_out
+        # 2026-10-26: a chain's final empty never rides on to later stops —
+        # it goes back to the head (or yard / delivery site). Once the tail
+        # is processed, the truck is empty again, so later stops must not
+        # inherit the tail's can as their Box In (Katchmark showed 3063 on
+        # every row). Terminal 'none' keeps the bin on the truck.
+        _cg = s["chain_group_id"] if "chain_group_id" in s.keys() else None
+        if _cg and _cg in _ctf_members:
+            _cg_tail = max(_ctf_members[_cg], key=_ctf_seq)
+            if _cg_tail["id"] == s["id"]:
+                _cg_term = (s["chain_terminal"] if "chain_terminal" in s.keys() else "") or "head"
+                if _cg_term != "none":
+                    _prev_box_out = ""
         # 2026-10-26: chain legs — the head isn't finished until the chain
         # ends (the driver returns to the first route), and a receiver leg
         # starts when the driver leaves the landfill toward it, not at the
