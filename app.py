@@ -244,6 +244,21 @@ def _error_page_home_url():
     return "/login"
 
 
+_flask_render_template_string = render_template_string
+
+
+def render_template_string(source, **context):
+    """Every page in this app is fully built HTML before it gets here — none of
+    them use Jinja. Running that HTML through Jinja meant any user-typed text
+    containing {{ ... }} (a company name, a customer note, a truck name) was
+    EXECUTED as a template: sign up as "{{ config.SECRET_KEY }}" and the
+    Settings page printed the session-signing key. 2026-10-27: pages are
+    returned as-is; Jinja is only used when a caller passes template context."""
+    if context:
+        return _flask_render_template_string(source, **context)
+    return source
+
+
 @app.errorhandler(404)
 def _handle_not_found(err):
     if request.path.startswith("/api/") or request.is_json:
@@ -11408,23 +11423,7 @@ def login():
 
         if user and check_password_hash(user["password_hash"], password):
             rate_limit_reset("login-user", username)
-            session.clear()
-            session.permanent = True
-            session["user_id"]       = user["id"]
-            session["username"]      = user["username"]
-            session["role"]          = user["role"]
-            session["roles"]         = sorted(user_role_set(user))
-            session["company_id"]    = user["company_id"]
-            session["is_superadmin"] = bool(user["is_superadmin"])
-            _co_conn = get_db()
-            _co_row = _co_conn.execute(
-                "SELECT name, subscription_plan FROM companies WHERE id=?",
-                (user["company_id"],)
-            ).fetchone()
-            _co_conn.close()
-            if _co_row:
-                session["company_name"] = _co_row["name"]
-                session["company_plan"] = _co_row["subscription_plan"]
+            _start_user_session(user)
             flash("Logged in.", "success")
 
             # 2026-10-23: brand-new boss with nothing set up → onboarding.
@@ -11440,7 +11439,8 @@ def login():
                     _ob_base = bool(_ob_co and (_ob_co["yard_address"] or "").strip())
                     _ob.close()
                     if _ob_nc == 0 and _ob_nd == 0 and not _ob_base:
-                        return redirect(url_for("onboarding_setup"))
+                        # 2026-10-27: the guided walkthrough, not the list.
+                        return redirect(url_for("onboarding_start"))
                 except Exception:
                     pass
 
@@ -14065,17 +14065,20 @@ def _invite_expires_at():
     return (_eastern_now() + timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
 
 
-@app.route("/team/invite-driver", methods=["POST"])
-@boss_required
-def invite_driver():
-    full_name = (request.form.get("full_name", "") or "").strip()[:100]
-    digits = re.sub(r"\D", "", request.form.get("phone", "") or "")
+def _clean_driver_phone(raw):
+    digits = re.sub(r"\D", "", raw or "")
     if digits.startswith("1") and len(digits) == 11:
         digits = digits[1:]
-    if not full_name or len(digits) != 10:
-        flash("Enter the driver's full name and a 10-digit phone number.", "error")
-        return redirect(url_for("team_page"))
-    conn = get_db()
+    return digits
+
+
+def _create_driver_invite(conn, full_name, digits):
+    """Create a pending driver + single-use invite for the current company.
+    Returns (invite_id, None) or (None, error message). Shared by the Team
+    page and the onboarding walkthrough (2026-10-27). Caller commits."""
+    full_name = (full_name or "").strip()[:100]
+    if not full_name or len(digits or "") != 10:
+        return None, "Enter the driver's full name and a 10-digit phone number."
     _ensure_driver_invite_tables(conn)
     # Seat reservation: active drivers + live pending invites count, so a
     # boss can't invite past the plan and strand a driver at acceptance.
@@ -14086,12 +14089,10 @@ def invite_driver():
     pending_n = conn.execute("SELECT COUNT(*) n FROM driver_invites WHERE company_id=? AND accepted_at IS NULL"
                              " AND revoked_at IS NULL AND expires_at > ?", (cid(), now_ts())).fetchone()["n"]
     if active_n + pending_n >= max_d:
-        conn.close()
         msg = f"Driver limit reached ({max_d})."
         if not is_native_app():
             msg += " Upgrade your plan to add more."
-        flash(msg, "error")
-        return redirect(url_for("team_page"))
+        return None, msg
     username = _suggest_username(conn, full_name)
     conn.execute(
         "INSERT INTO users (username, password_hash, role, full_name, phone, email, company_id, is_active, created_at)"
@@ -14105,6 +14106,29 @@ def invite_driver():
         " VALUES (?,?,?,?,?,?)",
         (cid(), user_id, token, digits, now_ts(), _invite_expires_at()))
     invite_id = conn.execute("SELECT id FROM driver_invites WHERE token=?", (token,)).fetchone()["id"]
+    return invite_id, None
+
+
+def _driver_invite_text(invite_row, co_name):
+    """(link, sms_href) for a pending invite row with full_name/phone/token."""
+    link = request.host_url.rstrip("/") + "/invite/" + invite_row["token"]
+    first = (invite_row["full_name"] or "there").split()[0]
+    body = (f"Hi {first}, {co_name or 'HAULTRA'} invited you to HAULTRA — "
+            f"tap here to set up your driver account: {link}")
+    return link, "sms:" + (invite_row["phone"] or "") + "?&body=" + urllib.parse.quote(body)
+
+
+@app.route("/team/invite-driver", methods=["POST"])
+@boss_required
+def invite_driver():
+    full_name = (request.form.get("full_name", "") or "").strip()[:100]
+    digits = _clean_driver_phone(request.form.get("phone", ""))
+    conn = get_db()
+    invite_id, err = _create_driver_invite(conn, full_name, digits)
+    if err:
+        conn.close()
+        flash(err, "error")
+        return redirect(url_for("team_page"))
     conn.commit()
     conn.close()
     return redirect(url_for("team_page") + f"?show_invite={invite_id}")
@@ -14169,6 +14193,54 @@ def revoke_invite(invite_id):
     return redirect(url_for("team_page"))
 
 
+_INVITE_CSS = """
+<style>
+.iv { max-width: 480px; margin: 24px auto 40px; padding-top: env(safe-area-inset-top, 0px); }
+.iv-brand { display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 16px;
+  font-weight: 900; letter-spacing: 6px; font-size: 13px; color: #FFB27A; }
+.iv-brand i { width: 8px; height: 8px; border-radius: 50%; background: #3DDC84; box-shadow: 0 0 10px #3DDC84; }
+.iv-card { border-radius: 26px; padding: 26px 20px; text-align: center; border: 1px solid rgba(255,107,26,.3);
+  background: radial-gradient(120% 70% at 50% 0%, rgba(255,107,26,.18), transparent 60%), linear-gradient(180deg, #1c1916, #141414);
+  box-shadow: 0 20px 50px rgba(0,0,0,.45); }
+.iv-card.iv-ok { border-color: rgba(61,220,132,.4);
+  background: radial-gradient(120% 70% at 50% 0%, rgba(61,220,132,.16), transparent 60%), #141414; }
+.iv-emoji { font-size: 48px; line-height: 1; margin-bottom: 10px; }
+.iv-kick { font-size: 11px; font-weight: 900; letter-spacing: 1.6px; text-transform: uppercase; color: #FF9D5C; }
+.iv-card h1 { font-size: clamp(1.7rem, 7.5vw, 2.3rem); font-weight: 900; margin: 6px 0 8px; line-height: 1.1; }
+.iv-sub { color: var(--text-dim, #B5B5AD); margin: 0 0 18px; }
+.iv-sub b { color: var(--text); }
+.iv-card form { text-align: left; }
+.iv-f { margin-bottom: 12px; }
+.iv-f label { display: block; font-size: 11px; font-weight: 800; letter-spacing: .09em; text-transform: uppercase;
+  color: var(--text-muted); margin-bottom: 6px; }
+.iv-f label small { text-transform: none; letter-spacing: 0; font-weight: 600; }
+.iv-f input { width: 100%; box-sizing: border-box; min-height: 54px; padding: 10px 14px; font-size: 16px; border-radius: 14px;
+  background: rgba(0,0,0,.28); border: 1px solid rgba(255,255,255,.14); color: var(--text); }
+.iv-f input:focus { outline: none; border-color: #FF6B1A; box-shadow: 0 0 0 3px rgba(255,107,26,.2); }
+.iv-pw { position: relative; } .iv-pw input { padding-right: 70px; }
+.iv-pw .iv-show { position: absolute !important; right: 8px; top: 50%; transform: translateY(-50%); min-height: 36px !important;
+  padding: 0 10px !important; margin: 0 !important; border: none !important; background: transparent !important;
+  box-shadow: none !important; color: #FF9D5C !important; font-size: 12px !important; font-weight: 800 !important; cursor: pointer; }
+.iv-hint { font-size: 12px; margin-top: 6px; min-height: 16px; }
+.iv-err { background: rgba(255,82,82,.1); border: 1px solid rgba(255,82,82,.4); color: #FF9B9B; border-radius: 12px;
+  padding: 10px 12px; font-weight: 700; font-size: .9rem; margin-bottom: 14px; text-align: left; }
+.iv-card .iv-go { display: flex; align-items: center; justify-content: center; width: 100%; min-height: 58px !important;
+  margin: 8px 0 0 !important; border: none !important; border-radius: 16px !important; cursor: pointer; text-decoration: none;
+  font-size: 1.05rem !important; font-weight: 900 !important; color: #00230e !important;
+  background: linear-gradient(135deg, #00c853, #00e57a) !important; box-shadow: 0 10px 26px rgba(0,232,125,.28) !important; }
+.iv-login { margin: 4px auto 0; max-width: 300px; padding: 14px; border-radius: 16px; background: rgba(0,0,0,.3);
+  border: 1px dashed rgba(61,220,132,.5); }
+.iv-login small { display: block; font-size: 11px; font-weight: 800; letter-spacing: 1px; text-transform: uppercase; color: var(--text-muted); }
+.iv-login b { font-size: 1.6rem; font-weight: 900; color: #3DDC84; word-break: break-all; }
+.iv-steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 16px; }
+.iv-steps span { display: flex; flex-direction: column; align-items: center; gap: 6px; text-align: center; font-size: 12px;
+  font-weight: 700; color: var(--text-muted); }
+.iv-steps b { width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.14); color: var(--text); }
+</style>
+"""
+
+
 @app.route("/invite/<token>", methods=["GET", "POST"])
 def accept_invite(token):
     """Public invite acceptance: the driver picks their username + password.
@@ -14190,40 +14262,63 @@ def accept_invite(token):
     elif not user:
         state = "invalid"
 
+    _first = ((user["full_name"] if user else "") or "").strip().split(" ")[0] if user else ""
+
     def _page(err="", username_pref=""):
-        err_html = f'<p style="color:#f87171;font-weight:700;">{e(err)}</p>' if err else ""
+        # 2026-10-27 redesign: welcoming, one card, big fields, live hints.
+        err_html = f'<div class="iv-err">{e(err)}</div>' if err else ""
         if state == "invalid":
-            inner = ('<p class="muted">This invite link is no longer valid — it may have expired, '
-                     'been revoked, or already been used. Ask your boss to send a fresh invite.</p>')
+            inner = ('<div class="iv-emoji">&#128279;</div><h1>This link has expired</h1>'
+                     '<p class="iv-sub">It may have been used already or replaced by a newer one. '
+                     'Ask your boss to send a fresh invite &mdash; it only takes them a second.</p>'
+                     f'<a class="iv-go" href="{url_for("login")}">Go to login</a>')
         elif state == "accepted":
-            inner = (f'<p class="muted">This account is already set up. '
-                     f'<a href="{url_for("login")}">Log in</a> with your username and password.</p>')
+            inner = ('<div class="iv-emoji">&#9989;</div><h1>You&rsquo;re already set up</h1>'
+                     '<p class="iv-sub">Log in with the username and password you picked.</p>'
+                     f'<a class="iv-go" href="{url_for("login")}">Log in</a>')
         else:
             inner = f"""
-            <form method="POST">
-                <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
-                <label>Username</label>
-                <input name="username" value="{e(username_pref or user['username'])}" required
-                       style="width:100%;min-height:48px;">
-                <p class="muted small">This is how you'll log in. Change it if you like.</p>
-                <label>Password</label>
-                <input type="password" name="password" required style="width:100%;min-height:48px;">
-                <label>Confirm password</label>
-                <input type="password" name="password_confirm" required style="width:100%;min-height:48px;">
-                <div style="margin-top:14px;">
-                    <button class="btn" type="submit" style="min-height:48px;">Create my account →</button>
-                </div>
-            </form>"""
-        return render_template_string(shell_page("You're invited", f"""
-        <div class="hero">
-            <h1>You're invited to {e(co_name)}</h1>
-            <p>Set up your driver account for HAULTRA — pick a username and password, then log in to the app.</p>
-        </div>
-        <div class="card" style="max-width:520px;">
+            <div class="iv-emoji">&#128666;</div>
+            <div class="iv-kick">Driver invite</div>
+            <h1>Welcome{(", " + e(_first)) if _first else ""}!</h1>
+            <p class="iv-sub"><b>{e(co_name)}</b> added you to HAULTRA. Pick a username and password &mdash;
+            you&rsquo;ll use them to log in to the app.</p>
             {err_html}
-            {inner}
-        </div>
-        """))
+            <form method="POST" id="iv-form">
+                <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+                <div class="iv-f"><label for="iv-un">Username</label>
+                <input id="iv-un" name="username" value="{e(username_pref or user['username'])}" required
+                       autocapitalize="none" autocomplete="username" spellcheck="false"></div>
+                <div class="iv-f"><label for="iv-pw">Password <small>(12+ characters)</small></label>
+                <div class="iv-pw"><input type="password" id="iv-pw" name="password" required autocomplete="new-password">
+                <button type="button" class="iv-show">Show</button></div></div>
+                <div class="iv-f"><label for="iv-pc">Confirm password</label>
+                <div class="iv-pw"><input type="password" id="iv-pc" name="password_confirm" required autocomplete="new-password">
+                <button type="button" class="iv-show">Show</button></div>
+                <div class="iv-hint" id="iv-hint"></div></div>
+                <button class="iv-go" type="submit">Create my account &rarr;</button>
+            </form>
+            <script>
+            (function(){{
+              var pw=document.getElementById('iv-pw'), pc=document.getElementById('iv-pc'), h=document.getElementById('iv-hint');
+              function chk(){{
+                if(!pw.value&&!pc.value){{h.textContent='';return;}}
+                if(pw.value.length<12){{h.textContent='At least 12 characters ('+pw.value.length+' so far)';h.style.color='#A6A69E';return;}}
+                if(!pc.value){{h.textContent='\u2713 Long enough';h.style.color='#3DDC84';return;}}
+                if(pw.value===pc.value){{h.textContent='\u2713 Passwords match';h.style.color='#3DDC84';}}
+                else{{h.textContent='\u2717 Passwords do not match';h.style.color='#FF7A7A';}}
+              }}
+              pw.addEventListener('input',chk); pc.addEventListener('input',chk);
+              Array.prototype.forEach.call(document.querySelectorAll('.iv-show'),function(b){{
+                b.addEventListener('click',function(){{var i=b.parentNode.querySelector('input');var on=i.type==='password';
+                  i.type=on?'text':'password'; b.textContent=on?'Hide':'Show';}});
+              }});
+            }})();
+            </script>"""
+        return render_template_string(shell_page("You're invited", _INVITE_CSS + f"""
+        <div class="iv"><div class="iv-brand"><i></i>HAULTRA</div><div class="iv-card">{inner}</div>
+        <div class="iv-steps"><span><b>1</b>Pick a login</span><span><b>2</b>Open the HAULTRA app</span><span><b>3</b>See your route</span></div>
+        </div>"""))
 
     if request.method != "POST" or state != "ok":
         conn.close()
@@ -14254,9 +14349,20 @@ def accept_invite(token):
                  (username, generate_password_hash(password), user["id"]))
     conn.execute("UPDATE driver_invites SET accepted_at=? WHERE id=?", (now_ts(), inv["id"]))
     conn.commit()
+    _fresh = conn.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
     conn.close()
-    flash("Account ready — log in with your new username.", "success")
-    return redirect(url_for("login"))
+    # 2026-10-27: signed straight in, and told exactly what to type in the app.
+    _start_user_session(_fresh)
+    return render_template_string(shell_page("You're all set", _INVITE_CSS + f"""
+    <div class="iv"><div class="iv-brand"><i></i>HAULTRA</div>
+    <div class="iv-card iv-ok">
+        <div class="iv-emoji">&#127881;</div>
+        <h1>You&rsquo;re all set{(", " + e(_first)) if _first else ""}!</h1>
+        <p class="iv-sub">Open the <b>HAULTRA</b> app on your phone and log in with:</p>
+        <div class="iv-login"><small>Username</small><b>{e(username)}</b></div>
+        <p class="iv-sub" style="margin-top:12px;">and the password you just picked.</p>
+        <a class="iv-go" href="{url_for('dashboard')}">Continue here &rarr;</a>
+    </div></div>"""))
 
 
 @app.route("/team")
@@ -14448,11 +14554,7 @@ def team_page():
             _co_name = (_crow["name"] if _crow else "") or "HAULTRA"
         _sc.close()
         if _srow:
-            _link = request.host_url.rstrip("/") + "/invite/" + _srow["token"]
-            _first = (_srow["full_name"] or "there").split()[0]
-            _sms_body = (f"Hi {_first}, {_co_name} invited you to HAULTRA — "
-                         f"tap here to set up your driver account: {_link}")
-            _sms_href = "sms:" + (_srow["phone"] or "") + "?&body=" + urllib.parse.quote(_sms_body)
+            _link, _sms_href = _driver_invite_text(_srow, _co_name)
             _invite_banner = f"""
     <div class="card" style="border-color:rgba(61,220,132,.4);">
         <h2 style="margin:0 0 4px;">✅ Invite ready for {e(_srow["full_name"])}</h2>
@@ -33406,6 +33508,30 @@ def onboarding_parser_page():
 # =========================================================
 # COMPANY REGISTRATION (public — creates a new tenant)
 # =========================================================
+def _start_user_session(user):
+    """Sign `user` (a users row) in — the one place the session is built, so
+    login, sign-up and invite acceptance can never drift apart."""
+    session.clear()
+    session.permanent = True
+    session["user_id"]       = user["id"]
+    session["username"]      = user["username"]
+    session["role"]          = user["role"]
+    session["roles"]         = sorted(user_role_set(user))
+    session["company_id"]    = user["company_id"]
+    session["is_superadmin"] = bool(user["is_superadmin"])
+    _co_conn = get_db()
+    try:
+        _co_row = _co_conn.execute(
+            "SELECT name, subscription_plan FROM companies WHERE id=?",
+            (user["company_id"],)
+        ).fetchone()
+    finally:
+        _co_conn.close()
+    if _co_row:
+        session["company_name"] = _co_row["name"]
+        session["company_plan"] = _co_row["subscription_plan"]
+
+
 @app.route("/register-company", methods=["GET", "POST"])
 def company_register():
     init_db()
@@ -33415,14 +33541,23 @@ def company_register():
     # payment flow. App Review needs it to record the registration flow
     # required by Guideline 2.1. The paid upgrade path (/settings#subscription
     # and /create-checkout-session) stays hidden and blocked natively.
+    #
+    # 2026-10-27: two short screens (your company → your login) instead of one
+    # seven-field wall; errors keep what was typed; success signs the new
+    # owner straight in and opens the guided setup — no second login.
+    vals = {k: (request.form.get(k, "") or "").strip()
+            for k in ("company_name", "full_name", "phone", "username", "email")}
+
+    def _reg_page(err="", step=1):
+        return render_template_string(shell_page("Start Free Trial", _register_body(vals, err, step)))
 
     if request.method == "POST":
-        company_name = request.form.get("company_name", "").strip()
-        username     = request.form.get("username", "").strip()
-        password     = request.form.get("password", "").strip()
-        full_name    = request.form.get("full_name", "").strip()
-        phone        = request.form.get("phone", "").strip()
-        email        = request.form.get("email", "").strip()
+        company_name = vals["company_name"]
+        username     = vals["username"]
+        password     = (request.form.get("password", "") or "").strip()
+        full_name    = vals["full_name"]
+        phone        = vals["phone"]
+        email        = vals["email"]
         allowed, retry_after = rate_limit_allow(
             "company-registration", username, limit=5, window_seconds=60 * 60
         )
@@ -33432,22 +33567,21 @@ def company_register():
             response.headers["Retry-After"] = str(retry_after)
             return response, 429
 
-        if not company_name or not username or not password:
-            flash("Company name, username, and password are required.", "error")
-            return redirect(url_for("company_register"))
+        if not company_name:
+            return _reg_page("Add your company name to get started.", 1)
+        if not username or not password:
+            return _reg_page("Pick a username and password.", 2)
         # 2026-10-21: confirm-password — a typo'd password locks the new boss
         # out of their own company on day one.
         password_confirm = request.form.get("password_confirm", "")
         if password != password_confirm:
-            flash("Passwords do not match — please re-enter them.", "error")
-            return redirect(url_for("company_register"))
+            return _reg_page("Passwords do not match — please re-enter them.", 2)
         policy_error = password_policy_error(password)
         if policy_error:
-            flash(policy_error, "error")
-            return redirect(url_for("company_register"))
+            return _reg_page(policy_error, 2)
 
         # make a URL-safe slug from company name
-        slug_base = re.sub(r"[^a-z0-9]+", "-", company_name.lower()).strip("-")
+        slug_base = re.sub(r"[^a-z0-9]+", "-", company_name.lower()).strip("-") or "company"
         slug = slug_base
         conn = get_db()
         # ensure unique slug
@@ -33460,8 +33594,7 @@ def company_register():
         # register() for why this matters now that login is case-insensitive.
         if conn.execute("SELECT id FROM users WHERE username = ? COLLATE NOCASE", (username,)).fetchone():
             conn.close()
-            flash("That username is already taken.", "error")
-            return redirect(url_for("company_register"))
+            return _reg_page("That username is already taken — try another.", 2)
 
         try:
             trial_ends = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d %H:%M:%S")
@@ -33474,8 +33607,7 @@ def company_register():
             _crow = conn.execute("SELECT id FROM companies WHERE slug=?", (slug,)).fetchone()
             if not _crow:
                 conn.close()
-                flash("Company creation failed. Please try again.", "error")
-                return redirect(url_for("company_register"))
+                return _reg_page("Company creation failed. Please try again.", 1)
             company_id = _crow["id"]
 
             conn.execute(
@@ -33486,12 +33618,11 @@ def company_register():
                  full_name, phone, email or None, company_id, now_ts())
             )
             conn.commit()
-            _urow = conn.execute("SELECT id FROM users WHERE username=? AND company_id=?",
+            _urow = conn.execute("SELECT * FROM users WHERE username=? AND company_id=?",
                                  (username, company_id)).fetchone()
             if not _urow:
                 conn.close()
-                flash("User creation failed. Please try again.", "error")
-                return redirect(url_for("company_register"))
+                return _reg_page("User creation failed. Please try again.", 2)
             owner_id = _urow["id"]
             conn.execute("UPDATE companies SET owner_id=? WHERE id=?", (owner_id, company_id))
 
@@ -33503,89 +33634,166 @@ def company_register():
             )
             conn.commit()
             conn.close()
-            flash("Account created! Please log in.", "success")
-            return redirect(url_for("login"))
+            # Signed straight in — they just proved who they are.
+            _start_user_session(_urow)
+            return redirect(url_for("onboarding_start"))
 
         except sqlite3.IntegrityError:
             conn.close()
-            flash("That username is already taken.", "error")
-            return redirect(url_for("company_register"))
+            return _reg_page("That username is already taken — try another.", 2)
 
-    body = """
-    <div style="max-width:560px;margin:60px auto;">
-        <div class="hero">
-            <h1>Start Free Trial</h1>
-            <p>Create your HAULTRA company account — free for 14 days, no credit card required.</p>
-        </div>
-        <div class="card">
-            <form method="POST">
-                <label>Company Name</label>
-                <input name="company_name" placeholder="ABC Hauling LLC" required>
-                <label>Your Username (boss login)</label>
-                <input name="username" required>
-                <label>Password</label>
-                <input type="password" name="password" id="reg-password" required minlength="12" autocomplete="new-password">
-                <label>Confirm Password</label>
-                <input type="password" name="password_confirm" id="reg-password-confirm" required minlength="12" autocomplete="new-password">
-                <div id="pw-match-msg" class="muted small" style="margin-top:6px;min-height:18px;"></div>
-                <script>
-                (function(){
-                    // 2026-10-21: live password-match feedback + show/hide toggles.
-                    var pw = document.getElementById('reg-password');
-                    var pc = document.getElementById('reg-password-confirm');
-                    var msg = document.getElementById('pw-match-msg');
-                    function check(){
-                        if(!pw.value && !pc.value){ msg.textContent=''; return; }
-                        if(pw.value === pc.value){
-                            msg.textContent = pc.value ? '✓ Passwords match' : '';
-                            msg.style.color = '#3DDC84';
-                        } else {
-                            msg.textContent = '✗ Passwords do not match';
-                            msg.style.color = '#FF7A7A';
-                        }
-                    }
-                    pw.addEventListener('input', check);
-                    pc.addEventListener('input', check);
-                    // show/hide toggles on both fields
-                    [pw, pc].forEach(function(inp){
-                        var wrap = document.createElement('div');
-                        wrap.style.cssText = 'position:relative;';
-                        inp.parentNode.insertBefore(wrap, inp);
-                        wrap.appendChild(inp);
-                        var t = document.createElement('button');
-                        t.type = 'button';
-                        t.textContent = 'Show';
-                        t.style.cssText = 'position:absolute;right:10px;top:50%;transform:translateY(-50%);' +
-                            'background:none;border:none;color:#FF8C42;font-size:12px;font-weight:700;cursor:pointer;padding:6px;';
-                        t.addEventListener('click', function(){
-                            var show = inp.type === 'password';
-                            inp.type = show ? 'text' : 'password';
-                            t.textContent = show ? 'Hide' : 'Show';
-                        });
-                        wrap.appendChild(t);
-                        inp.style.paddingRight = '64px';
-                    });
-                })();
-                </script>
-                <label>Full Name</label>
-                <input name="full_name">
-                <label>Email</label>
-                <input type="email" name="email" placeholder="for password reset / recovery">
-                <label>Phone</label>
-                <input name="phone">
-                <div style="margin-top:14px;">
-                    <button type="submit" class="btn green" style="width:100%;font-size:16px;padding:14px;">
-                        Create Company Account
-                    </button>
-                </div>
-                <p class="muted small" style="margin-top:12px;text-align:center;">
-                    Already have an account? <a href="/login">Log in</a>
-                </p>
-            </form>
-        </div>
-    </div>
-    """
-    return render_template_string(shell_page("Register", body))
+    return _reg_page()
+
+
+_REG_CSS = """
+<style>
+.rg{max-width:520px;margin:28px auto 40px;padding-top:env(safe-area-inset-top,0px);}
+.rg-brand{display:flex;align-items:center;gap:10px;justify-content:center;margin-bottom:18px;
+  font-weight:900;letter-spacing:6px;font-size:13px;color:#FFB27A;}
+.rg-brand i{width:8px;height:8px;border-radius:50%;background:#3DDC84;box-shadow:0 0 10px #3DDC84;}
+.rg-hero{text-align:center;margin-bottom:18px;}
+.rg-hero h1{font-size:clamp(1.9rem,8vw,2.5rem);font-weight:900;line-height:1.05;margin:0;letter-spacing:-.5px;}
+.rg-hero h1 span{background:linear-gradient(90deg,#FF6B1A,#FFB35C);-webkit-background-clip:text;background-clip:text;color:transparent;}
+.rg-hero p{color:var(--text-muted);margin:10px 0 0;font-size:.98rem;}
+.rg-perks{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin:14px 0 0;}
+.rg-perks span{font-size:12px;font-weight:700;padding:6px 10px;border-radius:999px;
+  background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);color:var(--text-dim,#B5B5AD);}
+.rg-card{border-radius:24px;padding:22px 20px;border:1px solid rgba(255,107,26,.3);
+  background:radial-gradient(120% 70% at 100% 0%,rgba(255,107,26,.14),transparent 60%),linear-gradient(180deg,#1b1815,#141414);
+  box-shadow:0 18px 50px rgba(0,0,0,.45);}
+.rg-steps{display:flex;align-items:center;gap:10px;margin-bottom:18px;}
+.rg-step{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:800;letter-spacing:.6px;
+  text-transform:uppercase;color:#6E6E66;}
+.rg-step b{width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  border:2px solid rgba(255,255,255,.18);font-size:12px;}
+.rg-step.on{color:#FFB27A;} .rg-step.on b{background:#FF6B1A;border-color:#FF6B1A;color:#170800;}
+.rg-step.ok{color:#3DDC84;} .rg-step.ok b{background:rgba(61,220,132,.18);border-color:#3DDC84;color:#3DDC84;}
+.rg-line{flex:1;height:2px;border-radius:2px;background:rgba(255,255,255,.1);}
+.rg-line.ok{background:#3DDC84;}
+.rg-pane[hidden]{display:none;}
+.rg-pane h2{font-size:1.25rem;margin:0 0 4px;}
+.rg-pane .rg-sub{color:var(--text-muted);font-size:.9rem;margin:0 0 16px;}
+.rg-f{margin-bottom:12px;}
+.rg-f label{display:block;font-size:11px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;
+  color:var(--text-muted);margin-bottom:6px;}
+.rg-f label small{text-transform:none;letter-spacing:0;font-weight:600;}
+.rg-f input{width:100%;box-sizing:border-box;min-height:52px;padding:10px 14px;font-size:16px;border-radius:14px;
+  background:rgba(0,0,0,.28);border:1px solid rgba(255,255,255,.14);color:var(--text);}
+.rg-f input:focus{outline:none;border-color:#FF6B1A;box-shadow:0 0 0 3px rgba(255,107,26,.2);}
+.rg-pw{position:relative;}
+.rg-pw input{padding-right:70px;}
+.rg-pw .rg-show{position:absolute!important;right:8px;top:50%;transform:translateY(-50%);min-height:36px!important;
+  padding:0 10px!important;margin:0!important;border:none!important;background:transparent!important;box-shadow:none!important;
+  color:#FF9D5C!important;font-size:12px!important;font-weight:800!important;cursor:pointer;}
+.rg-hint{font-size:12px;margin-top:6px;min-height:16px;color:var(--text-muted);}
+.rg-err{background:rgba(255,82,82,.1);border:1px solid rgba(255,82,82,.4);color:#FF9B9B;border-radius:12px;
+  padding:10px 12px;font-weight:700;font-size:.9rem;margin-bottom:14px;}
+.rg-row{display:flex;gap:10px;margin-top:16px;}
+.rg-card .rg-go{flex:1;min-height:56px!important;border:none!important;border-radius:16px!important;cursor:pointer;
+  font-size:1.05rem!important;font-weight:900!important;color:#170800!important;
+  background:linear-gradient(135deg,#FF8A42,#FF6B1A)!important;box-shadow:0 10px 26px rgba(255,107,26,.3)!important;}
+.rg-card .rg-go.green{background:linear-gradient(135deg,#00c853,#00e57a)!important;color:#00230e!important;
+  box-shadow:0 10px 26px rgba(0,232,125,.28)!important;}
+.rg-card .rg-back{flex:none;min-height:56px!important;padding:0 18px!important;border-radius:16px!important;cursor:pointer;
+  background:rgba(255,255,255,.05)!important;border:1px solid rgba(255,255,255,.14)!important;color:var(--text)!important;
+  box-shadow:none!important;font-weight:800!important;}
+.rg-foot{text-align:center;margin-top:16px;color:var(--text-muted);font-size:.92rem;}
+.rg-foot a{color:#FF9D5C;font-weight:700;}
+</style>
+"""
+
+_REG_JS = """
+<script>
+(function(){
+  var form = document.getElementById('rg-form'); if (!form) return;
+  var p1 = document.getElementById('rg-p1'), p2 = document.getElementById('rg-p2');
+  var s1 = document.getElementById('rg-s1'), s2 = document.getElementById('rg-s2'), ln = document.getElementById('rg-ln');
+  function show(n){
+    p1.hidden = n !== 1; p2.hidden = n !== 2;
+    s1.className = 'rg-step ' + (n === 1 ? 'on' : 'ok'); s1.querySelector('b').textContent = n === 1 ? '1' : '\\u2713';
+    s2.className = 'rg-step' + (n === 2 ? ' on' : ''); ln.className = 'rg-line' + (n === 2 ? ' ok' : '');
+    var f = (n === 1 ? p1 : p2).querySelector('input:not([type=hidden])'); if (f) { try { f.focus(); } catch (e) {} }
+    try { window.scrollTo(0, 0); } catch (e) {}
+  }
+  document.getElementById('rg-next').addEventListener('click', function(){
+    var c = form.querySelector('[name=company_name]');
+    if (!c.value.trim()) { c.focus(); c.setCustomValidity('Add your company name'); c.reportValidity(); c.setCustomValidity(''); return; }
+    var u = form.querySelector('[name=username]');
+    if (!u.value) {
+      var nm = (form.querySelector('[name=full_name]').value || c.value).toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 20);
+      if (nm) u.value = nm;
+    }
+    show(2);
+  });
+  document.getElementById('rg-prev').addEventListener('click', function(){ show(1); });
+  form.addEventListener('keydown', function(ev){
+    if (ev.key === 'Enter' && !p1.hidden) { ev.preventDefault(); document.getElementById('rg-next').click(); }
+  });
+  var pw = document.getElementById('reg-password'), pc = document.getElementById('reg-password-confirm');
+  var msg = document.getElementById('pw-match-msg');
+  function check(){
+    if (!pw.value && !pc.value) { msg.textContent = ''; return; }
+    if (pw.value.length && pw.value.length < 12) { msg.textContent = 'At least 12 characters (' + pw.value.length + ' so far)'; msg.style.color = '#A6A69E'; return; }
+    if (!pc.value) { msg.textContent = '\\u2713 Long enough'; msg.style.color = '#3DDC84'; return; }
+    if (pw.value === pc.value) { msg.textContent = '\\u2713 Passwords match'; msg.style.color = '#3DDC84'; }
+    else { msg.textContent = '\\u2717 Passwords do not match'; msg.style.color = '#FF7A7A'; }
+  }
+  pw.addEventListener('input', check); pc.addEventListener('input', check);
+  Array.prototype.forEach.call(document.querySelectorAll('.rg-show'), function(b){
+    b.addEventListener('click', function(){
+      var inp = b.parentNode.querySelector('input'); var on = inp.type === 'password';
+      inp.type = on ? 'text' : 'password'; b.textContent = on ? 'Hide' : 'Show';
+    });
+  });
+  show(parseInt(form.getAttribute('data-step'), 10) || 1);
+})();
+</script>
+"""
+
+
+def _register_body(vals, err="", step=1):
+    v = {k: e(vals.get(k, "")) for k in ("company_name", "full_name", "phone", "username", "email")}
+    err_html = f'<div class="rg-err">{e(err)}</div>' if err else ""
+    return (
+        _REG_CSS
+        + '<div class="rg">'
+        '<div class="rg-brand"><i></i>HAULTRA</div>'
+        '<div class="rg-hero"><h1>Run your yard<br><span>from your phone.</span></h1>'
+        '<p>Start your free 14-day trial &mdash; no credit card required.</p>'
+        '<div class="rg-perks"><span>&#9201; 2-minute sign-up</span><span>&#128666; Drivers join by text</span>'
+        '<span>&#128241; iPhone, iPad &amp; web</span></div></div>'
+        '<div class="rg-card">'
+        '<div class="rg-steps"><div class="rg-step on" id="rg-s1"><b>1</b>Your company</div>'
+        '<div class="rg-line" id="rg-ln"></div><div class="rg-step" id="rg-s2"><b>2</b>Your login</div></div>'
+        + err_html
+        + f'<form method="POST" id="rg-form" data-step="{int(step)}" novalidate>'
+        '<input type="hidden" name="_csrf_token" value="' + get_csrf_token() + '">'
+        '<div class="rg-pane" id="rg-p1">'
+        '<h2>Tell us about your company</h2><p class="rg-sub">This is what your drivers and customers will see.</p>'
+        f'<div class="rg-f"><label for="rg-co">Company name</label><input id="rg-co" name="company_name" value="{v["company_name"]}" placeholder="ABC Hauling LLC" autocomplete="organization" required></div>'
+        f'<div class="rg-f"><label for="rg-fn">Your name</label><input id="rg-fn" name="full_name" value="{v["full_name"]}" placeholder="First and last name" autocomplete="name"></div>'
+        f'<div class="rg-f"><label for="rg-ph">Mobile phone <small>(optional)</small></label><input id="rg-ph" name="phone" value="{v["phone"]}" type="tel" inputmode="tel" placeholder="(757) 555-0100" autocomplete="tel"></div>'
+        '<div class="rg-row"><button type="button" class="rg-go" id="rg-next">Continue &rarr;</button></div>'
+        '</div>'
+        '<div class="rg-pane" id="rg-p2" hidden>'
+        '<h2>Create your login</h2><p class="rg-sub">You&rsquo;ll use this to sign in on your phone and computer.</p>'
+        f'<div class="rg-f"><label for="rg-un">Username</label><input id="rg-un" name="username" value="{v["username"]}" autocapitalize="none" autocomplete="username" spellcheck="false" required></div>'
+        f'<div class="rg-f"><label for="rg-em">Email <small>(for password resets)</small></label><input id="rg-em" type="email" name="email" value="{v["email"]}" autocomplete="email" placeholder="you@company.com"></div>'
+        '<div class="rg-f"><label for="reg-password">Password <small>(12+ characters)</small></label><div class="rg-pw">'
+        '<input type="password" name="password" id="reg-password" minlength="12" autocomplete="new-password" required>'
+        '<button type="button" class="rg-show">Show</button></div></div>'
+        '<div class="rg-f"><label for="reg-password-confirm">Confirm password</label><div class="rg-pw">'
+        '<input type="password" name="password_confirm" id="reg-password-confirm" minlength="12" autocomplete="new-password" required>'
+        '<button type="button" class="rg-show">Show</button></div>'
+        '<div id="pw-match-msg" class="rg-hint"></div></div>'
+        '<div class="rg-row"><button type="button" class="rg-back" id="rg-prev">&larr;</button>'
+        '<button type="submit" class="rg-go green">Create my company</button></div>'
+        '</div>'
+        '</form></div>'
+        f'<div class="rg-foot">Already have an account? <a href="{url_for("login")}">Log in</a></div>'
+        '</div>'
+        + _REG_JS
+    )
 
 
 # =========================================================
@@ -37569,58 +37777,539 @@ def onboarding_setup():
     done_n = sum(1 for s in steps if s["done"])
     total_n = len(steps)
     pct = int(done_n / total_n * 100) if total_n else 0
+    # 2026-10-27 redesign: a progress ring, ONE big "Up next" card for the
+    # first unfinished essential, finished steps as green chips, and the
+    # optional extras tucked under "When you're ready".
+    _mins = {"base": "2 min", "drivers": "1 min", "customers": "5 min", "yard": "3 min",
+             "trucks": "1 min", "first_route": "2 min", "garbage": "5 min"}
+    _ico = {"base": "&#127968;", "drivers": "&#128119;", "customers": "&#128101;", "yard": "&#128465;",
+            "trucks": "&#128666;", "first_route": "&#128242;", "garbage": "&#128203;"}
+    nxt = next((s for s in essential if not s["done"]), None) or next((s for s in later if not s["done"]), None)
+    todo = [s for s in essential if not s["done"] and s is not nxt]
+    done = [s for s in steps if s["done"]]
+    later_todo = [s for s in later if not s["done"] and s is not nxt]
 
-    def _card(s):
-        _icon = "✅" if s["done"] else "⭕"
-        # Done steps stay tappable: the green check + dimmed card say "done",
-        # the button says "you can still go back in and change it."
-        _btn = (f"<a class='btn secondary' href='{s['url']}'>Update →</a>" if s["done"]
-                else f"<a class='btn' href='{s['url']}'>Set up →</a>")
-        return f"""
-        <div class="ob-step{' done' if s['done'] else ''}">
-            <div class="ob-step-icon">{_icon}</div>
-            <div class="ob-step-body">
-                <div class="ob-step-title">{e(s['title'])}</div>
-                <div class="ob-step-desc">{e(s['desc'])}</div>
-            </div>
-            <div class="ob-step-act">{_btn}</div>
-        </div>"""
+    def _row(s):
+        return (f'<a class="ck2-row" href="{s["url"]}"><span class="ck2-ico">{_ico.get(s["key"], "&#9675;")}</span>'
+                f'<span class="ck2-txt"><b>{e(s["title"])}</b><small>{e(s["desc"])}</small></span>'
+                f'<span class="ck2-time">{_mins.get(s["key"], "")}</span><span class="ck2-go">&#8250;</span></a>')
 
+    if nxt:
+        hero = (f'<div class="ck2-next"><div class="ck2-kick">Up next &middot; about {_mins.get(nxt["key"], "2 min")}</div>'
+                f'<div class="ck2-next-row"><span class="ck2-big-ico">{_ico.get(nxt["key"], "&#9675;")}</span>'
+                f'<div><h2>{e(nxt["title"])}</h2><p>{e(nxt["desc"])}</p></div></div>'
+                f'<a class="ck2-cta" href="{nxt["url"]}">Start &rarr;</a></div>')
+    else:
+        hero = ('<div class="ck2-next ck2-alldone"><div class="ck2-big-ico">&#127881;</div>'
+                '<h2>Setup complete</h2><p>Everything&rsquo;s in place. Your drivers are ready to roll.</p>'
+                f'<a class="ck2-cta" href="{url_for(role_landing_endpoint())}">Open the Route Board &rarr;</a></div>')
+    chips = "".join(f'<a class="ck2-chip" href="{s["url"]}">&#10003; {e(s["title"])}</a>' for s in done)
+    _ring = f"conic-gradient(#3DDC84 {pct * 3.6:.0f}deg, rgba(255,255,255,.08) 0)"
     body = f"""
-    <div class="hero">
-        <h1>🚀 Get Set Up</h1>
-        <p>Essentials first — your first route in 5 minutes. Polish the rest over the week.</p>
-    </div>
-    <div class="card">
-        <div class="ob-progress-wrap">
-            <div class="ob-progress-lbl">{done_n} of {total_n} complete</div>
-            <div class="ob-progress"><div style="width:{pct}%;"></div></div>
-        </div>
-        <h2 style="margin:18px 0 10px;">⚡ Essentials</h2>
-        {"".join(_card(s) for s in essential)}
-        <h2 style="margin:22px 0 10px;">✨ Finish later</h2>
-        {"".join(_card(s) for s in later)}
-        <div style="margin-top:18px;text-align:center;">
-            <a class="btn secondary" href="{url_for('dashboard')}">← Back to dashboard</a>
-        </div>
-    </div>
     <style>
-    .ob-progress-wrap {{ margin-bottom:6px; }}
-    .ob-progress-lbl {{ font-size:.85rem; color:var(--text-muted); margin-bottom:6px; }}
-    .ob-progress {{ height:10px; border-radius:5px; background:rgba(255,255,255,.08); overflow:hidden; }}
-    .ob-progress div {{ height:100%; border-radius:5px; background:linear-gradient(90deg,#FF6B1A,#FF9D5C); transition:width .4s; }}
-    .ob-step {{ display:flex; align-items:center; gap:14px; padding:14px; border:1px solid rgba(255,255,255,.08);
-        border-radius:12px; margin-bottom:10px; background:rgba(255,255,255,.02); }}
-    .ob-step.done {{ opacity:.75; border-color:rgba(61,220,132,.25); }}
-    .ob-step-icon {{ font-size:1.4rem; flex:none; }}
-    .ob-step-body {{ flex:1; min-width:0; }}
-    .ob-step-title {{ font-weight:800; font-size:1rem; }}
-    .ob-step-desc {{ color:var(--text-muted); font-size:.85rem; margin-top:2px; }}
-    .ob-step-act {{ flex:none; }}
-    .ob-done {{ color:#3DDC84; font-weight:700; font-size:.9rem; }}
+    .ck2 {{ max-width: 760px; margin: 0 auto; }}
+    .ck2-head {{ display: flex; align-items: center; gap: 18px; margin: 4px 2px 18px; }}
+    .ck2-ring {{ flex: none; width: 92px; height: 92px; border-radius: 50%; background: {_ring};
+        display: flex; align-items: center; justify-content: center; box-shadow: 0 0 30px rgba(61,220,132,.15); }}
+    .ck2-ring span {{ width: 72px; height: 72px; border-radius: 50%; background: #141414; display: flex; flex-direction: column;
+        align-items: center; justify-content: center; font-weight: 900; font-size: 1.3rem; line-height: 1; }}
+    .ck2-ring small {{ font-size: .62rem; color: var(--text-muted); letter-spacing: .5px; margin-top: 4px; font-weight: 800; }}
+    .ck2-head h1 {{ margin: 0; font-size: clamp(1.6rem, 7vw, 2.2rem); font-weight: 900; line-height: 1.1; }}
+    .ck2-head p {{ margin: 6px 0 0; color: var(--text-muted); }}
+    .ck2-guided {{ display: inline-flex; align-items: center; gap: 6px; margin-top: 10px; font-weight: 800; color: #FF9D5C;
+        text-decoration: none; font-size: .92rem; }}
+    .ck2-next {{ border-radius: 24px; padding: 22px 20px; margin-bottom: 18px; border: 1px solid rgba(255,107,26,.45);
+        background: radial-gradient(120% 80% at 100% 0%, rgba(255,107,26,.2), transparent 60%), linear-gradient(180deg, #1d1814, #141414);
+        box-shadow: 0 18px 40px rgba(0,0,0,.35); }}
+    .ck2-kick {{ font-size: 11px; font-weight: 900; letter-spacing: 1.5px; text-transform: uppercase; color: #FF9D5C; }}
+    .ck2-next-row {{ display: flex; gap: 14px; align-items: flex-start; margin-top: 10px; }}
+    .ck2-big-ico {{ flex: none; font-size: 34px; line-height: 1; }}
+    .ck2-next h2 {{ margin: 0; font-size: 1.45rem; font-weight: 900; }}
+    .ck2-next p {{ margin: 6px 0 0; color: var(--text-dim, #B5B5AD); }}
+    .ck2-cta {{ display: flex; align-items: center; justify-content: center; margin-top: 16px; min-height: 58px; border-radius: 16px;
+        background: linear-gradient(135deg, #FF8A42, #FF6B1A); color: #170800; font-weight: 900; font-size: 1.05rem;
+        text-decoration: none; box-shadow: 0 10px 26px rgba(255,107,26,.3); }}
+    .ck2-alldone {{ text-align: center; border-color: rgba(61,220,132,.45);
+        background: radial-gradient(120% 80% at 50% 0%, rgba(61,220,132,.18), transparent 60%), #141414; }}
+    .ck2-alldone .ck2-big-ico {{ font-size: 48px; margin-bottom: 8px; }}
+    .ck2-alldone .ck2-cta {{ background: linear-gradient(135deg, #00c853, #00e57a); color: #00230e; box-shadow: 0 10px 26px rgba(0,232,125,.28); }}
+    .ck2-sec {{ font-size: 11px; font-weight: 900; letter-spacing: 1.4px; text-transform: uppercase; color: #7A7A70;
+        margin: 22px 2px 10px; }}
+    .ck2-list {{ display: grid; gap: 8px; }}
+    .ck2-row {{ display: flex; align-items: center; gap: 12px; padding: 14px; border-radius: 16px; text-decoration: none;
+        color: var(--text); background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.08); min-height: 64px; }}
+    .ck2-row:active {{ background: rgba(255,255,255,.06); }}
+    .ck2-ico {{ flex: none; width: 42px; height: 42px; border-radius: 12px; display: flex; align-items: center; justify-content: center;
+        font-size: 20px; background: rgba(255,255,255,.05); }}
+    .ck2-txt {{ flex: 1; min-width: 0; display: flex; flex-direction: column; }}
+    .ck2-txt b {{ font-size: 1rem; }}
+    .ck2-txt small {{ color: var(--text-muted); font-size: .82rem; margin-top: 2px; display: -webkit-box; -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical; overflow: hidden; }}
+    .ck2-time {{ flex: none; font-size: .72rem; font-weight: 800; color: var(--text-muted); background: rgba(255,255,255,.05);
+        padding: 4px 8px; border-radius: 999px; white-space: nowrap; }}
+    .ck2-go {{ flex: none; color: #FF9D5C; font-size: 1.4rem; font-weight: 700; }}
+    .ck2-chips {{ display: flex; flex-wrap: wrap; gap: 8px; }}
+    .ck2-chip {{ display: inline-flex; align-items: center; gap: 6px; padding: 10px 14px; border-radius: 999px; font-weight: 800;
+        font-size: .9rem; text-decoration: none; background: rgba(61,220,132,.1); border: 1px solid rgba(61,220,132,.4); color: #3DDC84; }}
+    .ck2-foot {{ text-align: center; margin: 24px 0 8px; }}
+    .ck2-foot a {{ color: var(--text-muted); font-weight: 700; text-decoration: none; }}
+    @media (max-width: 420px) {{ .ck2-time {{ display: none; }} .ck2-ring {{ width: 80px; height: 80px; }}
+        .ck2-ring span {{ width: 62px; height: 62px; font-size: 1.15rem; }} }}
     </style>
+    <div class="ck2">
+        <div class="ck2-head">
+            <div class="ck2-ring" role="img" aria-label="{done_n} of {total_n} steps done"><span>{done_n}/{total_n}<small>DONE</small></span></div>
+            <div>
+                <h1>Get set up</h1>
+                <p>Essentials first &mdash; your first route in about 10 minutes.</p>
+                <a class="ck2-guided" href="{url_for('onboarding_start')}">&#10024; Walk me through it</a>
+            </div>
+        </div>
+        {hero}
+        {('<div class="ck2-sec">Still to do</div><div class="ck2-list">' + "".join(_row(s) for s in todo) + '</div>') if todo else ''}
+        {('<div class="ck2-sec">Done</div><div class="ck2-chips">' + chips + '</div>') if chips else ''}
+        {('<div class="ck2-sec">When you&rsquo;re ready</div><div class="ck2-list">' + "".join(_row(s) for s in later_todo) + '</div>') if later_todo else ''}
+        <div class="ck2-foot"><a href="{url_for('dashboard')}">&larr; Back to dashboard</a></div>
+    </div>
     """
     return render_template_string(shell_page("Get Set Up", body))
+
+
+# =========================================================
+# GUIDED SETUP WALKTHROUGH (2026-10-27)
+# One question per screen: yard → prices → trucks → drivers → first
+# dispatch → done. Every step saves to the same tables Settings, Trucks and
+# Team use, so nothing is set up twice and the checklist stays truthful.
+# Every step can be skipped; the checklist is always one tap away.
+# =========================================================
+_OB_WIZ = [
+    ("yard", "Yard", "&#127968;"),
+    ("prices", "Prices", "&#128181;"),
+    ("trucks", "Trucks", "&#128666;"),
+    ("drivers", "Drivers", "&#128119;"),
+    ("dispatch", "Dispatch", "&#128242;"),
+]
+_OB_WIZ_KEYS = [k for k, _, _ in _OB_WIZ]
+
+_OB_WIZ_CSS = """
+<style>
+.topnav, .haul-tabbar { display: none !important; }
+.obw { max-width: 640px; margin: 0 auto; padding: calc(env(safe-area-inset-top, 0px) + 10px) 0 40px; }
+.obw-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; }
+.obw-brand { font-weight: 900; letter-spacing: 5px; font-size: 12px; color: #FFB27A; display: flex; align-items: center; gap: 8px; }
+.obw-brand i { width: 8px; height: 8px; border-radius: 50%; background: #3DDC84; box-shadow: 0 0 10px #3DDC84; }
+.obw-exit { color: var(--text-muted); font-size: 13px; font-weight: 700; text-decoration: none; padding: 10px 4px; }
+.obw-track { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-bottom: 18px; }
+.obw-dot { display: flex; flex-direction: column; align-items: center; gap: 6px; text-decoration: none; color: #6E6E66;
+  font-size: 11px; font-weight: 800; letter-spacing: .4px; text-transform: uppercase; min-width: 0; }
+.obw-dot b { width: 100%; height: 6px; border-radius: 4px; background: rgba(255,255,255,.1); }
+.obw-dot.done { color: #3DDC84; } .obw-dot.done b { background: #3DDC84; }
+.obw-dot.cur { color: #FFB27A; } .obw-dot.cur b { background: #FF6B1A; box-shadow: 0 0 12px rgba(255,107,26,.7); }
+.obw-dot span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.obw-card { border-radius: 26px; padding: 24px 20px; border: 1px solid rgba(255,107,26,.3);
+  background: radial-gradient(120% 70% at 100% 0%, rgba(255,107,26,.16), transparent 60%), linear-gradient(180deg, #1c1916, #141414);
+  box-shadow: 0 20px 50px rgba(0,0,0,.45); }
+.obw-emoji { font-size: 40px; line-height: 1; margin-bottom: 10px; }
+.obw-kick { font-size: 11px; font-weight: 900; letter-spacing: 1.6px; text-transform: uppercase; color: #FF9D5C; }
+.obw-card h1 { font-size: clamp(1.6rem, 7vw, 2.2rem); font-weight: 900; line-height: 1.1; margin: 6px 0 6px; letter-spacing: -.4px; }
+.obw-sub { color: var(--text-muted); margin: 0 0 18px; font-size: .98rem; }
+.obw-f { margin-bottom: 12px; min-width: 0; }
+.obw-f label { display: block; font-size: 11px; font-weight: 800; letter-spacing: .09em; text-transform: uppercase;
+  color: var(--text-muted); margin-bottom: 6px; }
+.obw-f input, .obw-f textarea { width: 100%; box-sizing: border-box; min-height: 54px; padding: 10px 14px; font-size: 16px;
+  border-radius: 14px; background: rgba(0,0,0,.28); border: 1px solid rgba(255,255,255,.14); color: var(--text); }
+.obw-f textarea { min-height: 150px; font-family: ui-monospace, Menlo, monospace; font-size: 15px; line-height: 1.5; }
+.obw-f input:focus, .obw-f textarea:focus { outline: none; border-color: #FF6B1A; box-shadow: 0 0 0 3px rgba(255,107,26,.2); }
+.obw-grid { display: grid; grid-template-columns: 1.4fr .7fr 1fr; gap: 10px; }
+.obw-money { position: relative; }
+.obw-money:before { content: "$"; position: absolute; left: 14px; top: 50%; transform: translateY(-50%);
+  color: var(--text-muted); font-weight: 800; font-size: 17px; }
+.obw-money input { padding-left: 30px; font-size: 20px; font-weight: 800; }
+.obw-price { display: flex; align-items: center; gap: 12px; padding: 12px; border-radius: 16px; margin-bottom: 10px;
+  background: rgba(0,0,0,.2); border: 1px solid rgba(255,255,255,.08); }
+.obw-price-ico { flex: none; width: 46px; height: 46px; border-radius: 14px; display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 900; }
+.obw-price-txt { flex: 1; min-width: 0; } .obw-price-txt b { display: block; } .obw-price-txt small { color: var(--text-muted); }
+.obw-price .obw-money { flex: none; width: 140px; }
+.obw-chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 14px; }
+.obw-chip { display: inline-flex; align-items: center; gap: 6px; padding: 10px 14px; border-radius: 999px; font-weight: 800;
+  background: rgba(61,220,132,.12); border: 1px solid rgba(61,220,132,.45); color: #3DDC84; }
+.obw-card .obw-chip.ghost { background: transparent !important; border: 1px dashed rgba(255,255,255,.25) !important;
+  color: var(--text-dim, #B5B5AD) !important; cursor: pointer; box-shadow: none !important; min-height: 44px !important;
+  padding: 10px 14px !important; margin: 0 !important; font-size: .9rem !important; font-weight: 800 !important; border-radius: 999px !important; }
+.obw-add { display: flex; gap: 10px; align-items: flex-end; }
+.obw-add .obw-f { flex: 1; margin: 0; }
+.obw-card .obw-addbtn { flex: none; min-height: 54px !important; padding: 0 20px !important; border-radius: 14px !important;
+  background: rgba(255,107,26,.16) !important; border: 1px solid rgba(255,107,26,.5) !important; color: #FFB27A !important;
+  box-shadow: none !important; font-weight: 900 !important; cursor: pointer; margin: 0 !important; }
+.obw-people { display: grid; gap: 8px; margin: 0 0 14px; }
+.obw-person { display: flex; align-items: center; gap: 12px; padding: 12px; border-radius: 16px;
+  background: rgba(0,0,0,.2); border: 1px solid rgba(255,255,255,.08); }
+.obw-av { flex: none; width: 42px; height: 42px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  font-weight: 900; background: linear-gradient(135deg, #FFB35C, #FF6B1A); color: #1a0a00; }
+.obw-person-txt { flex: 1; min-width: 0; } .obw-person-txt b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.obw-person-txt small { color: var(--text-muted); }
+.obw-text { flex: none; display: inline-flex; align-items: center; gap: 6px; min-height: 44px; padding: 0 14px; border-radius: 12px;
+  background: #3DDC84; color: #03180c; font-weight: 900; text-decoration: none; font-size: .9rem; }
+.obw-badge { flex: none; font-size: 11px; font-weight: 900; letter-spacing: .5px; padding: 6px 10px; border-radius: 999px;
+  background: rgba(61,220,132,.14); color: #3DDC84; }
+.obw-nav { display: flex; gap: 10px; margin-top: 20px; align-items: center; }
+.obw-card .obw-next { flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 60px !important;
+  border: none !important; border-radius: 18px !important; cursor: pointer; text-decoration: none; margin: 0 !important;
+  font-size: 1.08rem !important; font-weight: 900 !important; color: #170800 !important;
+  background: linear-gradient(135deg, #FF8A42, #FF6B1A) !important; box-shadow: 0 10px 26px rgba(255,107,26,.32) !important; }
+.obw-card .obw-next.green { background: linear-gradient(135deg, #00c853, #00e57a) !important; color: #00230e !important;
+  box-shadow: 0 10px 26px rgba(0,232,125,.28) !important; }
+.obw-back { flex: none; display: inline-flex; align-items: center; justify-content: center; min-width: 56px; min-height: 60px;
+  border-radius: 18px; border: 1px solid rgba(255,255,255,.14); color: var(--text); text-decoration: none; font-weight: 900; font-size: 1.1rem; }
+.obw-skip { display: block; text-align: center; margin-top: 14px; color: var(--text-muted); font-weight: 700; font-size: .92rem; text-decoration: none; }
+.obw-err { background: rgba(255,82,82,.1); border: 1px solid rgba(255,82,82,.4); color: #FF9B9B; border-radius: 12px;
+  padding: 10px 12px; font-weight: 700; font-size: .9rem; margin-bottom: 14px; }
+.obw-ok { background: rgba(61,220,132,.1); border: 1px solid rgba(61,220,132,.4); color: #3DDC84; border-radius: 12px;
+  padding: 10px 12px; font-weight: 700; font-size: .9rem; margin-bottom: 14px; }
+.obw-tip { display: flex; gap: 10px; align-items: flex-start; padding: 12px 14px; border-radius: 14px; margin-top: 14px;
+  background: rgba(255,255,255,.035); border: 1px dashed rgba(255,255,255,.12); color: var(--text-dim, #B5B5AD); font-size: .88rem; }
+.obw-card .obw-sample { cursor: pointer; color: #FF9D5C !important; font-weight: 800 !important; background: none !important;
+  border: none !important; box-shadow: none !important; padding: 6px 0 !important; margin: 0 !important; min-height: 0 !important;
+  font-size: .9rem !important; text-decoration: underline; text-underline-offset: 3px; }
+/* finish */
+.obw-done { text-align: center; position: relative; overflow: hidden; }
+.obw-done h1 { font-size: clamp(2rem, 9vw, 2.8rem); }
+.obw-truck { font-size: 64px; display: inline-block; animation: obwDrive 1.4s cubic-bezier(.2,.8,.2,1) both; }
+@keyframes obwDrive { from { transform: translateX(-140%); } to { transform: translateX(0); } }
+.obw-confetti i { position: absolute; top: -12px; width: 8px; height: 14px; border-radius: 2px; opacity: .9;
+  animation: obwFall 2.6s ease-in forwards; }
+@keyframes obwFall { to { transform: translateY(520px) rotate(540deg); opacity: 0; } }
+.obw-sum { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; margin: 18px 0 6px; text-align: left; }
+.obw-sum div { display: flex; align-items: center; gap: 10px; padding: 12px; border-radius: 14px; background: rgba(0,0,0,.2);
+  border: 1px solid rgba(255,255,255,.08); font-weight: 800; font-size: .92rem; min-width: 0; }
+.obw-sum div.ok { border-color: rgba(61,220,132,.4); }
+.obw-sum div em { font-style: normal; flex: none; width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center;
+  justify-content: center; font-size: 13px; background: rgba(255,255,255,.08); color: var(--text-muted); }
+.obw-sum div.ok em { background: #3DDC84; color: #03180c; }
+.obw-sum div span { min-width: 0; line-height: 1.2; }
+@media (max-width: 420px) {
+  .obw-card { padding: 20px 16px; border-radius: 22px; }
+  .obw-grid { grid-template-columns: 1fr 1fr; } .obw-grid .obw-f:first-child { grid-column: 1 / -1; }
+  .obw-price .obw-money { width: 118px; }
+  .obw-dot span { font-size: 9.5px; }
+}
+@media (max-width: 360px) { .obw-price-txt small { display: none; } .obw-price .obw-money { width: 108px; } }
+@media (prefers-reduced-motion: reduce) { .obw-truck, .obw-confetti i { animation: none; } }
+</style>
+"""
+
+
+def _ob_wiz_status(conn, company_id):
+    """Done-state per walkthrough step, from real data."""
+    def _n(q, *a):
+        try:
+            return conn.execute(q, a).fetchone()[0] or 0
+        except Exception:
+            return 0
+    try:
+        _co = conn.execute("SELECT yard_address FROM companies WHERE id=?", (company_id,)).fetchone()
+        _yard = bool(_co and (_co["yard_address"] or "").strip())
+    except Exception:
+        _yard = False
+    try:
+        _ensure_driver_invite_tables(conn)
+    except Exception:
+        pass
+    return {
+        "yard": _yard,
+        "prices": _n("SELECT COUNT(*) FROM rate_cards WHERE company_id=? AND service IN ('pull','swap','delivery')",
+                     company_id) > 0,
+        "trucks": _n("SELECT COUNT(*) FROM trucks WHERE company_id=? AND is_active=1", company_id) > 0,
+        "drivers": (_n("SELECT COUNT(*) FROM users WHERE company_id=? AND role='driver' AND is_active=1", company_id)
+                    + _n("SELECT COUNT(*) FROM driver_invites WHERE company_id=? AND accepted_at IS NULL"
+                         " AND revoked_at IS NULL", company_id)) > 0,
+        "dispatch": _n("SELECT COUNT(*) FROM routes WHERE company_id=?", company_id) > 0,
+    }
+
+
+def _ob_wiz_page(step, status, emoji, title, sub, inner, err="", ok=""):
+    idx = _OB_WIZ_KEYS.index(step) if step in _OB_WIZ_KEYS else len(_OB_WIZ_KEYS)
+    dots = ""
+    for i, (k, lbl, _ic) in enumerate(_OB_WIZ):
+        cls = "cur" if k == step else ("done" if status.get(k) else "")
+        dots += (f'<a class="obw-dot {cls}" href="{url_for("onboarding_start", step=k)}">'
+                 f'<b></b><span>{lbl}</span></a>')
+    kick = (f"Step {idx + 1} of {len(_OB_WIZ)}" if step in _OB_WIZ_KEYS else "All set")
+    return (
+        _OB_WIZ_CSS
+        + '<div class="obw">'
+        '<div class="obw-top"><div class="obw-brand"><i></i>HAULTRA SETUP</div>'
+        f'<a class="obw-exit" href="{url_for("onboarding_setup")}">Finish later &rarr;</a></div>'
+        f'<div class="obw-track">{dots}</div>'
+        f'<div class="obw-card{" obw-done" if step == "done" else ""}">'
+        f'<div class="obw-emoji">{emoji}</div><div class="obw-kick">{kick}</div>'
+        f'<h1>{title}</h1><p class="obw-sub">{sub}</p>'
+        + (f'<div class="obw-err">{e(err)}</div>' if err else "")
+        + (f'<div class="obw-ok">{e(ok)}</div>' if ok else "")
+        + inner
+        + '</div></div>'
+    )
+
+
+def _ob_nav(step, next_label="Continue", form_submit=True, green=False):
+    i = _OB_WIZ_KEYS.index(step)
+    prev = url_for("onboarding_start", step=_OB_WIZ_KEYS[i - 1]) if i > 0 else ""
+    nxt = _OB_WIZ_KEYS[i + 1] if i + 1 < len(_OB_WIZ_KEYS) else "done"
+    back = f'<a class="obw-back" href="{prev}" aria-label="Back">&larr;</a>' if prev else ""
+    gcls = " green" if green else ""
+    if form_submit:
+        btn = (f'<button type="submit" name="act" value="next" class="obw-next{gcls}">'
+               f'{next_label} &rarr;</button>')
+    else:
+        btn = (f'<a class="obw-next{gcls}" href="{url_for("onboarding_start", step=nxt)}">'
+               f'{next_label} &rarr;</a>')
+    skip = f'<a class="obw-skip" href="{url_for("onboarding_start", step=nxt)}">Skip for now</a>'
+    return f'<div class="obw-nav">{back}{btn}</div>{skip}'
+
+
+def _ob_next_step(step):
+    i = _OB_WIZ_KEYS.index(step)
+    return _OB_WIZ_KEYS[i + 1] if i + 1 < len(_OB_WIZ_KEYS) else "done"
+
+
+@app.route("/onboarding/start", methods=["GET"])
+@app.route("/onboarding/start/<step>", methods=["GET", "POST"])
+@boss_required
+def onboarding_start(step=None):
+    """The guided walkthrough. Bare /onboarding/start opens the first step
+    that isn't done yet (or the finish screen when everything is)."""
+    conn = get_db()
+    company_id = cid()
+    status = _ob_wiz_status(conn, company_id)
+    if step is None:
+        conn.close()
+        first = next((k for k in _OB_WIZ_KEYS if not status[k]), "done")
+        return redirect(url_for("onboarding_start", step=first))
+    if step not in _OB_WIZ_KEYS and step != "done":
+        conn.close()
+        return redirect(url_for("onboarding_start"))
+    csrf = get_csrf_token()
+    hidden = f'<input type="hidden" name="_csrf_token" value="{csrf}">'
+    err = ok = ""
+
+    # ── POST: save, then move on (or stay to add another) ──────────────────
+    if request.method == "POST":
+        act = (request.form.get("act") or "next").strip()
+        if step == "yard":
+            addr = (request.form.get("yard_address") or "").strip()[:200]
+            city = (request.form.get("yard_city") or "").strip()[:80]
+            st = (request.form.get("yard_state") or "").strip()[:20]
+            zp = (request.form.get("yard_zip") or "").strip()[:12]
+            if not addr:
+                err = "Add your yard's street address — or tap Skip for now."
+            else:
+                conn.execute("UPDATE companies SET yard_address=?, yard_city=?, yard_state=?, yard_zip=? WHERE id=?",
+                             (addr, city or None, st.upper() or None, zp or None, company_id))
+                conn.commit()
+        elif step == "prices":
+            bad = []
+            for svc in ("pull", "swap", "delivery"):
+                raw = (request.form.get(f"rate_{svc}") or "").replace("$", "").replace(",", "").strip()
+                if not raw:
+                    continue
+                try:
+                    cents = int(round(float(raw) * 100))
+                    if cents <= 0 or cents > 10_000_000:
+                        raise ValueError
+                except ValueError:
+                    bad.append(svc)
+                    continue
+                conn.execute(
+                    "INSERT INTO rate_cards (company_id, service, tier, cents) VALUES (?, ?, 'standard', ?)"
+                    " ON CONFLICT(company_id, service, tier) DO UPDATE SET cents=excluded.cents",
+                    (company_id, svc, cents))
+            conn.commit()
+            if bad:
+                err = "Check the price for " + ", ".join(bad) + " — numbers only, like 450."
+        elif step == "trucks":
+            name = (request.form.get("truck_name") or "").strip()[:80]
+            if name:
+                exists = conn.execute(
+                    "SELECT id FROM trucks WHERE company_id=? AND name=? COLLATE NOCASE AND is_active=1",
+                    (company_id, name)).fetchone()
+                if not exists:
+                    conn.execute("INSERT INTO trucks (company_id, name, is_active, created_at) VALUES (?, ?, 1, ?)",
+                                 (company_id, name, now_ts()))
+                    conn.commit()
+                    ok = f"{name} added."
+            elif act == "add":
+                err = "Type a truck name or number first."
+        elif step == "drivers":
+            name = (request.form.get("full_name") or "").strip()
+            phone = (request.form.get("phone") or "").strip()
+            if name or phone:
+                _iid, _ierr = _create_driver_invite(conn, name, _clean_driver_phone(phone))
+                if _ierr:
+                    err = _ierr
+                else:
+                    conn.commit()
+                    ok = f"Invite ready for {name.split()[0] if name else 'your driver'} — tap Text invite to send it."
+            elif act == "add":
+                err = "Add the driver's name and phone."
+        if not err and act == "next":
+            conn.close()
+            return redirect(url_for("onboarding_start", step=_ob_next_step(step)))
+        status = _ob_wiz_status(conn, company_id)
+
+    co = conn.execute("SELECT * FROM companies WHERE id=?", (company_id,)).fetchone()
+    co = {k: co[k] for k in co.keys()} if co else {}
+    action_url = url_for("onboarding_start", step=step)
+
+    if step == "yard":
+        inner = (
+            f'<form method="POST" action="{action_url}">{hidden}'
+            f'<div class="obw-f"><label for="ob-addr">Street address</label>'
+            f'<input id="ob-addr" name="yard_address" value="{e(request.form.get("yard_address") or co.get("yard_address") or "")}" '
+            'placeholder="100 Industrial Blvd" autocomplete="street-address"></div>'
+            '<div class="obw-grid">'
+            f'<div class="obw-f"><label for="ob-city">City</label><input id="ob-city" name="yard_city" value="{e(co.get("yard_city") or "")}" placeholder="Suffolk"></div>'
+            f'<div class="obw-f"><label for="ob-st">State</label><input id="ob-st" name="yard_state" value="{e(co.get("yard_state") or "")}" placeholder="VA" maxlength="2" autocapitalize="characters"></div>'
+            f'<div class="obw-f"><label for="ob-zip">ZIP</label><input id="ob-zip" name="yard_zip" value="{e(co.get("yard_zip") or "")}" placeholder="23434" inputmode="numeric"></div>'
+            '</div>'
+            '<div class="obw-tip">&#128205; Routes start and end here, and drivers get a one-tap "Navigate to Yard" when the last stop is done.</div>'
+            + _ob_nav("yard", "Save yard") + '</form>'
+        )
+        page = _ob_wiz_page("yard", status, "&#127968;", "Where&rsquo;s your yard?",
+                            "Your home base &mdash; where the trucks park and the cans live.", inner, err, ok)
+    elif step == "prices":
+        _rates = {r["service"]: r["cents"] for r in conn.execute(
+            "SELECT service, cents FROM rate_cards WHERE company_id=? AND tier='standard'"
+            " AND service IN ('pull','swap','delivery')", (company_id,)).fetchall()}
+
+        def _row(svc, code, label, hint, color):
+            cur = request.form.get(f"rate_{svc}") if request.method == "POST" else None
+            if cur is None:
+                cur = ("%g" % (_rates[svc] / 100)) if svc in _rates else ""
+            return (f'<div class="obw-price"><div class="obw-price-ico" style="background:{color}22;color:{color};">{code}</div>'
+                    f'<div class="obw-price-txt"><b>{label}</b><small>{hint}</small></div>'
+                    f'<div class="obw-money"><input name="rate_{svc}" value="{e(cur)}" inputmode="decimal" '
+                    f'placeholder="0" aria-label="{label} price"></div></div>')
+        inner = (
+            f'<form method="POST" action="{action_url}">{hidden}'
+            + _row("delivery", "D", "Delivery", "Drop a can at a job", "#3DDC84")
+            + _row("pull", "P", "Pull", "Pick up a full can", "#4DABF5")
+            + _row("swap", "S", "Swap", "Full out, empty in", "#B98CFF")
+            + '<div class="obw-tip">&#129534; These fill your invoices automatically. Sizes, tonnage and fees '
+              'can be fine-tuned later in Settings.</div>'
+            + _ob_nav("prices", "Save prices") + '</form>'
+        )
+        page = _ob_wiz_page("prices", status, "&#128181;", "What do you charge?",
+                            "Your standard price for each job. Leave any blank if you&rsquo;re not sure yet.",
+                            inner, err, ok)
+    elif step == "trucks":
+        trucks = conn.execute("SELECT name FROM trucks WHERE company_id=? AND is_active=1 ORDER BY id",
+                              (company_id,)).fetchall()
+        have = {(t["name"] or "").lower() for t in trucks}
+        chips = "".join(f'<span class="obw-chip">&#128666; {e(t["name"])}</span>' for t in trucks)
+        sugg = [f"Truck {i}" for i in range(1, 9) if f"truck {i}" not in have][:3]
+        sugg_html = "".join(
+            f'<button type="button" class="obw-chip ghost" onclick="var f=document.getElementById(\'ob-truck\');'
+            f'f.value=this.getAttribute(\'data-n\');f.form.querySelector(\'[value=add]\').click();" '
+            f'data-n="{e(sname)}">+ {e(sname)}</button>' for sname in sugg)
+        inner = (
+            f'<div class="obw-chips">{chips or ""}{sugg_html}</div>'
+            f'<form method="POST" action="{action_url}">{hidden}'
+            '<div class="obw-add"><div class="obw-f"><label for="ob-truck">Truck name or number</label>'
+            '<input id="ob-truck" name="truck_name" placeholder="Truck 8" autocomplete="off"></div>'
+            '<button type="submit" name="act" value="add" class="obw-addbtn">+ Add</button></div>'
+            '<div class="obw-tip">&#128295; Make, model and plate can wait &mdash; drivers pick their truck when they '
+            'do the pre-trip inspection.</div>'
+            + _ob_nav("trucks", "Continue" if trucks else "Next") + '</form>'
+        )
+        page = _ob_wiz_page("trucks", status, "&#128666;", "Add your trucks",
+                            "Just a name or number for each one. Add as many as you run.", inner, err, ok)
+    elif step == "drivers":
+        rows = conn.execute(
+            "SELECT di.*, u.full_name FROM driver_invites di JOIN users u ON u.id=di.user_id"
+            " WHERE di.company_id=? AND di.accepted_at IS NULL AND di.revoked_at IS NULL AND di.expires_at > ?"
+            " ORDER BY di.id", (company_id, now_ts())).fetchall()
+        active = conn.execute(
+            "SELECT full_name, username FROM users WHERE company_id=? AND role='driver' AND is_active=1 ORDER BY id",
+            (company_id,)).fetchall()
+        people = ""
+        for a in active:
+            nm = (a["full_name"] or a["username"] or "Driver").strip()
+            people += (f'<div class="obw-person"><div class="obw-av">{e(nm[:1].upper())}</div>'
+                       f'<div class="obw-person-txt"><b>{e(nm)}</b><small>Ready to drive</small></div>'
+                       '<span class="obw-badge">&#10003; JOINED</span></div>')
+        for r in rows:
+            _link, _href = _driver_invite_text(r, co.get("name"))
+            nm = (r["full_name"] or "Driver").strip()
+            ph = r["phone"] or ""
+            ph_fmt = f"({ph[:3]}) {ph[3:6]}-{ph[6:]}" if len(ph) == 10 else ph
+            people += (f'<div class="obw-person"><div class="obw-av">{e(nm[:1].upper())}</div>'
+                       f'<div class="obw-person-txt"><b>{e(nm)}</b><small>{e(ph_fmt)} &middot; invite waiting</small></div>'
+                       f'<a class="obw-text" href="{e(_href)}">&#128172; Text invite</a></div>')
+        inner = (
+            (f'<div class="obw-people">{people}</div>' if people else "")
+            + f'<form method="POST" action="{action_url}">{hidden}'
+            '<div class="obw-f"><label for="ob-dn">Driver&rsquo;s name</label>'
+            '<input id="ob-dn" name="full_name" placeholder="First and last name" autocomplete="off"></div>'
+            '<div class="obw-add"><div class="obw-f"><label for="ob-dp">Mobile phone</label>'
+            '<input id="ob-dp" name="phone" type="tel" inputmode="tel" placeholder="(757) 555-0100"></div>'
+            '<button type="submit" name="act" value="add" class="obw-addbtn">+ Invite</button></div>'
+            '<div class="obw-tip">&#128233; Each driver gets a text link. They pick their own username and password '
+            '&mdash; nothing for you to make up or remember.</div>'
+            + _ob_nav("drivers", "Continue") + '</form>'
+        )
+        page = _ob_wiz_page("drivers", status, "&#128119;", "Invite your drivers",
+                            "Name and phone number &mdash; that&rsquo;s it.", inner, err, ok)
+    elif step == "dispatch":
+        sample = ("PR 4512 Elm St, Suffolk 30yd dump Holland\\n"
+                  "Drop empty 88 Harbor Rd 20yd\\n"
+                  "Swap 770 Industrial Pkwy 40yd")
+        _done_note = ('<div class="obw-ok">&#10003; You&rsquo;ve already sent a route &mdash; nice.</div>'
+                      if status.get("dispatch") else "")
+        inner = (
+            _done_note
+            + '<div class="obw-f"><label for="ob-text">Paste a dispatch text</label>'
+            '<textarea id="ob-text" placeholder="Paste the text you&rsquo;d normally send a driver&hellip;"></textarea></div>'
+            f'<button type="button" class="obw-sample" onclick="document.getElementById(\'ob-text\').value=\'{sample}\';">'
+            'Try a sample text</button>'
+            '<div class="obw-tip">&#10024; HAULTRA reads it like a dispatcher would &mdash; addresses, can sizes, dump '
+            'sites &mdash; and turns it into stops. You pick the driver and send.</div>'
+            '<div class="obw-nav">'
+            f'<a class="obw-back" href="{url_for("onboarding_start", step="drivers")}" aria-label="Back">&larr;</a>'
+            '<button type="button" class="obw-next" id="ob-go">Build my first route &rarr;</button></div>'
+            f'<a class="obw-skip" href="{url_for("onboarding_start", step="done")}">I&rsquo;ll do this later</a>'
+            '<script>(function(){var b=document.getElementById("ob-go");if(!b)return;'
+            'b.addEventListener("click",function(){var t=(document.getElementById("ob-text").value||"").trim();'
+            'try{if(t){sessionStorage.setItem("haultra_prefill",t);}}catch(e){}'
+            f'window.location.href={json.dumps(url_for("parser_view"))};}});}})();</script>'
+        )
+        page = _ob_wiz_page("dispatch", status, "&#128242;", "Send your first route",
+                            "Paste a text like the ones you send your drivers today.", inner, err, ok)
+    else:  # done
+        _items = [("yard", "Yard set"), ("prices", "Prices in"), ("trucks", "Trucks added"),
+                  ("drivers", "Drivers invited"), ("dispatch", "First route")]
+        summ = "".join(
+            f'<div class="{"ok" if status.get(k) else ""}"><em>{"&#10003;" if status.get(k) else "&ndash;"}</em>'
+            f'<span>{lbl}</span></div>' for k, lbl in _items)
+        colors = ["#FF6B1A", "#3DDC84", "#4DABF5", "#FFB35C", "#B98CFF"]
+        confetti = "".join(
+            f'<i style="left:{(i * 37) % 100}%;background:{colors[i % 5]};animation-delay:{(i % 7) * 0.12:.2f}s;"></i>'
+            for i in range(28))
+        all_done = all(status.values())
+        inner = (
+            f'<div class="obw-confetti" aria-hidden="true">{confetti}</div>'
+            f'<div class="obw-sum">{summ}</div>'
+            + ('' if all_done else
+               '<p class="obw-sub" style="margin:10px 0 0;">Anything with a dash can be finished from your setup checklist.</p>')
+            + '<div class="obw-nav">'
+            f'<a class="obw-next green" href="{url_for(role_landing_endpoint())}">Open my Route Board &rarr;</a></div>'
+            f'<a class="obw-skip" href="{url_for("onboarding_setup")}">See my setup checklist</a>'
+        )
+        page = _ob_wiz_page("done", status, '<span class="obw-truck">&#128666;</span>',
+                            "You&rsquo;re rolling!" if all_done else "You&rsquo;re in!",
+                            f"{e(co.get('name') or 'Your company')} is set up on HAULTRA.", inner, err, ok)
+    conn.close()
+    return render_template_string(shell_page("Set up HAULTRA", page))
 
 
 @app.route("/onboarding/import-garbage")
