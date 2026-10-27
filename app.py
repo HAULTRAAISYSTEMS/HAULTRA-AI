@@ -10618,7 +10618,11 @@ tr.status-in-progress td {{ background: rgba(255,107,26,0.03); }}
                 }});
             }});
         }}
+        // 2026-10-27: this script runs in <head>, where document.body is
+        // still null — observe(null) threw on every desktop page load. Guarded
+        // so it no longer errors; behaviour is unchanged (no tilt was ever bound).
         bindTilt(document);
+        if (!document.body) return;
         // Re-bind for dynamically added cards
         new MutationObserver(function(muts){{
             muts.forEach(function(m){{ m.addedNodes.forEach(function(n){{
@@ -11698,6 +11702,59 @@ def reset_password(token):
     return render_template_string(shell_page("Reset Password", body))
 
 
+# ── Driver home helpers (2026-10-27 redesign) ───────────────────────────────
+_DV_ICO_CLOCK = ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" '
+                 'stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="8"/>'
+                 '<path d="M12 9v4l2.5 2.5M9 2h6"/></svg>')
+_DV_ICO_PIN = ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" '
+               'stroke-linecap="round" stroke-linejoin="round"><path d="M3 11l18-8-8 18-2-8-8-2z"/></svg>')
+_DV_ICO_ARROW = ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" '
+                 'stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg>')
+
+# Short code for the chip + the full word for the Up Next card.
+_DV_ACTIONS = {"PR": ("PR", "Pickup & Return"), "P": ("P", "Pull"), "D": ("D", "Delivery"),
+               "S": ("S", "Swap"), "R": ("R", "Relocate"), "LL": ("LL", "Live Load"),
+               "YARD": ("YD", "Yard"), "DUMP": ("DMP", "Dump")}
+_DV_ACTION_WORDS = {"pickup and return": "PR", "pickup & return": "PR", "pull and return": "PR",
+                    "pull": "P", "pickup": "P", "delivery": "D", "drop": "D", "swap": "S",
+                    "relocate": "R", "live load": "LL", "yard": "YARD", "dump": "DUMP"}
+
+
+def _drv_action_parts(action):
+    """('PR', 'Pickup & Return') from either a parser code or a full word."""
+    a = (action or "").strip()
+    if not a:
+        return ("", "")
+    up = a.upper()
+    if up in _DV_ACTIONS:
+        return _DV_ACTIONS[up]
+    code = _DV_ACTION_WORDS.get(a.lower())
+    if code:
+        return _DV_ACTIONS[code]
+    return (up[:3], a[:1].upper() + a[1:])
+
+
+def _drv_nav_href(address, pref, user_agent=""):
+    """Turn-by-turn link honoring the route's navigation preference — same
+    choices Cab View offers (google / apple / waze / device_default)."""
+    enc = urllib.parse.quote_plus(address or "")
+    ua = (user_agent or "").lower()
+    pref = (pref or "").strip()
+    if pref == "google":
+        return "https://maps.google.com/?daddr=" + enc
+    if pref == "apple":
+        return "https://maps.apple.com/?daddr=" + enc
+    if pref == "waze":
+        return "https://waze.com/ul?q=" + enc + "&navigate=yes"
+    if pref == "device_default":
+        if "android" in ua:
+            return "geo:0,0?q=" + enc
+        if any(t in ua for t in ("iphone", "ipad", "ipod")):
+            return "https://maps.apple.com/?daddr=" + enc
+        return "https://maps.google.com/?daddr=" + enc
+    return "https://www.google.com/maps/dir/?api=1&destination=" + enc
+
+
 @app.route("/driver")
 @driver_required
 def driver_dashboard():
@@ -11776,22 +11833,36 @@ def dashboard():
         # still flags it) — no nag line on the driver's dashboard at all.
         _csrf_tok = get_csrf_token()
 
-        # Clock strip
+        # ── 2026-10-27 driver home redesign ─────────────────────────
+        # One glance answers the three things a driver opens the app for:
+        # am I on the clock, where am I going next, and what's left.
+        _me_name = ((user["full_name"] if "full_name" in user.keys() else "") or user["username"] or "").strip()
+        _first = _me_name.split()[0] if _me_name else ""
+        _hr = _now_local.hour if hasattr(_now_local, "hour") else 12
+        _greet = "Good morning" if _hr < 12 else ("Good afternoon" if _hr < 17 else "Good evening")
+        try:
+            _today_lbl = datetime.strptime(_clk_today, "%Y-%m-%d").strftime("%A, %B %-d")
+        except Exception:
+            _today_lbl = today
+        _ua = (request.headers.get("User-Agent") or "")
+
+        # Clock card — the first thing on the page, one big button.
         if _clk_on:
             _clock_strip = f"""
-        <div class="drv-clock on">
-            <span class="drv-clock-dot"></span>
-            <span>ON THE CLOCK since {_clk_in_at}</span>
-            <a href="{url_for('driver_clock')}">Clock In/Out</a>
-        </div>"""
+        <a class="dv-clock on" href="{url_for('driver_clock')}">
+            <span class="dv-pulse" aria-hidden="true"></span>
+            <span class="dv-clock-txt"><b>On the clock</b><small>since {_clk_in_at}</small></span>
+            <span class="dv-clock-go">Clock out &#8250;</span>
+        </a>"""
         else:
             _clock_strip = f"""
-        <form method="POST" action="{url_for('driver_clock_in_now_ep')}" class="drv-clock off">
+        <form method="POST" action="{url_for('driver_clock_in_now_ep')}" class="dv-clock off">
             <input type="hidden" name="_csrf_token" value="{_csrf_tok}">
             <input type="hidden" name="next" value="{e(request.path)}">
             {_PHONE_TS_INPUT}
-            <span>Not clocked in</span>
-            <button type="submit">&#9200; CLOCK IN</button>
+            <span class="dv-clock-ico" aria-hidden="true">{_DV_ICO_CLOCK}</span>
+            <span class="dv-clock-txt"><b>Off the clock</b><small>Tap Clock In to start your day</small></span>
+            <button type="submit" class="dv-clock-btn">Clock In</button>
         </form>
         {_PHONE_TS_JS}"""
 
@@ -11820,6 +11891,10 @@ def dashboard():
         # Route lanes — active first, then by date.
         # 2026-10-23: a route with all stops done sorts as DONE even if the
         # driver never hit "Finish Route" — old days stop floating to the top.
+        # 2026-10-27: ?all=1 shows older routes (the old "Full route history"
+        # link pointed back at this same page).
+        _show_all = request.args.get("all") == "1"
+        _route_limit = 30 if _show_all else 8
         _routes = conn.execute("""
             SELECT r.*,
                 (SELECT COUNT(*) FROM stops s
@@ -11838,20 +11913,28 @@ def dashboard():
                           THEN 0
                           WHEN r.status='open' THEN 1 ELSE 2 END,
                      r.route_date DESC, r.id DESC
-            LIMIT 8
-        """, (user["id"], company_id)).fetchall()
+            LIMIT ?
+        """, (user["id"], company_id, _route_limit)).fetchall()
+
+        def _dv_day(d):
+            if d == _clk_today:
+                return "Today"
+            try:
+                _dd = datetime.strptime(d or "", "%Y-%m-%d").date()
+                _t0 = datetime.strptime(_clk_today, "%Y-%m-%d").date()
+                if (_dd - _t0).days == 1:
+                    return "Tomorrow"
+                if (_dd - _t0).days == -1:
+                    return "Yesterday"
+                return _dd.strftime("%a, %b %-d")
+            except Exception:
+                return d or ""
 
         _lanes = ""
         _active_n = 0
-        _rc_total = 0
-        _stop_total = 0
+        _left_n = 0
+        _next_html = ""
         for _r in _routes:
-            _rc_total += 1
-            _r_total = _r["total_stops"] or 0
-            _r_done = _r["done_stops"] or 0
-            _r_all_done = _r_total > 0 and _r_done >= _r_total
-            if _r["status"] in ("open", "in_progress") and not _r_all_done:
-                _active_n += 1
             _stops = conn.execute("""
                 SELECT id, stop_order, action, customer_name, address, city, status
                 FROM stops WHERE route_id=? AND cancelled_at IS NULL
@@ -11859,195 +11942,371 @@ def dashboard():
             """, (_r["id"],)).fetchall()
             _total = _r["total_stops"] or 0
             _done = _r["done_stops"] or 0
-            _stop_total += _total
-            _pct = int(100 * _done / _total) if _total else 0
+            _all_done = _total > 0 and _done >= _total
             # 2026-10-23: all stops done = DONE, even if route still in_progress.
             _effective_status = _r["status"]
-            if _effective_status == "in_progress" and _total > 0 and _done >= _total:
+            if _effective_status == "in_progress" and _all_done:
                 _effective_status = "completed"
+            _is_active = _effective_status in ("open", "in_progress") and not _all_done
+            if _is_active:
+                _active_n += 1
+                # Only today's (or overdue) work counts as "left" — tomorrow's
+                # route isn't on the plate yet.
+                if (_r["route_date"] or "") <= _clk_today:
+                    _left_n += max(0, _total - _done)
             _status_cls = {"open": "open", "in_progress": "progress",
                            "completed": "done"}.get(_effective_status, "")
             _status_lbl = {"open": "NOT STARTED", "in_progress": "IN PROGRESS",
                            "completed": "DONE"}.get(_effective_status,
                                                    (_effective_status or "").upper())
-            # Garbage lanes get their own tag so the driver can tell them
-            # apart from roll-off at a glance — same board, one product.
             _type_tag = ""
             if (_r["route_type"] or "rolloff") == "garbage":
                 _type_tag = '<span class="drv-type garbage">GARBAGE</span>'
-            # Stop rows — first incomplete stop is "current"
-            _stop_rows = ""
-            _cur_marked = False
-            for _s in _stops:
-                _s_done = _s["status"] == "completed"
-                if _s_done:
-                    _dot = '<span class="drv-dot done">&#10003;</span>'
-                elif not _cur_marked:
-                    _dot = '<span class="drv-dot cur">&#9654;</span>'
-                    _cur_marked = True
-                else:
-                    _dot = '<span class="drv-dot todo"></span>'
-                _who = (_s["customer_name"] or _s["address"] or "Stop").strip()
-                _where = (_s["address"] or "").strip()
-                _sub = (" — " + _where) if _where and _where != _who else ""
-                _act = (_s["action"] or "").strip().upper()
-                # 2026-10-17: cancel button on every open stop (not done). The
-                # current stop is included on purpose — the mid-day "boss
-                # texted: cancel this one, go do another" flow.
-                _cancel_btn = ""
-                _row_cls = "drv-stop"
-                if not _s_done and _cur_marked:
-                    _cancel_btn = (
-                        f'<button type="button" class="drv-stop-cancel" '
-                        f'onclick="event.preventDefault();event.stopPropagation();drvCancelStop({_s["id"]}, \'{e(_who)}\')" '
-                        f'title="Cancel this stop">&#10005;</button>'
-                    )
-                    _row_cls = "drv-stop has-cancel"
-                _stop_rows += (
-                    f'<div class="{_row_cls}">{_dot}'
-                    + (f'<span class="drv-act">{e(_act)}</span>' if _act else "")
-                    + f'<span class="drv-stop-name">{e(_who)}{e(_sub)}</span>{_cancel_btn}</div>'
-                )
-            if not _stop_rows:
-                _stop_rows = '<div class="drv-stop"><span class="drv-stop-name muted">No stops yet.</span></div>'
             _cab = url_for("driver_route_detail", route_id=_r["id"])
-            _lanes += f"""
-        <a class="drv-lane" href="{_cab}">
-            <div class="drv-lane-head">
-                <div>
-                    <div class="drv-lane-name">{e(_r["route_name"])}</div>
-                    <div class="drv-lane-date">{e(_r["route_date"])}</div>
-                </div>
-                <div class="drv-pills">
-                    {_type_tag}<span class="drv-status {_status_cls}">{_status_lbl}</span>
-                </div>
-            </div>
-            <div class="drv-progress"><div style="width:{_pct}%;"></div></div>
-            <div class="drv-progress-lbl">{_done} of {_total} stops</div>
-            <div class="drv-stops">{_stop_rows}</div>
-            <div class="drv-actions" onclick="event.preventDefault();">
-                <button type="button" class="drv-act-btn"
-                        onclick="event.stopPropagation();drvOpenReorder({_r["id"]})">&#8645; Rearrange</button>
-                <button type="button" class="drv-act-btn"
-                        onclick="event.stopPropagation();drvOpenAddStop({_r["id"]})">&#65291; Add Stop</button>
-            </div>
-            <div class="drv-lane-foot">Open in Cab View &#8250;</div>
-        </a>"""
-        if not _lanes:
-            _lanes = '<div class="drv-empty">No routes assigned yet.</div>'
-        conn.close()
 
-        # 2026-10-21: driver push registration. The push card lives on the
-        # boss Alerts page, but drivers had no way to register their phone —
-        # without this, dispatch/message/truck-change pushes can never reach
-        # a driver. Plain string (not f-string): single braces are fine.
+            # Segmented progress — one block per stop, so "3 of 5" is visible
+            # without reading a number.
+            _segs = ""
+            _cur_marked = False
+            _cur_stop = None
+            _cur_idx = 0
+            for _i, _s in enumerate(_stops):
+                if _s["status"] == "completed":
+                    _segs += '<i class="d"></i>'
+                elif not _cur_marked:
+                    _segs += '<i class="c"></i>'
+                    _cur_marked = True
+                    _cur_stop = _s
+                    _cur_idx = _i + 1
+                else:
+                    _segs += '<i></i>'
+            if not _segs:
+                _segs = '<i></i>'
+
+            # Up Next hero: the very first active route's next stop.
+            if _is_active and _cur_stop is not None and not _next_html:
+                _code, _label = _drv_action_parts(_cur_stop["action"])
+                _who = (_cur_stop["customer_name"] or _cur_stop["address"] or "Stop").strip()
+                _addr = (_cur_stop["address"] or "").strip()
+                if _cur_stop["city"] and _cur_stop["city"].strip().lower() not in _addr.lower():
+                    _addr = (_addr + ", " + _cur_stop["city"].strip()).strip(", ")
+                _nav_pref = ((_r["nav_preference"] if "nav_preference" in _r.keys() else "")
+                             or session.get("nav_preference") or "")
+                _nav_btn = ""
+                if _addr:
+                    _nav_btn = (f'<a class="dv-btn dv-nav" href="{e(_drv_nav_href(_addr, _nav_pref, _ua))}" '
+                                f'target="_blank" rel="noopener">{_DV_ICO_PIN}<span>Navigate</span></a>')
+                _go_lbl = "Continue route" if _effective_status == "in_progress" else "Start route"
+                _show_addr = _addr and _addr.lower() != _who.lower()
+                _next_html = f"""
+        <section class="dv-next">
+            <div class="dv-next-top">
+                <span class="dv-kick">Up next &middot; stop {_cur_idx} of {_total}</span>
+                <span class="dv-next-route">{e(_r["route_name"] or "")}</span>
+            </div>
+            <div class="dv-next-act"><span class="dv-code">{e(_code)}</span>{e(_label)}</div>
+            <div class="dv-next-name">{e(_who)}</div>
+            {f'<div class="dv-next-addr">{e(_addr)}</div>' if _show_addr else ''}
+            <div class="dv-segs big">{_segs}</div>
+            <div class="dv-next-btns">
+                <a class="dv-btn dv-go" href="{_cab}"><span>{_go_lbl}</span>{_DV_ICO_ARROW}</a>
+                {_nav_btn}
+            </div>
+        </section>"""
+
+            # Stop rows (hidden for finished routes — nothing left to do there).
+            _stop_rows = ""
+            if not _all_done:
+                _cur_seen = False
+                for _s in _stops:
+                    _s_done = _s["status"] == "completed"
+                    if _s_done:
+                        _dot = '<span class="drv-dot done">&#10003;</span>'
+                        _rcls = "dv-stop done"
+                    elif not _cur_seen:
+                        _dot = '<span class="drv-dot cur">&#9654;</span>'
+                        _rcls = "dv-stop cur"
+                        _cur_seen = True
+                    else:
+                        _dot = '<span class="drv-dot todo"></span>'
+                        _rcls = "dv-stop"
+                    _who = (_s["customer_name"] or _s["address"] or "Stop").strip()
+                    _where = (_s["address"] or "").strip()
+                    _code, _label = _drv_action_parts(_s["action"])
+                    # 2026-10-17: cancel on every open stop (the mid-day "boss
+                    # texted: cancel this one" flow). Quiet ghost button now —
+                    # it used to be a big orange × that looked like the main action.
+                    _cancel_btn = ""
+                    if not _s_done:
+                        _cancel_btn = (
+                            f'<button type="button" class="dv-stop-x" '
+                            f'data-name="{e(_who)}" onclick="drvCancelStop({_s["id"]}, this.dataset.name)" '
+                            f'aria-label="Cancel stop {e(_who)}" title="Cancel this stop">&#10005;</button>'
+                        )
+                    _stop_rows += (
+                        f'<div class="{_rcls}">{_dot}'
+                        + (f'<span class="drv-act" title="{e(_label)}">{e(_code)}</span>' if _code else "")
+                        + f'<span class="dv-stop-txt"><span class="dv-stop-name">{e(_who)}</span>'
+                        + (f'<span class="dv-stop-addr">{e(_where)}</span>' if _where and _where != _who else "")
+                        + f'</span>{_cancel_btn}</div>'
+                    )
+                if not _stop_rows:
+                    _stop_rows = '<div class="dv-stop"><span class="dv-stop-name muted">No stops yet.</span></div>'
+                _stop_rows = f'<div class="dv-stops">{_stop_rows}</div>'
+
+            if _all_done:
+                _foot = (f'<div class="dv-lane-foot"><span class="dv-done-note">&#10003; All {_total} stops done</span>'
+                         f'<a class="dv-mini" href="{_cab}">View &#8250;</a></div>')
+            else:
+                _foot = f"""
+            <div class="dv-lane-foot">
+                <button type="button" class="dv-mini" onclick="drvOpenReorder({_r["id"]})">&#8645; Reorder</button>
+                <button type="button" class="dv-mini" onclick="drvOpenAddStop({_r["id"]})">&#65291; Add stop</button>
+                <a class="dv-mini dv-mini-go" href="{_cab}">Cab View &#8250;</a>
+            </div>"""
+            _lanes += f"""
+        <div class="dv-lane{' is-done' if _all_done else ''}">
+            <a class="dv-lane-link" href="{_cab}">
+                <div class="dv-lane-head">
+                    <div class="dv-lane-id">
+                        <div class="dv-lane-day">{e(_dv_day(_r["route_date"]))}</div>
+                        <div class="dv-lane-name">{e(_r["route_name"] or "")}</div>
+                    </div>
+                    <div class="drv-pills">{_type_tag}<span class="drv-status {_status_cls}">{_status_lbl}</span></div>
+                </div>
+                <div class="dv-segs">{_segs}</div>
+                <div class="dv-count">{_done} of {_total} stops done</div>
+            </a>
+            {_stop_rows}
+            {_foot}
+        </div>"""
+        if not _lanes:
+            _lanes = '<div class="drv-empty">No routes assigned yet. New routes from dispatch show up here.</div>'
+        if not _next_html:
+            _next_html = f"""
+        <section class="dv-next dv-clear">
+            <div class="dv-clear-ico" aria-hidden="true">&#10003;</div>
+            <div>
+                <div class="dv-next-name">You&rsquo;re all caught up</div>
+                <div class="dv-next-addr">No stops waiting right now. New routes from dispatch land here.</div>
+            </div>
+        </section>"""
+        if _show_all:
+            _more_html = f'<a href="{url_for("dashboard")}">Show fewer routes</a>'
+        elif len(_routes) >= _route_limit:
+            _more_html = f'<a href="{url_for("dashboard", all=1)}">Show older routes &#8250;</a>'
+        else:
+            _more_html = ""
+        conn.close()
 
         body = f"""
     <style>
-      .drv-clock {{ display:flex; align-items:center; gap:10px; border-radius:14px;
-        padding:14px 16px; margin-bottom:14px; font-weight:700; }}
-      .drv-clock.on {{ border:1px solid rgba(61,220,132,.35); background:rgba(61,220,132,.07);
-        color:#3DDC84; }}
-      .drv-clock-dot {{ width:12px; height:12px; border-radius:50%; background:#3DDC84;
-        box-shadow:0 0 10px rgba(61,220,132,.8); flex:none; }}
-      .drv-clock a {{ margin-left:auto; color:#3DDC84; font-size:13px; }}
-      .drv-clock.off {{ border:1px solid rgba(255,107,26,.35); background:rgba(255,107,26,.07);
+      .dv {{ max-width:1180px; margin:0 auto; }}
+      .dv-head {{ display:flex; align-items:flex-end; justify-content:space-between; gap:12px;
+        margin:4px 2px 16px; }}
+      .dv-date {{ font-size:12px; font-weight:800; letter-spacing:1.6px; text-transform:uppercase;
         color:#FF9D5C; }}
-      .drv-clock.off button {{ margin-left:auto; background:var(--orange,#FF6B1A); color:#111;
-        border:none; border-radius:10px; font-weight:800; padding:10px 18px; cursor:pointer;
-        min-height:48px; }}
+      .dv-hello {{ font-size:clamp(1.55rem,6vw,2.1rem); font-weight:800; line-height:1.1; margin:4px 0 0;
+        letter-spacing:-.4px; }}
+      .dv-top {{ display:grid; gap:14px; margin-bottom:14px; }}
+      .dv-side {{ display:grid; gap:12px; align-content:start; }}
+      /* clock */
+      .dv-clock {{ display:flex; align-items:center; gap:12px; border-radius:18px; padding:14px 14px 14px 16px;
+        text-decoration:none; margin:0; min-height:76px; }}
+      .dv-clock-txt {{ display:flex; flex-direction:column; min-width:0; flex:1; }}
+      .dv-clock-txt b {{ font-size:1.05rem; font-weight:800; }}
+      .dv-clock-txt small {{ font-size:.82rem; opacity:.8; margin-top:2px; }}
+      .dv-clock.on {{ border:1px solid rgba(61,220,132,.38);
+        background:linear-gradient(135deg,rgba(61,220,132,.16),rgba(61,220,132,.04)); color:#3DDC84; }}
+      .dv-pulse {{ position:relative; width:14px; height:14px; border-radius:50%; background:#3DDC84; flex:none;
+        margin:0 4px; box-shadow:0 0 12px rgba(61,220,132,.9); }}
+      .dv-pulse::after {{ content:""; position:absolute; inset:-6px; border-radius:50%;
+        border:2px solid rgba(61,220,132,.55); animation:dvPing 1.8s ease-out infinite; }}
+      @keyframes dvPing {{ from {{ transform:scale(.5); opacity:1; }} to {{ transform:scale(1.6); opacity:0; }} }}
+      .dv-clock-go {{ flex:none; font-weight:800; font-size:.9rem; padding:10px 14px; border-radius:12px;
+        background:rgba(61,220,132,.14); color:#3DDC84; }}
+      .dv-clock.off {{ border:1px solid rgba(255,107,26,.35);
+        background:linear-gradient(135deg,rgba(255,107,26,.14),rgba(255,107,26,.03)); color:#FFB27A; }}
+      .dv-clock-ico {{ flex:none; width:40px; height:40px; border-radius:12px; display:flex; align-items:center;
+        justify-content:center; background:rgba(255,107,26,.16); color:#FF9D5C; }}
+      .dv-clock-ico svg {{ width:22px; height:22px; }}
+      .dv-clock .dv-clock-btn {{ flex:none; min-height:52px !important; padding:0 22px !important;
+        border-radius:14px !important; border:none !important; cursor:pointer;
+        background:linear-gradient(135deg,#00c853,#00e57a) !important; color:#00230e !important;
+        font-weight:900 !important; font-size:1rem !important; letter-spacing:.3px;
+        box-shadow:0 6px 22px rgba(0,232,125,.28) !important; }}
+      /* stats */
+      .drv-stats {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; }}
+      .drv-stat {{ background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.08);
+        border-radius:16px; padding:12px 8px; text-align:center; text-decoration:none; color:var(--text); }}
+      .drv-stat .n {{ font-size:1.7rem; font-weight:800; line-height:1; }}
+      .drv-stat .l {{ margin-top:6px; font-size:.66rem; font-weight:700; letter-spacing:.5px;
+        text-transform:uppercase; color:var(--text-muted); }}
+      .drv-stat.drv-hours {{ border-color:rgba(61,220,132,.4);
+        background:linear-gradient(160deg,rgba(61,220,132,.14),rgba(61,220,132,.04)); }}
+      .drv-stat.drv-hours .n {{ color:#3DDC84; text-shadow:0 0 14px rgba(61,220,132,.5); }}
+      .drv-stat.drv-hours .l {{ color:#3DDC84; opacity:.85; }}
+      .drv-stat.left .n {{ color:#FF9D5C; }}
+      /* up next */
+      .dv-next {{ position:relative; overflow:hidden; border-radius:22px; padding:18px;
+        border:1px solid rgba(255,107,26,.4);
+        background:radial-gradient(120% 90% at 100% 0%,rgba(255,107,26,.22),transparent 60%),
+                   linear-gradient(180deg,#1d1814,#141414);
+        box-shadow:0 18px 40px rgba(0,0,0,.35), 0 0 0 1px rgba(255,107,26,.06) inset; }}
+      .dv-next-top {{ display:flex; justify-content:space-between; align-items:center; gap:10px; }}
+      .dv-kick {{ font-size:11px; font-weight:800; letter-spacing:1.4px; text-transform:uppercase; color:#FF9D5C; }}
+      .dv-next-route {{ font-size:12px; color:var(--text-muted); white-space:nowrap; overflow:hidden;
+        text-overflow:ellipsis; max-width:50%; }}
+      .dv-next-act {{ display:flex; align-items:center; gap:8px; margin-top:14px; font-weight:800;
+        color:#FFB27A; font-size:.95rem; }}
+      .dv-code {{ font-size:.72rem; font-weight:900; letter-spacing:.5px; padding:5px 8px; border-radius:8px;
+        background:#FF6B1A; color:#160800; }}
+      .dv-next-name {{ font-size:clamp(1.45rem,6.4vw,2rem); font-weight:800; line-height:1.15;
+        margin-top:6px; word-break:break-word; }}
+      .dv-next-addr {{ color:var(--text-dim,#B5B5AD); margin-top:4px; font-size:.98rem; word-break:break-word; }}
+      .dv-segs {{ display:flex; gap:4px; margin-top:14px; }}
+      .dv-segs i {{ flex:1; height:6px; border-radius:3px; background:rgba(255,255,255,.1); }}
+      .dv-segs i.d {{ background:#3DDC84; }}
+      .dv-segs i.c {{ background:#FF6B1A; box-shadow:0 0 10px rgba(255,107,26,.7); }}
+      .dv-segs.big i {{ height:8px; border-radius:4px; }}
+      .dv-next-btns {{ display:flex; gap:10px; margin-top:16px; }}
+      .dv-btn {{ display:inline-flex; align-items:center; justify-content:center; gap:8px; min-height:56px;
+        border-radius:16px; font-weight:900; font-size:1.02rem; text-decoration:none; padding:0 18px; }}
+      .dv-btn svg {{ width:20px; height:20px; flex:none; }}
+      .dv-go {{ flex:1.6; white-space:nowrap; background:linear-gradient(135deg,#FF6B1A,#FF9D5C); color:#1a0a00;
+        box-shadow:0 8px 24px rgba(255,107,26,.35); }}
+      .dv-nav {{ flex:1; background:rgba(255,255,255,.07); border:1px solid rgba(255,255,255,.16); color:var(--text); }}
+      .dv-go:active, .dv-nav:active {{ transform:scale(.98); }}
+      .dv-clear {{ display:flex; align-items:center; gap:14px; border-color:rgba(61,220,132,.35);
+        background:linear-gradient(180deg,rgba(61,220,132,.08),rgba(255,255,255,.02)); }}
+      .dv-clear .dv-next-name {{ font-size:1.25rem; margin:0; }}
+      .dv-clear-ico {{ flex:none; width:48px; height:48px; border-radius:50%; display:flex; align-items:center;
+        justify-content:center; font-size:22px; font-weight:900; background:rgba(61,220,132,.16); color:#3DDC84; }}
+      /* forgot clock-out */
       .drv-forgot {{ border:1px solid rgba(255,82,82,.4); background:rgba(255,82,82,.06);
-        border-radius:14px; padding:14px 16px; margin-bottom:12px; }}
+        border-radius:16px; padding:14px 16px; margin-bottom:12px; }}
       .drv-forgot-title {{ font-weight:800; color:#FF6B6B; margin-bottom:6px; }}
       .drv-forgot p {{ color:var(--text-dim); font-size:13px; margin:0 0 10px; }}
       .drv-forgot form {{ display:flex; gap:8px; }}
       .drv-forgot input[type=time] {{ flex:1; padding:10px 12px; background:rgba(255,255,255,.05);
-        border:1px solid rgba(255,107,26,.25); border-radius:8px; color:var(--text);
+        border:1px solid rgba(255,107,26,.25); border-radius:10px; color:var(--text);
         font-size:16px; min-height:48px; }}
       .drv-forgot button {{ min-height:48px; }}
-      .drv-stats {{ display:flex; gap:10px; margin-bottom:16px; }}
-      .drv-stat {{ flex:1; background:rgba(255,255,255,.04); border:1px solid rgba(255,255,255,.07);
-        border-radius:12px; padding:12px 8px; text-align:center; }}
-      .drv-stat .n {{ font-size:1.6rem; font-weight:800; line-height:1; }}
-      .drv-stat .l {{ margin-top:6px; font-size:.68rem; letter-spacing:.4px; text-transform:uppercase;
-        color:var(--text-muted); }}
-      .drv-stat.drv-hours {{ border-color:rgba(61,220,132,.4);
-        background:linear-gradient(160deg,rgba(61,220,132,.14),rgba(61,220,132,.04));
-        box-shadow:0 0 18px rgba(61,220,132,.12); }}
-      .drv-stat.drv-hours .n {{ color:#3DDC84; text-shadow:0 0 14px rgba(61,220,132,.55); }}
-      .drv-stat.drv-hours .l {{ color:#3DDC84; opacity:.85; }}
-      .drv-board-lbl {{ font-size:11px; font-weight:700; letter-spacing:1.2px; text-transform:uppercase;
-        color:#55554C; margin:0 0 12px; }}
-      .drv-lane {{ display:block; background:var(--card-bg,#171717);
-        border:1px solid rgba(255,255,255,.08); border-radius:16px; padding:16px;
-        margin-bottom:14px; text-decoration:none; color:var(--text); }}
-      .drv-lane:active {{ filter:brightness(1.15); }}
-      .drv-lane-head {{ display:flex; align-items:flex-start; justify-content:space-between;
-        gap:10px; margin-bottom:10px; }}
-      .drv-lane-name {{ font-size:1.15rem; font-weight:800; word-break:break-word; }}
-      .drv-lane-date {{ color:var(--text-muted); font-size:.85rem; margin-top:2px; }}
-      .drv-status {{ flex:none; font-size:.68rem; font-weight:800; letter-spacing:.6px;
-        padding:6px 10px; border-radius:999px; }}
+      /* route lanes */
+      .drv-board-lbl {{ display:flex; align-items:center; justify-content:space-between; font-size:11px;
+        font-weight:800; letter-spacing:1.4px; text-transform:uppercase; color:#7A7A70; margin:22px 2px 10px; }}
+      .dv-lanes {{ display:grid; gap:14px; grid-template-columns:repeat(auto-fill,minmax(min(100%,340px),1fr));
+        align-items:start; }}
+      .dv-lane {{ background:var(--card-bg,#171717); border:1px solid rgba(255,255,255,.08);
+        border-radius:18px; overflow:hidden; }}
+      .dv-lane.is-done {{ opacity:.78; }}
+      .dv-lane-link {{ display:block; padding:16px 16px 12px; text-decoration:none; color:var(--text); }}
+      .dv-lane-link:active {{ background:rgba(255,255,255,.03); }}
+      .dv-lane-head {{ display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }}
+      .dv-lane-id {{ min-width:0; }}
+      .dv-lane-day {{ font-size:11px; font-weight:800; letter-spacing:1.2px; text-transform:uppercase; color:#FF9D5C; }}
+      .dv-lane.is-done .dv-lane-day {{ color:var(--text-muted); }}
+      .dv-lane-name {{ font-size:1.12rem; font-weight:800; margin-top:3px; word-break:break-word; }}
+      .dv-count {{ font-size:.75rem; color:var(--text-muted); margin-top:7px; }}
+      .drv-status {{ flex:none; font-size:.66rem; font-weight:800; letter-spacing:.6px;
+        padding:6px 10px; border-radius:999px; white-space:nowrap; }}
       .drv-status.open {{ background:rgba(255,255,255,.08); color:var(--text-dim); }}
       .drv-status.progress {{ background:rgba(255,107,26,.16); color:#FF8C42; }}
       .drv-status.done {{ background:rgba(61,220,132,.14); color:#3DDC84; }}
-      .drv-pills {{ flex:none; display:flex; gap:6px; align-items:center; }}
-      .drv-type {{ font-size:.68rem; font-weight:800; letter-spacing:.6px;
-        padding:6px 10px; border-radius:999px; }}
+      .drv-pills {{ flex:none; display:flex; gap:6px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }}
+      .drv-type {{ font-size:.66rem; font-weight:800; letter-spacing:.6px; padding:6px 10px; border-radius:999px; }}
       .drv-type.garbage {{ background:rgba(77,171,245,.16); color:#4DABF5; }}
-      .drv-progress {{ height:8px; border-radius:4px; background:rgba(255,255,255,.08);
-        overflow:hidden; }}
-      .drv-progress div {{ height:100%; border-radius:4px;
-        background:linear-gradient(90deg,#FF6B1A,#FF9D5C); }}
-      .drv-progress-lbl {{ font-size:.75rem; color:var(--text-muted); margin:6px 0 10px; }}
-      .drv-stop {{ display:flex; align-items:center; gap:8px; padding:7px 0;
-        border-top:1px solid rgba(255,255,255,.05); font-size:.9rem; }}
-      .drv-dot {{ flex:none; width:22px; height:22px; border-radius:50%;
+      .dv-stops {{ padding:0 16px; }}
+      .dv-stop {{ display:flex; align-items:center; gap:10px; padding:9px 0; min-height:48px;
+        border-top:1px solid rgba(255,255,255,.06); }}
+      .dv-stop.done .dv-stop-name {{ color:var(--text-muted); text-decoration:line-through;
+        text-decoration-color:rgba(255,255,255,.25); }}
+      .dv-stop.cur {{ margin:0 -16px; padding-left:16px; padding-right:16px;
+        background:linear-gradient(90deg,rgba(255,107,26,.12),transparent 70%); }}
+      .drv-dot {{ flex:none; width:24px; height:24px; border-radius:50%;
         display:inline-flex; align-items:center; justify-content:center; font-size:.7rem; }}
       .drv-dot.done {{ background:rgba(61,220,132,.18); color:#3DDC84; }}
-      .drv-dot.cur {{ background:rgba(255,107,26,.2); color:#FF8C42; }}
-      .drv-dot.todo {{ border:2px solid rgba(255,255,255,.18); }}
-      .drv-act {{ flex:none; font-size:.66rem; font-weight:800; letter-spacing:.4px;
-        color:#FF8C42; background:rgba(255,107,26,.12); padding:4px 8px; border-radius:6px; }}
-      .drv-stop-name {{ color:var(--text); overflow:hidden; text-overflow:ellipsis;
-        white-space:nowrap; }}
-      .drv-stop-name.muted {{ color:var(--text-muted); }}
-      .drv-lane-foot {{ margin-top:10px; text-align:right; color:#FF8C42; font-weight:700;
-        font-size:.85rem; }}
-      .drv-empty {{ text-align:center; color:var(--text-muted); padding:30px 0; }}
-      .drv-more {{ text-align:center; margin-top:4px; }}
-      .drv-more a {{ color:var(--text-dim); font-size:13px; font-weight:600; }}
-      /* 2026-10-17: driver dashboard actions — rearrange / add stop / cancel */
-      .drv-actions {{ display:flex; gap:8px; margin-top:12px; padding-top:12px;
-        border-top:1px solid rgba(255,255,255,0.07); }}
-      .drv-act-btn {{ flex:1; display:flex; align-items:center; justify-content:center; gap:6px;
-        min-height:46px; padding:8px 6px; background:rgba(255,255,255,0.05);
-        border:1px solid rgba(255,255,255,0.12); border-radius:12px; color:#E8E8E2;
-        font-size:13px; font-weight:700; cursor:pointer; }}
-      .drv-act-btn:active {{ background:rgba(255,255,255,0.10); }}
-      .drv-stop {{ position:relative; }}
-      .drv-stop-cancel {{ position:absolute; right:0; top:50%; transform:translateY(-50%);
-        width:32px; height:32px; border-radius:8px; background:transparent;
-        border:1px solid rgba(255,82,82,0.3); color:rgba(255,122,122,0.7);
-        font-size:14px; cursor:pointer; display:flex; align-items:center; justify-content:center; }}
-      .drv-stop-cancel:active {{ background:rgba(255,82,82,0.12); }}
-      .drv-stop.has-cancel {{ padding-right:40px; }}
+      .drv-dot.cur {{ background:#FF6B1A; color:#1a0a00; }}
+      .drv-dot.todo {{ border:2px solid rgba(255,255,255,.2); }}
+      .drv-act {{ flex:none; min-width:30px; text-align:center; font-size:.66rem; font-weight:800; letter-spacing:.4px;
+        color:#FF8C42; background:rgba(255,107,26,.12); padding:4px 7px; border-radius:7px; }}
+      .dv-stop-txt {{ flex:1; min-width:0; display:flex; flex-direction:column; }}
+      .dv-stop-name {{ color:var(--text); font-weight:600; overflow:hidden; text-overflow:ellipsis;
+        white-space:nowrap; font-size:.93rem; }}
+      .dv-stop-name.muted {{ color:var(--text-muted); font-weight:400; }}
+      .dv-stop-addr {{ color:var(--text-muted); font-size:.78rem; overflow:hidden; text-overflow:ellipsis;
+        white-space:nowrap; margin-top:1px; }}
+      .dv-stops .dv-stop-x {{ flex:none; width:36px !important; height:36px !important; min-height:0 !important;
+        padding:0 !important; margin:0 !important; border-radius:10px !important;
+        background:transparent !important; box-shadow:none !important;
+        border:1px solid rgba(255,255,255,.12) !important; color:#8C8C84 !important;
+        font-size:13px !important; font-weight:700 !important; cursor:pointer;
+        display:inline-flex !important; align-items:center; justify-content:center; }}
+      .dv-stops .dv-stop-x:hover, .dv-stops .dv-stop-x:active {{ border-color:rgba(255,82,82,.55) !important;
+        color:#FF7A7A !important; background:rgba(255,82,82,.08) !important; }}
+      .dv-lane-foot {{ display:flex; gap:8px; align-items:center; padding:12px 16px 14px;
+        border-top:1px solid rgba(255,255,255,.06); margin-top:2px; }}
+      .dv-lane .dv-mini {{ flex:1; display:inline-flex; align-items:center; justify-content:center; gap:4px;
+        min-height:46px !important; padding:0 8px !important; margin:0 !important; border-radius:12px !important;
+        background:rgba(255,255,255,.05) !important; border:1px solid rgba(255,255,255,.12) !important;
+        box-shadow:none !important; color:#E8E8E2 !important; font-size:13px !important; font-weight:700 !important;
+        text-decoration:none; cursor:pointer; white-space:nowrap; }}
+      .dv-lane .dv-mini.dv-mini-go {{ background:rgba(255,107,26,.14) !important;
+        border-color:rgba(255,107,26,.4) !important; color:#FFB27A !important; }}
+      .dv-lane.is-done .dv-lane-foot .dv-mini {{ flex:none; padding:0 16px !important; }}
+      .dv-done-note {{ flex:1; color:#3DDC84; font-weight:700; font-size:.88rem; }}
+      .drv-empty {{ text-align:center; color:var(--text-muted); padding:30px 16px; border:1px dashed rgba(255,255,255,.12);
+        border-radius:18px; }}
+      .drv-more {{ text-align:center; margin:16px 0 4px; }}
+      .drv-more a {{ display:inline-flex; align-items:center; min-height:44px; padding:0 18px; border-radius:12px;
+        color:var(--text-dim); font-size:13px; font-weight:700; border:1px solid rgba(255,255,255,.1);
+        text-decoration:none; }}
+      /* Phone, not clocked in yet: Clock In is the first tap of the day. */
+      @media (max-width:959px) {{ .dv-top.clock-first .dv-side {{ order:-1; }} }}
+      @media (max-width:420px) {{
+        .dv-btn {{ font-size:.96rem; padding:0 14px; }}
+        .dv-nav {{ flex:none; }}
+      }}
+      @media (max-width:380px) {{
+        .dv-next-btns {{ flex-direction:column; }}
+        .dv-clock .dv-clock-btn {{ padding:0 16px !important; }}
+        .dv-lane .dv-mini {{ font-size:12px !important; }}
+      }}
+      @media (min-width:960px) {{
+        .dv-top {{ grid-template-columns:minmax(0,1.5fr) minmax(300px,1fr); align-items:stretch; }}
+        .dv-side {{ grid-template-rows:auto 1fr; }}
+        .dv-side .drv-stats {{ align-self:stretch; }}
+        .dv-side .drv-stat {{ display:flex; flex-direction:column; justify-content:center; }}
+        .dv-next {{ padding:24px; }}
+      }}
+      @media (prefers-reduced-motion: reduce) {{ .dv-pulse::after {{ animation:none; }} }}
+      #drv-reorder-modal .btn.secondary, #drv-addstop-modal .btn.secondary {{
+        background:rgba(255,255,255,.05) !important; border:1px solid rgba(255,255,255,.16) !important;
+        color:var(--text) !important; box-shadow:none !important; }}
     </style>
-    <div class="hero">
-        <h1>Driver Dashboard</h1>
-        <p>{e(today)} &mdash; your board, your routes, your stops.</p>
-    </div>
-    {_clock_strip}
+    <div class="dv">
+    <header class="dv-head">
+        <div>
+            <div class="dv-date">{e(_today_lbl)}</div>
+            <h1 class="dv-hello">{_greet}{(", " + e(_first)) if _first else ""}</h1>
+        </div>
+    </header>
     {_forgot_html}
-    <div class="drv-stats">
-        <div class="drv-stat"><div class="n" style="color:#FF8C42;">{_active_n}</div><div class="l">Active</div></div>
-        <div class="drv-stat"><div class="n">{_rc_total}</div><div class="l">Routes</div></div>
-        <div class="drv-stat"><div class="n">{_stop_total}</div><div class="l">Stops</div></div>
-        <div class="drv-stat drv-hours"><div class="n"{_dash_hours_attrs}>{_week_hours:.1f}</div><div class="l">Hours</div></div>
+    <div class="dv-top{'' if _clk_on else ' clock-first'}">
+        {_next_html}
+        <div class="dv-side">
+            {_clock_strip}
+            <div class="drv-stats">
+                <a class="drv-stat drv-hours" href="{url_for('driver_clock')}"><div class="n"{_dash_hours_attrs}>{_week_hours:.1f}</div><div class="l">Hours this week</div></a>
+                <div class="drv-stat left"><div class="n">{_left_n}</div><div class="l">Stops left today</div></div>
+                <div class="drv-stat"><div class="n">{_active_n}</div><div class="l">Active routes</div></div>
+            </div>
+        </div>
     </div>
-    <h2 class="drv-board-lbl">Route Board</h2>
-    {_lanes}
-    <div class="drv-more"><a href="{url_for('driver_dashboard')}">Full route history &#8250;</a></div>
+    <h2 class="drv-board-lbl"><span>My routes</span></h2>
+    <div class="dv-lanes">{_lanes}</div>
+    {('<div class="drv-more">' + _more_html + '</div>') if _more_html else ''}
+    </div>
     <script>
     // 2026-10-14: dashboard hours tick from the phone's clock (same logic as
     // _WEEK_LIVE_TICK_JS) — immune to server timezone issues.
@@ -12074,6 +12333,11 @@ def dashboard():
         tick();
         setInterval(tick, 1000);
     }})();
+    </script>
+    <!-- 2026-10-27: the hours script above was never closed, so the browser
+         read the modals and the second script below as JavaScript. That
+         threw "Unexpected token '<'" and left Rearrange, Add Stop and the stop
+         cancel buttons dead. Closed now. -->
     <!-- 2026-10-17: driver dashboard modals — reorder stops, add stop -->
     <div id="drv-modal-overlay" class="no-photo-confirm-overlay" hidden
          onclick="drvCloseModal()"></div>
@@ -41444,39 +41708,63 @@ def _driver_time_off_card_html(conn, company_id, driver_id, today, co_settings, 
     # The Running-late control used to live here, at the bottom of the page
     # under Time Off. It now renders next to Clock In / Out — see
     # _driver_late_card_html().
+    # 2026-10-27: the From / To boxes used to be inline-blocks with <br>s
+    # between label and input, so they sat at different heights and the
+    # Request button floated off on its own. A labelled grid now: two dates
+    # side by side, reason full width, one big button.
+    _to_css = (
+        '<style>'
+        '.to-card h2{display:flex;align-items:center;gap:8px;margin:0 0 4px;}'
+        '.to-sub{color:var(--text-muted);font-size:13px;margin:0 0 14px;}'
+        '.to-form{display:grid;grid-template-columns:1fr 1fr;gap:10px 10px;}'
+        '.to-f{display:flex;flex-direction:column;gap:6px;min-width:0;}'
+        '.to-f.wide{grid-column:1/-1;}'
+        '.to-f label{font-size:10.5px;font-weight:800;letter-spacing:.09em;text-transform:uppercase;color:var(--text-muted);}'
+        '.to-f input,.to-f select{width:100%;min-width:0;box-sizing:border-box;min-height:48px;padding:8px 12px;'
+        'background:var(--bg-0,#121212);border:1px solid rgba(255,255,255,0.14);border-radius:12px;color:var(--text);'
+        'font-size:16px;-webkit-appearance:none;appearance:none;}'
+        '.to-f input[type=date]{display:block;line-height:30px;}'
+        '.to-form .to-go{grid-column:1/-1;min-height:52px!important;border-radius:14px!important;border:none!important;'
+        'cursor:pointer;font-weight:900!important;font-size:15px!important;margin:4px 0 0!important;'
+        'background:linear-gradient(135deg,#00c853,#00e57a)!important;color:#00230e!important;box-shadow:0 6px 20px rgba(0,232,125,.22)!important;}'
+        '.to-form .to-go.alt{background:rgba(255,255,255,0.05)!important;color:var(--text)!important;'
+        'border:1px solid rgba(255,255,255,0.16)!important;box-shadow:none!important;font-weight:800!important;}'
+        '.to-list{margin-top:16px;}'
+        '.to-rec{margin-top:14px;border-top:1px solid rgba(255,255,255,0.07);padding-top:6px;}'
+        '.to-rec summary{cursor:pointer;min-height:44px;display:flex;align-items:center;font-weight:700;font-size:14px;'
+        'color:var(--text-dim);list-style:none;}'
+        '.to-rec summary::-webkit-details-marker{display:none;}'
+        '.to-rec summary::after{content:"\\203A";margin-left:auto;font-size:20px;transition:transform .15s;}'
+        '.to-rec[open] summary::after{transform:rotate(90deg);}'
+        '</style>'
+    )
     return (
-        '<div class="card" style="margin-top:16px;">'
-        '<h2 style="margin-top:0;">&#127796; Time Off</h2>'
-        '<form method="POST" action="' + url_for("time_off_request") + '" '
-        'style="display:flex;gap:8px;flex-wrap:wrap;align-items:end;margin-bottom:6px;">'
+        _to_css
+        + '<div class="card to-card">'
+        '<h2>&#127796; Time Off</h2>'
+        '<p class="to-sub">Ask for a day (or a few) off. Dispatch approves it.</p>'
+        '<form method="POST" action="' + url_for("time_off_request") + '" class="to-form">'
         '<input type="hidden" name="_csrf_token" value="' + csrf + '">'
-        '<div><label class="muted small">From</label><br>'
-        '<input type="date" name="start_date" required style="min-height:44px;padding:6px 10px;'
-        'background:var(--bg-0,#121212);border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);"></div>'
-        '<div><label class="muted small">To (optional)</label><br>'
-        '<input type="date" name="end_date" style="min-height:44px;padding:6px 10px;'
-        'background:var(--bg-0,#121212);border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);"></div>'
-        '<div style="flex:1;min-width:120px;"><label class="muted small">Reason (optional)</label><br>'
-        '<input name="reason" style="width:100%;min-height:44px;padding:6px 10px;'
-        'background:var(--bg-0,#121212);border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);"></div>'
-        '<button style="min-height:44px;padding:0 18px;border-radius:9px;border:none;cursor:pointer;font-weight:800;'
-        'background:linear-gradient(135deg,#00c853,#00e57a);color:#001a0a;">Request</button>'
+        '<div class="to-f"><label for="to-from">From</label>'
+        '<input id="to-from" type="date" name="start_date" min="' + e(today) + '" required></div>'
+        '<div class="to-f"><label for="to-to">To <span style="text-transform:none;letter-spacing:0;font-weight:600;">(optional)</span></label>'
+        '<input id="to-to" type="date" name="end_date" min="' + e(today) + '"></div>'
+        '<div class="to-f wide"><label for="to-why">Reason <span style="text-transform:none;letter-spacing:0;font-weight:600;">(optional)</span></label>'
+        '<input id="to-why" name="reason" maxlength="200" placeholder="Doctor, family, vacation&hellip;"></div>'
+        '<button type="submit" class="to-go">Request time off</button>'
         '</form>'
-        + '<div style="margin-top:14px;">' + req_html + '</div>'
-        + ('<details style="margin-top:12px;"><summary class="muted small" style="cursor:pointer;min-height:36px;">'
-           'Recurring days off</summary>'
-           '<div style="margin-top:8px;">' + (rule_html or '<div class="muted small">None yet.</div>')
-           + '<form method="POST" action="' + url_for("recurring_off_create") + '" '
-           'style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:10px;">'
+        + '<div class="to-list">' + req_html + '</div>'
+        + ('<details class="to-rec"><summary>Recurring days off</summary>'
+           '<div style="margin-top:4px;">' + (rule_html or '<div class="muted small">None yet.</div>')
+           + '<form method="POST" action="' + url_for("recurring_off_create") + '" class="to-form" style="margin-top:12px;">'
            '<input type="hidden" name="_csrf_token" value="' + csrf + '">'
-           '<select name="frequency" style="min-height:44px;padding:6px 10px;background:var(--bg-0,#121212);'
-           'border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);">'
+           '<div class="to-f"><label for="to-freq">How often</label>'
+           '<select id="to-freq" name="frequency">'
            '<option value="weekly">Every week</option><option value="biweekly">Every other week</option>'
-           '<option value="monthly">Monthly</option></select>'
-           '<input type="date" name="start_date" required style="min-height:44px;padding:6px 10px;'
-           'background:var(--bg-0,#121212);border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:var(--text);">'
-           '<button style="min-height:44px;padding:0 14px;border-radius:9px;border:1px solid rgba(255,255,255,0.14);'
-           'background:transparent;color:var(--text);font-weight:700;cursor:pointer;">Request recurring</button>'
+           '<option value="monthly">Monthly</option></select></div>'
+           '<div class="to-f"><label for="to-start">Starting</label>'
+           '<input id="to-start" type="date" name="start_date" required></div>'
+           '<button type="submit" class="to-go alt">Request recurring day off</button>'
            '</form></div></details>')
         + '</div>'
     )
@@ -41679,12 +41967,6 @@ def driver_clock():
     _me_row = conn.execute(
         "SELECT id, username, full_name, avatar_path FROM users WHERE id=?", (driver_id,)
     ).fetchone()
-    driver_avatar_card = (
-        '<div class="card" style="max-width:460px;margin:0 auto 16px;display:flex;'
-        'align-items:center;gap:14px;flex-wrap:wrap;">'
-        + _avatar_upload_control_html(_me_row, size=56, show_remove=True)
-        + '</div>'
-    ) if _me_row else ""
 
     # 2026-10-14: warn before clocking out with stops still open — the yard
     # drive is paid time, but an unfinished route usually means "not done yet".
@@ -41720,7 +42002,9 @@ def driver_clock():
     # Status badge
     if has_ci and not has_co:
         badge_bg = "rgba(0,232,125,0.14)"; badge_color = "#3DDC84"
-        badge_text = "&#9899;&nbsp;Clocked In"
+        # 2026-10-27: was &#9899; (a BLACK circle emoji) — rendered as a dark
+        # blob on the green pill. A live CSS dot now.
+        badge_text = '<span class="ck-dot"></span>Clocked In'
     elif has_co:
         badge_bg = "rgba(255,107,26,0.10)"; badge_color = "#FF9D5C"
         badge_text = "&#10003;&nbsp;Day Complete"
@@ -41894,50 +42178,136 @@ def driver_clock():
         '</div>'
     )
 
+    # Live "on the clock" timer while clocked in (ticks from the phone's
+    # clock, epoch ms so iOS doesn't misread the wall time as UTC).
+    _elapsed_html = ""
+    if has_ci and not has_co:
+        try:
+            _ci_ms = _wall_clock_in_ms(_ci, (co_settings.get("timezone") if co_settings else None))
+        except Exception:
+            _ci_ms = 0
+        if _ci_ms:
+            _elapsed_html = (
+                '<div class="ck-elapsed" data-ci-ms="' + str(int(_ci_ms)) + '">'
+                '<span class="ck-elapsed-n">&nbsp;</span><span class="ck-elapsed-l">on the clock today</span></div>'
+                '<script>(function(){var el=document.querySelector(".ck-elapsed");if(!el)return;'
+                'var t=parseInt(el.getAttribute("data-ci-ms"),10);if(!t)return;'
+                'var n=el.querySelector(".ck-elapsed-n");function tick(){var m=Math.max(0,Math.floor((Date.now()-t)/60000));'
+                'n.textContent=Math.floor(m/60)+"h "+("0"+(m%60)).slice(-2)+"m";}tick();setInterval(tick,15000);})();</script>'
+            )
+
+    # ── header: who + what day, with the profile photo built in ─────────────
+    _hdr_photo = ""
+    if _me_row:
+        _uid = _me_row["id"]
+        _has_photo = bool((_me_row["avatar_path"] or "").strip())
+        _hdr_photo = (
+            '<span class="ck-av" onclick="haAvatarPick(' + str(_uid) + ')" title="Change photo">'
+            + avatar_html(_me_row, 60) + '</span>'
+            '<input id="ha-av-input-' + str(_uid) + '" type="file" accept="image/*" style="display:none;" '
+            'onchange="haAvatarChange(' + str(_uid) + ', this)">'
+        )
+        _photo_ctrls = (
+            '<div class="ck-photo">'
+            '<button type="button" class="ck-photo-btn" onclick="haAvatarPick(' + str(_uid) + ')">'
+            + ("Change photo" if _has_photo else "Add photo") + '</button>'
+            + ('<button type="button" class="ck-photo-btn rm" onclick="haAvatarRemove(' + str(_uid) + ')">Remove</button>'
+               if _has_photo else '')
+            + '<span id="ha-av-status-' + str(_uid) + '" class="muted small" hidden></span>'
+            '</div>'
+        )
+    else:
+        _photo_ctrls = ""
+    _me_name = ""
+    if _me_row:
+        _me_name = (_me_row["full_name"] or _me_row["username"] or "").strip()
+
+    _CK_CSS = """
+    <style>
+    .ck-wrap{max-width:1100px;margin:0 auto;}
+    .ck-head{display:flex;align-items:center;gap:14px;margin:4px 2px 16px;}
+    .ck-av{position:relative;cursor:pointer;flex:none;border-radius:50%;
+      box-shadow:0 0 0 3px rgba(255,107,26,.35),0 0 22px rgba(255,107,26,.25);}
+    .ck-id{min-width:0;flex:1;}
+    .ck-kick{font-size:12px;font-weight:800;letter-spacing:1.5px;text-transform:uppercase;color:#FF9D5C;}
+    .ck-name{font-size:clamp(1.4rem,6vw,1.9rem);font-weight:800;line-height:1.15;margin:3px 0 0;
+      overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    .ck-photo{display:flex;gap:6px;align-items:center;margin-top:6px;flex-wrap:wrap;}
+    .ck-photo .ck-photo-btn{min-height:32px!important;padding:0 10px!important;margin:0!important;border-radius:9px!important;
+      background:rgba(255,255,255,.05)!important;border:1px solid rgba(255,255,255,.14)!important;box-shadow:none!important;
+      color:var(--text)!important;font-size:12px!important;font-weight:700!important;cursor:pointer;}
+    .ck-photo .ck-photo-btn.rm{color:#FF9B9B!important;border-color:rgba(255,82,82,.35)!important;}
+    .ck-grid{display:grid;gap:0 18px;}
+    .ck-grid .card{max-width:none!important;margin:0 0 16px!important;}
+    .ck-status{border-radius:22px!important;}
+    .ck-status-top{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:16px;}
+    .ck-lbl{font-size:11px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:var(--text-soft);}
+    .ck-pill{display:inline-flex;align-items:center;gap:8px;padding:8px 16px;border-radius:999px;
+      font-weight:800;font-size:14px;white-space:nowrap;}
+    .ck-dot{position:relative;width:10px;height:10px;border-radius:50%;background:#3DDC84;flex:none;
+      box-shadow:0 0 10px rgba(61,220,132,.9);}
+    .ck-dot::after{content:"";position:absolute;inset:-5px;border-radius:50%;border:2px solid rgba(61,220,132,.5);
+      animation:ckPing 1.8s ease-out infinite;}
+    @keyframes ckPing{from{transform:scale(.5);opacity:1}to{transform:scale(1.6);opacity:0}}
+    @media (prefers-reduced-motion: reduce){.ck-dot::after{animation:none}}
+    .ck-times{display:grid;grid-template-columns:1fr 1fr;border:1px solid rgba(255,255,255,.08);
+      border-radius:16px;overflow:hidden;background:rgba(0,0,0,.18);}
+    .ck-times>div{padding:14px 16px;}
+    .ck-times>div+div{border-left:1px solid rgba(255,255,255,.08);}
+    .ck-times .v{font-size:clamp(1.35rem,6vw,1.75rem);font-weight:800;margin-top:6px;white-space:nowrap;}
+    .ck-elapsed{display:flex;align-items:baseline;gap:8px;margin:14px 2px 0;}
+    .ck-elapsed-n{font-size:1.5rem;font-weight:800;color:#3DDC84;font-variant-numeric:tabular-nums;}
+    .ck-elapsed-l{color:var(--text-muted);font-size:.9rem;}
+    .ck-actions{margin-top:18px;}
+    .ck-actions button{min-height:58px;}
+    .ck-sec-title{font-size:11px;font-weight:800;letter-spacing:1.4px;text-transform:uppercase;color:#7A7A70;
+      margin:6px 2px 10px;}
+    @media (min-width:960px){
+      .ck-grid{grid-template-columns:minmax(0,1fr) minmax(0,1.15fr);align-items:start;}
+    }
+    </style>
+    """
+
     # ── assemble page ────────────────────────────────────────────────────────
     body = (
-        '<div class="hero">'
-        '<h1>&#9201; Clock In / Out</h1>'
-        '<p>' + e(day_label) + '</p>'
+        _CK_CSS
+        + '<div class="ck-wrap">'
+        '<header class="ck-head">' + _hdr_photo
+        + '<div class="ck-id"><div class="ck-kick">' + e(day_label) + '</div>'
+        '<h1 class="ck-name">' + (e(_me_name) if _me_name else 'Clock In / Out') + '</h1>'
+        + _photo_ctrls + '</div></header>'
+        + (_AVATAR_UPLOAD_JS if _me_row else '')
+
+        + '<div class="ck-grid"><div class="ck-col">'
+
+        # Status + the punch button live in ONE card: read it, tap it.
+        '<div class="card ck-status">'
+        '<div class="ck-status-top"><span class="ck-lbl">Today</span>'
+        '<span class="ck-pill" style="background:' + badge_bg + ';color:' + badge_color + ';">'
+        + badge_text + '</span></div>'
+        '<div class="ck-times">'
+        '<div><div class="ck-lbl">Clock in</div>'
+        '<div class="v" style="color:' + ci_color + ';">' + ci_display + '</div></div>'
+        '<div><div class="ck-lbl">Clock out</div>'
+        '<div class="v" style="color:' + co_color + ';">' + co_display + '</div></div>'
         '</div>'
-
-        + driver_avatar_card +
-
-        '<div class="card" style="max-width:460px;margin:0 auto 16px;">'
-        '<div style="font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;'
-        'color:var(--text-soft);margin-bottom:14px;">Today&rsquo;s Status</div>'
-        '<div style="display:inline-block;padding:8px 22px;border-radius:100px;margin-bottom:18px;'
-        'background:' + badge_bg + ';color:' + badge_color + ';font-weight:700;font-size:15px;">'
-        + badge_text + '</div>'
-        '<div style="display:flex;border:1px solid rgba(255,107,26,0.12);'
-        'border-radius:10px;overflow:hidden;">'
-        '<div style="flex:1;padding:14px 18px;border-right:1px solid rgba(255,107,26,0.12);">'
-        '<div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;'
-        'color:var(--text-soft);margin-bottom:6px;">Clock In</div>'
-        '<div style="font-size:24px;font-weight:800;color:' + ci_color + ';">'
-        + ci_display + '</div></div>'
-        '<div style="flex:1;padding:14px 18px;">'
-        '<div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;'
-        'color:var(--text-soft);margin-bottom:6px;">Clock Out</div>'
-        '<div style="font-size:24px;font-weight:800;color:' + co_color + ';">'
-        + co_display + '</div></div>'
-        '</div></div>'
-
-        '<div class="card" style="max-width:460px;margin:0 auto 16px;">'
-        + actions_html +
+        + _elapsed_html
+        + '<div class="ck-actions">' + actions_html + '</div>'
         '</div>'
 
         # Running late sits with the punch buttons — a driver reaching for it is
         # already behind and should not have to scroll to the bottom of the page.
         + late_card_html
+        # ── Fix a past day ─────────────────────────────────────────────
+        + correction_card_html
+        + '</div><div class="ck-col">'
 
-        # ── THIS WEEK summary (below today's status) ─────────────────────
+        # ── THIS WEEK summary ───────────────────────────────────────────
         + week_card_html
         + week_tick_js
-        # ── Fix a past day (below the weekly summary that flags ⚠) ────────
-        + correction_card_html
-        # ── TIME OFF (below weekly hours) ────────────────────────────────
+        # ── TIME OFF ─────────────────────────────────────────────────────
         + time_off_card_html
+        + '</div></div></div>'
         # 2026-10-16: stamps the phone's tap time into clock forms.
         + _PHONE_TS_JS
     )
