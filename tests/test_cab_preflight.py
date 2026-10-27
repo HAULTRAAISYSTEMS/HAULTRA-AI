@@ -68,7 +68,9 @@ def geturl(rid):
 
 # 1) Fresh route → pre-flight only, no stop list.
 h = geturl(r_fresh)
-ok("pf-card" in h and "PRE-FLIGHT" in h and "START ROUTE" in h, "fresh route shows the pre-flight card")
+# Not clocked in yet → the big button is CLOCK IN first (2026-10-14), then START ROUTE.
+ok("pf-card" in h and "PRE-FLIGHT" in h and ("START ROUTE" in h or "CLOCK IN" in h),
+   "fresh route shows the pre-flight card")
 ok("Tap to Navigate" not in h and "cab-sticky-bar" not in h and "2 B St" not in h and "3 C St" not in h,
    "fresh route hides the stop list (no nav, no sticky bar, no later stops)")
 ok(">3<" in h and ">60<" in h and ">1<" in h, "stat tiles: 3 stops / 60 yards / 1 dump")
@@ -79,7 +81,7 @@ ok("min-height:64px" in h, "START ROUTE button is >=64px tall")
 
 # 2) 0-stop route must not crash the tiles.
 h0 = geturl(r_zero)
-ok("pf-card" in h0 and "START ROUTE" in h0, "0-stop route renders pre-flight without crashing")
+ok("pf-card" in h0 and ("START ROUTE" in h0 or "CLOCK IN" in h0), "0-stop route renders pre-flight without crashing")
 ok("No stops on this route yet" in h0, "0-stop route says so in place of a first-stop preview")
 
 # 3) START transition sets started_at once + shows running view.

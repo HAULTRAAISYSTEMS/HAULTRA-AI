@@ -3220,19 +3220,6 @@ def init_db():
     )
     """)
 
-    # Prevent duplicate open routes from concurrent dispatch (double-tap / retry).
-    # Partial index: only one open/in_progress route per driver per day per type.
-    try:
-        cur.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ux_routes_driver_day_open "
-            "ON routes(company_id, assigned_to, route_date, route_type) "
-            "WHERE status IN ('open','in_progress')"
-        )
-    except sqlite3.OperationalError:
-        # route_type column may not exist yet on very old DBs; the migration
-        # at line ~4540 adds it, and this index will be created on next run.
-        pass
-
     cur.execute("""
     CREATE TABLE IF NOT EXISTS stops (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4700,6 +4687,20 @@ def init_db():
     # timestamps, weight_tons for landfill legs, not_before for time windows
     # ("no HOA before 7am").
     safe_add_column(conn, "routes", "route_type TEXT NOT NULL DEFAULT 'rolloff'")
+    # Prevent duplicate open routes from concurrent dispatch (double-tap / retry).
+    # Partial index: only one open/in_progress route per driver per day per type.
+    # 2026-10-27: moved here from right after CREATE TABLE routes — on an old
+    # database company_id / route_type didn't exist yet at that point, the
+    # CREATE failed silently, and the guard was missing until the next restart.
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_routes_driver_day_open "
+            "ON routes(company_id, assigned_to, route_date, route_type) "
+            "WHERE status IN ('open','in_progress')"
+        )
+    except sqlite3.OperationalError:
+        # Existing duplicate open routes block a UNIQUE index; boot anyway.
+        pass
     safe_add_column(conn, "stops", "service_count INTEGER")
     safe_add_column(conn, "stops", "started_at TEXT")
     safe_add_column(conn, "stops", "departed_at TEXT")
@@ -13695,14 +13696,14 @@ def _push_settings_toggle():
           headers: {'Content-Type': 'application/json',
                     'X-CSRF-Token': csrf ? csrf.getAttribute('content') : ''},
           body: JSON.stringify({token: token})
-        }).then(function (r) { return r.json().then(function (d) { return {ok: r.ok, d: d}; }); })
+        }).then(function (r) { return r.json().then(function (d) { return {ok: r.ok, status: r.status, d: d}; }); })
         .then(function (res) {
           if (res.ok && res.d.success) {
             setOn(true); tgl.disabled = true;
             sub.textContent = 'This phone is registered for notifications and alerts.';
           } else {
             setOn(false); tgl.disabled = false;
-            sub.textContent = 'Couldn\u2019t register this phone (' + (res.d.error || r.status) + ') \u2014 try again.';
+            sub.textContent = 'Couldn\u2019t register this phone (' + (res.d.error || res.status) + ') \u2014 try again.';
           }
         }).catch(function () {
           setOn(false); tgl.disabled = false;
@@ -13922,10 +13923,7 @@ def boss_notifications_page():
     else:
         _empty = '<div class="card muted">No alerts yet.</div>' 
 
-    # Phone alerts. The permission prompt has to come from a real tap — browsers
-    # reject one fired on page load, and ambushing someone with it is rude
-    # anyway. The row hides itself when push isn't configured server-side, so
-    # nobody is offered a button that cannot work.
+    # Phone alerts are turned on from Settings (_push_settings_toggle).
     body = f"""
     <div class="hero">
         <h1>Alerts</h1>
@@ -38727,7 +38725,7 @@ def yard_setup_page():
         </div>
         <p class="ai-sub" style="margin-top:16px;">Everything still lives here — pick a tab above and only that section opens. Fleet is grouped by status with filters, and Address Book shows the first 25 rows with search, so a hundred learned cans no longer means a hundred rows of scrolling.</p>
     </div>
-    <div class="ys-panel" id="ys-panel-disposal" style="display:none;">{_dump_locations_section_html()}</div>
+    <div class="ys-panel" id="ys-panel-disposal" style="display:none;">{_dump_locations_section_html()}{_site_locations_section_html()}</div>
     <div class="ys-panel" id="ys-panel-vocab" style="display:none;">{_parse_vocab_section_html()}</div>
     <div class="ys-panel" id="ys-panel-address" style="display:none;">{_address_book_section_html()}</div>
     <div class="ys-panel" id="ys-panel-fleet" style="display:none;">{_containers_section_html()}</div>
@@ -38744,7 +38742,7 @@ def yard_setup_page():
     }}
     (function() {{
         var hash = (window.location.hash || '').replace('#', '');
-        var map = {{'containers': 'fleet', 'address-book': 'address', 'dump-locations': 'disposal', 'parse-vocab': 'vocab'}};
+        var map = {{'containers': 'fleet', 'address-book': 'address', 'dump-locations': 'disposal', 'site-locations': 'disposal', 'parse-vocab': 'vocab'}};
         var tab = map[hash] || null;
         if (!tab) {{ try {{ tab = sessionStorage.getItem('ys_tab'); }} catch (e) {{}} }}
         if (tab && tab !== 'overview') {{ ysShow(tab); }}
@@ -40395,13 +40393,19 @@ def team_hours_page():
                 f'<div class="pay-day-lbl">{_day["weekday"][0]}</div></div>'
             )
         _dname = (d.get("full_name") or d["username"] or "Driver").strip()
+        # 2026-10-27: show the driver's uploaded photo (the query already
+        # loads avatar_path); keep the orange initial when there isn't one.
+        if (d.get("avatar_path") or "").strip():
+            _pav = avatar_html(d, 44)
+        else:
+            _pav = '<div class="pay-avatar">' + e(_dname[0].upper() if _dname else '?') + '</div>'
         _live_tag = (' <span class="pay-live">● ON CLOCK</span>' if summ["has_live"] else '')
         _miss_tag = (f' <span class="pay-miss">⚠ {miss} missing</span>' if miss else '')
         href = "%s?w=%d&driver_id=%d" % (url_for("team_hours_page"), w, d["id"])
         rows_html += f"""
         <a href="{href}" class="pay-driver" style="display:block;text-decoration:none;color:inherit;">
             <div class="pay-driver-head">
-                <div class="pay-avatar">{e(_dname[0].upper() if _dname else '?')}</div>
+                {_pav}
                 <div class="pay-driver-meta">
                     <div class="pay-driver-name">{e(_dname)}{_live_tag}{_miss_tag}</div>
                     <div class="pay-driver-sub">tap for daily breakdown ›</div>
@@ -51217,13 +51221,43 @@ def garbage_templates_dispatch(tid):
     if not drv:
         conn.close()
         return jsonify({"error": "driver not found"}), 400
-    cur = conn.execute(
-        "INSERT INTO routes (company_id, route_date, route_name, assigned_to,"
-        " created_by, status, route_type, created_at) VALUES (?,?,?,?,?,'in_progress','garbage',?)",
-        (cid(), route_date, f"{drv['full_name'] or drv['username']} — {route_date}",
-         driver_id, get_current_user()["id"], now_ts()))
-    rid = cur.lastrowid
-    for i, s in enumerate(stops, start=1):
+    # 2026-10-27: one open garbage route per driver per day is enforced by
+    # ux_routes_driver_day_open. Dispatching a template to a driver who
+    # already has one used to hit that index and 500; append to it instead
+    # (same as /api/dispatch does).
+    def _open_garbage_route():
+        return conn.execute(
+            """SELECT id FROM routes
+                WHERE company_id=? AND assigned_to=? AND route_date=?
+                  AND status IN ('open','in_progress') AND cancelled_at IS NULL
+                  AND COALESCE(route_type,'rolloff')='garbage'
+                ORDER BY id LIMIT 1""",
+            (cid(), driver_id, route_date)).fetchone()
+    _existing = _open_garbage_route()
+    appended = bool(_existing)
+    if _existing:
+        rid = _existing["id"]
+    else:
+        try:
+            cur = conn.execute(
+                "INSERT INTO routes (company_id, route_date, route_name, assigned_to,"
+                " created_by, status, route_type, created_at) VALUES (?,?,?,?,?,'in_progress','garbage',?)",
+                (cid(), route_date, f"{drv['full_name'] or drv['username']} — {route_date}",
+                 driver_id, get_current_user()["id"], now_ts()))
+            rid = cur.lastrowid
+        except sqlite3.IntegrityError:
+            # Lost a race with a concurrent dispatch; use the winner.
+            conn.rollback()
+            _existing = _open_garbage_route()
+            if not _existing:
+                raise
+            rid = _existing["id"]
+            appended = True
+    _base = 0
+    if appended:
+        _base = conn.execute("SELECT COALESCE(MAX(stop_order),0) FROM stops WHERE route_id=?",
+                             (rid,)).fetchone()[0] or 0
+    for i, s in enumerate(stops, start=_base + 1):
         action = {"toter": "Toter", "hpu": "Hand Pickup", "landfill": "Landfill"}[s["service_type"]]
         conn.execute(
             "INSERT INTO stops (route_id, stop_order, customer_name, address, city, action,"
@@ -51236,6 +51270,7 @@ def garbage_templates_dispatch(tid):
     conn.commit()
     conn.close()
     return jsonify({"success": True, "route_id": rid, "stop_count": len(stops),
+                    "appended": appended,
                     "driver": drv["full_name"] or drv["username"]})
 
 
@@ -52474,7 +52509,10 @@ def apple_app_site_association():
                     "appID": f"{APPLE_TEAM_ID}.com.rockkstaar.haultra",
                     # 2026-10-12: Customer portal links (/c/*) must open in Safari,
                     # not the app. Customers don't have the app or a login.
-                    "paths": ["*", "NOT /c/*"],
+                    # QuickBooks connect returns from Intuit to Safari, so
+                    # /quickbooks/* must open in Safari too. Exclusions go
+                    # first: Apple applies the first pattern that matches.
+                    "paths": ["NOT /c/*", "NOT /quickbooks/*", "*"],
                 }
             ],
         }
@@ -52510,7 +52548,8 @@ except ImportError:
 if _QBO_AVAILABLE:
     _qbo_module.init_app(app, get_db=get_db, cid=cid, boss_required=boss_required,
                          shell_page=shell_page, csrf_token=get_csrf_token, e=e,
-                         fmt_money=_fmt_money, csrf_exempt=_CSRF_EXEMPT_ENDPOINTS)
+                         fmt_money=_fmt_money, is_native=is_native_app,
+                         csrf_exempt=_CSRF_EXEMPT_ENDPOINTS)
     qbo = _qbo_module
 
 init_db()

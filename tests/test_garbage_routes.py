@@ -246,10 +246,13 @@ ok("Not before 8am" in nb_html, "not-before warning shown")
 
 # ── Daily report ───────────────────────────────────────────────────────
 login_as(boss, "boss")
-rep = cl.get(f"/route/{rid}/report").get_data(as_text=True)
+# /route/<id>/report now redirects to the Daily Log.
+rep = cl.get(f"/route/{rid}/report", follow_redirects=True).get_data(as_text=True)
 ok("Daily Route Log" in rep, "report page renders")
 ok("2545 Squadron Ct" in rep, "report lists stops")
-ok("cans: 8" in rep and "bags: 132" in rep and "tons: 4.25" in rep,
+import re as _re
+_rep_txt = _re.sub(r"\s+", " ", _re.sub(r"<[^>]+>|&nbsp;", " ", rep)).lower()
+ok("cans: 8" in _rep_txt and "bags: 132" in _rep_txt and "tons: 4.25" in _rep_txt,
    "report totals correct")
 
 # ── Garbage dispatch page ──────────────────────────────────────────────
@@ -260,10 +263,11 @@ ok("Garbage Dispatch" in gp and "gd-lines" in gp, "garbage dispatch page renders
 # Nav has the Garbage link; the board shows the GARBAGE badge, Report link,
 # and toter/HPU stop badges.
 login_as(boss, "boss")
-board = cl.get("/routes").get_data(as_text=True)
+# The board shows one day; these routes are dated 2026-10-10.
+board = cl.get("/routes?day=2026-10-10").get_data(as_text=True)
 ok('href="/garbage-dispatch"' in board, "nav has Garbage Dispatch link")
 ok("GARBAGE" in board, "board shows GARBAGE badge on the lane")
-ok(f"/route/{nb_rid}/report" in board, "board links the daily report")
+ok(f"/route/{nb_rid}/daily-log" in board, "board links the daily log (report)")
 ok(">T<" in board or ">HPU<" in board, "board shows garbage stop badges")
 
 # ── Blocked flow ─────────────────────────────────────────────────────
@@ -287,7 +291,7 @@ ok(msg and "can't get in" in msg["body"] and "806 Curtis Saunders" in msg["body"
    "boss alerted via route message thread")
 # Board shows the BLOCKED badge.
 login_as(boss, "boss")
-board2 = cl.get("/routes").get_data(as_text=True)
+board2 = cl.get("/routes?day=2026-10-10").get_data(as_text=True)
 ok("BLOCKED" in board2, "board shows BLOCKED badge")
 # Driver clears once he's in.
 login_as(drv, "driver")

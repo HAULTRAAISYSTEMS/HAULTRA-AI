@@ -106,7 +106,7 @@ def pos(t): return html.find(t)
 _items = [_re.sub(r"<[^>]+>", "", m).strip()
           for m in _re.findall(r'<a class="nav-item[^"]*"[^>]*>(.*?)</a>', html, _re.S)]
 _items += [_re.sub(r"<[^>]+>", "", m).strip()
-           for m in _re.findall(r'<button[^>]*class="nav-item[^"]*"[^>]*>(.*?)</button>', html, _re.S)]
+           for m in _re.findall(r'<button[^>]*class="(?:nav-item|haul-more-logout)[^"]*"[^>]*>(.*?)</button>', html, _re.S)]
 order = ["Team Hours","Team Time Off","Trucks","Vendors","Maintenance","Team","Yard Setup","Settings","Logout"]
 missing = [lbl for lbl in order if lbl not in _items]
 ok(not missing, "all More-menu items present (missing: %s; found: %s)" % (missing, _items))

@@ -6,7 +6,7 @@
 # the bin back to it, so the card keeps showing it.
 import os, sqlite3, sys
 
-sys.path.insert(0, os.path.expanduser("~/workspace/haultra"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("SECRET_KEY", "test")
 DB = "/tmp/test_truck_card_chain.db"
 if os.path.exists(DB):
@@ -33,8 +33,15 @@ conn.execute("INSERT INTO users (username, password_hash, role, full_name, compa
 drv = conn.execute("SELECT id FROM users WHERE username='truckdrv'").fetchone()["id"]
 
 
+_ROUTE_DAY = [0]
+
+
 def mkroute(name):
-    conn.execute("INSERT INTO routes (company_id, route_name, route_date, status, assigned_to, created_by, created_at, started_at) VALUES (?, ?, '2026-10-26', 'in_progress', ?, ?, ?, '2026-10-26 07:00:00')", (co, name, drv, drv, TS))
+    # One open route per driver per day is enforced by ux_routes_driver_day_open,
+    # so each scenario gets its own day.
+    _ROUTE_DAY[0] += 1
+    day = "2026-10-%02d" % _ROUTE_DAY[0]
+    conn.execute("INSERT INTO routes (company_id, route_name, route_date, status, assigned_to, created_by, created_at, started_at) VALUES (?, ?, ?, 'in_progress', ?, ?, ?, ?)", (co, name, day, drv, drv, TS, day + " 07:00:00"))
     return conn.execute("SELECT id FROM routes WHERE route_name=?", (name,)).fetchone()["id"]
 
 

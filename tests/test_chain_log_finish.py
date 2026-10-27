@@ -6,7 +6,7 @@
 # completion time.
 import os, re, sqlite3, sys
 
-sys.path.insert(0, os.path.expanduser("~/workspace/haultra"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("SECRET_KEY", "test")
 DB = "/tmp/test_chain_log_finish.db"
 if os.path.exists(DB):
