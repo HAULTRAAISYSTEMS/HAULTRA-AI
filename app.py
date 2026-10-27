@@ -20391,6 +20391,28 @@ def driver_route_detail(route_id):
         if _trow:
             _stat_tiles.append('<div class="cab-done-stat"><span>Truck</span><b>' + e(_trow["name"]) + '</b></div>')
         _done_stats = '<div class="cab-done-stats">' + "".join(_stat_tiles) + '</div>'
+        # 2026-10-27 ROOT CAUSE: "Fix Last Stop" posted to stops[-1] -- the
+        # last row by stop_order, CANCELLED rows included. On a route whose
+        # final row was cancelled the tap hit a stop with status='open', so
+        # toggle_stop_complete's open->completed branch marked the cancelled
+        # stop COMPLETED instead of reopening anything. Cancelled stops are
+        # filtered out of the live list, so the screen redrew identically and
+        # the button looked dead. Target the last stop the driver actually
+        # completed -- the same stop "Previous Stop" reopens.
+        _fix_last = next(
+            (s for s in reversed(stops)
+             if not stop_is_cancelled(s) and s["status"] == "completed"),
+            None)
+        _fix_last_html = ""
+        if _fix_last is not None:
+            _fix_last_html = f"""
+                <form method="POST" action="{url_for('toggle_stop_complete', stop_id=_fix_last['id'])}"
+                      onsubmit="return confirm('Reopen the last stop? It will become your current stop again, right where you left off.');">
+                    <input type="hidden" name="_csrf_token" value="{_csrf}">
+                    <input type="hidden" name="intent" value="reopen">
+                    <button type="submit" class="btn secondary">&#8592; Fix Last Stop</button>
+                </form>
+                """
         body = f"""
 <div class="cab-wrap">
     <div class="cab-header">
@@ -20417,14 +20439,7 @@ def driver_route_detail(route_id):
             {route_action_buttons}
             {_yard_nav_html}
             <div class="cab-done-quiet">
-                {f'''
-                <form method="POST" action="{url_for('toggle_stop_complete', stop_id=stops[-1]['id'])}"
-                      onsubmit="return confirm('Reopen the last stop? It will become your current stop again, right where you left off.');">
-                    <input type="hidden" name="_csrf_token" value="{_csrf}">
-                    <input type="hidden" name="intent" value="reopen">
-                    <button type="submit" class="btn secondary">&#8592; Fix Last Stop</button>
-                </form>
-                ''' if total_count > 0 else ''}
+                {_fix_last_html}
                 <a class="btn secondary" href="{url_for('driver_dashboard')}">&#8592; Back to My Routes</a>
             </div>
         </div>
@@ -26483,7 +26498,22 @@ def _route_final_bin_detail(conn, route_id):
             # still carrying the empty back to the return leg.
             is_swap = (bool(sd.get("swap_flag")) or sd.get("id") in takes_from
                        or sd.get("id") in gives_to)
-            if is_pr and not is_swap:
+            # 2026-10-27 ROOT CAUSE: a Delivery ALWAYS ends with the can on
+            # the ground at the customer, so the truck leaves empty. This
+            # must be decided BEFORE the swap branch below. A delivery that
+            # is a chain receiver -- it takes the previous leg's empty,
+            # chain_terminal='delivery', the common "start on a yard can,
+            # swap down the route, drop the last empty at a customer" day --
+            # satisfies is_swap through takes_from/gives_to, so the swap
+            # branch carried its can forward. The end-of-day screen then
+            # asked "Bin NNNN -- where'd it go?" about a can the driver had
+            # just set down, every single time a route ended on a chained
+            # drop, and the yard strip kept showing it on the truck.
+            is_delivery = ("delivery" in act or "drop" in act)
+            if is_delivery:
+                prev = ""
+                prev_size = ""
+            elif is_pr and not is_swap:
                 if ticket_can and prev and prev != ticket_can:
                     prev = ticket_can
                     prev_size = size
