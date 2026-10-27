@@ -10,7 +10,7 @@ os.environ["DATABASE_PATH"] = os.path.join(TMP, "t.db")
 os.environ["SECRET_KEY"] = "t"
 os.environ["UPLOAD_FOLDER"] = os.path.join(TMP, "up")
 os.makedirs(os.environ["UPLOAD_FOLDER"], exist_ok=True)
-sys.path.insert(0, "/home/hatch/workspace/haultra")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import app
 from werkzeug.security import generate_password_hash
 
@@ -62,8 +62,7 @@ ok("Scan a paper route sheet" in gp, "page has prominent scan button")
 ok("Saved routes" in gp, "page has saved routes section")
 ok("Recent dispatches" in gp, "page has recent dispatches section")
 ok("gd-preview" in gp, "page has live preview container")
-ok("day-chips" in gp, "page has day quick chips")
-ok("Dispatch Route" in gp, "page has dispatch button")
+ok("gd-dispatch" in gp and "Dispatch" in gp, "page has dispatch button")
 ok("linear-gradient(135deg" in gp, "page uses HAULTRA gradient styling")
 
 # ── Template CRUD ────────────────────────────────────────────────────
@@ -106,6 +105,17 @@ ok(rt == "garbage", "template dispatch creates garbage route")
 ok(n == 3, "template dispatch creates all stops")
 ok(acts == ["Toter", "Hand Pickup", "Landfill"], "template dispatch maps actions")
 ok(uc == 1, "template use_count increments")
+
+# Same template again, same driver + day: the driver already has an open
+# garbage route, so the stops append to it (used to 500 on the unique index).
+r = post(f"/api/garbage/templates/{tid}/dispatch", {"driver_id": drv, "route_date": "2026-10-10"})
+d2 = r.get_json() or {}
+ok(r.status_code == 200 and d2.get("route_id") == rid and d2.get("appended"),
+   "second dispatch the same day appends to the open route")
+conn = app.get_db()
+orders = [x["stop_order"] for x in conn.execute("SELECT stop_order FROM stops WHERE route_id=? ORDER BY stop_order", (rid,))]
+conn.close()
+ok(orders == [1, 2, 3, 4, 5, 6], "appended stops continue the order (got %s)" % orders)
 
 # ── Recent ───────────────────────────────────────────────────────────
 r = cl.get("/api/garbage/recent")

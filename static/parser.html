@@ -894,7 +894,9 @@
      bottom edge instead of floating 68px above it over the cards. */
   @media (min-width: 768px) {
     body { padding-bottom: calc(118px + env(safe-area-inset-bottom, 0px)); }
-    .bottom-bar { bottom: env(safe-area-inset-bottom, 0px); }
+    /* bottom:0 — the bar's own padding already carries the home-indicator
+       inset; offsetting it too left a double gap on iPad. */
+    .bottom-bar { bottom: 0; }
   }
   .assign-row {
     display: flex; align-items: center; gap: 10px; flex-wrap: wrap;

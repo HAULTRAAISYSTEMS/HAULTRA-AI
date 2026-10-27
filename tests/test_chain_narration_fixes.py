@@ -190,6 +190,9 @@ ALLOW = {
     "convert_order_to_route",  # one customer order -> one stop
     "_perform_assignment",     # one customer request -> one stop
     "_insert_vendor_stop",     # one breakdown/vendor shop stop
+    # Garbage routes (Toter / Hand Pickup / Landfill) never carry roll-off cans,
+    # so there's no can-swap chain to resolve:
+    "garbage_templates_dispatch",
 }
 missing = []
 for f in funcs:

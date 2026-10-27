@@ -256,12 +256,13 @@ ok(cl.post("/api/push/register", json={"_csrf_token": "t"}).status_code == 400,
 ok(cl.post("/api/push/register", json={"_csrf_token": "t", "subscription": {"keys": {}}}).status_code == 400,
    "a subscription with no endpoint is rejected")
 
-html = cl.get("/boss/notifications").get_data(as_text=True)
-ok("push-card" in html, "the phone-alerts row is on the page")
+# The phone-alerts toggle moved from the Alerts feed to Settings.
+html = cl.get("/settings").get_data(as_text=True)
+ok("push-card" in html, "the phone-alerts row is on the Settings page")
 ok("firebasejs" not in html, "no Firebase scripts are loaded any more")
-ok("applicationServerKey" in html, "the client subscribes through the standard PushManager")
-ok("Add to Home Screen" in html,
-   "iPhone users in a Safari tab are told why push can't work, instead of a button that fails")
+ok("/api/push/apns-register" in html, "the app registers its phone for native (APNs) alerts")
+ok("HAULTRA iPhone app" in html,
+   "browser users are pointed to the iPhone app instead of a button that fails")
 ok("HaultraNativeApp" in html,
    "the store build is detected and told where push does work")
 

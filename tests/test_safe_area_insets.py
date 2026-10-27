@@ -42,7 +42,7 @@ def rule_body(css, selector):
     """The declaration block for `selector`, or None. Good enough for these
     hand-written single-file pages; no CSS parser dependency."""
     match = re.search(
-        r"(?:^|[},;>])\s*" + re.escape(selector) + r"\s*\{(.*?)\}", css, re.S
+        r"(?:^|[},;>])\s*" + re.escape(selector) + r"\s*\{(.*?)\}", css, re.S | re.M
     )
     return match.group(1) if match else None
 

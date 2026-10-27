@@ -25,6 +25,10 @@ cur.execute("INSERT INTO dump_locations (company_id,name,address,city,state,zip_
             (co,"Legacy DL","900 Old Rd","Chesapeake","VA","23320",ts))
 
 def route_with_stop(dump_name="", dump_site_id=None, ds="going_to_dump"):
+    # One open route per driver per day (ux_routes_driver_day_open): park the
+    # previous scenario's route as completed before opening the next one.
+    cur.execute("UPDATE routes SET status='completed' WHERE assigned_to=? AND route_date=?"
+                " AND status IN ('open','in_progress')", (drv, today))
     cur.execute("INSERT INTO routes (company_id,route_date,route_name,created_by,assigned_to,status,started_at,created_at) VALUES (?,?,?,?,?,?,?,?)",
                 (co,today,"R",boss,drv,"in_progress",ts,ts)); rid = cur.lastrowid
     cur.execute("""INSERT INTO stops (route_id,stop_order,customer_name,address,action,container_size,dump_location,dump_site_id,status,driver_status,created_at)

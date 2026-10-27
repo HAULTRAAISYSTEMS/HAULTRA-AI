@@ -51,6 +51,10 @@ vendor_id = cur.lastrowid
 
 
 def mkroute(name, nstops, status="in_progress"):
+    # One open route per driver per day (ux_routes_driver_day_open): park the
+    # previous scenario's route as completed before opening the next one.
+    cur.execute("UPDATE routes SET status='completed' WHERE assigned_to=? AND route_date=?"
+                " AND status IN ('open','in_progress')", (drv, "2026-10-10"))
     cur.execute("INSERT INTO routes (company_id, route_date, route_name, created_by, assigned_to,"
                 " status, created_at) VALUES (?,?,?,?,?,?,?)",
                 (co, "2026-10-10", name, boss, drv, status, ts))

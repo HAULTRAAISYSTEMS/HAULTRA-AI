@@ -22,6 +22,10 @@ cur.execute("INSERT INTO users (username,password_hash,role,full_name,company_id
             ("aa_drv", "x", "driver", "Dave", co, ts)); drv = cur.lastrowid
 
 def mkroute(name):
+    # One open route per driver per day (ux_routes_driver_day_open): park the
+    # previous scenario's route as completed before opening the next one.
+    cur.execute("UPDATE routes SET status='completed' WHERE assigned_to=? AND route_date=?"
+                " AND status IN ('open','in_progress')", (drv, today))
     cur.execute("INSERT INTO routes (company_id,route_date,route_name,created_by,assigned_to,status,started_at,created_at) VALUES (?,?,?,?,?,'in_progress',?,?)",
                 (co, today, name, boss, drv, ts, ts))
     return cur.lastrowid
@@ -106,7 +110,7 @@ a2 = mkstop(r3, 2, "HEARTLAND", "999 Heartland Rd")
 conn.commit()
 r = post_action(a1)
 ok(r.status_code == 302, "deliver tap redirects (302)")
-ok(("handoff=%d" % a2) in r.location, "redirect carries handoff=<next stop>")
+ok(("show_stop=%d" % a2) in r.location, "redirect opens the next stop card (show_stop=<next stop>)")
 st = row(a1)
 ok(st["status"] == "completed" and st["driver_status"] == "completed",
    "PR carry_next tap completes the stop")
@@ -123,16 +127,15 @@ b2 = mkstop(r4, 2, "Camden Site", "114 Sawyers Creek", dstatus="need_box_in",
             chain={"group": "g2", "takes": b1})  # terminal NULL -> defaults to head
 conn.commit()
 r = post_action(b2)
-ok(r.status_code == 302 and ("handoff=%d" % b1) in r.location,
-   "tail tap redirects with handoff=<head>")
+# 2026-10-26 (user): the "Empty can goes to" strip was removed — the
+# Return/Deliver button carries the driver to the destination card. Here the
+# head is already completed, so there's no card to open: back to the route.
+ok(r.status_code == 302 and r.location.endswith("/driver/route/%d" % r4),
+   "tail tap with the head already done goes back to the route")
 ok(row(b2)["status"] == "completed", "tail tap completes the tail stop")
 h = cl.get(r.location).get_data(as_text=True)
 ok("All Stops Done" in h, "route shows all-done when the tail was last")
-ok("Empty can goes to" in h and "Priority Pest" in h,
-   "one-time banner names the head stop")
-ok("destination=543+Central+Dr" in h,
-   "banner Navigate link carries the head address")
-ok("google.com/maps/dir/?api=1&destination=" in h, "banner has a Navigate link")
+ok("Empty can goes to" not in h, "no Empty-goes-to strip (removed 2026-10-26)")
 
 # ── HTTP 3: chain middle tap advances to the next chain stop, no banner ─────
 r5 = mkroute("R5")
@@ -145,8 +148,8 @@ conn.commit()
 set_stop(m1, chain_gives_to_stop_id=m2)
 set_stop(m2, chain_gives_to_stop_id=m3)
 r = post_action(m2)
-ok(r.status_code == 302 and ("handoff=%d" % m3) in r.location,
-   "middle tap redirects with handoff=<next chain stop>")
+ok(r.status_code == 302 and ("show_stop=%d" % m3) in r.location,
+   "middle tap redirects with show_stop=<next chain stop>")
 ok(row(m2)["status"] == "completed", "middle tap completes the stop")
 h = cl.get(r.location).get_data(as_text=True)
 ok(">S3</div>" in h, "card advances to the next chain stop")
