@@ -21232,7 +21232,7 @@ def driver_route_detail(route_id):
             f'<div class="cab-legs-switch" id="cab-legs-switch" role="group" aria-label="Active leg" '
             f'data-stop="{stop_id}" data-csrf="{_csrf}" data-active="{e(_curleg["key"])}" '
             f'data-navpref="{e(_nav_pref)}" data-legs="{e(json.dumps(_legs))}">'
-            f'<div class="cab-leg-header">LEG {_leg_idx + 1} OF {_leg_total}</div>{_chip_btns}</div>'
+            f'<div class="cab-leg-header" id="cab-leg-head">LEG {_leg_idx + 1} OF {_leg_total}</div>{_chip_btns}</div>'
         )
         _noaddr_html = (
             f'<div class="cab-noaddr" id="cab-noaddr"{"" if not nav_has_addr else " hidden"}>'
@@ -21329,13 +21329,37 @@ def driver_route_detail(route_id):
         {_noaddr_html}
         <a class="cab-primary{_dis}" id="cab-nav-btn" href="{nav_google_web}"
            aria-disabled="{_dis_aria}" onclick="{_nav_onclick}">{icon('pin','ic ic-lg')} Navigate</a>
-        {_msg_boss_html}
         <form method="POST" action="{_arrive_action}" class="inline" style="margin:0;">
             <input type="hidden" name="_csrf_token" value="{_csrf}">
             <input type="hidden" name="action" value="arrived">
             <button type="submit" class="cab-neutral cab-arrived-btn" id="cab-arrived-btn">{icon('check')} Arrived at Stop</button>
         </form>
+        {_msg_boss_html}
         """
+
+    # ── 2026-10-27 Cab View redesign: per-stop progress segments + Up Next ──
+    _cab_segs = ""
+    for _sg in stops:
+        if stop_is_cancelled(_sg):
+            continue
+        if _sg["status"] == "completed":
+            _cab_segs += '<i class="d"></i>'
+        elif current_stop is not None and _sg["id"] == current_stop["id"]:
+            _cab_segs += '<i class="c"></i>'
+        else:
+            _cab_segs += '<i></i>'
+    _cab_next_html = ""
+    if _reorderable:
+        _nx = _reorderable[0]
+        _more_n = len(_reorderable) - 1
+        _cab_next_html = (
+            '<div class="cab2-next"><span class="cab2-next-k">Up next</span>'
+            '<span class="cab2-next-v"><b>' + e(_nx["name"]) + '</b>'
+            + ('<small>' + e(_nx["address"]) + '</small>' if _nx["address"] and _nx["address"] != _nx["name"] else '')
+            + '</span>'
+            + ('<span class="cab2-next-more">+' + str(_more_n) + '</span>' if _more_n > 0 else '')
+            + '</div>'
+        )
 
     body = f"""
 <style>
@@ -21598,11 +21622,122 @@ def driver_route_detail(route_id):
     border: 1px solid rgba(255,255,255,0.14) !important; box-shadow: none !important;
     min-height: 56px !important; font-size: 1.05rem !important;
 }}
-      background: var(--orange, #FF6B1A) !important; color:#0A0A0A !important; border:none !important;
-      box-shadow:none !important; min-height:64px !important; font-weight:800 !important; font-size:1.12rem !important; }}
   .cab-primary-zone button:disabled, .cab-primary-zone .btn:disabled {{ opacity:.5; }}
   .cab-nav-btn.is-disabled, .cab-copy-btn:disabled {{ opacity:.45; pointer-events:none; }}
   .cab-truck-icon {{ font-size: 1.1rem; }}
+  /* ══ 2026-10-27 CAB VIEW REDESIGN ══════════════════════════════════════
+     Built for a glance from the driver's seat: where am I going, what do I
+     do there, one obvious next tap. Left-aligned hero, a numbered leg route,
+     Navigate + Arrived stacked like a phone dialer, Up Next under the card. */
+  .cab-wrap {{ max-width: 620px; }}
+  .cab-mission {{ border-radius: 0 0 18px 18px; padding-bottom: 10px;
+      background: linear-gradient(180deg, rgba(18,18,18,.98), rgba(22,18,15,.96)) !important;
+      box-shadow: 0 10px 24px rgba(0,0,0,.35); }}
+  .cab-mission-count {{ font-size: 1rem; letter-spacing: 1.4px; }}
+  .cab-mission-track {{ display: none; }}
+  .cab2-segs {{ display: flex; gap: 4px; }}
+  .cab2-segs i {{ flex: 1; height: 7px; border-radius: 4px; background: rgba(255,255,255,.1); }}
+  .cab2-segs i.d {{ background: #3DDC84; }}
+  .cab2-segs i.c {{ background: #FF6B1A; box-shadow: 0 0 10px rgba(255,107,26,.75); }}
+  .cab-online-badge {{ white-space: nowrap; }}
+
+  .cab2-subbar {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 12px; }}
+  .cab2-subbar:empty {{ display: none; }}
+  .cab2-subbar {{ flex-wrap: nowrap; }}
+  .cab2-subbar .cab-truck-bar {{ margin: 0 !important; padding: 7px 12px !important; border-radius: 999px !important;
+      font-size: .82rem !important; display: inline-flex !important; align-items: center; gap: 6px;
+      width: auto !important; flex: 0 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; }}
+  .cab2-subbar .cab-truck-text {{ overflow: hidden; text-overflow: ellipsis; }}
+  .cab2-prev {{ margin: 0 0 0 auto; flex: none; }}
+  .cab2-subbar .cab2-prev-btn {{ min-height: 40px !important; margin: 0 !important; padding: 0 14px !important;
+      font-size: .82rem !important; font-weight: 700 !important; border-radius: 999px !important;
+      color: var(--text-dim, #B5B5AD) !important; width: auto !important; white-space: nowrap; }}
+
+  .cab-card.cab2 {{ padding: 20px 18px 18px !important; border-radius: 24px;
+      border-color: rgba(255,107,26,.28);
+      background: radial-gradient(120% 70% at 100% 0%, rgba(255,107,26,.16), transparent 60%),
+                  linear-gradient(180deg, #1c1916, #141414) !important; }}
+  .cab2 .cab-action-row {{ flex-direction: column; align-items: flex-start !important; text-align: left !important;
+      gap: 10px; margin-bottom: 14px; }}
+  .cab-phase-2.cab2 .cab-action-row {{ padding-right: 46px; }}
+  .cab2 .cab-action-badge {{ min-width: 0; min-height: 0; max-width: 100%; padding: 6px 12px; border-radius: 10px;
+      font-family: var(--font-body, inherit); font-size: .78rem !important; font-weight: 900; letter-spacing: 1px;
+      text-transform: uppercase; line-height: 1.2;
+      background: #FF6B1A; color: #170800; border: none; box-shadow: 0 4px 14px rgba(255,107,26,.3); }}
+  .cab2 .cab-action-badge.badge-p {{ background: #4DABF5; color: #04131f; box-shadow: 0 4px 14px rgba(77,171,245,.3); }}
+  .cab2 .cab-action-badge.badge-d {{ background: #3DDC84; color: #03180c; box-shadow: 0 4px 14px rgba(61,220,132,.3); }}
+  .cab2 .cab-action-badge.badge-s {{ background: #B98CFF; color: #14062b; box-shadow: 0 4px 14px rgba(185,140,255,.3); }}
+  .cab2 .cab-action-badge.vendor {{ background: #F5B43C; color: #1e1300; }}
+  .cab2 .cab-action-name {{ font-size: clamp(1.6rem, 7.4vw, 2.1rem) !important; line-height: 1.1; text-align: left;
+      word-break: break-word; }}
+  .cab2 .cab-address, .cab2 .cab-meta-line {{ text-align: left !important; }}
+  .cab2 .cab-address {{ font-size: 1.12rem; color: var(--text, #F5F5F0); font-weight: 600; margin: 4px 0 6px;
+      padding-left: 26px; position: relative; }}
+  .cab2 .cab-address::before {{ content: ""; position: absolute; left: 2px; top: 4px; width: 14px; height: 14px;
+      border-radius: 50% 50% 50% 0; transform: rotate(-45deg); background: #FF6B1A;
+      box-shadow: 0 0 0 3px rgba(255,107,26,.2); }}
+  .cab2 .cab-meta-line {{ padding-left: 26px; }}
+
+  /* Leg route: numbered stops on a line; label above the place, never truncated. */
+  .cab2 .cab-legs-switch {{ counter-reset: leg; gap: 6px; padding: 10px; border-radius: 16px;
+      background: rgba(0,0,0,.22); position: relative; }}
+  .cab2 .cab-leg-header {{ text-align: left; padding: 0 4px 2px; font-weight: 800; letter-spacing: 1.2px;
+      text-transform: uppercase; }}
+  .cab2 .cab-leg-chip {{ counter-increment: leg; position: relative; min-height: 56px; padding: 8px 12px 8px 50px;
+      flex-direction: column; align-items: flex-start; justify-content: center; gap: 2px;
+      background: transparent; border-color: rgba(255,255,255,.08); border-radius: 12px; }}
+  .cab2 .cab-leg-chip::before {{ content: counter(leg); position: absolute; left: 12px; top: 50%;
+      transform: translateY(-50%); width: 26px; height: 26px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center; font-size: .78rem; font-weight: 900;
+      border: 2px solid rgba(255,255,255,.22); color: var(--text-dim, #B5B5AD); background: #151515; }}
+  .cab2 .cab-leg-chip + .cab-leg-chip::after {{ content: ""; position: absolute; left: 24px; top: -10px; width: 2px;
+      height: 12px; background: rgba(255,255,255,.18); }}
+  .cab2 .cab-leg-chip.active {{ background: rgba(255,107,26,.12); border-color: rgba(255,107,26,.5); box-shadow: none; }}
+  .cab2 .cab-leg-chip.active::before {{ background: #FF6B1A; border-color: #FF6B1A; color: #170800; }}
+  .cab2 .cab-leg-chip-lbl {{ font-size: .66rem; color: var(--text-muted); }}
+  .cab2 .cab-leg-chip.active .cab-leg-chip-lbl {{ color: #FFB27A; }}
+  .cab2 .cab-leg-chip-sub {{ font-size: .98rem; white-space: normal; overflow: visible; color: var(--text, #F5F5F0);
+      text-align: left; }}
+  .cab2 .cab-leg-chip-sub::before {{ content: none; }}
+
+  /* Actions: Navigate (orange) → Arrived (green) → Message (quiet). */
+  .cab2 .cab-primary {{ min-height: 66px; margin-top: 16px; border-radius: 18px; font-size: 1.2rem;
+      background: linear-gradient(135deg, #FF8A42, #FF6B1A); color: #170800;
+      box-shadow: 0 10px 26px rgba(255,107,26,.33); }}
+  .cab2 .cab-arrived-btn {{ min-height: 60px; margin-top: 10px; border-radius: 18px; font-size: 1.08rem; font-weight: 800;
+      background: rgba(61,220,132,.12); border: 1.5px solid rgba(61,220,132,.55); color: #3DDC84; }}
+  .cab2 .cab-arrived-btn:active {{ background: rgba(61,220,132,.2); }}
+  .cab-phase-1.cab2 > .cab-quick-btn {{ min-height: 48px; margin: 10px 0 0; border-radius: 14px;
+      background: transparent; border-color: rgba(255,255,255,.1); color: var(--text-dim, #B5B5AD); }}
+
+  /* Phase 2: the address strip wraps instead of cutting off the street. */
+  .cab2 .cab-navstrip {{ flex-wrap: wrap; justify-content: flex-start !important; text-align: left !important;
+      border-radius: 16px; padding: 12px; }}
+  .cab2 .cab-navstrip-addr {{ flex: 1 1 100%; white-space: normal; text-align: left !important; font-size: 1.02rem; }}
+  .cab2 .cab-navstrip-go {{ flex: 1; min-height: 50px; border-color: rgba(255,107,26,.45); color: #FFB27A; }}
+  .cab2 .cab-quick-btn {{ border-radius: 16px; }}
+  /* Complete Stop: the one big finish button (the old rule had lost its selector). */
+  .cab-primary-zone .cab-complete-btn:not([style]) {{
+      width: 100%; min-height: 66px !important; border: none !important; border-radius: 18px !important;
+      background: linear-gradient(135deg, #00c853, #00e57a) !important; color: #00230e !important;
+      font-size: 1.15rem !important; font-weight: 900 !important; box-shadow: 0 10px 26px rgba(0,232,125,.28) !important; }}
+  .cab-primary-zone .cab-complete-btn:disabled {{ opacity: .5; box-shadow: none !important; }}
+
+  .cab2-next {{ display: flex; align-items: center; gap: 12px; padding: 12px 16px; margin: 0 0 12px;
+      border-radius: 16px; background: rgba(255,255,255,.035); border: 1px dashed rgba(255,255,255,.12); }}
+  .cab2-next-k {{ flex: none; font-size: .68rem; font-weight: 900; letter-spacing: 1.3px; text-transform: uppercase;
+      color: #7A7A70; }}
+  .cab2-next-v {{ flex: 1; min-width: 0; display: flex; flex-direction: column; }}
+  .cab2-next-v b {{ white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  .cab2-next-v small {{ color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  .cab2-next-more {{ flex: none; font-size: .78rem; font-weight: 800; color: var(--text-dim, #B5B5AD);
+      background: rgba(255,255,255,.06); border-radius: 999px; padding: 4px 9px; }}
+  .cab2-foot {{ display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }}
+  .cab2-back {{ display: inline-flex; align-items: center; min-height: 44px; padding: 0 14px; border-radius: 12px;
+      color: var(--text-dim, #B5B5AD); font-weight: 700; text-decoration: none; font-size: .92rem; }}
+  @media (min-width: 900px) {{
+      .cab-card.cab2 {{ padding: 26px 26px 24px !important; }}
+  }}
 </style>
 <div class="cab-wrap">
     <!-- 2026-10-10: unified top bar — stop counter, controls, and a quiet End link in one row.
@@ -21624,6 +21759,7 @@ def driver_route_detail(route_id):
             </span>
         </div>
         <div class="cab-mission-track"><div class="cab-mission-fill" id="cab-progress-fill" style="width:{pct}%;"></div></div>
+        <div class="cab2-segs" aria-hidden="true">{_cab_segs}</div>
     </div>
     <!-- Dropdowns anchored to the top bar -->
     <div id="cab-reorder-dropdown" class="cab-topbar-dropdown haul-dropdown" hidden>
@@ -21639,23 +21775,20 @@ def driver_route_detail(route_id):
     {nav_pref_modal_html}
     {urgent_banner_html}
     {_handoff_banner_html}
-    {_truck_bar_html}
+    <div class="cab2-subbar">{_truck_bar_html}{f'''
+    <form method="POST" action="{url_for('toggle_stop_complete', stop_id=prev_stop['id'])}" class="cab2-prev"
+          onsubmit="return confirm('Reopen the previous stop? It will become your current stop again, right where you left off.');">
+        <input type="hidden" name="_csrf_token" value="{_csrf}">
+        <input type="hidden" name="intent" value="reopen">
+        <button type="submit" class="cab-neutral cab2-prev-btn">&#8592; Previous stop</button>
+    </form>''' if prev_stop else ''}</div>
 
     <div id="route-updated-banner" class="route-updated-banner" hidden>
         <span id="route-updated-text"></span>
         <button type="button" onclick="document.getElementById('route-updated-banner').hidden=true;" aria-label="Dismiss">&times;</button>
     </div>
 
-    {f'''
-    <form method="POST" action="{url_for('toggle_stop_complete', stop_id=prev_stop['id'])}" style="margin-bottom:14px;"
-          onsubmit="return confirm('Reopen the previous stop? It will become your current stop again, right where you left off.');">
-        <input type="hidden" name="_csrf_token" value="{_csrf}">
-        <input type="hidden" name="intent" value="reopen">
-        <button type="submit" class="cab-neutral" style="min-height:48px;margin-top:0;">&#8592; Previous Stop</button>
-    </form>
-    ''' if prev_stop else ''}
-
-    <div class="cab-card cab-phase-{"2" if _arrived else "1"}">
+    <div class="cab-card cab2 cab-phase-{"2" if _arrived else "1"}">
         <div class="cab-action-row">
             {cab_action_badge}
             <div class="cab-action-name">{e(s['customer_name'] or ('Stop ' + str(current_stop_num)))}</div>
@@ -21666,9 +21799,10 @@ def driver_route_detail(route_id):
         {_phase_body}
     </div>
 
-    <div style="display:flex;gap:10px;flex-wrap:wrap;">
+    {_cab_next_html}
+    <div class="cab2-foot">
         {route_action_buttons}
-        <a class="btn secondary" href="{url_for('driver_dashboard')}">&#8592; My Routes</a>
+        <a class="cab2-back" href="{url_for('driver_dashboard')}">&#8592; My Routes</a>
     </div>
 
     <!-- 2026-10-10: Reorder and More moved to top bar dropdowns -->

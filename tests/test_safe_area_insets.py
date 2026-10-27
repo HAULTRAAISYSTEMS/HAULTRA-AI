@@ -178,11 +178,12 @@ ok(
 # The cab view's STOP n OF m / END ROUTE bar is sticky inside the same scroll
 # context as the sticky .topnav; pinned at top:0 it slides underneath and
 # becomes unreachable.
-cab_at = app_py.find(".cab-sticky-bar {{")
-ok(cab_at != -1, "app.py still defines .cab-sticky-bar")
+# (The bar is .cab-mission since the 2026-10-17 mission header.)
+cab_at = app_py.find(".cab-mission {{")
+ok(cab_at != -1, "app.py still defines the sticky .cab-mission bar")
 ok(
     cab_at != -1 and "--haul-topnav-h" in app_py[cab_at:cab_at + 400],
-    "app.py .cab-sticky-bar pins below the topnav, not underneath it",
+    "app.py .cab-mission pins below the topnav, not underneath it",
 )
 ok(
     "--haul-topnav-h'," in app_py or '--haul-topnav-h"' in app_py
