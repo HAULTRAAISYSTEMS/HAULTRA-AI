@@ -17880,7 +17880,7 @@ def routes_page():
             if _route_ids:
                 _q = ",".join("?" * len(_route_ids))
                 for _iv in conn.execute(
-                    f"SELECT route_id, id, invoice_number, status FROM invoices "
+                    f"SELECT route_id, id, invoice_number, status, total_cents, qb_sync_status FROM invoices "
                     f"WHERE company_id=? AND route_id IN ({_q}) AND status != 'void' ORDER BY id DESC",
                     (cid(), *tuple(_route_ids))).fetchall():
                     _inv_by_route_h.setdefault(_iv["route_id"], dict(_iv))
@@ -17927,25 +17927,39 @@ def routes_page():
                 _stop_rows += f'<div class="drv-stop"><span class="drv-stop-name muted">+{_total - 5} more stops</span></div>'
             if not _stop_rows:
                 _stop_rows = '<div class="drv-stop"><span class="drv-stop-name muted">No stops yet.</span></div>'
-            _del = (f'''
-                <form class="inline" method="POST" action="{url_for('delete_route', route_id=r['id'])}"
-                      onsubmit="return confirm('Delete this entire route?')">
-                    <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
-                    <button class="hist-ghost-btn danger" type="submit">Delete</button>
-                </form>''' if user['role'] == 'boss' else '')
-            # 2026-10-23: one-tap invoice from the route card — no more digging
-            # for the button inside the route detail page.
-            # 2026-10-26: a route with a live invoice links to it instead of
-            # starting a duplicate.
+            # 2026-10-27: one action dock that always fits the card. Delete is
+            # an icon; the invoice cell shows where the money is.
+            _ico = {
+                "open": '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17 17 7"/><path d="M8 7h9v9"/></svg>',
+                "csv": '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg>',
+                "bill": '<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h9l3 3v15l-2.5-1.5L13 21l-2.5-1.5L8 21l-2-1.5z"/><path d="M9 9h6M9 13h6"/></svg>',
+                "trash": '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><path d="M10 11v6M14 11v6"/><path d="M6 7l1 13h10l1-13"/><path d="M9 7V4h6v3"/></svg>',
+            }
             _inv_h = _inv_by_route_h.get(r["id"])
+            _inv_cell = ""
             if user["role"] == "boss" and _inv_h:
-                _inv_btn = f'''
-                <a class="hist-ghost-btn" style="color:#FF9D5C;border-color:rgba(255,157,92,.4);" href="{url_for('invoice_detail', invoice_id=_inv_h['id'])}">&#x1F9FE; Invoice &middot; {_inv_h['status'].title()}</a>'''
+                _ist = (_inv_h["status"] or "draft").lower()
+                _qb = ('<span class="dock-qb" title="In QuickBooks">QB</span>'
+                       if (_inv_h["qb_sync_status"] or "") == "synced" else "")
+                if _ist == "paid":
+                    _lbl = '<b>Paid &#10003;</b>'
+                else:
+                    _lbl = (f'<b>{e(_inv_h["invoice_number"])}</b>'
+                            f'<span class="dock-sub">{e(_ist.title())}</span>')
+                _inv_cell = (f'<a class="dock-cell dock-inv is-{e(_ist)}" '
+                             f'href="{url_for("invoice_detail", invoice_id=_inv_h["id"])}">'
+                             f'{_ico["bill"]}<span class="dock-txt">{_lbl}</span>{_qb}<span class="dock-go">&#8250;</span></a>')
             elif user["role"] == "boss" and _done > 0:
-                _inv_btn = f'''
-                <a class="hist-ghost-btn" style="color:#FF9D5C;border-color:rgba(255,157,92,.4);" href="{url_for('invoice_new', route_id=r['id'])}">&#x1F9FE; Invoice</a>'''
-            else:
-                _inv_btn = ''
+                _amt = f' {_fmt_money(_rev)}' if _rev else ''
+                _inv_cell = (f'<a class="dock-cell dock-inv is-new" '
+                             f'href="{url_for("invoice_new", route_id=r["id"])}">'
+                             f'{_ico["bill"]}<span class="dock-txt"><b>Bill{_amt}</b></span>'
+                             f'<span class="dock-go"><span class="go-word">Create invoice </span>&#8250;</span></a>')
+            _del = (f'''<form class="dock-del-form" method="POST" action="{url_for('delete_route', route_id=r['id'])}"
+                      onsubmit="return confirm('Delete this entire route? This cannot be undone.')">
+                    <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+                    <button class="dock-cell dock-del" type="submit" aria-label="Delete route" title="Delete route">{_ico["trash"]}</button>
+                </form>''' if user['role'] == 'boss' else '')
             return f"""
             <div class="drv-lane hist-lane">
                 <div class="drv-lane-head">
@@ -17958,14 +17972,11 @@ def routes_page():
                 <div class="drv-progress"><div style="width:{_pct}%;"></div></div>
                 <div class="drv-progress-lbl">{_done} of {_total} stops</div>
                 <div class="drv-stops">{_stop_rows}</div>
-                <div class="hist-lane-foot">
-                    <span class="hist-ghost-actions">
-                        <a class="hist-ghost-btn" href="{url_for('view_route', route_id=r['id'])}">Open</a>
-                        <a class="hist-ghost-btn" href="{url_for('export_route_csv', route_id=r['id'])}">CSV</a>
-                        {_inv_btn}
-                        {_del}
-                    </span>
-                    <a class="drv-lane-foot-link" href="{url_for('view_route', route_id=r['id'])}">Open Route &#8250;</a>
+                <div class="route-dock{' has-inv' if _inv_cell else ''}{' has-del' if _del else ''}">
+                    <a class="dock-cell dock-open" href="{url_for('view_route', route_id=r['id'])}">{_ico["open"]}<span class="dock-txt"><b>Open</b></span></a>
+                    <a class="dock-cell dock-csv" href="{url_for('export_route_csv', route_id=r['id'])}">{_ico["csv"]}<span class="dock-txt"><b>CSV</b></span></a>
+                    {_inv_cell}
+                    {_del}
                 </div>
             </div>
             """
@@ -18072,6 +18083,56 @@ def routes_page():
         .hist-ghost-btn.danger {{ color:#FF7A7A; }}
         .drv-lane-foot-link {{ color:#FF8C42; font-weight:700; font-size:.85rem;
             text-decoration:none; white-space:nowrap; }}
+        /* 2026-10-27: route card action dock — one segmented bar, always inside the card */
+        .route-dock {{ margin-top:12px; display:grid; grid-template-columns:1fr 1fr;
+            width:100%; align-self:stretch; box-sizing:border-box;
+            border:1px solid rgba(255,255,255,.10); border-radius:14px; overflow:hidden;
+            background:rgba(255,255,255,.03); }}
+        .route-dock.has-del {{ grid-template-columns:1fr 1fr 54px; }}
+        /* invoice gets a full-width strip on top; Open · CSV · trash sit below */
+        .route-dock a.dock-cell.dock-inv {{ grid-column:1 / -1; order:-1; border-left:0 !important;
+            border-bottom:1px solid rgba(255,255,255,.08); justify-content:space-between;
+            padding:0 14px; min-height:52px; font-size:14px; }}
+        .route-dock a.dock-inv .dock-txt {{ flex:1; flex-direction:row; align-items:baseline; gap:8px; }}
+        .route-dock .dock-inv .dock-go {{ flex:none; font-weight:800; opacity:.85; }}
+        .route-dock a.dock-cell.dock-open {{ border-left:0 !important; }}
+        .route-dock a.dock-open .dock-txt, .route-dock a.dock-csv .dock-txt {{ flex:none; }}
+        .route-dock a.dock-open .dock-txt b, .route-dock a.dock-csv .dock-txt b {{ overflow:visible; }}
+        .route-dock a.dock-inv .dock-txt b {{ flex:none; }}
+        @media (max-width:360px) {{
+            .route-dock .dock-cell {{ padding:0 4px; gap:4px; font-size:12.5px; }}
+            .route-dock a.dock-cell.dock-inv {{ padding:0 10px; }}
+            .route-dock .go-word {{ display:none; }}
+        }}
+        .route-dock .dock-cell, .route-dock .dock-del {{ all:unset; box-sizing:border-box;
+            min-width:0; min-height:48px; display:flex; align-items:center; justify-content:center;
+            gap:6px; padding:0 8px; color:var(--text-dim,#C9C9C2); font-size:13px; cursor:pointer;
+            border-left:1px solid rgba(255,255,255,.08); -webkit-tap-highlight-color:transparent;
+            transition:background .15s, color .15s; }}
+
+        .route-dock .dock-cell:active, .route-dock .dock-cell:hover {{ background:rgba(255,255,255,.07); color:#fff; }}
+        .route-dock .dock-txt {{ display:flex; flex-direction:column; line-height:1.1; min-width:0; }}
+        .route-dock .dock-txt b {{ font-weight:800; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+        .route-dock .dock-sub {{ font-size:10px; font-weight:700; letter-spacing:.5px; text-transform:uppercase; opacity:.8; }}
+        .route-dock svg {{ flex:none; }}
+        .route-dock .dock-open {{ color:#FF9D5C; }}
+        .route-dock .dock-inv.is-new {{ color:#111; font-weight:800;
+            background:linear-gradient(135deg,#FF8C42,#FF6B1A); }}
+        .route-dock .dock-inv.is-new:active, .route-dock .dock-inv.is-new:hover {{ color:#111; filter:brightness(1.08); }}
+        .route-dock .dock-inv.is-draft {{ color:#FFD36E; background:rgba(255,211,110,.08); }}
+        .route-dock .dock-inv.is-sent {{ color:#7FD1FF; background:rgba(127,209,255,.08); }}
+        .route-dock .dock-inv.is-paid {{ color:#3DDC84; background:rgba(61,220,132,.10); }}
+        .route-dock .dock-qb {{ flex:none; font-size:9px; font-weight:900; letter-spacing:.4px;
+            color:#0b3; background:rgba(61,220,132,.18); border:1px solid rgba(61,220,132,.45);
+            border-radius:5px; padding:1px 4px; }}
+        .route-dock .dock-del-form {{ display:contents; }}
+        /* the app styles every <button> orange; the trash cell opts out */
+        .route-dock button.dock-del {{ color:#FF7A7A !important; background:transparent !important;
+            border:0 !important; border-left:1px solid rgba(255,255,255,.08) !important; box-shadow:none !important;
+            border-radius:0 !important; width:100% !important; height:100% !important; min-height:48px !important;
+            margin:0 !important; padding:0 !important; font:inherit !important; text-transform:none !important;
+            display:flex !important; align-items:center !important; justify-content:center !important; }}
+        .route-dock button.dock-del:hover, .route-dock button.dock-del:active {{ background:rgba(255,77,77,.16) !important; color:#FF5A5A !important; }}
         /* 2026-10-16: collapsible driver groups */
         .hist-driver-group {{ margin-bottom:10px; border:1px solid rgba(255,255,255,.08);
             border-radius:16px; background:rgba(255,255,255,.02); overflow:hidden; }}
