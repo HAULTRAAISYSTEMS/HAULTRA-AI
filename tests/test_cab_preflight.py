@@ -94,7 +94,7 @@ ok(after["status"] == "in_progress" and after["started_at"] is not None, "START 
 first_started = after["started_at"]
 
 hr = geturl(r_fresh)
-ok("cab-sticky-bar" in hr and "END ROUTE" in hr, "running view has the sticky bar + END ROUTE")
+ok("cab-mission" in hr and 'class="cab-topbar-end">End<' in hr, "running view has the sticky mission bar + End")
 ok("STOP 1 OF 3" in hr, "running view shows STOP 1 OF 3")
 ok("pf-card" not in hr and "START ROUTE" not in hr, "running view has no pre-flight card")
 
