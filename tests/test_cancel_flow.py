@@ -200,7 +200,7 @@ ok(stop_row(sids[4])["cancel_reason"] == "OTHER", "unknown reason stored as OTHE
 as_boss()
 ok(cl.get("/route/%d" % rid).status_code == 200, "boss route page renders")
 as_driver()
-ok(cl.get("/driver").status_code == 200, "driver dashboard renders")
+ok(cl.get("/driver", follow_redirects=True).status_code == 200, "driver dashboard renders")
 ok(cl.get("/driver/route/%d" % rid).status_code == 200, "cab view renders")
 
 # ── driver-facing UI surfaces ─────────────────────────────────────────────
