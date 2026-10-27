@@ -2659,5 +2659,21 @@ else loadYardInventory();
     });
 })();
 </script>
+<script>
+// 2026-10-27: the setup walkthrough's "Build my first route" hands its text
+// over here (sessionStorage, same tab). Fill the box once, then forget it.
+(function(){
+  try {
+    var t = sessionStorage.getItem('haultra_prefill');
+    if (!t) return;
+    sessionStorage.removeItem('haultra_prefill');
+    var box = document.getElementById('raw-text');
+    if (!box || box.value) return;
+    box.value = t;
+    box.dispatchEvent(new Event('input', {bubbles: true}));
+    try { box.focus(); box.scrollIntoView({block: 'center'}); } catch (e) {}
+  } catch (e) {}
+})();
+</script>
 </body>
 </html>
