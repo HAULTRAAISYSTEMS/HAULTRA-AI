@@ -17250,11 +17250,11 @@ def _build_route_board_html(user, day=None):
                 _lane_inv = _inv_by_route.get(_lane_route_id)
                 if _lane_inv:
                     _util_items.append(
-                        f'<a class="lane-util-link" style="color:#FF9D5C;" href="{url_for("invoice_detail", invoice_id=_lane_inv["id"])}">&#x1F9FE; Invoice &middot; {_lane_inv["status"].title()}</a>',
+                        f'<a class="lane-util-link" style="color:#FF9D5C;" href="{url_for("invoice_detail", invoice_id=_lane_inv["id"])}">{_RECEIPT_SVG}Invoice &middot; {_lane_inv["status"].title()}</a>',
                     )
                 elif _lane_done > 0:
                     _util_items.append(
-                        f'<a class="lane-util-link" style="color:#FF9D5C;" href="{url_for("invoice_new", route_id=_lane_route_id)}">&#x1F9FE; Invoice</a>',
+                        f'<a class="lane-util-link" style="color:#FF9D5C;" href="{url_for("invoice_new", route_id=_lane_route_id)}">{_RECEIPT_SVG}Invoice</a>',
                     )
             if len(stops) >= 2:
                 _util_items.append(
@@ -17479,10 +17479,17 @@ def _build_route_board_html(user, day=None):
         try:
             _tname = lane.get("truck_name")
             if not _tname and lane.get("driver_id"):
-                _utruck = _driver_truck_id(conn, lane["driver_id"])
-                if _utruck:
-                    _urow = conn.execute("SELECT name FROM trucks WHERE id=?", (_utruck,)).fetchone()
-                    _tname = _urow["name"] if _urow else None
+                # 2026-10-27: the board's main connection is closed by now
+                # (it closes before lanes render), so this lookup always
+                # failed and the usual-truck chip never showed. Own conn.
+                _tconn = get_db()
+                try:
+                    _utruck = _driver_truck_id(_tconn, lane["driver_id"])
+                    if _utruck:
+                        _urow = _tconn.execute("SELECT name FROM trucks WHERE id=?", (_utruck,)).fetchone()
+                        _tname = _urow["name"] if _urow else None
+                finally:
+                    _tconn.close()
             if _tname:
                 _truck_chip = (
                     f'<span class="lane-truck-chip">'
@@ -17684,17 +17691,149 @@ def routes_page():
         history_params["status"] = status
     history_tab_href = url_for("routes_page") + "?" + urllib.parse.urlencode(history_params)
 
-    _invoices_tab = ""
+    # 2026-10-27: the top of the board — one dispatch card + a segmented
+    # Board / History / Invoices control with live counts.
+    _day_routes = _day_stops = _day_done = _open_inv = 0
+    _hc = get_db()
+    try:
+        _rs = _hc.execute(
+            """SELECT COUNT(DISTINCT r.id) AS routes, COUNT(s.id) AS stops,
+                      COALESCE(SUM(CASE WHEN s.status='completed' THEN 1 ELSE 0 END),0) AS done
+                 FROM routes r LEFT JOIN stops s ON s.route_id=r.id
+                WHERE r.company_id=? AND r.route_date=?"""
+            + ("" if user["role"] == "boss" else " AND r.assigned_to=?"),
+            (cid(), _board_day) if user["role"] == "boss" else (cid(), _board_day, user["id"]),
+        ).fetchone()
+        _day_routes, _day_stops, _day_done = (_rs["routes"] or 0), (_rs["stops"] or 0), (_rs["done"] or 0)
+        if user["role"] == "boss":
+            _open_inv = _hc.execute(
+                "SELECT COUNT(*) FROM invoices WHERE company_id=? AND status IN ('draft','sent')",
+                (cid(),)).fetchone()[0] or 0
+    except Exception:
+        pass
+    finally:
+        _hc.close()
+
+    _seg_ico = {
+        "board": '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="7" height="16" rx="2"/><rect x="14" y="4" width="7" height="10" rx="2"/></svg>',
+        "history": '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/><path d="M12 8v4l3 2"/></svg>',
+        "invoices": '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h9l3 3v15l-2.5-1.5L13 21l-2.5-1.5L8 21l-2-1.5z"/><path d="M9 9h6M9 13h6"/></svg>',
+    }
+
+    def _seg(key, label, href, count=None):
+        _on = active_tab == key
+        _badge = (f'<span class="seg-count">{count}</span>' if count else "")
+        _cur = ' aria-current="page"' if _on else ""
+        return (f'<a class="seg{" on" if _on else ""}" href="{href}"{_cur}>'
+                f'{_seg_ico[key]}<span class="seg-lbl">{label}</span>{_badge}</a>')
+
+    _segs = (_seg("board", "Board", url_for("routes_page"), _day_stops or None)
+             + _seg("history", "History", history_tab_href))
     if user["role"] == "boss":
-        _invoices_tab = f"""<a class="route-tab {'active' if active_tab == 'invoices' else ''}" href="{url_for('routes_page')}?tab=invoices" style="min-height:48px;display:inline-flex;align-items:center;">Invoices</a>"""
-    tabs_html = f"""
-    <div class="route-tabs">
-        <a class="route-tab {'active' if active_tab == 'board' else ''}" href="{url_for('routes_page')}"
-           style="min-height:48px;display:inline-flex;align-items:center;">Board</a>
-        <a class="route-tab {'active' if active_tab == 'history' else ''}" href="{history_tab_href}"
-           style="min-height:48px;display:inline-flex;align-items:center;">History</a>
-        {_invoices_tab}
-    </div>
+        _segs += _seg("invoices", "Invoices", url_for("routes_page") + "?tab=invoices", _open_inv or None)
+    _n_segs = 3 if user["role"] == "boss" else 2
+
+    _dispatch_card = ""
+    if user["role"] == "boss" and active_tab in ("board", "history"):
+        if _day_routes:
+            _pct = int(_day_done * 100 / _day_stops) if _day_stops else 0
+            _pulse = (f'<div class="dc-pulse"><span class="dc-dot"></span>'
+                      f'{_day_routes} route{"s" if _day_routes != 1 else ""} &middot; '
+                      f'{_day_done}/{_day_stops} stops done'
+                      f'<span class="dc-bar"><i style="width:{_pct}%"></i></span></div>')
+        else:
+            _pulse = '<div class="dc-pulse quiet"><span class="dc-dot"></span>Nothing dispatched for this day yet</div>'
+        _dispatch_card = f"""
+    <div class="dispatch-card">
+        <a class="dc-main" href="/parser?day={_board_day}">
+            <span class="dc-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v10H9l-5 4z"/><path d="m13 7-2 4h3l-2 4"/></svg>
+            </span>
+            <span class="dc-text">
+                <span class="dc-title">New Dispatch</span>
+                <span class="dc-sub">Paste the text &mdash; AI builds the route</span>
+            </span>
+            <span class="dc-go" aria-hidden="true">&#8250;</span>
+        </a>
+        {_pulse}
+        <div class="dc-alt">
+            <a href="{url_for('new_route')}">&#9998; Build by hand</a>
+            <a href="{url_for('text_to_route')}">&#9000; Classic paste</a>
+        </div>
+    </div>"""
+
+    tabs_html = f"""{_dispatch_card}
+    <nav class="seg-track" style="--n:{_n_segs};" aria-label="Route Board sections">{_segs}</nav>
+    <style>
+    .dispatch-card {{ position:relative; margin:0 0 16px; border-radius:20px; overflow:hidden;
+        background:radial-gradient(120% 140% at 0% 0%, rgba(255,140,66,.22), rgba(255,140,66,0) 55%),
+                   linear-gradient(180deg, rgba(34,26,20,.95), rgba(22,19,17,.95));
+        border:1px solid rgba(255,140,66,.35);
+        box-shadow:0 10px 30px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.06); }}
+    .dispatch-card .dc-main {{ display:flex; align-items:center; gap:14px; padding:18px 18px 12px;
+        color:#fff; text-decoration:none; -webkit-tap-highlight-color:transparent; }}
+    .dispatch-card .dc-main:active {{ background:rgba(255,140,66,.08); }}
+    .dispatch-card .dc-icon {{ flex:none; width:52px; height:52px; border-radius:16px; display:flex;
+        align-items:center; justify-content:center; color:#1a0f08;
+        background:linear-gradient(135deg,#FFB070,#FF6B1A); box-shadow:0 6px 18px rgba(255,107,26,.45); }}
+    .dispatch-card .dc-text {{ flex:1; min-width:0; display:flex; flex-direction:column; gap:3px; }}
+    .dispatch-card .dc-title {{ font-size:20px; font-weight:900; letter-spacing:.2px; }}
+    .dispatch-card .dc-sub {{ font-size:13px; color:#C9B8A8; }}
+    .dispatch-card .dc-go {{ flex:none; font-size:30px; font-weight:300; color:#FF9D5C; line-height:1; }}
+    .dispatch-card .dc-pulse {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+        margin:0 18px 12px; font-size:12.5px; font-weight:700; color:#E9D7C6; }}
+    .dispatch-card .dc-pulse.quiet {{ color:#9C8F84; font-weight:600; }}
+    .dispatch-card .dc-dot {{ width:8px; height:8px; border-radius:50%; background:#3DDC84;
+        box-shadow:0 0 0 0 rgba(61,220,132,.6); animation:dcPulse 2s infinite; }}
+    .dispatch-card .dc-pulse.quiet .dc-dot {{ background:#6E655E; animation:none; }}
+    @keyframes dcPulse {{ 0% {{ box-shadow:0 0 0 0 rgba(61,220,132,.55); }} 70% {{ box-shadow:0 0 0 8px rgba(61,220,132,0); }} 100% {{ box-shadow:0 0 0 0 rgba(61,220,132,0); }} }}
+    .dispatch-card .dc-bar {{ flex:1; min-width:60px; height:5px; border-radius:3px; background:rgba(255,255,255,.08); overflow:hidden; }}
+    .dispatch-card .dc-bar i {{ display:block; height:100%; border-radius:3px; background:linear-gradient(90deg,#3DDC84,#9BE7A8); }}
+    .dispatch-card .dc-alt {{ display:grid; grid-template-columns:1fr 1fr; border-top:1px solid rgba(255,255,255,.07); }}
+    .dispatch-card .dc-alt a {{ display:flex; align-items:center; justify-content:center; gap:6px; min-height:46px;
+        color:#D8C4B2; font-size:13px; font-weight:700; text-decoration:none; }}
+    .dispatch-card .dc-alt a + a {{ border-left:1px solid rgba(255,255,255,.07); }}
+    .dispatch-card .dc-alt a:active, .dispatch-card .dc-alt a:hover {{ background:rgba(255,255,255,.05); color:#fff; }}
+    .seg-track {{ display:grid; grid-template-columns:repeat(var(--n),1fr); gap:4px; padding:4px; margin:0 0 18px;
+        border-radius:16px; background:rgba(12,12,12,.7); border:1px solid rgba(255,255,255,.08);
+        box-shadow:inset 0 2px 6px rgba(0,0,0,.45); }}
+    .seg-track .seg {{ position:relative; display:flex; align-items:center; justify-content:center; gap:7px;
+        min-height:46px; min-width:0; padding:0 6px; border-radius:12px; color:#A6A69E;
+        font-size:13.5px; font-weight:800; letter-spacing:.2px; text-decoration:none;
+        -webkit-tap-highlight-color:transparent; transition:background .2s, color .2s; }}
+    .seg-track .seg svg {{ flex:none; }}
+    .seg-track .seg-lbl {{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+    .seg-track .seg:active {{ background:rgba(255,255,255,.05); }}
+    .seg-track .seg.on {{ color:#FFF1E4; background:linear-gradient(135deg,#D9702E,#A84C14);
+        box-shadow:0 4px 14px rgba(206,98,36,.35), inset 0 1px 0 rgba(255,255,255,.18); }}
+    .seg-track .seg-count {{ position:absolute; top:-7px; right:-3px; z-index:1; min-width:18px; height:18px; padding:0 5px;
+        border-radius:9px; display:inline-flex; align-items:center; justify-content:center;
+        font-size:10.5px; font-weight:900; color:#1a0f08; background:#FFB070;
+        box-shadow:0 0 0 2px rgba(12,12,12,.9); }}
+    .seg-track .seg.on .seg-count {{ background:rgba(255,255,255,.9); }}
+    /* iPad / Mac: the dispatch card lays out wide — action on the left,
+       the two alternates stacked on the right; tabs stay a compact bar */
+    @media (min-width:700px) {{
+        .dispatch-card {{ display:grid; grid-template-columns:1fr 220px; }}
+        .dispatch-card .dc-main {{ grid-column:1; grid-row:1; padding:20px 22px 10px; }}
+        .dispatch-card .dc-pulse {{ grid-column:1; grid-row:2; margin:0 22px 18px; }}
+        .dispatch-card .dc-alt {{ grid-column:2; grid-row:1 / span 2; grid-template-columns:1fr;
+            border-top:0; border-left:1px solid rgba(255,255,255,.07); }}
+        .dispatch-card .dc-alt a + a {{ border-left:0; border-top:1px solid rgba(255,255,255,.07); }}
+        .dispatch-card .dc-alt a {{ justify-content:flex-start; padding:0 20px; }}
+        .dispatch-card .dc-bar {{ max-width:260px; }}
+        .seg-track {{ max-width:520px; margin-left:auto; margin-right:auto; }}
+    }}
+    @media (min-width:1100px) {{
+        .dispatch-card .dc-title {{ font-size:22px; }}
+        .dispatch-card .dc-icon {{ width:56px; height:56px; }}
+    }}
+    @media (max-width:360px) {{
+        .seg-track .seg {{ gap:5px; font-size:12.5px; }}
+        .seg-track .seg svg {{ width:16px; height:16px; }}
+        .dispatch-card .dc-title {{ font-size:18px; }}
+    }}
+    </style>
     """
 
     # 2026-10-14: board header message envelope — the topnav (which carries the
@@ -17727,9 +17866,6 @@ def routes_page():
     {_cmd_header("Route Board", _board_meta)}
     <div class="board-controls" style="margin-bottom:16px;">
         {_day_nav}
-        <div style="display:flex;justify-content:center;margin-top:12px;">
-            <a class="btn gold" href="/parser?day={_board_day}" style="min-height:48px;display:inline-flex;align-items:center;white-space:nowrap;">+ New Dispatch</a>
-        </div>
     </div>
     """
 
@@ -18005,12 +18141,6 @@ def routes_page():
             _first_group = False
 
         main_panel = f"""
-        {f'''
-        <div class="row" style="margin-bottom:18px;gap:10px;">
-            <a class="btn gold" href="{url_for('new_route')}">+ Create Route</a>
-            <a class="btn secondary" href="{url_for('text_to_route')}">⌨ Paste Dispatch Text</a>
-        </div>
-        ''' if user['role'] == 'boss' else ''}
         <div class="card">
             <form method="GET" class="row">
                 <input type="hidden" name="tab" value="history">
@@ -25308,7 +25438,7 @@ def view_route(route_id):
         <p>Progress: {completed_count}/{total_count} stops completed{f' &middot; {cancelled_count} cancelled' if cancelled_count else ''}{_route_rev_html}</p>
         <div class="row" style="margin-top:12px;">
             {route_action_buttons}
-            {f'<a class="btn gold" href="{url_for("invoice_new", route_id=route_id)}">&#x1F9FE; Create Invoice</a>' if session.get("role") == "boss" and _raw_completed_count else ''}
+            {f'<a class="btn gold" href="{url_for("invoice_new", route_id=route_id)}">{_RECEIPT_SVG}Create Invoice</a>' if session.get("role") == "boss" and _raw_completed_count else ''}
         </div>
         <div style="margin-top:10px;"><a href="{url_for('routes_page', day=route['route_date'])}" style="color:#8C8C82;font-size:13px;">&larr; Back to {e(route['route_date'])} board</a></div>
     </div>
@@ -27117,7 +27247,7 @@ def _invoice_card_html(d, line_count):
     return f"""
         <a class="card" style="display:block;text-decoration:none;margin-bottom:12px;border-left:4px solid #FFB84D;" href="{url_for('invoice_detail', invoice_id=d['id'])}">
             <div class="row between">
-                <div><span style="font-weight:800;">&#x1F9FE; {e(d['invoice_number'])}</span> &middot; {e(d['customer_name'] or '—')}</div>
+                <div><span style="font-weight:800;">{_RECEIPT_SVG}{e(d['invoice_number'])}</span> &middot; {e(d['customer_name'] or '—')}</div>
                 <span class="badge {_status_badge.get(d['status'], '')}">{e(d['status'].title())}</span>
             </div>
             <div class="row between" style="margin-top:10px;align-items:flex-end;">
@@ -35587,6 +35717,10 @@ def _container_money(conn, company_id, container, asof_date=None):
         "rate_cents": rate_cents,
         "customer_id": cust_id, "site_id": site_id, "customer_label": label,
     }
+
+
+# 2026-10-27: line-icon receipt for invoice buttons (replaces the emoji).
+_RECEIPT_SVG = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px;" aria-hidden="true"><path d="M6 3h9l3 3v15l-2.5-1.5L13 21l-2.5-1.5L8 21l-2-1.5z"/><path d="M9 9h6M9 13h6"/></svg>'
 
 
 def _fmt_money(cents):
