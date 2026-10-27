@@ -4466,6 +4466,9 @@ def init_db():
         FOREIGN KEY (stop_id) REFERENCES stops(id)
     )
     """)
+    # 2026-10-27: customers can ask for several containers in one request
+    # (Drop / New bin). Each one becomes its own delivery stop on approval.
+    safe_add_column(conn, "requests", "quantity INTEGER NOT NULL DEFAULT 1")
 
     # =========================================================
     # Phase 6 — DVIR (Driver Vehicle Inspection Reports) + defect tracking.
@@ -43290,6 +43293,7 @@ def api_location_hide(sa_id):
 # =========================================================
 REQUEST_TYPES     = {"PR", "P", "D", "NEW_BIN", "S"}  # S = Swap (Phase 7B)
 REQUEST_SIZES     = ["10yd", "15yd", "20yd", "30yd", "40yd"]
+REQUEST_MAX_QTY   = 10  # most containers one Drop/New-bin request can ask for
 REQUEST_STATUSES  = {"pending", "accepted", "approved", "scheduled", "in_progress", "done", "denied"}
 REQUEST_OPEN      = ("pending", "accepted", "approved", "scheduled", "in_progress")  # dupe-guard scope
 
@@ -43553,10 +43557,15 @@ def customer_create_request(token):
         if owned_bin is None:
             return bad("bin_id is not a container at this site")
         size_requested = None  # not used for PR/P/S
+        quantity = 1           # PR/P/S act on one existing bin
     else:  # D or NEW_BIN
         if not isinstance(size_requested, str) or size_requested not in REQUEST_SIZES:
             return bad("size_requested must be one of " + ", ".join(REQUEST_SIZES))
         bin_id = None  # not used for D/NEW_BIN
+        quantity = data.get("quantity", 1)
+        if isinstance(quantity, bool) or not isinstance(quantity, int) \
+                or not 1 <= quantity <= REQUEST_MAX_QTY:
+            return bad(f"quantity must be a whole number from 1 to {REQUEST_MAX_QTY}")
 
     # --- preferred_date: "asap" or ISO date today-or-future ---
     preferred_date = data.get("preferred_date")
@@ -43589,11 +43598,14 @@ def customer_create_request(token):
             (customer["id"], rtype, bin_id, *REQUEST_OPEN),
         ).fetchone()
     else:
+        # One open drop request per (site, size): asking for more of the same
+        # size goes in its quantity; a different size is its own request.
         dupe = conn.execute(
             f"""SELECT id FROM requests
                  WHERE customer_id = ? AND type = ? AND site_id = ?
+                   AND COALESCE(size_requested, '') = ?
                    AND status IN ({open_ph})""",
-            (customer["id"], rtype, site_id, *REQUEST_OPEN),
+            (customer["id"], rtype, site_id, size_requested or "", *REQUEST_OPEN),
         ).fetchone()
     if dupe is not None:
         conn.close()
@@ -43604,10 +43616,10 @@ def customer_create_request(token):
     cur = conn.cursor()
     cur.execute(
         """INSERT INTO requests
-               (customer_id, site_id, type, bin_id, size_requested,
+               (customer_id, site_id, type, bin_id, size_requested, quantity,
                 preferred_date, notes, status, stop_id, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)""",
-        (customer["id"], site_id, rtype, bin_id, size_requested,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, ?)""",
+        (customer["id"], site_id, rtype, bin_id, size_requested, quantity,
          preferred_date, notes, ts, ts),
     )
     conn.commit()
@@ -43817,13 +43829,34 @@ _PORTAL_JS = r"""
       font-size: 15px; font-weight: 700; padding: 14px; cursor: pointer; font-family: inherit; }
   .p-err { background: rgba(255,82,82,0.14); color: #FF7A7A; border: 1px solid rgba(255,82,82,0.45);
       border-radius: 12px; padding: 12px 14px; margin-top: 14px; font-size: 15px; font-weight: 600; }
+  .qty-btn { width:48px; height:48px; border-radius:12px; border:1px solid rgba(255,255,255,0.25);
+      background:rgba(255,255,255,0.08); color:#fff; font-size:26px; font-weight:800; cursor:pointer; }
+  .qty-btn:disabled { opacity:.3; cursor:default; }
+  .qty-val { min-width:34px; text-align:center; font-size:26px; font-weight:800; }
+  .yard { display:flex; flex-wrap:wrap; align-items:flex-end; gap:6px; min-height:56px; padding:12px;
+      margin-bottom:14px; border-radius:14px; background:repeating-linear-gradient(135deg,
+      rgba(255,255,255,0.03) 0 10px, rgba(255,255,255,0.06) 10px 20px); border:1px dashed rgba(255,255,255,0.18); }
+  .yard.empty { align-items:center; justify-content:center; color:var(--slate); font-size:14px; }
+  .yard .can { animation: canDrop .28s ease-out; }
+  @keyframes canDrop { from { transform:translateY(-14px); opacity:0; } to { transform:none; opacity:1; } }
+  .ord-row { display:flex; align-items:center; gap:12px; padding:12px; margin-bottom:10px; border-radius:14px;
+      background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.10); }
+  .ord-row.on { border-color:rgba(255,157,92,0.7); background:rgba(255,157,92,0.10); }
+  .ord-can { width:60px; display:flex; justify-content:center; }
+  .ord-info { flex:1; min-width:0; } .ord-info .sz { font-size:20px; font-weight:800; }
+  .ord-info .cue { font-size:12px; color:var(--slate); }
+  .ord-step { display:flex; align-items:center; gap:8px; }
+  .ord-pend { font-size:12px; font-weight:700; color:#FFD36E; text-align:right; max-width:96px; }
+  .ord-sum { margin-top:6px; font-size:15px; font-weight:700; color:#FF9D5C; }
+  .p-link { background:none; border:0; color:#FF9D5C; font-weight:700; font-size:14px; padding:4px 0 14px; cursor:pointer; }
+  .p-send:disabled { opacity:.45; }
   .p-ok { background: rgba(61,220,132,0.14); color: #3DDC84; border: 1px solid rgba(61,220,132,0.4);
       border-radius: 12px; padding: 14px; margin-bottom: 16px; font-size: 16px; font-weight: 700; text-align: center; }
 </style>
 <script>
 (function(){
   var BOOT  = JSON.parse(document.getElementById('portal-boot').textContent);
-  var TOKEN = BOOT.token, TODAY = BOOT.today, SIZES = BOOT.sizes;
+  var TOKEN = BOOT.token, TODAY = BOOT.today, SIZES = BOOT.sizes, MAXQ = BOOT.max_qty || 10;
   var CUES = {'10yd':'Fits a garage cleanout','15yd':'Kitchen remodel','20yd':'Roof tear-off','30yd':'Full house cleanout','40yd':'Construction / commercial'};
   var root  = document.getElementById('portal-root');
   var st = { view:'home', data:null, action:null, when:'asap', date:'', note:'', sending:false, error:'', ok:'' };
@@ -43846,9 +43879,15 @@ _PORTAL_JS = r"""
     for(var i=0;i<st.data.requests.length;i++){ var r=st.data.requests[i];
       if(OPEN.indexOf(r.status)<0 || r.type!==type) continue;
       if((type==='PR'||type==='P'||type==='S') && r.bin_id===binId) return r;
-      if(type==='D' && r.site_id===siteId) return r;
     }
     return null;
+  }
+  // Open drop / new-bin requests at a site, shown as chips above the button.
+  function openDrops(siteId){
+    if(!st.data) return [];
+    return st.data.requests.filter(function(r){
+      return OPEN.indexOf(r.status)>=0 && (r.type==='D'||r.type==='NEW_BIN') && r.site_id===siteId;
+    });
   }
   function infoReqs(binId, siteId){
     if(!st.data) return [];
@@ -43880,6 +43919,10 @@ _PORTAL_JS = r"""
     else if(r.status==='done'){ cls='green'; txt='Completed &#10003;'; }
     else if(r.status==='denied'){ cls='red'; txt='We couldn&rsquo;t do this one &mdash; call us'+(r.deny_reason?(': '+esc(r.deny_reason)):''); }
     var typ = r.type==='PR'?'Empty &amp; return':(r.type==='P'?'Pick up':(r.type==='S'?'Swap':'New bin'));
+    if(r.type==='D'||r.type==='NEW_BIN'){
+      var n = parseInt(r.quantity,10)||1;
+      typ = (n>1 ? (n+' new bins') : 'New bin') + (r.size_requested ? (' &middot; '+esc(r.size_requested)) : '');
+    }
     // 2026-10-12: Let customer cancel a pending request (tapped wrong button)
     var cancelBtn = '';
     if(r.status==='pending'){
@@ -43907,7 +43950,7 @@ _PORTAL_JS = r"""
     var d = st.data || {bins:[], sites:[], requests:[]};
     var hi = BOOT.contact_name ? ('Hi, '+esc(BOOT.contact_name)) : 'Hi there';
     var html = '<div class="portal-greeting"><div class="co">'+esc(BOOT.company_name)+'</div><div class="hi">'+hi+'</div></div>';
-    if(st.ok){ html += '<div class="p-ok">'+esc(st.ok)+'</div>'; st.ok=''; }
+    if(st.ok && Date.now() < (st.okUntil||0)){ html += '<div class="p-ok">'+st.ok+'</div>'; }
 
     if(d.bins.length){
       // Group bins by site; show a site-address header only when the customer
@@ -43915,6 +43958,7 @@ _PORTAL_JS = r"""
       var siteIds = {}; d.bins.forEach(function(b){ siteIds[b.site_id]=1; });
       var multiSite = Object.keys(siteIds).length > 1;
       var lastSite = null;
+      var dropShown = {};
       d.bins.forEach(function(b){
         if(multiSite && b.site_id!==lastSite){
           html += '<div class="p-site-head">'+esc(b.site_address||'Site')+'</div>';
@@ -43938,15 +43982,20 @@ _PORTAL_JS = r"""
         var iS = acts.push(function(){ startPR_P('S', b); })-1;
         html += actionBtn('s','S','SWAP','Empty this one, bring another', b.id, b.site_id, iS);
         var iD = acts.push(function(){ startD(b.site_id, b.site_address); })-1;
-        html += actionBtn('d','D','NEED ANOTHER BIN','Bring an additional dumpster to this site', null, b.site_id, iD);
+        if(!dropShown[b.site_id]){
+          dropShown[b.site_id] = 1;
+          openDrops(b.site_id).forEach(function(r){ html += chip(r); });
+        }
+        html += actionBtn('d','D','NEED MORE BINS','Bring one or more dumpsters to this site', null, b.site_id, iD);
         html += '</div>';
       });
     } else {
       html += '<div class="p-card"><div class="p-card-head">No dumpsters on site</div>'+
               '<div class="p-card-sub">Request one and your hauler will schedule a drop-off.</div>';
       if(d.sites.length){
+        d.sites.forEach(function(s){ openDrops(s.id).forEach(function(r){ html += chip(r); }); });
         var i0 = acts.push(function(){ startNewBin(); })-1;
-        html += '<button class="p-btn d" data-act="'+i0+'"><span class="l">REQUEST A BIN</span><span class="s">Pick a size and we&rsquo;ll bring it out</span></button>';
+        html += '<button class="p-btn d" data-act="'+i0+'"><span class="l">REQUEST BINS</span><span class="s">Pick a size and how many &mdash; we&rsquo;ll bring them out</span></button>';
       } else {
         html += '<div class="chip gray">No service address on file &mdash; contact your hauler.</div>';
       }
@@ -43961,7 +44010,7 @@ _PORTAL_JS = r"""
     goConfirm();
   }
   function startD(siteId, address){
-    st.action = { type:'D', binId:null, siteId:siteId, size:null, address:address };
+    st.action = { type:'D', binId:null, siteId:siteId, size:null, address:address, items:{} };
     st.view='size'; st.error=''; render();
   }
   function startNewBin(){
@@ -43983,14 +44032,60 @@ _PORTAL_JS = r"""
     root.innerHTML = html; wire();
   }
 
+  // ── Job-site order builder: any mix of sizes, any count per size ─────────
+  var SZW = {'10yd':30,'15yd':36,'20yd':42,'30yd':50,'40yd':58};   // bigger can, bigger icon
+  var SZC = {'10yd':'#7FD1FF','15yd':'#9BE7A8','20yd':'#FFD36E','30yd':'#FF9D5C','40yd':'#FF6B6B'};
+  function canIcon(sz){
+    var w = SZW[sz]||40, h = Math.round(w*0.55), c = SZC[sz]||'#FF9D5C';
+    return '<svg class="can" width="'+w+'" height="'+(h+6)+'" viewBox="0 0 '+w+' '+(h+6)+'" aria-hidden="true">'+
+           '<path d="M2 4 L'+(w-2)+' 4 L'+(w-6)+' '+h+' L6 '+h+' Z" fill="'+c+'" stroke="rgba(0,0,0,.35)" stroke-width="1.5"/>'+
+           '<line x1="'+(w*0.33)+'" y1="6" x2="'+(w*0.36)+'" y2="'+(h-2)+'" stroke="rgba(0,0,0,.25)"/>'+
+           '<line x1="'+(w*0.66)+'" y1="6" x2="'+(w*0.63)+'" y2="'+(h-2)+'" stroke="rgba(0,0,0,.25)"/>'+
+           '<circle cx="9" cy="'+(h+2)+'" r="3" fill="#222"/><circle cx="'+(w-9)+'" cy="'+(h+2)+'" r="3" fill="#222"/></svg>';
+  }
+  function orderTotal(items){ var t=0; for(var k in items){ t += items[k]||0; } return t; }
+  function orderList(items){
+    return SIZES.filter(function(sz){ return (items[sz]||0)>0; })
+                .map(function(sz){ return {size:sz, n:items[sz]}; });
+  }
+  function orderText(items){
+    return orderList(items).map(function(o){ return o.n+' &times; '+esc(o.size); }).join(', ');
+  }
+  function yardIcons(items){
+    var h='';
+    orderList(items).forEach(function(o){ for(var i=0;i<o.n;i++){ h += canIcon(o.size); } });
+    return h ? '<div class="yard">'+h+'</div>' : '<div class="yard empty">Your job site is empty &mdash; tap + to add dumpsters</div>';
+  }
+  function pendingBySize(siteId){
+    var m={}; openDrops(siteId).forEach(function(r){ if(r.size_requested){ m[r.size_requested]=(parseInt(r.quantity,10)||1); } });
+    return m;
+  }
+
   function renderSize(){
     acts=[];
-    var html = '<div class="p-restate">What size dumpster?</div><div class="size-grid">';
+    var a = st.action, items = a.items, total = orderTotal(items), pend = pendingBySize(a.siteId);
+    var html = '<div class="p-restate">What do you need at '+esc(a.address||'the job site')+'?</div>';
+    html += yardIcons(items);
     SIZES.forEach(function(sz){
-      var i = acts.push(function(){ st.action.size=sz; goConfirm(); })-1;
-      html += '<button class="size-card" data-act="'+i+'"><span class="sz">'+esc(sz)+'</span><span class="cue">'+esc(CUES[sz]||'')+'</span></button>';
+      var n = items[sz]||0;
+      html += '<div class="ord-row'+(n?' on':'')+'">'+
+              '<div class="ord-can">'+canIcon(sz)+'</div>'+
+              '<div class="ord-info"><div class="sz">'+esc(sz)+'</div><div class="cue">'+esc(CUES[sz]||'')+'</div></div>';
+      if(pend[sz]){
+        html += '<div class="ord-pend">'+pend[sz]+' already requested</div>';
+      } else {
+        var iM = acts.push(function(){ if((items[sz]||0)>0){ items[sz]=(items[sz]||0)-1; } render(); })-1;
+        var iP = acts.push(function(){ if((items[sz]||0)<MAXQ){ items[sz]=(items[sz]||0)+1; } render(); })-1;
+        html += '<div class="ord-step">'+
+                '<button class="qty-btn" aria-label="Fewer '+esc(sz)+'" data-act="'+iM+'"'+(n<=0?' disabled':'')+'>&minus;</button>'+
+                '<div class="qty-val">'+n+'</div>'+
+                '<button class="qty-btn" aria-label="More '+esc(sz)+'" data-act="'+iP+'"'+(n>=MAXQ?' disabled':'')+'>+</button></div>';
+      }
+      html += '</div>';
     });
-    html += '</div>';
+    var iN = acts.push(function(){ if(orderTotal(st.action.items)>0) goConfirm(); })-1;
+    html += '<button class="p-send" id="p-next" data-act="'+iN+'"'+(total?'':' disabled')+'>'+
+            (total ? ('NEXT &mdash; '+total+' DUMPSTER'+(total>1?'S':'')) : 'TAP + TO ADD DUMPSTERS')+'</button>';
     var bi = acts.push(function(){ st.view='home'; render(); })-1;
     html += '<button class="p-back" data-act="'+bi+'">&larr; Back</button>';
     root.innerHTML = html; wire();
@@ -44003,6 +44098,11 @@ _PORTAL_JS = r"""
     if(a.type==='PR') return 'Empty the '+sz+'dumpster at '+esc(a.address)+' and bring it back';
     if(a.type==='P')  return 'Pick up the '+sz+'dumpster at '+esc(a.address);
     if(a.type==='S')  return 'Swap the '+sz+'dumpster at '+esc(a.address)+' &mdash; empty this one and leave a replacement';
+    if(a.items){
+      var t = orderTotal(a.items);
+      return 'Drop off '+(t>1?(t+' dumpsters'):'1 dumpster')+' at '+esc(a.address)+
+             '<div class="ord-sum">'+orderText(a.items)+'</div>';
+    }
     return 'Drop off a '+sz+'dumpster at '+esc(a.address);
   }
   function renameBin(bin){
@@ -44019,6 +44119,10 @@ _PORTAL_JS = r"""
     acts=[];
     var a = st.action;
     var html = '<div class="p-restate">'+restate(a)+'</div>';
+    if(a.type==='D'){
+      html += yardIcons(a.items);
+      html += '<button class="p-link" data-act="'+(acts.push(function(){ captureConfirmInputs(); st.view='size'; render(); })-1)+'">&#9998; Change order</button>';
+    }
     html += '<div style="font-size:13px;color:var(--slate);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px;">When?</div>';
     html += '<div class="when-row">'+
             '<button class="when-btn '+(st.when==='asap'?'sel':'')+'" data-act="'+(acts.push(function(){ st.when='asap'; render(); })-1)+'">ASAP</button>'+
@@ -44048,10 +44152,10 @@ _PORTAL_JS = r"""
       if(!st.date || st.date < TODAY){ st.error = 'Please pick today or a later day.'; render(); return; }
       pref = st.date;
     }
-    var body = { type:a.type, site_id:a.siteId, preferred_date:pref };
-    if(a.type==='PR' || a.type==='P' || a.type==='S') body.bin_id = a.binId;
-    else body.size_requested = a.size;
-    if(st.note && st.note.trim()) body.notes = st.note.trim();
+    var note = (st.note && st.note.trim()) ? st.note.trim() : null;
+    if(a.type==='D'){ return submitOrder(a, pref, note); }
+    var body = { type:a.type, site_id:a.siteId, preferred_date:pref, bin_id:a.binId };
+    if(note) body.notes = note;
 
     st.sending=true; st.error=''; render();
     api('/api/c/'+encodeURIComponent(TOKEN)+'/requests', {
@@ -44060,7 +44164,7 @@ _PORTAL_JS = r"""
       return r.json().then(function(j){ return {ok:r.ok, status:r.status, j:j}; });
     }).then(function(res){
       st.sending=false;
-      if(res.ok){ st.ok='Request sent! Your hauler will confirm shortly.'; st.view='home'; load(function(){ /* refreshed */ }); render(); return; }
+      if(res.ok){ done('Request sent! Your hauler will confirm shortly.'); return; }
       if(res.status===409){ st.error='You&rsquo;ve already got an open request for this bin.'; render(); return; }
       st.error = (res.j && res.j.error) ? esc(res.j.error) : 'Something went wrong. Please try again.';
       render();
@@ -44069,6 +44173,49 @@ _PORTAL_JS = r"""
       st.error='Couldn&rsquo;t send &mdash; check your signal and try again.';
       render();
     });
+  }
+
+  function done(msg){
+    st.ok = msg; st.okUntil = Date.now() + 8000; st.view='home';
+    load(function(){}); render();
+    setTimeout(function(){ if(st.view==='home') render(); }, 8100);
+  }
+
+  // Sends the order as one request per size, one after another, so a
+  // dropped signal mid-way leaves a clear record of what went through.
+  function submitOrder(a, pref, note){
+    var list = orderList(a.items);
+    if(!list.length){ st.view='size'; render(); return; }
+    st.sending=true; st.error=''; render();
+    var sent=[], failed=[];
+    function next(i){
+      if(i>=list.length){
+        st.sending=false;
+        if(!failed.length){
+          done('&#10003; Order sent: '+list.map(function(o){ return o.n+' &times; '+esc(o.size); }).join(', ')+
+               '. Your hauler will confirm shortly.');
+          return;
+        }
+        sent.forEach(function(o){ delete a.items[o.size]; });
+        st.error = (sent.length ? ('Sent '+sent.map(function(o){ return o.n+' &times; '+esc(o.size); }).join(', ')+'. ') : '')+
+                   'Couldn&rsquo;t send '+failed.map(function(f){ return f.o.n+' &times; '+esc(f.o.size)+' ('+f.why+')'; }).join(', ')+'.';
+        load(function(){}); render();
+        return;
+      }
+      var o = list[i];
+      var body = { type:'D', site_id:a.siteId, preferred_date:pref, size_requested:o.size, quantity:o.n };
+      if(note) body.notes = note;
+      api('/api/c/'+encodeURIComponent(TOKEN)+'/requests', {
+        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
+      }).then(function(r){ return r.json().then(function(j){ return {ok:r.ok, status:r.status, j:j}; }); })
+        .then(function(res){
+          if(res.ok) sent.push(o);
+          else failed.push({o:o, why: res.status===409 ? 'already requested' : ((res.j && res.j.error) ? esc(res.j.error) : 'error')});
+          next(i+1);
+        })
+        .catch(function(){ failed.push({o:o, why:'no signal'}); next(i+1); });
+    }
+    next(0);
   }
 
   function wire(){
@@ -44111,6 +44258,7 @@ def customer_portal(token):
         "company_name":  (co["name"] if co and co["name"] else "HAULTRA"),
         "contact_name":  customer["contact_name"] or "",
         "sizes":         REQUEST_SIZES,
+        "max_qty":       REQUEST_MAX_QTY,
         "today":         today_str(),
     }
     body = (
@@ -44272,6 +44420,16 @@ def boss_list_requests():
 _REQUEST_TO_PARSER_CODE = {"PR": "PR", "P": "P", "D": "D", "NEW_BIN": "D", "S": "PR"}
 
 
+def _request_qty(r):
+    """Containers asked for on a request row (1 for anything but a drop)."""
+    try:
+        if r["type"] not in ("D", "NEW_BIN"):
+            return 1
+        return max(1, int(r["quantity"] or 1))
+    except (IndexError, KeyError, TypeError, ValueError):
+        return 1
+
+
 def cascade_request_from_stop(conn, stop_id):
     """Keep a linked customer request's status in sync with its stop, derived
     from the stop's authoritative state. No-op for stops with no request_id
@@ -44283,13 +44441,19 @@ def cascade_request_from_stop(conn, stop_id):
         otherwise (open, not started, e.g. reopened) -> request 'scheduled'
     """
     row = conn.execute(
-        "SELECT request_id, status, driver_status FROM stops WHERE id=?", (stop_id,)
+        "SELECT request_id FROM stops WHERE id=?", (stop_id,)
     ).fetchone()
     if not row or not row["request_id"]:
         return
-    if row["status"] == "completed":
+    # A multi-container request has one stop per container: it's done only
+    # when every one is completed, and in progress once any has started.
+    stops = conn.execute(
+        "SELECT status, driver_status FROM stops WHERE request_id=?", (row["request_id"],)
+    ).fetchall()
+    if stops and all(s["status"] == "completed" for s in stops):
         new_status = "done"
-    elif (row["driver_status"] or "pending") != "pending":
+    elif any(s["status"] == "completed" or (s["driver_status"] or "pending") != "pending"
+             for s in stops):
         new_status = "in_progress"
     else:
         new_status = "scheduled"
@@ -44389,15 +44553,31 @@ def _perform_assignment(conn, req, req_id, data):
             (route_id,),
         ).fetchone()["n"]
 
-        cur.execute(
-            """INSERT INTO stops (route_id, stop_order, customer_name, address, action,
-                                  container_size, notes, status, request_id, customer_id,
-                                  created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)""",
-            (route_id, next_order, customer_name, address, action_label, size, notes,
-             req_id, req["customer_id"], now_ts()),
-        )
-        stop_id = cur.lastrowid
+        # 2026-10-27: a multi-container drop request becomes one delivery stop
+        # per container. Stops already linked to this request (e.g. it was
+        # sent back to Unassigned after part of a route was deleted) count
+        # toward the quantity, so re-assigning never over-delivers.
+        try:
+            qty = int(req["quantity"] or 1)
+        except (IndexError, KeyError, TypeError, ValueError):
+            qty = 1
+        qty = max(1, min(qty, REQUEST_MAX_QTY)) if req["type"] in ("D", "NEW_BIN") else 1
+        already = conn.execute(
+            "SELECT COUNT(*) FROM stops WHERE request_id=?", (req_id,)).fetchone()[0] or 0
+        to_make = max(1, qty - already)
+
+        stop_ids = []
+        for i in range(to_make):
+            cur.execute(
+                """INSERT INTO stops (route_id, stop_order, customer_name, address, action,
+                                      container_size, notes, status, request_id, customer_id,
+                                      created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)""",
+                (route_id, next_order + i, customer_name, address, action_label, size, notes,
+                 req_id, req["customer_id"], now_ts()),
+            )
+            stop_ids.append(cur.lastrowid)
+        stop_id = stop_ids[0]
 
         conn.execute(
             "UPDATE requests SET status='scheduled', stop_id=?, updated_at=? WHERE id=?",
@@ -44418,7 +44598,7 @@ def _perform_assignment(conn, req, req_id, data):
         app.logger.warning("assign request: compute_can_flow error: %s", exc)
 
     return {"success": True, "request_id": req_id, "stop_id": stop_id,
-            "route_id": route_id, "status": "scheduled"}, None
+            "stop_ids": stop_ids, "route_id": route_id, "status": "scheduled"}, None
 
 
 @app.route("/api/requests/<int:req_id>/approve", methods=["PATCH"])
@@ -44738,6 +44918,9 @@ def unassigned_work():
         name = e(r["customer_business_name"] or r["customer_contact_name"] or "Customer")
         addr = e(r["site_address"] or "—")
         size = r["bin_size"] if r["type"] in ("PR", "P") else r["size_requested"]
+        _qty = _request_qty(r)
+        if _qty > 1 and size:
+            size = f"{_qty} × {size}"
         size_html = (f'<div style="color:var(--slate);font-size:13px;margin-top:2px;">📦 {e(size)}</div>'
                      if size else "")
         pref = r["preferred_date"]
@@ -48967,6 +49150,9 @@ def requests_page():
         name = e(r["customer_business_name"] or r["customer_contact_name"] or "Customer")
         addr = e(r["site_address"] or "—")
         size = r["bin_size"] if r["type"] in ("PR", "P") else r["size_requested"]
+        _qty = _request_qty(r)
+        if _qty > 1 and size:
+            size = f"{_qty} × {size} — {_qty} delivery stops"
         size_html = f'<div style="color:var(--slate);font-size:13px;margin-top:2px;">{e(size)}</div>' if size else ""
         pref = r["preferred_date"]
         pref_label = "ASAP" if pref == "asap" else e(pref)
