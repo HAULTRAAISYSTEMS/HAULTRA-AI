@@ -14523,28 +14523,36 @@ def team_page():
             # repeating "Inactive tombstone" on each card is noise.
             delete_cell = ""
         elif is_self:
-            delete_cell = f'<span class="muted small">You</span>'
+            # Shown as a chip beside the role badge instead, so your own card
+            # has no actions row and no divider with an orphan word under it.
+            delete_cell = ""
         elif is_last_boss:
             delete_cell = f'<span class="muted small" title="Cannot delete the last boss">&mdash;</span>'
         else:
             _del_uname  = e(u["username"])
             _del_action = url_for("delete_user", user_id=u["id"])
+            # "Delete driver", not bare "Delete": it sits in the same row as
+            # the photo's "Remove photo", and the two must never read alike.
+            _del_what = "driver" if is_driver else "user"
             delete_cell = (
-                f'<form method="POST" action="{_del_action}" style="margin:0;display:inline;" '
-                f'onsubmit="return confirm(\'Delete {_del_uname}? This cannot be undone.\');">'
+                f'<form method="POST" action="{_del_action}" class="tm-danger" style="margin:0;display:inline;" '
+                f'onsubmit="return confirm(\'Delete {_del_uname}? This removes the account and cannot be undone.\');">'
                 f'<button type="submit" '
                 f'style="background:transparent;color:#f87171;border:1px solid rgba(248,113,113,0.4);'
-                f'border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;line-height:1.4;">'
-                f'Delete</button>'
+                f'border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;line-height:1.4;'
+                f'min-height:36px;white-space:nowrap;">'
+                f'Delete {_del_what}</button>'
                 f'</form>'
             )
 
         # A tombstone keeps role='driver' for FK integrity, so `is_driver`
         # alone offered an Hours link on a deleted row — a page that can only
         # ever read 0.0h for a person who no longer exists.
+        # Sized to match the buttons beside it: as a bare text link this was an
+        # 18px tap target next to 36px buttons -- too small to hit on a tablet.
         hours_cell = (
-            f'<a href="{url_for("driver_hours_page")}?driver_id={u["id"]}" '
-            f'style="color:#FF9D5C;font-size:12px;margin-right:10px;">Hours</a>'
+            f'<a class="tm-btn" href="{url_for("driver_hours_page")}?driver_id={u["id"]}">'
+            f'Hours</a>'
             if (is_driver and not is_deleted) else ""
         )
 
@@ -14593,7 +14601,9 @@ def team_page():
             # and a second copy beside the buttons just looked like a bug.
             _av_cell = _avatar_upload_control_html(u, size=40, show_remove=True,
                                                    include_js=False, compact=True,
-                                                   show_avatar=False)
+                                                   show_avatar=False,
+                                                   remove_label="Remove photo",
+                                                   remove_danger=False)
         else:
             _av_cell = avatar_html(u, 40)
         # Team chat toggle: boss controls who's in the Team channel.
@@ -14636,6 +14646,26 @@ def team_page():
         _sub_line = " &middot; ".join(e(b) for b in _sub_bits)
 
         _meta_rows = ""
+        if not is_driver and not is_deleted:
+            # A boss card used to carry one row (Joined) against a driver's
+            # four, so it sat half-empty next to them and the grid looked
+            # broken. These are real attributes, not filler: what this account
+            # can reach, and that bosses are always in team chat.
+            _acc = []
+            for _k, _lbl in (("role_owner", "Owner"),
+                             ("role_dispatcher", "Dispatcher"),
+                             ("role_customer_manager", "Customer manager")):
+                try:
+                    if u[_k]:
+                        _acc.append(_lbl)
+                except (KeyError, IndexError):
+                    pass
+            _meta_rows += (
+                f'<div class="tm-meta"><span class="tm-meta-k">Access</span>'
+                f'<span class="tm-meta-v">{e(", ".join(_acc) or "Boss")}</span></div>'
+                f'<div class="tm-meta"><span class="tm-meta-k">Team chat</span>'
+                f'<span class="tm-meta-v muted">Always in</span></div>'
+            )
         if is_driver and not is_deleted:
             _meta_rows += (
                 f'<div class="tm-meta"><span class="tm-meta-k">Activity</span>'
@@ -14677,10 +14707,10 @@ def team_page():
                     <div class="tm-name">{e(_display)}</div>
                     <div class="tm-sub muted small">{_sub_line or '&nbsp;'}</div>
                 </div>
-                <div class="tm-role">{role_badge}</div>
+                <div class="tm-role">{role_badge}{'<span class="tm-you">You</span>' if is_self else ''}</div>
             </div>
             <div class="tm-body">{_meta_rows}</div>
-            <div class="tm-actions">{_actions or '<span class="muted small">&mdash;</span>'}</div>
+            <div class="tm-actions">{_actions}</div>
         </div>
         """
         if is_deleted and not (is_pending or is_stale):
@@ -14772,10 +14802,12 @@ def team_page():
     {_AVATAR_UPLOAD_JS}
     <style>
     /* ── Team roster cards ─────────────────────────────────────── */
-    /* align-items:start so a sparse card (the boss has no driver rows) sizes
-       to its content instead of stretching to the tallest card in the row. */
-    .tm-grid{{display:grid;gap:14px;align-items:start;
-        grid-template-columns:repeat(auto-fill,minmax(310px,1fr));}}
+    /* Cards stretch to a common height per row. align-items:start left a
+       short card floating with a hole beneath it, which is what the two-column
+       tablet width made obvious. minmax(290px) so a 820px iPad still gets two
+       columns with comfortable gutters. */
+    .tm-grid{{display:grid;gap:14px;align-items:stretch;
+        grid-template-columns:repeat(auto-fill,minmax(290px,1fr));}}
     .tm-card{{display:flex;flex-direction:column;gap:12px;padding:16px;
         border:1px solid rgba(255,255,255,.09);border-radius:var(--radius);
         background:linear-gradient(180deg,rgba(38,38,44,.5),rgba(20,20,24,.42));
@@ -14787,10 +14819,19 @@ def team_page():
     .tm-top{{display:flex;align-items:flex-start;gap:12px;}}
     .tm-avatar{{flex:0 0 auto;}}
     .tm-id{{flex:1;min-width:0;}}
+    /* Wrap, never truncate: at three columns the ellipsis was eating the back
+       half of the phone number ("(804) ..."), which is the one thing on the
+       card a boss actually needs to read. overflow-wrap handles a long
+       single-token username with no spaces to break on. */
     .tm-name{{font-weight:700;font-size:15px;line-height:1.25;
-        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}}
-    .tm-sub{{margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}}
-    .tm-role{{flex:0 0 auto;}}
+        overflow-wrap:anywhere;}}
+    .tm-sub{{margin-top:2px;overflow-wrap:anywhere;}}
+    .tm-role{{flex:0 0 auto;display:flex;align-items:center;gap:6px;
+        flex-wrap:wrap;justify-content:flex-end;}}
+    .tm-you{{font-size:10px;font-weight:700;letter-spacing:.5px;
+        text-transform:uppercase;color:var(--text-muted);
+        border:1px solid rgba(255,255,255,.14);border-radius:999px;
+        padding:2px 7px;white-space:nowrap;}}
     .tm-body{{display:flex;flex-direction:column;gap:7px;}}
     .tm-meta{{display:flex;align-items:center;gap:10px;min-height:26px;}}
     .tm-meta-k{{flex:0 0 78px;font-size:11px;letter-spacing:.4px;
@@ -14804,7 +14845,20 @@ def team_page():
     .tm-actions a{{margin-right:0 !important;}}
     .tm-actions:empty{{display:none;}}
     .tm-actions > div{{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}}
+    /* Deleting the account is pushed away from the photo buttons and sits on
+       its own, so "Remove photo" and "Delete driver" are never adjacent. */
+    .tm-actions .tm-danger{{margin-left:auto;}}
+    .tm-btn{{display:inline-flex;align-items:center;justify-content:center;
+        min-height:36px;padding:5px 12px;border-radius:8px;
+        border:1px solid rgba(255,157,92,.4);background:rgba(255,157,92,.08);
+        color:#FF9D5C;font-weight:700;font-size:12.5px;text-decoration:none;
+        white-space:nowrap;}}
+    .tm-btn:hover{{background:rgba(255,157,92,.16);}}
     .tm-card.is-former .tm-actions{{display:none;}}
+    /* Selects filled their own width, so the same control was a different
+       size on every card. */
+    .tm-meta-v select,
+    .tm-meta-v form{{width:100%;}}
     .tm-former{{padding:16px 22px;}}
     .tm-former > summary{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
         cursor:pointer;list-style:none;user-select:none;}}
@@ -41776,7 +41830,8 @@ _AVATAR_UPLOAD_JS = """
 
 
 def _avatar_upload_control_html(user, size=64, show_remove=True, include_js=True,
-                                compact=False, show_avatar=True):
+                                compact=False, show_avatar=True,
+                                remove_label="Remove", remove_danger=True):
     """A tappable avatar + hidden camera/library input + Add/Change/Remove
     controls for the given user (self or, for a boss, a driver). Pass
     include_js=False when the page already injected _AVATAR_UPLOAD_JS once.
@@ -41786,9 +41841,17 @@ def _avatar_upload_control_html(user, size=64, show_remove=True, include_js=True
     has = bool((_row_get(user, "avatar_path") or "").strip())
     remove = ""
     if show_remove and has:
+        # remove_danger=False for callers that sit this button next to a
+        # genuinely destructive one (the team roster puts it beside "Delete
+        # driver"): two red buttons side by side, one clearing a photo and one
+        # deleting a person, is a mis-tap waiting to happen on a tablet.
+        _rm_border = "rgba(255,82,82,0.4)" if remove_danger else "rgba(255,255,255,0.16)"
+        _rm_color = "#FF9B9B" if remove_danger else "var(--text-soft)"
         remove = (f'<button type="button" onclick="haAvatarRemove({uid})" '
-                  f'style="min-height:36px;padding:4px 10px;border-radius:8px;border:1px solid rgba(255,82,82,0.4);'
-                  f'background:transparent;color:#FF9B9B;font-size:12px;cursor:pointer;">Remove</button>')
+                  f'style="min-height:36px;padding:4px 10px;border-radius:8px;'
+                  f'border:1px solid {_rm_border};'
+                  f'background:transparent;color:{_rm_color};font-size:12px;'
+                  f'cursor:pointer;white-space:nowrap;">{remove_label}</button>')
     _btn_label = ("Change" if (compact and has) else ("Change photo" if has else ("Photo" if compact else "Add photo")))
     ctrl = (
         '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'
