@@ -131,12 +131,23 @@ ok(r.status_code == 200, "DM thread to a live driver still works (got %d)" % r.s
 print("\n-- team page --")
 code, html = body("/team")
 ok(code == 200, "team page renders (got %d)" % code)
-ok(TOMB_NAME in html,
-   "tombstone row IS still shown on the team page (audit trail, by design)")
-_tomb_seg = html.split(TOMB_NAME, 1)[1][:1400] if TOMB_NAME in html else ""
-ok("driver_id=%d" % goner not in _tomb_seg,
-   "no Hours link on the tombstone row")
+# The row is still rendered -- it is the deletion audit trail -- but inside a
+# collapsed "Former members" section and under a readable label, never the
+# raw "deleted-<id>-<hex>" string.
+ok(TOMB_NAME not in html, "raw tombstone username is not printed on the team page")
+ok("Former members" in html, "a Former members section exists")
+ok("Former driver" in html, "the removed account is shown under a readable label")
+_former = html.split("Former members", 1)[1] if "Former members" in html else ""
+ok("Former driver" in _former, "the removed account sits inside that section")
+ok("Former driver" not in html.split("Former members", 1)[0],
+   "and not in the main roster above it")
+ok("driver_id=%d" % goner not in html, "no Hours link anywhere for the tombstone")
 ok(("driver_id=%d" % keeper) in html, "live driver keeps an Hours link")
+# Roster readability: formatted dates and phones, no raw timestamps.
+ok("2026-04" not in _former.split("Former driver", 1)[0][-400:],
+   "no raw YYYY-MM-DD timestamp next to the roster cards")
+ok("tm-card" in html, "roster renders as member cards")
+ok("<table" not in html, "the 9-column roster table is gone")
 
 # ── 6. The history itself is untouched ─────────────────────────────
 print("\n-- history preserved --")

@@ -2074,6 +2074,48 @@ def display_user_name(name, fallback="Former driver"):
     return fallback if is_tombstone_username(s) else s
 
 
+def _tombstone_avatar_html(size=44):
+    """Neutral avatar for a deleted account.
+
+    The normal avatar derives initials from the username, which for a
+    tombstone is "deleted-<id>-<hex>" — it rendered a meaningless "DE" disc.
+    """
+    return (
+        f'<span style="display:inline-flex;align-items:center;justify-content:center;'
+        f'width:{size}px;height:{size}px;border-radius:50%;flex:0 0 auto;'
+        f'background:rgba(255,255,255,.06);border:1px dashed rgba(255,255,255,.18);'
+        f'color:var(--text-muted);font-size:{max(14, size // 2)}px;line-height:1;"'
+        f' aria-hidden="true">&#8212;</span>'
+    )
+
+
+def _fmt_phone_display(raw):
+    """(804) 466-0801 from a 10-digit string; anything else passes through."""
+    d = re.sub(r"\D", "", (raw or ""))
+    if len(d) == 11 and d.startswith("1"):
+        d = d[1:]
+    if len(d) == 10:
+        return f"({d[:3]}) {d[3:6]}-{d[6:]}"
+    return (raw or "").strip()
+
+
+def _fmt_date_display(raw):
+    """'Apr 21, 2026' from a stored timestamp. '' when it can't be parsed.
+
+    Roster dates were rendered as the raw '2026-04-21 07:09:31' -- the
+    seconds are noise to anyone reading a team list.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s[:len(fmt) + 2].strip(), fmt).strftime("%b %-d, %Y")
+        except ValueError:
+            continue
+    return s[:10]
+
+
 def compute_can_flow(conn, route_id, starts_with_can=False):
     """
     Walk ordered stops, stamp can_state_before, and derive swap_with_prev_pull.
@@ -14436,7 +14478,9 @@ def team_page():
     current_uid = session["user_id"]
     boss_count  = sum(1 for u in users if u["role"] == "boss" and u["is_active"])
 
-    rows = ""
+    active_cards = ""
+    former_cards = ""
+    former_count = 0
     for u in users:
         is_self      = u["id"] == current_uid
         is_driver    = u["role"] == "driver"
@@ -14449,7 +14493,6 @@ def team_page():
             _stale_row = None
         is_stale     = bool(_stale_row)
 
-        _del_td_style = 'style="text-align:right;white-space:nowrap;width:170px;"'
         if is_pending:
             _resend_action = url_for("resend_invite", invite_id=_pend["id"])
             _revoke_action = url_for("revoke_invite", invite_id=_pend["id"])
@@ -14476,7 +14519,9 @@ def team_page():
                 f'Resend</button></form>'
             )
         elif is_deleted:
-            delete_cell = '<span class="muted small">Inactive tombstone</span>'
+            # The Former members section already says what these rows are;
+            # repeating "Inactive tombstone" on each card is noise.
+            delete_cell = ""
         elif is_self:
             delete_cell = f'<span class="muted small">You</span>'
         elif is_last_boss:
@@ -14515,8 +14560,11 @@ def team_page():
             else '<span class="badge">Driver</span>'
         )
 
+        _n_rt = u["routes_assigned"] or 0
+        _n_st = u["completed_stops"] or 0
         stats_cell = (
-            f'{u["routes_assigned"] or 0} routes &middot; {u["completed_stops"] or 0} stops'
+            f'{_n_rt} route{"" if _n_rt == 1 else "s"} &middot;'
+            f' {_n_st} stop{"" if _n_st == 1 else "s"}'
             if is_driver else '<span class="muted small">&mdash;</span>'
         )
 
@@ -14541,8 +14589,11 @@ def team_page():
         # Avatar cell: drivers get the boss-managed upload control; others show
         # just the avatar. The shared upload JS is injected once in the body.
         if u["role"] == "driver":
+            # Buttons only: the card draws the avatar itself in the name row,
+            # and a second copy beside the buttons just looked like a bug.
             _av_cell = _avatar_upload_control_html(u, size=40, show_remove=True,
-                                                   include_js=False, compact=True)
+                                                   include_js=False, compact=True,
+                                                   show_avatar=False)
         else:
             _av_cell = avatar_html(u, 40)
         # Team chat toggle: boss controls who's in the Team channel.
@@ -14562,20 +14613,81 @@ def team_page():
                 f'<input type="checkbox" {_chk} data-uid="{u["id"]}" aria-label="Team chat">'
                 f'<span class="slider"></span></label>'
             )
-        rows += f"""
-        <tr>
-            <td>{_av_cell}</td>
-            <td>{e(u['username'])}</td>
-            <td>{e(u['full_name'] or '')}</td>
-            <td>{e(u['phone'] or '')}</td>
-            <td>{role_badge}</td>
-            <td class="muted small">{stats_cell}</td>
-            <td>{nav_cell}</td>
-            <td>{_chat_cell}</td>
-            <td>{e(u['created_at'])}</td>
-            <td {_del_td_style}>{hours_cell}{delete_cell}</td>
-        </tr>
+        # ── Member card ───────────────────────────────────────────
+        # 2026-10-28: the roster was a 9-column table that ran off the side
+        # of a phone and stacked the avatar's Photo/Change/Remove buttons
+        # inside the first cell, so every row was a different height. One
+        # card per person instead: identity on top, details in the middle,
+        # actions grouped at the bottom.
+        # Two delete paths write two different tombstone names -- the full
+        # account deletion stores full_name "Deleted driver"/"Deleted manager",
+        # the quick roster delete stores NULL -- so the roster showed the same
+        # thing under two labels. Deleted rows get one label, derived from role.
+        if is_deleted:
+            _display = "Former driver" if is_driver else "Former manager"
+        else:
+            _display = (u["full_name"] or "").strip() or display_user_name(u["username"])
+        _handle = display_user_name(u["username"])
+        _sub_bits = []
+        if not is_deleted:
+            _sub_bits.append("@" + _handle)
+        if (u["phone"] or "").strip():
+            _sub_bits.append(_fmt_phone_display(u["phone"]))
+        _sub_line = " &middot; ".join(e(b) for b in _sub_bits)
+
+        _meta_rows = ""
+        if is_driver and not is_deleted:
+            _meta_rows += (
+                f'<div class="tm-meta"><span class="tm-meta-k">Activity</span>'
+                f'<span class="tm-meta-v">{stats_cell}</span></div>'
+                f'<div class="tm-meta"><span class="tm-meta-k">Nav app</span>'
+                f'<span class="tm-meta-v">{nav_cell}</span></div>'
+                f'<div class="tm-meta"><span class="tm-meta-k">Team chat</span>'
+                f'<span class="tm-meta-v">{_chat_cell}</span></div>'
+            )
+        _joined = _fmt_date_display(u["created_at"])
+        if _joined:
+            _meta_rows += (
+                f'<div class="tm-meta"><span class="tm-meta-k">'
+                f'{"Removed" if is_deleted else "Joined"}</span>'
+                f'<span class="tm-meta-v muted">{e(_joined)}</span></div>'
+            )
+        if is_deleted:
+            _meta_rows += (
+                '<div class="tm-meta"><span class="tm-meta-k">History</span>'
+                '<span class="tm-meta-v muted">Past routes preserved</span></div>'
+            )
+
+        # The avatar upload control is its own inline flex row of buttons.
+        # Keeping it in the identity line pushed the name across and truncated
+        # the phone, so it lives in the actions row with everything else and
+        # the identity line gets a plain avatar.
+        _photo_ctl = _av_cell if (u["role"] == "driver" and not is_deleted) else ""
+        _actions = (hours_cell + _photo_ctl + delete_cell).strip()
+        _card = f"""
+        <div class="tm-card{' is-former' if is_deleted else ''}{' is-you' if is_self else ''}">
+            <div class="tm-top">
+                <div class="tm-avatar">{
+                    _tombstone_avatar_html(44) if is_deleted
+                    else (f'<span onclick="haAvatarPick({u["id"]})" style="cursor:pointer;" '
+                          f'title="Change photo">{avatar_html(u, 44)}</span>'
+                          if u["role"] == "driver" else avatar_html(u, 44))
+                }</div>
+                <div class="tm-id">
+                    <div class="tm-name">{e(_display)}</div>
+                    <div class="tm-sub muted small">{_sub_line or '&nbsp;'}</div>
+                </div>
+                <div class="tm-role">{role_badge}</div>
+            </div>
+            <div class="tm-body">{_meta_rows}</div>
+            <div class="tm-actions">{_actions or '<span class="muted small">&mdash;</span>'}</div>
+        </div>
         """
+        if is_deleted and not (is_pending or is_stale):
+            former_cards += _card
+            former_count += 1
+        else:
+            active_cards += _card
 
     _invite_banner = ""
     _show_raw = (request.args.get("show_invite", "") or "").strip()
@@ -14609,6 +14721,22 @@ def team_page():
     </div>
     """
 
+    # Former members live behind a closed <details>: the rows must stay (past
+    # routes point at them) and they are the deletion audit trail, but they
+    # are not people you can dispatch, so they do not belong in the roster.
+    former_section = ""
+    if former_cards:
+        former_section = f"""
+    <details class="card tm-former">
+        <summary>
+            <span class="tm-former-title">Former members</span>
+            <span class="tm-former-count">{former_count}</span>
+            <span class="muted small tm-former-hint">Removed accounts &middot; work history kept on past routes</span>
+        </summary>
+        <div class="tm-grid" style="margin-top:16px;">{former_cards}</div>
+    </details>
+    """
+
     body = f"""
     <div class="hero">
         <h1>Team</h1>
@@ -14632,25 +14760,68 @@ def team_page():
         </form>
     </div>
     <div class="card">
-        <div class="row between">
+        <div class="row between" style="margin-bottom:16px;">
             <h2 style="margin:0;">All Team Members</h2>
             <a class="btn" href="{url_for('register')}">Create User</a>
         </div>
-        <div class="table-wrap">
-            <table>
-                <thead>
-                    <tr>
-                        <th style="width:56px;"></th>
-                        <th>Username</th><th>Full Name</th><th>Phone</th><th>Role</th>
-                        <th>Driver Activity</th><th>Nav App</th><th>Team Chat</th><th>Created</th><th style="width:170px;"></th>
-                    </tr>
-                </thead>
-                <tbody>{rows or '<tr><td colspan="10" class="muted">No team members found.</td></tr>'}</tbody>
-            </table>
+        <div class="tm-grid">
+            {active_cards or '<div class="empty-state" style="padding:20px 0;">No team members yet.</div>'}
         </div>
     </div>
+    {former_section}
     {_AVATAR_UPLOAD_JS}
     <style>
+    /* ── Team roster cards ─────────────────────────────────────── */
+    /* align-items:start so a sparse card (the boss has no driver rows) sizes
+       to its content instead of stretching to the tallest card in the row. */
+    .tm-grid{{display:grid;gap:14px;align-items:start;
+        grid-template-columns:repeat(auto-fill,minmax(310px,1fr));}}
+    .tm-card{{display:flex;flex-direction:column;gap:12px;padding:16px;
+        border:1px solid rgba(255,255,255,.09);border-radius:var(--radius);
+        background:linear-gradient(180deg,rgba(38,38,44,.5),rgba(20,20,24,.42));
+        transition:border-color .15s ease,transform .15s ease;}}
+    .tm-card:hover{{border-color:rgba(255,138,61,.34);transform:translateY(-1px);}}
+    .tm-card.is-you{{border-color:rgba(255,138,61,.3);}}
+    .tm-card.is-former{{opacity:.72;background:rgba(255,255,255,.02);}}
+    .tm-card.is-former:hover{{opacity:1;transform:none;}}
+    .tm-top{{display:flex;align-items:flex-start;gap:12px;}}
+    .tm-avatar{{flex:0 0 auto;}}
+    .tm-id{{flex:1;min-width:0;}}
+    .tm-name{{font-weight:700;font-size:15px;line-height:1.25;
+        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}}
+    .tm-sub{{margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}}
+    .tm-role{{flex:0 0 auto;}}
+    .tm-body{{display:flex;flex-direction:column;gap:7px;}}
+    .tm-meta{{display:flex;align-items:center;gap:10px;min-height:26px;}}
+    .tm-meta-k{{flex:0 0 78px;font-size:11px;letter-spacing:.4px;
+        text-transform:uppercase;color:var(--text-muted);}}
+    .tm-meta-v{{flex:1;min-width:0;font-size:13px;}}
+    .tm-meta-v .compact-select{{max-width:100%;}}
+    .tm-actions{{display:flex;align-items:center;flex-wrap:wrap;gap:8px;
+        margin-top:auto;padding-top:11px;
+        border-top:1px solid rgba(255,255,255,.07);}}
+    .tm-actions form{{margin:0;}}
+    .tm-actions a{{margin-right:0 !important;}}
+    .tm-actions:empty{{display:none;}}
+    .tm-actions > div{{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}}
+    .tm-card.is-former .tm-actions{{display:none;}}
+    .tm-former{{padding:16px 22px;}}
+    .tm-former > summary{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+        cursor:pointer;list-style:none;user-select:none;}}
+    .tm-former > summary::-webkit-details-marker{{display:none;}}
+    .tm-former > summary::before{{content:"\\25B8";color:var(--text-muted);
+        font-size:12px;transition:transform .15s ease;}}
+    .tm-former[open] > summary::before{{transform:rotate(90deg);}}
+    .tm-former-title{{font-weight:700;font-size:14px;}}
+    .tm-former-count{{display:inline-flex;align-items:center;justify-content:center;
+        min-width:22px;height:22px;padding:0 7px;border-radius:999px;font-size:12px;
+        font-weight:700;background:rgba(255,255,255,.08);color:var(--text-soft);}}
+    .tm-former-hint{{margin-left:auto;}}
+    @media (max-width:520px){{
+        .tm-grid{{grid-template-columns:1fr;}}
+        .tm-meta-k{{flex-basis:70px;}}
+        .tm-former-hint{{margin-left:0;flex-basis:100%;}}
+    }}
     .team-chat-toggle{{position:relative;display:inline-block;width:44px;height:26px;cursor:pointer;}}
     .team-chat-toggle input{{opacity:0;width:0;height:0;}}
     .team-chat-toggle .slider{{position:absolute;inset:0;border-radius:999px;
@@ -41604,10 +41775,13 @@ _AVATAR_UPLOAD_JS = """
 """
 
 
-def _avatar_upload_control_html(user, size=64, show_remove=True, include_js=True, compact=False):
+def _avatar_upload_control_html(user, size=64, show_remove=True, include_js=True,
+                                compact=False, show_avatar=True):
     """A tappable avatar + hidden camera/library input + Add/Change/Remove
     controls for the given user (self or, for a boss, a driver). Pass
-    include_js=False when the page already injected _AVATAR_UPLOAD_JS once."""
+    include_js=False when the page already injected _AVATAR_UPLOAD_JS once.
+    Pass show_avatar=False for buttons only, when the caller already draws
+    the avatar elsewhere (the team roster cards show it in the name row)."""
     uid = _row_get(user, "id")
     has = bool((_row_get(user, "avatar_path") or "").strip())
     remove = ""
@@ -41618,7 +41792,9 @@ def _avatar_upload_control_html(user, size=64, show_remove=True, include_js=True
     _btn_label = ("Change" if (compact and has) else ("Change photo" if has else ("Photo" if compact else "Add photo")))
     ctrl = (
         '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'
-        f'<span onclick="haAvatarPick({uid})" style="cursor:pointer;">{avatar_html(user, size)}</span>'
+        + (f'<span onclick="haAvatarPick({uid})" style="cursor:pointer;">'
+           f'{avatar_html(user, size)}</span>' if show_avatar else '')
+        + (
         # NB: no `capture` attribute — that forces the camera and hides the
         # photo library on mobile. Plain accept="image/*" lets the native
         # picker offer Camera, Photo Library, and Files.
@@ -41630,7 +41806,7 @@ def _avatar_upload_control_html(user, size=64, show_remove=True, include_js=True
         f'{_btn_label}</button>'
         f'{remove}'
         f'<span id="ha-av-status-{uid}" class="muted small" hidden></span>'
-        '</div>'
+        '</div>')
     )
     return ctrl + (_AVATAR_UPLOAD_JS if include_js else "")
 
