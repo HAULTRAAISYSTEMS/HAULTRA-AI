@@ -181,8 +181,18 @@ boss = conn.execute("SELECT * FROM users WHERE id=?", (boss_id,)).fetchone()
 conn.close()
 set_user_session(boss_client, boss)
 team = boss_client.get("/team")
-check(b"Inactive tombstone" in team.data and b"Original Driver Name" not in team.data,
-      "boss roster shows inactive tombstone without former name")
+# 2026-10-28: the roster became member cards and the removed account moved
+# into a collapsed "Former members" section, so the old "Inactive tombstone"
+# label is gone. The guarantee this check exists for is unchanged and still
+# asserted below: the row is present, and the former name is not.
+check(b"Former members" in team.data and b"Former driver" in team.data,
+      "boss roster still shows the removed account, under a readable label")
+check(b"Original Driver Name" not in team.data,
+      "boss roster never shows the former name")
+check(b"deleted-" not in team.data,
+      "boss roster never prints the raw tombstone username")
+check(b"Deleted driver" not in team.data,
+      "removed accounts use one label, not the stored tombstone name too")
 
 
 # In-progress route blocks deletion with zero database changes.
