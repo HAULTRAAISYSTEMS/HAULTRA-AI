@@ -2046,6 +2046,34 @@ def stop_is_open(row):
     return (not stop_is_cancelled(row)) and row["status"] != "completed"
 
 
+# Deleting a user overwrites the row as a non-identifying tombstone whose
+# username is "deleted-<id>-<hex>" or "deleted-<role>-<id>-<hex>". The row has
+# to stay so historical routes keep a valid foreign key, which means that
+# machine-generated string can surface anywhere a past assignee is printed.
+_TOMBSTONE_USERNAME_RE = re.compile(r"^deleted-(?:[a-z_]+-)?\d+-[0-9a-f]{6,}$", re.I)
+
+
+def is_tombstone_username(name):
+    """True if `name` is a deleted-user tombstone username."""
+    return bool(_TOMBSTONE_USERNAME_RE.match((name or "").strip()))
+
+
+def display_user_name(name, fallback="Former driver"):
+    """A name safe to show a human.
+
+    Use wherever a PAST assignee is attributed (a completed route's driver,
+    today's pull counts) — that work really happened, so dropping the row
+    would make the totals disagree with themselves; only the raw tombstone
+    string needs replacing. Do NOT use to paper over a tombstone appearing in
+    a roster of current people (payroll, leaderboards, dropdowns): those
+    queries should filter `is_active=1` instead.
+    """
+    s = (name or "").strip()
+    if not s:
+        return s
+    return fallback if is_tombstone_username(s) else s
+
+
 def compute_can_flow(conn, route_id, starts_with_can=False):
     """
     Walk ordered stops, stamp can_state_before, and derive swap_with_prev_pull.
@@ -12524,7 +12552,10 @@ def dashboard():
 
     driver_pull_counts = {}
     for s in pulls_today_rows:
-        name = s["driver_username"] or "Unassigned"
+        # A driver deleted after working today still did these pulls, so the
+        # count stays (dropping it would disagree with Pulls Today) — but the
+        # label must not be the raw "deleted-<id>-<hex>" tombstone string.
+        name = display_user_name(s["driver_username"]) or "Unassigned"
         driver_pull_counts[name] = driver_pull_counts.get(name, 0) + 1
     driver_pull_list = sorted(driver_pull_counts.items(), key=lambda kv: kv[1], reverse=True)
 
@@ -12656,8 +12687,13 @@ def dashboard():
     # ── Driver pay-week hours (2026-10-17) ─────────────────────────
     # One row per driver: total hours + 7-day strip. Uses the same
     # get_driver_week_summary the Clock page uses, so payroll never disagrees.
+    # is_active=1: deleting a driver keeps the row as a non-identifying
+    # tombstone (role stays 'driver' so historical routes keep a valid FK),
+    # so a role-only filter put "deleted-24-<hex>" in the payroll list
+    # forever at 0.0h. A tombstone is not a person and is never paid.
     _drivers = conn.execute(
-        "SELECT id, username, full_name FROM users WHERE company_id=? AND role='driver' ORDER BY username",
+        "SELECT id, username, full_name FROM users"
+        " WHERE company_id=? AND role='driver' AND is_active=1 ORDER BY username",
         (company_id,)).fetchall()
     _now_local = _company_local_now(co_settings)
     _week_start = company_week_start_for(co_settings, _now_local.date())
@@ -12772,7 +12808,7 @@ def dashboard():
 <tr>
     <td>{e(r['route_date'])}</td>
     <td><a href="{url_for('view_route', route_id=r['id'])}">{e(r['route_name'])}</a></td>
-    <td>{e(r['assigned_username'] or 'Unassigned')}</td>
+    <td>{e(display_user_name(r['assigned_username']) or 'Unassigned')}</td>
     <td><span class="badge {e(r['status'])}">{e(r['status'])}</span></td>
     <td>
         <div class="row">
@@ -12982,7 +13018,7 @@ def analytics_page():
         FROM users u
         LEFT JOIN routes r ON r.assigned_to = u.id AND r.company_id = ?
         LEFT JOIN stops s ON s.route_id = r.id
-        WHERE u.role='driver' AND u.company_id = ?
+        WHERE u.role='driver' AND u.company_id = ? AND u.is_active = 1
         GROUP BY u.id
         ORDER BY completed_stops DESC, routes_handled DESC, u.username ASC
     """, (company_id, company_id)).fetchall()
@@ -14458,10 +14494,13 @@ def team_page():
                 f'</form>'
             )
 
+        # A tombstone keeps role='driver' for FK integrity, so `is_driver`
+        # alone offered an Hours link on a deleted row — a page that can only
+        # ever read 0.0h for a person who no longer exists.
         hours_cell = (
             f'<a href="{url_for("driver_hours_page")}?driver_id={u["id"]}" '
             f'style="color:#FF9D5C;font-size:12px;margin-right:10px;">Hours</a>'
-            if is_driver else ""
+            if (is_driver and not is_deleted) else ""
         )
 
         role_badge = (
@@ -15932,7 +15971,7 @@ def boss_dashboard():
         FROM users u
         LEFT JOIN routes r ON r.assigned_to = u.id AND r.company_id = ?
         LEFT JOIN stops s ON s.route_id = r.id
-        WHERE u.role = 'driver' AND u.company_id = ?
+        WHERE u.role = 'driver' AND u.company_id = ? AND u.is_active = 1
         GROUP BY u.id
         ORDER BY u.username
     """, (company_id, company_id)).fetchall()
@@ -15984,7 +16023,7 @@ def boss_dashboard():
             </td>
             <td style="white-space:nowrap;">{e(r['route_date'] or '')}</td>
             <td><span class="badge {e(r['status'])}">{status_label}</span></td>
-            <td>{e(r['assigned_username'])}</td>
+            <td>{e(display_user_name(r['assigned_username']))}</td>
             <td>{progress_cell}</td>
             <td>{reassign_cell}</td>
         </tr>"""
@@ -18393,7 +18432,7 @@ def routes_page():
         # stats. 10 drivers = 10 rows, tap to expand a driver's routes.
         _groups = {}
         for r in routes:
-            _groups.setdefault(r["assigned_username"] or "Unassigned", []).append(r)
+            _groups.setdefault(display_user_name(r["assigned_username"]) or "Unassigned", []).append(r)
 
         def _route_card_html(r):
             _rstops = [s for s in _stops_by_route.get(r["id"], []) if not stop_is_cancelled(dict(s))]
@@ -18465,7 +18504,7 @@ def routes_page():
                 <div class="drv-lane-head">
                     <div>
                         <div class="drv-lane-name">{e(r['route_name'])}</div>
-                        <div class="drv-lane-date">{e(r['route_date'])} &middot; {e(r['assigned_username'] or 'Unassigned')}{_rev_txt}</div>
+                        <div class="drv-lane-date">{e(r['route_date'])} &middot; {e(display_user_name(r['assigned_username']) or 'Unassigned')}{_rev_txt}</div>
                     </div>
                     <div class="drv-pills"><span class="drv-status {_st_cls}">{_st_lbl}</span></div>
                 </div>
@@ -23978,7 +24017,8 @@ def direct_messages_api(driver_id):
     role = session.get("role")
     company = cid()
     driver = conn.execute(
-        "SELECT id, username, full_name FROM users WHERE id=? AND role='driver'",
+        "SELECT id, username, full_name FROM users"
+        " WHERE id=? AND role='driver' AND is_active=1",
         (driver_id,),
     ).fetchone()
     if not driver:
