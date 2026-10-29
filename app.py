@@ -377,6 +377,63 @@ def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
+# ── Bandwidth: downscaled photo thumbnails (2026-10-29) ─────────────────────
+# Phone photos are multi-MB but galleries display them at 54–160px. Serving
+# the full file for every thumbnail is the biggest per-page bandwidth cost
+# after polling. Thumbs are small JPEGs beside the original (<stem>_thumb.jpg);
+# detail views and downloads always keep the full original. Generation never
+# raises: a failed thumb just means that view serves the original.
+_THUMB_MAX_WIDTH = 480
+
+
+def _ensure_thumb(fs_path):
+    """Create (or confirm) the downscaled JPEG thumbnail for an uploaded photo.
+    Returns the thumbnail filesystem path, or None when no thumbnail applies
+    (PDF, missing file, Pillow unavailable, unreadable image). Never raises."""
+    try:
+        if not fs_path or not os.path.isfile(fs_path):
+            return None
+        stem, ext = os.path.splitext(fs_path)
+        if ext.lower() == ".pdf":
+            return None
+        thumb = stem + "_thumb.jpg"
+        if os.path.isfile(thumb):
+            return thumb
+        from PIL import Image, ImageOps
+        with Image.open(fs_path) as im:
+            im = ImageOps.exif_transpose(im)
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            w, h = im.size
+            if w > _THUMB_MAX_WIDTH:
+                im = im.resize((_THUMB_MAX_WIDTH, max(1, int(h * _THUMB_MAX_WIDTH / w))), Image.LANCZOS)
+            im.save(thumb, "JPEG", quality=72, optimize=True)
+        return thumb
+    except Exception:
+        app.logger.debug("thumbnail failed", exc_info=True)
+        return None
+
+
+def _thumb_src(db_path):
+    """Web-relative path for a photo's thumbnail, for <img> tags in lists and
+    galleries. Falls back to the original when no thumbnail exists and none
+    can be made. Detail views keep using the original path."""
+    try:
+        if not db_path:
+            return db_path
+        stem, ext = os.path.splitext(db_path)
+        if ext.lower() == ".pdf":
+            return db_path
+        thumb_db = stem + "_thumb.jpg"
+        if os.path.isfile(os.path.join(app.root_path, thumb_db)):
+            return thumb_db
+        if _ensure_thumb(os.path.join(app.root_path, db_path)):
+            return thumb_db
+        return db_path
+    except Exception:
+        return db_path
+
+
 # ── Driver avatars (feat/driver-avatars) ─────────────────────────────────────
 # Uploaded photos live on disk under UPLOAD_FOLDER/avatars (git-ignored); the DB
 # stores only the web-relative path. No photo → a deterministic initials avatar,
@@ -3134,7 +3191,7 @@ def build_photo_gallery_html(photos):
         if ext == "pdf":
             media = f'<a class="photo-pdf-link" href="{e(path)}" target="_blank">&#128196; PDF Document</a>'
         else:
-            media = f'<a href="{e(path)}" target="_blank"><img class="photo-thumb" src="{e(path)}" alt="stop photo" loading="lazy"></a>'
+            media = f'<a href="{e(path)}" target="_blank"><img class="photo-thumb" src="{e(path)}?thumb=1" alt="stop photo" loading="lazy"></a>'
         items.append(
             f'<div class="photo-item">'
             f'{media}'
@@ -7458,8 +7515,11 @@ def _msg_nav_badge(n):
 
 
 # 2026-10-14: Keeps every .msg-nav-badge fresh on the page — polls the unread
-# count every 3s and on tab refocus. Exposes window.refreshMsgBadge() so the
-# inbox can clear badges the moment a thread is read.
+# count every 3s while the tab is visible and on tab refocus. 2026-10-29: while
+# the tab is hidden the poll slows to 60s (bandwidth — a backgrounded phone
+# gains nothing from 3s badge checks); refocus restores 3s and refreshes
+# immediately. Exposes window.refreshMsgBadge() so the inbox can clear badges
+# the moment a thread is read.
 _MSG_BADGE_POLL_JS = """
 <script>
 (function() {
@@ -7479,9 +7539,18 @@ _MSG_BADGE_POLL_JS = """
             .catch(function() {});
     };
     window.refreshMsgBadge();
-    setInterval(window.refreshMsgBadge, 3000);
+    var msgBadgeTimer = setInterval(window.refreshMsgBadge, 3000);
+    function setMsgBadgeInterval(ms) {
+        if (msgBadgeTimer) clearInterval(msgBadgeTimer);
+        msgBadgeTimer = setInterval(window.refreshMsgBadge, ms);
+    }
     document.addEventListener('visibilitychange', function() {
-        if (!document.hidden) window.refreshMsgBadge();
+        if (document.hidden) {
+            setMsgBadgeInterval(60000);
+        } else {
+            window.refreshMsgBadge();
+            setMsgBadgeInterval(3000);
+        }
     });
 })();
 </script>
@@ -29752,6 +29821,7 @@ def _save_surcharge_photo(conn, company_id, raw, ext):
     fname = f"sc_{uid}.{ext}"
     with open(os.path.join(app.config["UPLOAD_FOLDER"], fname), "wb") as fh:
         fh.write(raw)
+    _ensure_thumb(os.path.join(app.config["UPLOAD_FOLDER"], fname))
     return os.path.join("static", "uploads", fname)
 
 
@@ -30685,6 +30755,7 @@ def dump_ticket(stop_id):
             fname = f"dt_{stop_id}_{uid}_{secure_filename(photo.filename)}"
             path = os.path.join(app.config["UPLOAD_FOLDER"], fname)
             photo.save(path)
+            _ensure_thumb(path)
             db_path = os.path.join("static", "uploads", fname)
             conn.execute(
                 "UPDATE dump_tickets SET photo_path=? WHERE stop_id=?", (db_path, stop_id)
@@ -31692,7 +31763,7 @@ def route_daily_log(route_id):
             thumbs += (
                 f'<a href="{_href}" target="_blank" style="text-decoration:none;">'
                 f'<div style="display:inline-block;margin:8px;text-align:center;position:relative;">'
-                f'<img src="/{e(tp["photo"])}" style="width:120px;height:120px;object-fit:cover;'
+                f'<img src="/{e(_thumb_src(tp["photo"]))}" style="width:120px;height:120px;object-fit:cover;'
                 f'border-radius:8px;border:1px solid #444;">'
                 f'{_badge}'
                 f'<div style="font-size:11px;margin-top:4px;color:#C9C9C0;">'
@@ -31704,7 +31775,7 @@ def route_daily_log(route_id):
                 thumbs += (
                     f'<a href="/{e(_sc["photo"])}" target="_blank" style="text-decoration:none;">'
                     f'<div style="display:inline-block;margin:8px;text-align:center;">'
-                    f'<img src="/{e(_sc["photo"])}" style="width:120px;height:120px;object-fit:cover;'
+                    f'<img src="/{e(_thumb_src(_sc["photo"]))}" style="width:120px;height:120px;object-fit:cover;'
                     f'border-radius:8px;border:1px solid rgba(255,157,92,.5);">'
                     f'<div style="font-size:11px;margin-top:4px;color:#FF9D5C;">'
                     f'{e(_sc_label)}<br>{e((_sc.get("material") or "")[:25])}</div>'
@@ -32460,6 +32531,7 @@ def stop_drop_bin(stop_id):
         try:
             fname = f"drop_{bin_id}_{secrets.token_hex(6)}_{secure_filename(photo.filename)}"
             photo.save(os.path.join(app.config["UPLOAD_FOLDER"], fname))
+            _ensure_thumb(os.path.join(app.config["UPLOAD_FOLDER"], fname))
             updates.append("drop_photo_path=?"); params.append(os.path.join("static", "uploads", fname))
         except OSError as exc:
             app.logger.warning("drop photo save failed: %s", exc)
@@ -32516,6 +32588,7 @@ def upload_stop_photo(stop_id):
             filename = f"{stop_id}_{uid}_{secure_filename(file.filename)}"
             path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
             file.save(path)
+            _ensure_thumb(path)
             # Always store a web-relative path so the URL builder at load_stop_photos works
             # regardless of whether UPLOAD_FOLDER is absolute or relative.
             db_path = os.path.join("static", "uploads", filename)
@@ -32570,6 +32643,13 @@ def serve_stop_photo(photo_id):
     full_path = os.path.join(app.root_path, photo["file_path"])
     if not os.path.isfile(full_path):
         abort(404)
+    if request.args.get("thumb") == "1":
+        # Downscaled preview for galleries (bandwidth, 2026-10-29); the link
+        # itself still opens the full original. Falls back to the original
+        # when no thumbnail applies (PDF, generation failure).
+        thumb = _ensure_thumb(full_path)
+        if thumb:
+            return send_file(thumb, mimetype="image/jpeg")
     return send_file(full_path)
 
 
@@ -47517,6 +47597,7 @@ def _save_maintenance_receipts(conn, files, defect_item_id=None, manual_entry_id
         try:
             fname = f"mnt_{secrets.token_hex(8)}_{secure_filename(f.filename)}"
             f.save(os.path.join(app.config["UPLOAD_FOLDER"], fname))
+            _ensure_thumb(os.path.join(app.config["UPLOAD_FOLDER"], fname))
             conn.execute(
                 """INSERT INTO maintenance_photos (company_id, defect_item_id,
                        manual_entry_id, file_path, uploaded_at, uploaded_by)
@@ -48607,6 +48688,7 @@ def inspection_submit():
                     fname = f"insp_{inspection_id}_{iid}_{secrets.token_hex(6)}_{secure_filename(photo.filename)}"
                     try:
                         photo.save(os.path.join(app.config["UPLOAD_FOLDER"], fname))
+                        _ensure_thumb(os.path.join(app.config["UPLOAD_FOLDER"], fname))
                         photo_db_path = os.path.join("static", "uploads", fname)
                     except OSError as exc:
                         app.logger.warning("inspection photo save failed: %s", exc)
