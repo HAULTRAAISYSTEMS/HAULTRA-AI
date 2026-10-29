@@ -2653,9 +2653,18 @@ else loadYardInventory();
             .catch(function() {});
     };
     window.refreshMsgBadge();
-    setInterval(window.refreshMsgBadge, 3000);
+    var msgBadgeTimer = setInterval(window.refreshMsgBadge, 3000);
+    function setMsgBadgeInterval(ms) {
+        if (msgBadgeTimer) clearInterval(msgBadgeTimer);
+        msgBadgeTimer = setInterval(window.refreshMsgBadge, ms);
+    }
     document.addEventListener('visibilitychange', function() {
-        if (!document.hidden) window.refreshMsgBadge();
+        if (document.hidden) {
+            setMsgBadgeInterval(60000);
+        } else {
+            window.refreshMsgBadge();
+            setMsgBadgeInterval(3000);
+        }
     });
 })();
 </script>
