@@ -21,3 +21,7 @@ cryptography==47.0.0
 # to raise and all company-local times to silently fall back to UTC —
 # which corrupts live hours, clock-in dates, and pay-week boundaries.
 tzdata==2025.2
+# Downscaled photo thumbnails (bandwidth, 2026-10-29): small JPEG previews
+# beside uploads. Imported lazily inside the thumbnail helper; uploads still
+# work if Pillow is ever missing (views fall back to the original file).
+Pillow==11.3.0
