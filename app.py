@@ -3974,6 +3974,19 @@ def init_db():
     # completing it can close the defect. Nullable; normal stops leave these NULL.
     safe_add_column(conn, "stops", "defect_item_id INTEGER")
     safe_add_column(conn, "stops", "vendor_id INTEGER")
+    # Truck-to-truck meets (2026-10-30). Two kinds, one mechanism, because
+    # both are "meet the other truck somewhere":
+    #   action='Transfer' — hand a can over: roles 'give' / 'take'
+    #   action='Ride'     — carry a driver:  roles 'driver' / 'rider'
+    # Always a PAIR of stops, one on each driver's route, tied by
+    # transfer_group_id and pointing at each other through
+    # transfer_peer_stop_id, so neither side can be dispatched alone and a
+    # meeting can never exist on one board but not the other.
+    safe_add_column(conn, "stops", "transfer_group_id TEXT")
+    safe_add_column(conn, "stops", "transfer_role TEXT")
+    safe_add_column(conn, "stops", "transfer_peer_stop_id INTEGER")
+    safe_add_column(conn, "stops", "transfer_can TEXT")
+    safe_add_column(conn, "stops", "transfer_user_id INTEGER")
     # Customer Request System (Phase 3): boss's reason when denying a request.
     safe_add_column(conn, "requests", "deny_reason TEXT")
     # Phase 5 — two-stage workflow adds the 'accepted' status and a manager's
@@ -26842,6 +26855,7 @@ def _route_final_bin_detail(conn, route_id):
             stops = conn.execute(
                 """SELECT s.id, s.action, s.swap_with_prev_pull AS swap_flag, s.container_size,
                           s.chain_gives_to_stop_id AS gives_to, s.assigned_can, s.notes, s.placement_note,
+                          s.transfer_role, s.transfer_can,
                           dt.can_number AS ticket_can
                    FROM stops s LEFT JOIN dump_tickets dt ON dt.stop_id = s.id
                    WHERE s.route_id=? AND s.status='completed' AND s.cancelled_at IS NULL
@@ -26851,6 +26865,7 @@ def _route_final_bin_detail(conn, route_id):
             stops = conn.execute(
                 """SELECT s.id, s.action, s.container_size,
                           s.chain_gives_to_stop_id AS gives_to, s.assigned_can, s.notes, s.placement_note,
+                          s.transfer_role, s.transfer_can,
                           dt.can_number AS ticket_can
                    FROM stops s LEFT JOIN dump_tickets dt ON dt.stop_id = s.id
                    WHERE s.route_id=? AND s.status='completed' AND s.cancelled_at IS NULL
@@ -26881,7 +26896,24 @@ def _route_final_bin_detail(conn, route_id):
             # just set down, every single time a route ended on a chained
             # drop, and the yard strip kept showing it on the truck.
             is_delivery = ("delivery" in act or "drop" in act)
-            if is_delivery:
+            # 2026-10-30: a truck-to-truck meet moves the can between trucks,
+            # so the replay has to follow it or the giver keeps showing a can
+            # he physically handed away -- the same phantom-can shape as the
+            # chained-Delivery bug. A Ride carries a person, never a can, and
+            # must leave the load untouched.
+            _trole = (sd.get("transfer_role") or "").strip().lower()
+            if act == "ride":
+                pass
+            elif act == "transfer":
+                if _trole == "give":
+                    prev = ""
+                    prev_size = ""
+                elif _trole == "take":
+                    _tc = (sd.get("transfer_can") or "").strip()
+                    if _tc:
+                        prev = _tc
+                        prev_size = size
+            elif is_delivery:
                 prev = ""
                 prev_size = ""
             elif is_pr and not is_swap:
@@ -49865,6 +49897,154 @@ def driver_vendors():
         (cid(),)).fetchall()
     conn.close()
     return jsonify({"vendors": [dict(r) for r in rows]})
+
+
+def _route_for_driver_today(conn, driver_id, actor_id):
+    """That driver's live route for today, creating an empty one if needed.
+
+    Returns (route_id, created), or (None, False) when the driver already
+    finished today. A meet has to land on both boards, so a driver with
+    nothing dispatched yet still needs somewhere to put it.
+    """
+    route_id = driver_active_route_id(conn, driver_id)
+    if route_id:
+        row = conn.execute("SELECT status FROM routes WHERE id=?", (route_id,)).fetchone()
+        if row and (row["status"] or "") == "completed":
+            return None, False
+        return route_id, False
+    drv = conn.execute("SELECT username FROM users WHERE id=?", (driver_id,)).fetchone()
+    _today = today_str()
+    cur = conn.execute(
+        """INSERT INTO routes (route_date, route_name, raw_text, assigned_to, created_by,
+                               status, notes, company_id, route_type, created_at)
+           VALUES (?,?,'',?,?,'open','',?, 'rolloff', ?)""",
+        (_today, "%s — %s" % ((drv["username"] if drv else "driver"), _today),
+         driver_id, actor_id, cid(), now_ts()))
+    return cur.lastrowid, True
+
+
+def _append_meet_stop(conn, route_id, customer_name, address, action, role,
+                      group_id, peer_id, can, other_user_id, note):
+    """Append one half of a truck-to-truck meet to a route and renumber.
+
+    Appended rather than pushed to the front: a meet is arranged, not an
+    emergency, and the boss reorders with the tools that already exist.
+    """
+    cur = conn.execute(
+        """INSERT INTO stops (route_id, stop_order, customer_name, address, action,
+                              notes, status, driver_status,
+                              transfer_group_id, transfer_role, transfer_peer_stop_id,
+                              transfer_can, transfer_user_id, created_at)
+           VALUES (?, 0, ?, ?, ?, ?, 'open', 'pending', ?, ?, ?, ?, ?, ?)""",
+        (route_id, customer_name, address, action, note, group_id, role,
+         peer_id, can or None, other_user_id, now_ts()))
+    new_id = cur.lastrowid
+    rows = conn.execute(
+        "SELECT id FROM stops WHERE route_id=? AND id != ? ORDER BY stop_order ASC, id ASC",
+        (route_id, new_id)).fetchall()
+    for pos, sid in enumerate([r["id"] for r in rows] + [new_id], start=1):
+        conn.execute("UPDATE stops SET stop_order=? WHERE id=?", (pos, sid))
+    return new_id
+
+
+@app.route("/api/dispatch/truck-meet", methods=["POST"])
+@boss_required
+def boss_dispatch_truck_meet():
+    """Two trucks meet: hand a can over, or carry a driver.
+
+    2026-10-30: there was no way to dispatch either. A can handed between
+    trucks had to be typed as a Delivery plus a Pull at a made-up address,
+    which told the bin tracker the can went to a customer; a driver whose
+    truck was down and needed carrying to a spare had no stop at all, so
+    neither board showed where he actually was.
+
+    Always writes a PAIR, one stop per driver, tied by transfer_group_id and
+    pointing at each other, so a meeting can never exist on one board only.
+
+    Body: kind ('can'|'ride'), from_driver_id, to_driver_id, address,
+          can (can transfers), note.
+    """
+    data = request.get_json(silent=True) or {}
+    kind = str(data.get("kind") or "can").strip().lower()
+    if kind not in ("can", "ride"):
+        return jsonify({"error": "kind must be 'can' or 'ride'."}), 400
+    try:
+        from_id = int(data.get("from_driver_id") or 0)
+        to_id = int(data.get("to_driver_id") or 0)
+    except (TypeError, ValueError):
+        from_id = to_id = 0
+    address = str(data.get("address") or "").strip()[:200]
+    can = str(data.get("can") or "").strip()[:40]
+    note = str(data.get("note") or "").strip()[:300]
+    if not from_id or not to_id:
+        return jsonify({"error": "Pick both drivers."}), 400
+    if from_id == to_id:
+        return jsonify({"error": "Pick two different drivers."}), 400
+    if not address:
+        return jsonify({"error": "Where are they meeting?"}), 400
+
+    conn = get_db()
+    try:
+        drivers = {}
+        for uid in (from_id, to_id):
+            row = conn.execute(
+                "SELECT id, username, full_name FROM users"
+                " WHERE id=? AND company_id=? AND role='driver' AND is_active=1",
+                (uid, cid())).fetchone()
+            if not row:
+                return jsonify({"error": "Driver not found."}), 404
+            drivers[uid] = row
+
+        def _who(uid):
+            r = drivers[uid]
+            return (r["full_name"] or r["username"] or "Driver").strip()
+
+        from_route, from_new = _route_for_driver_today(conn, from_id, session["user_id"])
+        to_route, to_new = _route_for_driver_today(conn, to_id, session["user_id"])
+        if not from_route or not to_route:
+            return jsonify({"error": "One of those drivers has already finished today."}), 400
+
+        group = secrets.token_hex(8)
+        _canlbl = ("can " + can) if can else "the can"
+        if kind == "can":
+            act, a_role, b_role = "Transfer", "give", "take"
+            a_label = "Give %s to %s" % (_canlbl, _who(to_id))
+            b_label = "Take %s from %s" % (_canlbl, _who(from_id))
+        else:
+            act, a_role, b_role = "Ride", "driver", "rider"
+            a_label = "Pick up %s" % _who(to_id)
+            b_label = "Ride with %s" % _who(from_id)
+
+        a_id = _append_meet_stop(conn, from_route, a_label, address, act, a_role,
+                                 group, None, can, to_id, note or None)
+        b_id = _append_meet_stop(conn, to_route, b_label, address, act, b_role,
+                                 group, a_id, can, from_id, note or None)
+        conn.execute("UPDATE stops SET transfer_peer_stop_id=? WHERE id=?", (b_id, a_id))
+
+        if kind == "can":
+            msg_a = "🔁 Meet %s at %s — hand over %s." % (_who(to_id), address, _canlbl)
+            msg_b = "🔁 Meet %s at %s — pick up %s." % (_who(from_id), address, _canlbl)
+        else:
+            msg_a = "🧑 Pick up %s at %s." % (_who(to_id), address)
+            msg_b = "🧑 %s is coming to get you at %s." % (_who(from_id), address)
+        if note:
+            msg_a += " " + note
+            msg_b += " " + note
+        ts = now_ts()
+        for _rid, _body in ((from_route, msg_a), (to_route, msg_b)):
+            conn.execute(
+                "INSERT INTO messages (route_id, sender_user_id, body, created_at)"
+                " VALUES (?,?,?,?)", (_rid, session["user_id"], _body[:500], ts))
+        notify(conn, cid(), "TRUCK_MEET",
+               "%s and %s are meeting" % (_who(from_id), _who(to_id)), msg_a,
+               link=url_for("view_route", route_id=from_route),
+               actor_user_id=session["user_id"], entity_type="stop", entity_id=a_id)
+        conn.commit()
+        return jsonify({"success": True, "kind": kind, "group": group,
+                        "from_stop_id": a_id, "to_stop_id": b_id,
+                        "from_route_id": from_route, "to_route_id": to_route})
+    finally:
+        conn.close()
 
 
 @app.route("/api/dispatch/vendor-visit", methods=["POST"])
