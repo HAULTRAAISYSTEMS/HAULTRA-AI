@@ -335,6 +335,16 @@
   }
   .qa-badge.pickup { background: var(--orange-dim); color: var(--orange); border: 1px solid var(--orange-border); }
   .qa-badge.dropswap { background: var(--slate-dim); color: var(--slate); border: 1px solid var(--slate-border); }
+  /* Vendor: its own identity, deliberately not any work-action colour, and not
+     red (reserved for urgent/overdue) or teal (reserved for AI-parsed). */
+  .vsheet-vendor { font-size: 1.05rem; font-weight: 800; }
+  .vsheet-addr { font-size: 0.82rem; color: var(--text-faint); margin-top: 2px; }
+  .vsheet-hint { font-size: 0.76rem; color: var(--text-faint); margin-top: 8px; min-height: 1.1em; }
+  .qa-badge.badge-shop { letter-spacing: .5px; }
+  .qa-row.is-vendor .qa-label::after {
+    content: 'VENDOR'; margin-left: 8px; font-size: 0.58rem; font-weight: 800;
+    letter-spacing: .08em; color: #94A3B8; vertical-align: middle;
+  }
   /* 2026-10-23: no presumed action — dotted "?" badge invites the pick. */
   .qa-badge.badge-unset {
     background: transparent; color: var(--text-muted);
@@ -343,12 +353,15 @@
   #sheet-actions.invalid { animation: qa-shake .3s; border: 2px solid #FF5252; border-radius: 12px; }
   @keyframes qa-shake { 0%,100% { transform: translateX(0); } 25% { transform: translateX(-4px); } 75% { transform: translateX(4px); } }
   /* Action-badge palette — solid fill + near-black ink (matches haultra-theme.css). */
-  .badge-pr,.badge-p,.badge-d,.badge-s,.badge-r,.badge-yard,.badge-ll {
+  .badge-pr,.badge-p,.badge-d,.badge-s,.badge-r,.badge-yard,.badge-ll,.badge-shop {
     color:#0A0A0A !important; border:none !important; box-shadow:none !important; text-shadow:none !important; }
   .badge-pr{background:#FF6B1A !important;} .badge-p{background:#FFC53D !important;}
   .badge-d{background:#4DA3FF !important;} .badge-s{background:#A78BFA !important;}
   .badge-r{background:#7C8CA1 !important;} .badge-yard{background:#E5E5E5 !important;}
   .badge-ll{background:#FFC53D !important;}
+  /* SHOP — teal is reserved for AI-parsed and red for urgent, so a shop visit
+     takes a muted steel-cyan of its own: clearly not a container job. */
+  .badge-shop{background:#7FD1C4 !important;}
   .qa-text { flex: 1; min-width: 0; }
   .qa-label { font-size: 0.98rem; font-weight: 700; line-height: 1.25; word-break: break-word; }
   .qa-sub {
@@ -1134,6 +1147,42 @@
 
 <div id="toast" class="toast"></div>
 
+<!-- Send-to-vendor sheet (2026-10-30). A vendor is not a container job, so
+     picking one in Quick Add opens this instead of the Confirm-Stop sheet:
+     who goes, and when. Reuses the Vendor stop the breakdown flow already
+     ships, so arrive / complete / route holds all behave identically. -->
+<div id="vendor-sheet-backdrop" class="sheet-backdrop" aria-hidden="true">
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="vsheet-title">
+    <div class="sheet-head">
+      <div id="vsheet-title" class="sheet-title">Send to vendor</div>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <button type="button" id="vsheet-send" class="btn btn-orange-solid" style="min-height:44px;padding:0 20px;">Send</button>
+        <button type="button" id="vsheet-close" class="sheet-close" aria-label="Cancel">&times;</button>
+      </div>
+    </div>
+    <div class="sheet-body">
+      <div class="sheet-field">
+        <div id="vsheet-vendor" class="vsheet-vendor"></div>
+        <div id="vsheet-addr" class="vsheet-addr"></div>
+      </div>
+      <div class="sheet-field">
+        <label class="sheet-label" for="vsheet-driver">Who goes</label>
+        <select id="vsheet-driver" class="sheet-input"></select>
+      </div>
+      <div class="sheet-field">
+        <label class="sheet-label">When</label>
+        <div id="vsheet-when" class="sheet-chips" role="group" aria-label="When"></div>
+        <div id="vsheet-when-hint" class="vsheet-hint"></div>
+      </div>
+      <div class="sheet-field">
+        <label class="sheet-label" for="vsheet-note">Note for the driver</label>
+        <input id="vsheet-note" class="sheet-input" type="text" autocomplete="off"
+               autocapitalize="sentences" placeholder="What needs doing (optional)">
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Confirm / Edit Stop bottom sheet: a Quick-Add suggestion or chip opens this
      prefilled instead of committing instantly; nothing is added until Add Stop. -->
 <div id="stop-sheet-backdrop" class="sheet-backdrop" aria-hidden="true">
@@ -1141,6 +1190,8 @@
     <div class="sheet-head">
       <div id="sheet-title" class="sheet-title">Confirm Stop</div>
       <div style="display:flex;gap:8px;align-items:center;">
+        <button type="button" id="sheet-send-now" class="btn btn-secondary" hidden
+                style="min-height:44px;padding:0 16px;" title="Send a driver there now instead of adding it to the tray">Send now →</button>
         <button type="button" id="sheet-add-top" class="btn btn-orange-solid" style="min-height:44px;padding:0 20px;">Add Stop</button>
         <button type="button" id="sheet-close" class="sheet-close" aria-label="Cancel">&times;</button>
       </div>
@@ -1160,7 +1211,7 @@
         <input id="sheet-address" class="sheet-input" type="text" autocomplete="off"
                autocapitalize="words" spellcheck="false" placeholder="Street address" required>
       </div>
-      <div class="sheet-field">
+      <div class="sheet-field" id="sheet-size-field">
         <span class="sheet-label">Container size</span>
         <div id="sheet-sizes" class="sheet-chips" role="group" aria-label="Container size"></div>
       </div>
@@ -1170,13 +1221,13 @@
           <option value="">Pick from yard…</option>
         </select>
       </div>
-      <div class="sheet-field">
+      <div class="sheet-field" id="sheet-dump-field">
         <label class="sheet-label" for="sheet-dump">Dump at (site)</label>
         <input id="sheet-dump" class="sheet-input" type="text" autocomplete="off"
                list="sheet-dump-list" placeholder="e.g. transfer station (optional)">
         <datalist id="sheet-dump-list"></datalist>
       </div>
-      <div class="sheet-field">
+      <div class="sheet-field" id="sheet-return-field">
         <label class="sheet-label" for="sheet-return">Return to</label>
         <input id="sheet-return" class="sheet-input" type="text" autocomplete="off"
                list="sheet-return-list" placeholder="e.g. yard (optional)">
@@ -1208,10 +1259,16 @@
     S:    { full: 'Swap',          group: 'dropswap' },
     R:    { full: 'Relocate',      group: 'dropswap' },
     YARD: { full: 'Yard',          group: 'dropswap' },
+    // 2026-10-30: a shop visit — tyre shop, tarp repair, parts pickup. Not a
+    // container job, so it carries no size, dump leg or return leg.
+    SHOP: { full: 'Shop / repair',  group: 'shop' },
   };
   var ACTION_CODES = Object.keys(ACTION_META);
   // Order of the action chips in the Confirm-Stop sheet.
-  var SHEET_ACTIONS = ['P', 'D', 'S', 'PR', 'R', 'YARD'];
+  var SHEET_ACTIONS = ['P', 'D', 'S', 'PR', 'R', 'YARD', 'SHOP'];
+  // Actions that are a visit, not a container job: the sheet hides size, dump
+  // and return for these, and the card shows no can.
+  function isShopAction(code) { return code === 'SHOP'; }
 
   var currentStops = [];
   var editMode = false;
@@ -1999,11 +2056,32 @@
 
   // 2026-10-23: Yard can picker — only for Deliveries. Lists available yard
   // cans, filtered by selected size when one is picked.
+  var sheetVendorLoc = null;
+
+  function renderSheetSendNow() {
+    var btn = document.getElementById('sheet-send-now');
+    if (!btn) return;
+    // Only a place that IS in the vendor list can be sent straight out: the
+    // dispatch endpoint takes a vendor id, not a name.
+    var can = isShopAction(sheetAction) && sheetVendorLoc && sheetVendorLoc.vendor_id;
+    btn.hidden = !can;
+  }
+
   function renderSheetCanField() {
+    // A shop visit has no container, nothing to dump and nowhere to return to;
+    // leaving those on screen invites the boss to fill in fields that will be
+    // thrown away.
+    var shop = isShopAction(sheetAction);
+    ['sheet-size-field', 'sheet-dump-field', 'sheet-return-field'].forEach(function (id) {
+      var f = document.getElementById(id);
+      if (f) f.hidden = shop;
+    });
+    if (shop) { sheetSize = ''; renderSheetSizeChips(); }
+    renderSheetSendNow();
     var field = el('sheet-can-field');
     var sel = el('sheet-can');
     if (!field || !sel) return;
-    var isDelivery = (sheetAction === 'D');
+    var isDelivery = (sheetAction === 'D') && !shop;
     field.hidden = !isDelivery;
     if (!isDelivery) return;
     sel.innerHTML = '<option value="">Pick from yard…</option>';
@@ -2050,6 +2128,7 @@
     sheetEditId = editId || null;
     var pa = (prefill.action || '').toUpperCase();
     sheetAction = (ACTION_CODES.indexOf(pa) !== -1) ? pa : '';
+    sheetVendorLoc = prefill._vendor || null;
     sheetSize = (CONTAINER_SIZES.indexOf(prefill.container_size) !== -1) ? prefill.container_size : '';
     sheetAssignedCan = (prefill.assigned_can || '').trim();
     el('sheet-title').textContent = editId ? 'Edit Stop' : 'Confirm Stop';
@@ -2195,9 +2274,15 @@
     'delivery': 'D', 'deliver': 'D', 'drop': 'D', 'drop off': 'D', 'd': 'D',
     'swap': 'S', 's': 'S',
     'relocate': 'R', 'move': 'R', 'reposition': 'R', 'r': 'R',
+    'vendor': 'SHOP', 'shop': 'SHOP', 'repair': 'SHOP', 'v': 'SHOP',
   };
+  // 2026-10-30 ROOT CAUSE of the vendor-shows-as-Pull bug: this used to end
+  // in `|| 'P'`, so ANY action it did not recognise rendered as a Pickup
+  // badge. A tarp-repair shop came back from the server as action "Vendor",
+  // fell through, and was offered to the boss as a Pull. Unknown now returns
+  // null and the caller decides, so a new action can never masquerade as P.
   function codeFromAction(name) {
-    return ACTION_BY_NAME[(name || '').trim().toLowerCase()] || 'P';
+    return ACTION_BY_NAME[(name || '').trim().toLowerCase()] || null;
   }
 
   var qaInput   = el('qa-input');
@@ -2216,17 +2301,161 @@
 
   function hideSuggest() { if (qaSuggest) { qaSuggest.hidden = true; qaSuggest.innerHTML = ''; } }
 
+  // ── Send-to-vendor sheet ────────────────────────────────────────────
+  // Three modes, because "go get it fixed before you start" and "drop
+  // everything and go" are different instructions to a driver even though
+  // both park the rest of the route.
+  var VENDOR_MODES = [
+    { id: 'first', label: 'Go to vendor first',
+      hint: 'Start of day — handle this, then run the route.' },
+    { id: 'now',   label: 'Go now',
+      hint: 'Something went wrong — leave the route where it is.' },
+    { id: 'line',  label: 'Add to route',
+      hint: 'Not urgent — just another stop in order.' }
+  ];
+  var vendorSheetLoc = null;
+  var vendorMode = 'first';
+
+  function vsheetEl(id) { return document.getElementById(id); }
+
+  function renderVendorModes() {
+    var wrap = vsheetEl('vsheet-when');
+    var hint = vsheetEl('vsheet-when-hint');
+    if (!wrap) return;
+    wrap.innerHTML = '';
+    VENDOR_MODES.forEach(function (m) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'sheet-chip' + (vendorMode === m.id ? ' active' : '');
+      b.textContent = m.label;
+      b.addEventListener('click', function () {
+        vendorMode = m.id;
+        renderVendorModes();
+      });
+      wrap.appendChild(b);
+    });
+    var cur = VENDOR_MODES.filter(function (m) { return m.id === vendorMode; })[0];
+    if (hint) hint.textContent = cur ? cur.hint : '';
+  }
+
+  function openVendorSheet(loc) {
+    vendorSheetLoc = loc;
+    vendorMode = 'first';
+    var name = vsheetEl('vsheet-vendor');
+    var addr = vsheetEl('vsheet-addr');
+    if (name) name.textContent = loc.customer_name || 'Vendor';
+    if (addr) addr.textContent = locFullAddress(loc) || '';
+    // Mirror the page's own driver list so there is one roster, not two.
+    var sel = vsheetEl('vsheet-driver');
+    var src = el('driver-select');
+    if (sel) {
+      sel.innerHTML = '';
+      if (src) {
+        Array.prototype.forEach.call(src.options, function (o) {
+          if (!o.value) return;
+          var opt = document.createElement('option');
+          opt.value = o.value; opt.textContent = o.textContent;
+          if (o.value === src.value) opt.selected = true;
+          sel.appendChild(opt);
+        });
+      }
+      if (!sel.options.length) {
+        var none = document.createElement('option');
+        none.value = ''; none.textContent = 'No drivers yet';
+        sel.appendChild(none);
+      }
+    }
+    var note = vsheetEl('vsheet-note');
+    if (note) note.value = '';
+    renderVendorModes();
+    var bd = vsheetEl('vendor-sheet-backdrop');
+    if (bd) { bd.classList.add('open'); bd.setAttribute('aria-hidden', 'false'); }
+  }
+
+  function closeVendorSheet() {
+    var bd = vsheetEl('vendor-sheet-backdrop');
+    if (bd) { bd.classList.remove('open'); bd.setAttribute('aria-hidden', 'true'); }
+    vendorSheetLoc = null;
+  }
+
+  function sendToVendor() {
+    if (!vendorSheetLoc) return;
+    var sel = vsheetEl('vsheet-driver');
+    var note = vsheetEl('vsheet-note');
+    var btn = vsheetEl('vsheet-send');
+    var driverId = sel ? sel.value : '';
+    if (!driverId) { showToast('Pick a driver first.'); return; }
+    if (!vendorSheetLoc.vendor_id) {
+      showToast('That vendor is not in the vendor list — add it under Vendors first.');
+      return;
+    }
+    if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+    fetch('/api/dispatch/vendor-visit', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF_TOKEN },
+      body: JSON.stringify({
+        driver_id: parseInt(driverId, 10),
+        vendor_id: vendorSheetLoc.vendor_id,
+        mode: vendorMode,
+        note: note ? note.value : ''
+      })
+    }).then(function (r) {
+      return r.json().then(function (j) { return { ok: r.ok, j: j }; });
+    }).then(function (res) {
+      if (btn) { btn.disabled = false; btn.textContent = 'Send'; }
+      if (!res.ok) { showToast((res.j && res.j.error) || 'Could not send.'); return; }
+      closeVendorSheet();
+      if (qaInput) qaInput.value = '';
+      var held = (res.j && res.j.held) || 0;
+      showToast(held
+        ? 'Sent — ' + held + ' stop' + (held === 1 ? '' : 's') + ' held until it is done.'
+        : 'Sent to the vendor.');
+    }).catch(function () {
+      if (btn) { btn.disabled = false; btn.textContent = 'Send'; }
+      showToast('Network error — try again.');
+    });
+  }
+
+  document.addEventListener('DOMContentLoaded', function () {
+    var sn = document.getElementById('sheet-send-now');
+    if (sn) sn.addEventListener('click', function () {
+      var loc = sheetVendorLoc;
+      if (!loc) return;
+      closeStopSheet(false);
+      openVendorSheet(loc);
+    });
+    var c = vsheetEl('vsheet-close'); if (c) c.addEventListener('click', closeVendorSheet);
+    var s = vsheetEl('vsheet-send');  if (s) s.addEventListener('click', sendToVendor);
+    var bd = vsheetEl('vendor-sheet-backdrop');
+    if (bd) bd.addEventListener('click', function (ev) {
+      if (ev.target === bd) closeVendorSheet();
+    });
+  });
+
+  function isVendorLoc(loc) {
+    return (loc && (loc.kind === 'vendor' ||
+      String(loc.default_action || '').trim().toLowerCase() === 'vendor'));
+  }
+
   function buildQaRow(loc) {
     // 2026-10-23: no presumed action. Learned default shows as a badge;
     // new customers get a "?" — the boss picks the action in the sheet.
-    var learnedCode = loc.default_action ? codeFromAction(loc.default_action) : null;
+    var vendor = isVendorLoc(loc);
+    var learnedCode = (!vendor && loc.default_action) ? codeFromAction(loc.default_action) : null;
     var row = document.createElement('button');
     row.type = 'button';
-    row.className = 'qa-row';
+    row.className = 'qa-row' + (vendor ? ' is-vendor' : '');
     row.setAttribute('role', 'option');
 
     var badge = document.createElement('span');
-    if (learnedCode) {
+    if (vendor) {
+      // A vendor is somewhere the truck goes, not a container job — it gets
+      // its own badge and never a work action.
+      badge.className = 'qa-badge badge-shop';
+      badge.textContent = 'SHOP';
+      badge.title = 'Vendor — send a driver here';
+    } else if (learnedCode) {
       badge.className = 'qa-badge badge-' + learnedCode.toLowerCase();
       badge.textContent = learnedCode;
       badge.title = 'Usual: ' + ((ACTION_META[learnedCode] || {}).full || learnedCode);
@@ -2263,7 +2492,13 @@
       ev.preventDefault();
       hideSuggest();
       if (qaInput) qaInput.blur();
-      openStopSheet(prefillFromLoc(loc), null);
+      // 2026-10-30: a vendor used to open a different sheet from every other
+      // suggestion, which made the one concept feel like two. It opens the
+      // same Confirm Stop sheet now, with SHOP already picked; "Send now"
+      // inside that sheet is the urgent path.
+      var pre = prefillFromLoc(loc);
+      if (isVendorLoc(loc)) { pre.action = 'SHOP'; pre._vendor = loc; }
+      openStopSheet(pre, null);
     });
     return row;
   }

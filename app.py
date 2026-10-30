@@ -4950,6 +4950,35 @@ def init_db():
         conn.commit()
     except sqlite3.OperationalError:
         pass
+    # 2026-10-30: reclassify vendors that learn_location filed as customers.
+    # It never wrote `kind`, so every vendor address landed as kind='customer'
+    # and surfaced in Quick Add as a dispatchable customer carrying whatever
+    # work action had been used at that address -- a tarp-repair shop offered
+    # as a Pull. Match the saved row back to the vendors table by name, flip
+    # the kind, and clear the work-action defaults a vendor can never have.
+    # Idempotent: re-running only ever touches rows still marked customer.
+    try:
+        conn.execute("""
+            UPDATE saved_addresses
+               SET kind='vendor',
+                   default_action='Vendor',
+                   default_container_size='',
+                   default_dump_location=''
+             WHERE kind='customer'
+               AND EXISTS (SELECT 1 FROM vendors v
+                            WHERE v.company_id = saved_addresses.company_id
+                              AND TRIM(LOWER(v.name)) = TRIM(LOWER(COALESCE(saved_addresses.customer_name,'')))
+                              AND TRIM(COALESCE(v.name,'')) != '')
+        """)
+        # Detail rows drive the Quick Add badge; a vendor has no work actions.
+        conn.execute("""
+            DELETE FROM saved_address_details
+             WHERE saved_address_id IN (SELECT id FROM saved_addresses WHERE kind='vendor')
+               AND COALESCE(action,'') != 'Vendor'
+        """)
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     # Per-company one-time backfill flag: seeds the address book from all
     # historical stops the first time the company's parser/quick-add loads.
     safe_add_column(conn, "companies", "address_book_seeded INTEGER NOT NULL DEFAULT 0")
@@ -14605,28 +14634,36 @@ def team_page():
             # repeating "Inactive tombstone" on each card is noise.
             delete_cell = ""
         elif is_self:
-            delete_cell = f'<span class="muted small">You</span>'
+            # Shown as a chip beside the role badge instead, so your own card
+            # has no actions row and no divider with an orphan word under it.
+            delete_cell = ""
         elif is_last_boss:
             delete_cell = f'<span class="muted small" title="Cannot delete the last boss">&mdash;</span>'
         else:
             _del_uname  = e(u["username"])
             _del_action = url_for("delete_user", user_id=u["id"])
+            # "Delete driver", not bare "Delete": it sits in the same row as
+            # the photo's "Remove photo", and the two must never read alike.
+            _del_what = "driver" if is_driver else "user"
             delete_cell = (
-                f'<form method="POST" action="{_del_action}" style="margin:0;display:inline;" '
-                f'onsubmit="return confirm(\'Delete {_del_uname}? This cannot be undone.\');">'
+                f'<form method="POST" action="{_del_action}" class="tm-danger" style="margin:0;display:inline;" '
+                f'onsubmit="return confirm(\'Delete {_del_uname}? This removes the account and cannot be undone.\');">'
                 f'<button type="submit" '
                 f'style="background:transparent;color:#f87171;border:1px solid rgba(248,113,113,0.4);'
-                f'border-radius:6px;padding:3px 10px;font-size:11px;cursor:pointer;line-height:1.4;">'
-                f'Delete</button>'
+                f'border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer;line-height:1.4;'
+                f'min-height:36px;white-space:nowrap;">'
+                f'Delete {_del_what}</button>'
                 f'</form>'
             )
 
         # A tombstone keeps role='driver' for FK integrity, so `is_driver`
         # alone offered an Hours link on a deleted row — a page that can only
         # ever read 0.0h for a person who no longer exists.
+        # Sized to match the buttons beside it: as a bare text link this was an
+        # 18px tap target next to 36px buttons -- too small to hit on a tablet.
         hours_cell = (
-            f'<a href="{url_for("driver_hours_page")}?driver_id={u["id"]}" '
-            f'style="color:#FF9D5C;font-size:12px;margin-right:10px;">Hours</a>'
+            f'<a class="tm-btn" href="{url_for("driver_hours_page")}?driver_id={u["id"]}">'
+            f'Hours</a>'
             if (is_driver and not is_deleted) else ""
         )
 
@@ -14675,7 +14712,9 @@ def team_page():
             # and a second copy beside the buttons just looked like a bug.
             _av_cell = _avatar_upload_control_html(u, size=40, show_remove=True,
                                                    include_js=False, compact=True,
-                                                   show_avatar=False)
+                                                   show_avatar=False,
+                                                   remove_label="Remove photo",
+                                                   remove_danger=False)
         else:
             _av_cell = avatar_html(u, 40)
         # Team chat toggle: boss controls who's in the Team channel.
@@ -14718,6 +14757,26 @@ def team_page():
         _sub_line = " &middot; ".join(e(b) for b in _sub_bits)
 
         _meta_rows = ""
+        if not is_driver and not is_deleted:
+            # A boss card used to carry one row (Joined) against a driver's
+            # four, so it sat half-empty next to them and the grid looked
+            # broken. These are real attributes, not filler: what this account
+            # can reach, and that bosses are always in team chat.
+            _acc = []
+            for _k, _lbl in (("role_owner", "Owner"),
+                             ("role_dispatcher", "Dispatcher"),
+                             ("role_customer_manager", "Customer manager")):
+                try:
+                    if u[_k]:
+                        _acc.append(_lbl)
+                except (KeyError, IndexError):
+                    pass
+            _meta_rows += (
+                f'<div class="tm-meta"><span class="tm-meta-k">Access</span>'
+                f'<span class="tm-meta-v">{e(", ".join(_acc) or "Boss")}</span></div>'
+                f'<div class="tm-meta"><span class="tm-meta-k">Team chat</span>'
+                f'<span class="tm-meta-v muted">Always in</span></div>'
+            )
         if is_driver and not is_deleted:
             _meta_rows += (
                 f'<div class="tm-meta"><span class="tm-meta-k">Activity</span>'
@@ -14759,10 +14818,10 @@ def team_page():
                     <div class="tm-name">{e(_display)}</div>
                     <div class="tm-sub muted small">{_sub_line or '&nbsp;'}</div>
                 </div>
-                <div class="tm-role">{role_badge}</div>
+                <div class="tm-role">{role_badge}{'<span class="tm-you">You</span>' if is_self else ''}</div>
             </div>
             <div class="tm-body">{_meta_rows}</div>
-            <div class="tm-actions">{_actions or '<span class="muted small">&mdash;</span>'}</div>
+            <div class="tm-actions">{_actions}</div>
         </div>
         """
         if is_deleted and not (is_pending or is_stale):
@@ -14854,10 +14913,12 @@ def team_page():
     {_AVATAR_UPLOAD_JS}
     <style>
     /* ── Team roster cards ─────────────────────────────────────── */
-    /* align-items:start so a sparse card (the boss has no driver rows) sizes
-       to its content instead of stretching to the tallest card in the row. */
-    .tm-grid{{display:grid;gap:14px;align-items:start;
-        grid-template-columns:repeat(auto-fill,minmax(310px,1fr));}}
+    /* Cards stretch to a common height per row. align-items:start left a
+       short card floating with a hole beneath it, which is what the two-column
+       tablet width made obvious. minmax(290px) so a 820px iPad still gets two
+       columns with comfortable gutters. */
+    .tm-grid{{display:grid;gap:14px;align-items:stretch;
+        grid-template-columns:repeat(auto-fill,minmax(290px,1fr));}}
     .tm-card{{display:flex;flex-direction:column;gap:12px;padding:16px;
         border:1px solid rgba(255,255,255,.09);border-radius:var(--radius);
         background:linear-gradient(180deg,rgba(38,38,44,.5),rgba(20,20,24,.42));
@@ -14869,10 +14930,19 @@ def team_page():
     .tm-top{{display:flex;align-items:flex-start;gap:12px;}}
     .tm-avatar{{flex:0 0 auto;}}
     .tm-id{{flex:1;min-width:0;}}
+    /* Wrap, never truncate: at three columns the ellipsis was eating the back
+       half of the phone number ("(804) ..."), which is the one thing on the
+       card a boss actually needs to read. overflow-wrap handles a long
+       single-token username with no spaces to break on. */
     .tm-name{{font-weight:700;font-size:15px;line-height:1.25;
-        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}}
-    .tm-sub{{margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}}
-    .tm-role{{flex:0 0 auto;}}
+        overflow-wrap:anywhere;}}
+    .tm-sub{{margin-top:2px;overflow-wrap:anywhere;}}
+    .tm-role{{flex:0 0 auto;display:flex;align-items:center;gap:6px;
+        flex-wrap:wrap;justify-content:flex-end;}}
+    .tm-you{{font-size:10px;font-weight:700;letter-spacing:.5px;
+        text-transform:uppercase;color:var(--text-muted);
+        border:1px solid rgba(255,255,255,.14);border-radius:999px;
+        padding:2px 7px;white-space:nowrap;}}
     .tm-body{{display:flex;flex-direction:column;gap:7px;}}
     .tm-meta{{display:flex;align-items:center;gap:10px;min-height:26px;}}
     .tm-meta-k{{flex:0 0 78px;font-size:11px;letter-spacing:.4px;
@@ -14886,7 +14956,20 @@ def team_page():
     .tm-actions a{{margin-right:0 !important;}}
     .tm-actions:empty{{display:none;}}
     .tm-actions > div{{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}}
+    /* Deleting the account is pushed away from the photo buttons and sits on
+       its own, so "Remove photo" and "Delete driver" are never adjacent. */
+    .tm-actions .tm-danger{{margin-left:auto;}}
+    .tm-btn{{display:inline-flex;align-items:center;justify-content:center;
+        min-height:36px;padding:5px 12px;border-radius:8px;
+        border:1px solid rgba(255,157,92,.4);background:rgba(255,157,92,.08);
+        color:#FF9D5C;font-weight:700;font-size:12.5px;text-decoration:none;
+        white-space:nowrap;}}
+    .tm-btn:hover{{background:rgba(255,157,92,.16);}}
     .tm-card.is-former .tm-actions{{display:none;}}
+    /* Selects filled their own width, so the same control was a different
+       size on every card. */
+    .tm-meta-v select,
+    .tm-meta-v form{{width:100%;}}
     .tm-former{{padding:16px 22px;}}
     .tm-former > summary{{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
         cursor:pointer;list-style:none;user-select:none;}}
@@ -23453,7 +23536,8 @@ _PASTE_ROUTE_JS = """
 
 
 def learn_location(conn, company_id, address, city="", state="", zip_code="",
-                   customer_name="", action="", container_size="", dump_location=""):
+                   customer_name="", action="", container_size="", dump_location="",
+                   kind="customer"):
     """Self-building address book: upsert a dispatched/inserted location keyed on
     its NORMALIZED name+address so the same place collapses to one entry no
     matter how it was typed, while two different customers sharing a building
@@ -23478,7 +23562,14 @@ def learn_location(conn, company_id, address, city="", state="", zip_code="",
     # Dedupe on the same name+street-address key the startup migration uses, so a
     # place collapses to one row no matter how it was typed (or whether a zip was
     # captured) and different customers at one building stay distinct.
-    norm = _address_book_key(cname, addr)
+    # 2026-10-30 ROOT CAUSE: the key was always built with kind="customer",
+    # whatever the caller was learning. A vendor therefore shared one
+    # address-book row with any customer at the same address, and inherited
+    # that customer's action defaults -- which is why a tarp-repair shop
+    # surfaced in Quick Add wearing a Pull badge. The kind is part of the
+    # identity of a place, so it belongs in the key.
+    kind = (kind or "customer").strip().lower() or "customer"
+    norm = _address_book_key(cname, addr, kind)
     if not _normalize_addr(addr):
         return
     try:
@@ -23492,8 +23583,8 @@ def learn_location(conn, company_id, address, city="", state="", zip_code="",
                 INSERT INTO saved_addresses
                     (company_id, customer_name, address, city, state, zip, full_address,
                      default_action, default_container_size, default_dump_location,
-                     norm_key, hidden, times_used, last_used_at, created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,0,1,?,?)
+                     norm_key, kind, hidden, times_used, last_used_at, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,1,?,?)
                 ON CONFLICT(company_id, norm_key) DO UPDATE SET
                     customer_name = COALESCE(NULLIF(saved_addresses.customer_name,''), excluded.customer_name),
                     city          = COALESCE(NULLIF(saved_addresses.city,''),          excluded.city),
@@ -23503,7 +23594,7 @@ def learn_location(conn, company_id, address, city="", state="", zip_code="",
                     times_used    = saved_addresses.times_used + 1,
                     last_used_at  = excluded.last_used_at
             """, (company_id, cname, addr, city or "", state or "", zip_code or "", full,
-                  action or "", container_size or "", dump_location or "", norm, ts, ts))
+                  action or "", container_size or "", dump_location or "", norm, kind, ts, ts))
         except sqlite3.OperationalError:
             # Unique index not present yet (e.g. duplicates survived the merge and
             # the CREATE was skipped) — fall back to the SELECT-then-branch upsert
@@ -23529,10 +23620,10 @@ def learn_location(conn, company_id, address, city="", state="", zip_code="",
                     INSERT INTO saved_addresses
                         (company_id, customer_name, address, city, state, zip, full_address,
                          default_action, default_container_size, default_dump_location,
-                         norm_key, hidden, times_used, last_used_at, created_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,0,1,?,?)
+                         norm_key, kind, hidden, times_used, last_used_at, created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,1,?,?)
                 """, (company_id, cname, addr, city or "", state or "", zip_code or "", full,
-                      action or "", container_size or "", dump_location or "", norm, ts, ts))
+                      action or "", container_size or "", dump_location or "", norm, kind, ts, ts))
         _sarow = conn.execute(
             "SELECT id FROM saved_addresses WHERE company_id=? AND norm_key=? "
             "ORDER BY times_used DESC, id ASC LIMIT 1",
@@ -41888,7 +41979,8 @@ _AVATAR_UPLOAD_JS = """
 
 
 def _avatar_upload_control_html(user, size=64, show_remove=True, include_js=True,
-                                compact=False, show_avatar=True):
+                                compact=False, show_avatar=True,
+                                remove_label="Remove", remove_danger=True):
     """A tappable avatar + hidden camera/library input + Add/Change/Remove
     controls for the given user (self or, for a boss, a driver). Pass
     include_js=False when the page already injected _AVATAR_UPLOAD_JS once.
@@ -41898,9 +41990,17 @@ def _avatar_upload_control_html(user, size=64, show_remove=True, include_js=True
     has = bool((_row_get(user, "avatar_path") or "").strip())
     remove = ""
     if show_remove and has:
+        # remove_danger=False for callers that sit this button next to a
+        # genuinely destructive one (the team roster puts it beside "Delete
+        # driver"): two red buttons side by side, one clearing a photo and one
+        # deleting a person, is a mis-tap waiting to happen on a tablet.
+        _rm_border = "rgba(255,82,82,0.4)" if remove_danger else "rgba(255,255,255,0.16)"
+        _rm_color = "#FF9B9B" if remove_danger else "var(--text-soft)"
         remove = (f'<button type="button" onclick="haAvatarRemove({uid})" '
-                  f'style="min-height:36px;padding:4px 10px;border-radius:8px;border:1px solid rgba(255,82,82,0.4);'
-                  f'background:transparent;color:#FF9B9B;font-size:12px;cursor:pointer;">Remove</button>')
+                  f'style="min-height:36px;padding:4px 10px;border-radius:8px;'
+                  f'border:1px solid {_rm_border};'
+                  f'background:transparent;color:{_rm_color};font-size:12px;'
+                  f'cursor:pointer;white-space:nowrap;">{remove_label}</button>')
     _btn_label = ("Change" if (compact and has) else ("Change photo" if has else ("Photo" if compact else "Add photo")))
     ctrl = (
         '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'
@@ -43900,7 +44000,23 @@ def add_parsed_stops(route_id):
 # labels used everywhere else (is_pull_job, compute_can_flow, Route Board
 # badges), so a dispatched route behaves identically to one created via
 # Create Route / Paste Dispatch Text.
-_PARSER_ACTION_MAP = {"PR": "Pickup and Return", "P": "Pull", "D": "Delivery", "S": "Swap", "R": "Relocate", "LL": "Live Load", "YARD": "Yard"}
+def _kind_for_action(action):
+    """Address-book kind implied by a stop's action.
+
+    A shop visit teaches the book a vendor, not a customer, so the next time
+    the boss types that name Quick Add shows it as a shop instead of offering
+    it as a Pull.
+    """
+    return "vendor" if (action or "").strip().lower() == "vendor" else "customer"
+
+
+# 2026-10-30: SHOP is the boss's way to say "this stop is a shop visit, not a
+# container job" from the Confirm Stop sheet. It maps to the Vendor stop the
+# breakdown flow already ships, so arrive / complete / holds behave identically.
+# Without it the only way to mark a repair shop was to add it to the Vendors
+# page first -- a place typed straight into Quick Add had no vendor option at
+# all and came back as a Pull.
+_PARSER_ACTION_MAP = {"PR": "Pickup and Return", "P": "Pull", "D": "Delivery", "S": "Swap", "R": "Relocate", "LL": "Live Load", "YARD": "Yard", "SHOP": "Vendor"}
 
 
 def _persist_manual_delivery(conn, clean_stops, new_ids):
@@ -44655,7 +44771,7 @@ def api_dispatch():
             _new_ids.append(cur.lastrowid)
             _new_ids_is_synth.append(_is_synth)
             learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
-                           action=s["action"])
+                           action=s["action"], kind=_kind_for_action(s["action"]))
             continue
         _acan_val = (s.get("assigned_can") or "").strip()[:20]
         try:
@@ -44685,7 +44801,8 @@ def api_dispatch():
         # Self-building address book: learn every dispatched stop's address.
         learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
                        action=s["action"], container_size=s["container_size"],
-                       dump_location=s.get("dump_leg") or "")
+                       dump_location=s.get("dump_leg") or "",
+                       kind=_kind_for_action(s["action"]))
 
     # Persist a confirm-sheet [change] -> delivery pick: translate the D stop's
     # POSITION to its real id and pre-write it as a manual delivery on the picking
@@ -44852,7 +44969,7 @@ def api_insert_stops(route_id):
             new_stops.append((cur.lastrowid, s.get("insert_before", "end")))
             _new_by_index[(_kind, _key)] = cur.lastrowid
             learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
-                           action=s["action"])
+                           action=s["action"], kind=_kind_for_action(s["action"]))
             continue
         cur.execute("""
             INSERT INTO stops (route_id, stop_order, customer_name, address, action, container_size,
@@ -44869,7 +44986,8 @@ def api_insert_stops(route_id):
         # Self-building address book: learn every inserted stop's address.
         learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
                        action=s["action"], container_size=s["container_size"],
-                       dump_location=s.get("dump_leg") or "")
+                       dump_location=s.get("dump_leg") or "",
+                       kind=_kind_for_action(s["action"]))
 
     if _rewrite and _rewrite["rewrite"]:
         # Plan order already accounts for converts, cancels, and the locked
@@ -44948,9 +45066,22 @@ def address_suggestions():
     rows = conn.execute("""
         SELECT COALESCE(NULLIF(sa.label, ''), sa.customer_name) AS customer_name,
                sa.address, sa.city, sa.state, sa.zip, sa.full_address,
-               COALESCE(sad.action, '')         AS default_action,
-               COALESCE(sad.container_size, '') AS default_container_size,
-               COALESCE(sad.dump_location, '')  AS default_dump_location
+               COALESCE(sa.kind, 'customer')    AS kind,
+               -- Bind a vendor suggestion back to its vendors row so the
+               -- dispatch sheet can post an id, not a name it has to re-match.
+               (SELECT v.id FROM vendors v
+                 WHERE v.company_id = sa.company_id AND v.is_active = 1
+                   AND TRIM(LOWER(v.name)) = TRIM(LOWER(COALESCE(sa.customer_name,'')))
+                 LIMIT 1)                          AS vendor_id,
+               -- A vendor is a place you visit, never a container job: it must
+               -- never offer a work action, whatever was once used at that
+               -- address. (2026-10-30)
+               CASE WHEN COALESCE(sa.kind,'customer') = 'vendor' THEN 'Vendor'
+                    ELSE COALESCE(sad.action, '') END  AS default_action,
+               CASE WHEN COALESCE(sa.kind,'customer') = 'vendor' THEN ''
+                    ELSE COALESCE(sad.container_size, '') END AS default_container_size,
+               CASE WHEN COALESCE(sa.kind,'customer') = 'vendor' THEN ''
+                    ELSE COALESCE(sad.dump_location, '') END  AS default_dump_location
         FROM saved_addresses sa
         LEFT JOIN saved_address_details sad
                ON sad.saved_address_id = sa.id
@@ -44991,9 +45122,22 @@ def api_locations_top():
         SELECT sa.id AS id,
                COALESCE(NULLIF(sa.label, ''), sa.customer_name) AS customer_name,
                sa.address, sa.city, sa.state, sa.zip, sa.full_address,
-               COALESCE(sad.action, '')         AS default_action,
-               COALESCE(sad.container_size, '') AS default_container_size,
-               COALESCE(sad.dump_location, '')  AS default_dump_location
+               COALESCE(sa.kind, 'customer')    AS kind,
+               -- Bind a vendor suggestion back to its vendors row so the
+               -- dispatch sheet can post an id, not a name it has to re-match.
+               (SELECT v.id FROM vendors v
+                 WHERE v.company_id = sa.company_id AND v.is_active = 1
+                   AND TRIM(LOWER(v.name)) = TRIM(LOWER(COALESCE(sa.customer_name,'')))
+                 LIMIT 1)                          AS vendor_id,
+               -- A vendor is a place you visit, never a container job: it must
+               -- never offer a work action, whatever was once used at that
+               -- address. (2026-10-30)
+               CASE WHEN COALESCE(sa.kind,'customer') = 'vendor' THEN 'Vendor'
+                    ELSE COALESCE(sad.action, '') END  AS default_action,
+               CASE WHEN COALESCE(sa.kind,'customer') = 'vendor' THEN ''
+                    ELSE COALESCE(sad.container_size, '') END AS default_container_size,
+               CASE WHEN COALESCE(sa.kind,'customer') = 'vendor' THEN ''
+                    ELSE COALESCE(sad.dump_location, '') END  AS default_dump_location
         FROM saved_addresses sa
         LEFT JOIN saved_address_details sad
                ON sad.saved_address_id = sa.id
@@ -47772,7 +47916,8 @@ def _learn_vendor_location(conn, company_id, vendor_name, address):
     if not (vendor_name or "").strip() or not (address or "").strip():
         return
     try:
-        learn_location(conn, company_id, address, customer_name=vendor_name, action="Vendor")
+        learn_location(conn, company_id, address, customer_name=vendor_name,
+                       action="Vendor", kind="vendor")
     except Exception as exc:
         app.logger.warning("_learn_vendor_location failed for %r: %s", vendor_name, exc)
 
@@ -49898,6 +50043,131 @@ def boss_dispatch_truck_meet():
         return jsonify({"success": True, "kind": kind, "group": group,
                         "from_stop_id": a_id, "to_stop_id": b_id,
                         "from_route_id": from_route, "to_route_id": to_route})
+    finally:
+        conn.close()
+
+
+@app.route("/api/dispatch/vendor-visit", methods=["POST"])
+@boss_required
+def boss_dispatch_vendor_visit():
+    """Boss sends a driver to a vendor — no defect required.
+
+    2026-10-30: until now a boss could only put a driver in front of a vendor
+    through the defect/breakdown flow, so a routine errand (tarp repair, tire
+    shop, parts pickup) had to be faked as a broken truck or typed as a
+    customer stop. The driver could already self-dispatch; the boss could not.
+
+    Reuses the proven Vendor-stop lifecycle rather than inventing one:
+    _insert_vendor_stop places it, _reprioritize_for_vendor parks the rest when
+    go_now is set, and the driver closes it with the same vendor-complete tap
+    that releases the holds.
+
+    Body: driver_id, vendor_id, mode, note.
+
+    mode (2026-10-30, from the yard):
+      "first" — start of day: go get it fixed, THEN start the route. The
+                commonest case and the default.
+      "now"   — something went wrong mid-route: drop everything and go.
+      "line"  — not urgent: just another stop in running order.
+    "first" and "now" park the remaining stops the same way; they differ in
+    what the driver is told, which is the whole point of separating them —
+    "skip your remaining stops" and "first stop today" are not the same
+    instruction, even when the route ends up in the same shape.
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        driver_id = int(data.get("driver_id") or 0)
+    except (TypeError, ValueError):
+        driver_id = 0
+    try:
+        vendor_id = int(data.get("vendor_id") or 0)
+    except (TypeError, ValueError):
+        vendor_id = 0
+    mode = str(data.get("mode") or "").strip().lower()
+    if mode not in ("first", "now", "line"):
+        # Legacy/boolean callers, and the safe default: treat anything
+        # unrecognised as the start-of-day errand rather than silently
+        # queueing a repair behind a day of pulls.
+        mode = "now" if data.get("go_now") else "first"
+    hold_rest = mode in ("first", "now")
+    note = str(data.get("note") or "").strip()[:300]
+    if not driver_id or not vendor_id:
+        return jsonify({"error": "Pick a driver and a vendor."}), 400
+
+    conn = get_db()
+    try:
+        drv = conn.execute(
+            "SELECT id, username, full_name FROM users"
+            " WHERE id=? AND company_id=? AND role='driver' AND is_active=1",
+            (driver_id, cid())).fetchone()
+        if not drv:
+            return jsonify({"error": "Driver not found."}), 404
+        ven = conn.execute(
+            "SELECT id, name, address FROM vendors"
+            " WHERE id=? AND company_id=? AND is_active=1",
+            (vendor_id, cid())).fetchone()
+        if not ven:
+            return jsonify({"error": "Vendor not found."}), 404
+
+        route_id = driver_active_route_id(conn, driver_id)
+        created_route = False
+        if not route_id:
+            # No route today: the errand IS the day's first move. Mirrors the
+            # defect path, so later /api/dispatch work appends behind it.
+            _today = today_str()
+            _cur = conn.execute(
+                """INSERT INTO routes (route_date, route_name, raw_text, assigned_to,
+                                       created_by, status, notes, company_id,
+                                       route_type, created_at)
+                   VALUES (?,?,'',?,?,'open','',?, 'rolloff', ?)""",
+                (_today, "%s — %s" % (drv["username"], _today), driver_id,
+                 session["user_id"], cid(), now_ts()))
+            route_id = _cur.lastrowid
+            created_route = True
+        else:
+            _r = conn.execute("SELECT status FROM routes WHERE id=?", (route_id,)).fetchone()
+            if _r and (_r["status"] or "") == "completed":
+                return jsonify({"error": "That driver's route is already finished."}), 400
+
+        # One open vendor stop at a time, same guard the driver's own
+        # self-dispatch uses -- two live vendor visits can't both be "current".
+        if conn.execute(
+                "SELECT id FROM stops WHERE route_id=? AND action='Vendor'"
+                " AND status != 'completed' AND cancelled_at IS NULL",
+                (route_id,)).fetchone():
+            return jsonify({"error": "That driver is already headed to a vendor."}), 400
+
+        vname = ven["name"]
+        vaddr = (ven["address"] or "").strip() or vname
+        stop_id = _insert_vendor_stop(conn, route_id, 0, vname, vaddr,
+                                      None, ven["id"], note or None)
+        held = _reprioritize_for_vendor(conn, route_id, stop_id) if hold_rest else 0
+
+        who = (drv["full_name"] or drv["username"] or "Driver").strip()
+        _rest = ("" if not held else
+                 " Your %d other stop%s will open back up when you're done."
+                 % (held, "" if held == 1 else "s"))
+        if mode == "now":
+            body = "🔧 Head to %s now — leave the route where it is.%s" % (vname, _rest)
+        elif mode == "first":
+            body = "🔧 First stop today: %s. Get it handled, then start your route.%s" % (vname, _rest)
+        else:
+            body = "🔧 Added a stop: %s." % vname
+        if note:
+            body += " " + note
+        conn.execute(
+            "INSERT INTO messages (route_id, sender_user_id, body, created_at, priority)"
+            " VALUES (?,?,?,?,?)",
+            (route_id, session["user_id"], body[:500], now_ts(),
+             "urgent" if mode == "now" else None))
+        notify(conn, cid(), "VENDOR_DISPATCH",
+               "%s → %s" % (who, vname),
+               body, link=url_for("view_route", route_id=route_id),
+               actor_user_id=session["user_id"], entity_type="stop", entity_id=stop_id)
+        conn.commit()
+        return jsonify({"success": True, "stop_id": stop_id, "route_id": route_id,
+                        "held": held, "created_route": created_route,
+                        "mode": mode, "message": body})
     finally:
         conn.close()
 

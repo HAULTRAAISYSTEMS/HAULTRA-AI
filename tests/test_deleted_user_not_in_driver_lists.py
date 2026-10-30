@@ -165,6 +165,23 @@ ok(app.display_user_name("deleted_items_report") == "deleted_items_report",
    "does not match a username that merely starts with 'deleted'")
 ok(app.display_user_name("") == "", "empty stays empty for the or-Unassigned callers")
 
+
+# ── 8. Roster action labels ────────────────────────────────────────
+# 2026-10-28: on a tablet the photo control rendered "Remove" (clears the
+# photo) directly beside "Delete" (deletes the person), both red. Two very
+# different consequences, one mis-tap apart.
+print("\n-- action labels --")
+cur.execute("UPDATE users SET avatar_path=? WHERE id=?", ("avatars/k.jpg", keeper))
+conn.commit()
+code, html = body("/team")
+ok("Remove photo" in html, "photo removal is labelled 'Remove photo', not 'Remove'")
+ok("Delete driver" in html, "account deletion is labelled 'Delete driver', not 'Delete'")
+ok(">Remove<" not in html, "no bare 'Remove' button on the roster")
+ok(">Delete<" not in html, "no bare 'Delete' button on the roster")
+_ri, _di = html.find("Remove photo"), html.find("Delete driver")
+ok(_ri != -1 and _di != -1 and _di > _ri,
+   "the destructive action comes after the photo action in the markup")
+
 print("\n%d failure(s)" % len(FAILURES))
 for f in FAILURES:
     print("  FAILED: " + f)
