@@ -4937,6 +4937,35 @@ def init_db():
         conn.commit()
     except sqlite3.OperationalError:
         pass
+    # 2026-10-30: reclassify vendors that learn_location filed as customers.
+    # It never wrote `kind`, so every vendor address landed as kind='customer'
+    # and surfaced in Quick Add as a dispatchable customer carrying whatever
+    # work action had been used at that address -- a tarp-repair shop offered
+    # as a Pull. Match the saved row back to the vendors table by name, flip
+    # the kind, and clear the work-action defaults a vendor can never have.
+    # Idempotent: re-running only ever touches rows still marked customer.
+    try:
+        conn.execute("""
+            UPDATE saved_addresses
+               SET kind='vendor',
+                   default_action='Vendor',
+                   default_container_size='',
+                   default_dump_location=''
+             WHERE kind='customer'
+               AND EXISTS (SELECT 1 FROM vendors v
+                            WHERE v.company_id = saved_addresses.company_id
+                              AND TRIM(LOWER(v.name)) = TRIM(LOWER(COALESCE(saved_addresses.customer_name,'')))
+                              AND TRIM(COALESCE(v.name,'')) != '')
+        """)
+        # Detail rows drive the Quick Add badge; a vendor has no work actions.
+        conn.execute("""
+            DELETE FROM saved_address_details
+             WHERE saved_address_id IN (SELECT id FROM saved_addresses WHERE kind='vendor')
+               AND COALESCE(action,'') != 'Vendor'
+        """)
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
     # Per-company one-time backfill flag: seeds the address book from all
     # historical stops the first time the company's parser/quick-add loads.
     safe_add_column(conn, "companies", "address_book_seeded INTEGER NOT NULL DEFAULT 0")
@@ -23440,7 +23469,8 @@ _PASTE_ROUTE_JS = """
 
 
 def learn_location(conn, company_id, address, city="", state="", zip_code="",
-                   customer_name="", action="", container_size="", dump_location=""):
+                   customer_name="", action="", container_size="", dump_location="",
+                   kind="customer"):
     """Self-building address book: upsert a dispatched/inserted location keyed on
     its NORMALIZED name+address so the same place collapses to one entry no
     matter how it was typed, while two different customers sharing a building
@@ -23465,7 +23495,14 @@ def learn_location(conn, company_id, address, city="", state="", zip_code="",
     # Dedupe on the same name+street-address key the startup migration uses, so a
     # place collapses to one row no matter how it was typed (or whether a zip was
     # captured) and different customers at one building stay distinct.
-    norm = _address_book_key(cname, addr)
+    # 2026-10-30 ROOT CAUSE: the key was always built with kind="customer",
+    # whatever the caller was learning. A vendor therefore shared one
+    # address-book row with any customer at the same address, and inherited
+    # that customer's action defaults -- which is why a tarp-repair shop
+    # surfaced in Quick Add wearing a Pull badge. The kind is part of the
+    # identity of a place, so it belongs in the key.
+    kind = (kind or "customer").strip().lower() or "customer"
+    norm = _address_book_key(cname, addr, kind)
     if not _normalize_addr(addr):
         return
     try:
@@ -23479,8 +23516,8 @@ def learn_location(conn, company_id, address, city="", state="", zip_code="",
                 INSERT INTO saved_addresses
                     (company_id, customer_name, address, city, state, zip, full_address,
                      default_action, default_container_size, default_dump_location,
-                     norm_key, hidden, times_used, last_used_at, created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,0,1,?,?)
+                     norm_key, kind, hidden, times_used, last_used_at, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,1,?,?)
                 ON CONFLICT(company_id, norm_key) DO UPDATE SET
                     customer_name = COALESCE(NULLIF(saved_addresses.customer_name,''), excluded.customer_name),
                     city          = COALESCE(NULLIF(saved_addresses.city,''),          excluded.city),
@@ -23490,7 +23527,7 @@ def learn_location(conn, company_id, address, city="", state="", zip_code="",
                     times_used    = saved_addresses.times_used + 1,
                     last_used_at  = excluded.last_used_at
             """, (company_id, cname, addr, city or "", state or "", zip_code or "", full,
-                  action or "", container_size or "", dump_location or "", norm, ts, ts))
+                  action or "", container_size or "", dump_location or "", norm, kind, ts, ts))
         except sqlite3.OperationalError:
             # Unique index not present yet (e.g. duplicates survived the merge and
             # the CREATE was skipped) — fall back to the SELECT-then-branch upsert
@@ -23516,10 +23553,10 @@ def learn_location(conn, company_id, address, city="", state="", zip_code="",
                     INSERT INTO saved_addresses
                         (company_id, customer_name, address, city, state, zip, full_address,
                          default_action, default_container_size, default_dump_location,
-                         norm_key, hidden, times_used, last_used_at, created_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,0,1,?,?)
+                         norm_key, kind, hidden, times_used, last_used_at, created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,1,?,?)
                 """, (company_id, cname, addr, city or "", state or "", zip_code or "", full,
-                      action or "", container_size or "", dump_location or "", norm, ts, ts))
+                      action or "", container_size or "", dump_location or "", norm, kind, ts, ts))
         _sarow = conn.execute(
             "SELECT id FROM saved_addresses WHERE company_id=? AND norm_key=? "
             "ORDER BY times_used DESC, id ASC LIMIT 1",
@@ -44916,9 +44953,22 @@ def address_suggestions():
     rows = conn.execute("""
         SELECT COALESCE(NULLIF(sa.label, ''), sa.customer_name) AS customer_name,
                sa.address, sa.city, sa.state, sa.zip, sa.full_address,
-               COALESCE(sad.action, '')         AS default_action,
-               COALESCE(sad.container_size, '') AS default_container_size,
-               COALESCE(sad.dump_location, '')  AS default_dump_location
+               COALESCE(sa.kind, 'customer')    AS kind,
+               -- Bind a vendor suggestion back to its vendors row so the
+               -- dispatch sheet can post an id, not a name it has to re-match.
+               (SELECT v.id FROM vendors v
+                 WHERE v.company_id = sa.company_id AND v.is_active = 1
+                   AND TRIM(LOWER(v.name)) = TRIM(LOWER(COALESCE(sa.customer_name,'')))
+                 LIMIT 1)                          AS vendor_id,
+               -- A vendor is a place you visit, never a container job: it must
+               -- never offer a work action, whatever was once used at that
+               -- address. (2026-10-30)
+               CASE WHEN COALESCE(sa.kind,'customer') = 'vendor' THEN 'Vendor'
+                    ELSE COALESCE(sad.action, '') END  AS default_action,
+               CASE WHEN COALESCE(sa.kind,'customer') = 'vendor' THEN ''
+                    ELSE COALESCE(sad.container_size, '') END AS default_container_size,
+               CASE WHEN COALESCE(sa.kind,'customer') = 'vendor' THEN ''
+                    ELSE COALESCE(sad.dump_location, '') END  AS default_dump_location
         FROM saved_addresses sa
         LEFT JOIN saved_address_details sad
                ON sad.saved_address_id = sa.id
@@ -44959,9 +45009,22 @@ def api_locations_top():
         SELECT sa.id AS id,
                COALESCE(NULLIF(sa.label, ''), sa.customer_name) AS customer_name,
                sa.address, sa.city, sa.state, sa.zip, sa.full_address,
-               COALESCE(sad.action, '')         AS default_action,
-               COALESCE(sad.container_size, '') AS default_container_size,
-               COALESCE(sad.dump_location, '')  AS default_dump_location
+               COALESCE(sa.kind, 'customer')    AS kind,
+               -- Bind a vendor suggestion back to its vendors row so the
+               -- dispatch sheet can post an id, not a name it has to re-match.
+               (SELECT v.id FROM vendors v
+                 WHERE v.company_id = sa.company_id AND v.is_active = 1
+                   AND TRIM(LOWER(v.name)) = TRIM(LOWER(COALESCE(sa.customer_name,'')))
+                 LIMIT 1)                          AS vendor_id,
+               -- A vendor is a place you visit, never a container job: it must
+               -- never offer a work action, whatever was once used at that
+               -- address. (2026-10-30)
+               CASE WHEN COALESCE(sa.kind,'customer') = 'vendor' THEN 'Vendor'
+                    ELSE COALESCE(sad.action, '') END  AS default_action,
+               CASE WHEN COALESCE(sa.kind,'customer') = 'vendor' THEN ''
+                    ELSE COALESCE(sad.container_size, '') END AS default_container_size,
+               CASE WHEN COALESCE(sa.kind,'customer') = 'vendor' THEN ''
+                    ELSE COALESCE(sad.dump_location, '') END  AS default_dump_location
         FROM saved_addresses sa
         LEFT JOIN saved_address_details sad
                ON sad.saved_address_id = sa.id
@@ -47740,7 +47803,8 @@ def _learn_vendor_location(conn, company_id, vendor_name, address):
     if not (vendor_name or "").strip() or not (address or "").strip():
         return
     try:
-        learn_location(conn, company_id, address, customer_name=vendor_name, action="Vendor")
+        learn_location(conn, company_id, address, customer_name=vendor_name,
+                       action="Vendor", kind="vendor")
     except Exception as exc:
         app.logger.warning("_learn_vendor_location failed for %r: %s", vendor_name, exc)
 
@@ -49720,6 +49784,131 @@ def driver_vendors():
         (cid(),)).fetchall()
     conn.close()
     return jsonify({"vendors": [dict(r) for r in rows]})
+
+
+@app.route("/api/dispatch/vendor-visit", methods=["POST"])
+@boss_required
+def boss_dispatch_vendor_visit():
+    """Boss sends a driver to a vendor — no defect required.
+
+    2026-10-30: until now a boss could only put a driver in front of a vendor
+    through the defect/breakdown flow, so a routine errand (tarp repair, tire
+    shop, parts pickup) had to be faked as a broken truck or typed as a
+    customer stop. The driver could already self-dispatch; the boss could not.
+
+    Reuses the proven Vendor-stop lifecycle rather than inventing one:
+    _insert_vendor_stop places it, _reprioritize_for_vendor parks the rest when
+    go_now is set, and the driver closes it with the same vendor-complete tap
+    that releases the holds.
+
+    Body: driver_id, vendor_id, mode, note.
+
+    mode (2026-10-30, from the yard):
+      "first" — start of day: go get it fixed, THEN start the route. The
+                commonest case and the default.
+      "now"   — something went wrong mid-route: drop everything and go.
+      "line"  — not urgent: just another stop in running order.
+    "first" and "now" park the remaining stops the same way; they differ in
+    what the driver is told, which is the whole point of separating them —
+    "skip your remaining stops" and "first stop today" are not the same
+    instruction, even when the route ends up in the same shape.
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        driver_id = int(data.get("driver_id") or 0)
+    except (TypeError, ValueError):
+        driver_id = 0
+    try:
+        vendor_id = int(data.get("vendor_id") or 0)
+    except (TypeError, ValueError):
+        vendor_id = 0
+    mode = str(data.get("mode") or "").strip().lower()
+    if mode not in ("first", "now", "line"):
+        # Legacy/boolean callers, and the safe default: treat anything
+        # unrecognised as the start-of-day errand rather than silently
+        # queueing a repair behind a day of pulls.
+        mode = "now" if data.get("go_now") else "first"
+    hold_rest = mode in ("first", "now")
+    note = str(data.get("note") or "").strip()[:300]
+    if not driver_id or not vendor_id:
+        return jsonify({"error": "Pick a driver and a vendor."}), 400
+
+    conn = get_db()
+    try:
+        drv = conn.execute(
+            "SELECT id, username, full_name FROM users"
+            " WHERE id=? AND company_id=? AND role='driver' AND is_active=1",
+            (driver_id, cid())).fetchone()
+        if not drv:
+            return jsonify({"error": "Driver not found."}), 404
+        ven = conn.execute(
+            "SELECT id, name, address FROM vendors"
+            " WHERE id=? AND company_id=? AND is_active=1",
+            (vendor_id, cid())).fetchone()
+        if not ven:
+            return jsonify({"error": "Vendor not found."}), 404
+
+        route_id = driver_active_route_id(conn, driver_id)
+        created_route = False
+        if not route_id:
+            # No route today: the errand IS the day's first move. Mirrors the
+            # defect path, so later /api/dispatch work appends behind it.
+            _today = today_str()
+            _cur = conn.execute(
+                """INSERT INTO routes (route_date, route_name, raw_text, assigned_to,
+                                       created_by, status, notes, company_id,
+                                       route_type, created_at)
+                   VALUES (?,?,'',?,?,'open','',?, 'rolloff', ?)""",
+                (_today, "%s — %s" % (drv["username"], _today), driver_id,
+                 session["user_id"], cid(), now_ts()))
+            route_id = _cur.lastrowid
+            created_route = True
+        else:
+            _r = conn.execute("SELECT status FROM routes WHERE id=?", (route_id,)).fetchone()
+            if _r and (_r["status"] or "") == "completed":
+                return jsonify({"error": "That driver's route is already finished."}), 400
+
+        # One open vendor stop at a time, same guard the driver's own
+        # self-dispatch uses -- two live vendor visits can't both be "current".
+        if conn.execute(
+                "SELECT id FROM stops WHERE route_id=? AND action='Vendor'"
+                " AND status != 'completed' AND cancelled_at IS NULL",
+                (route_id,)).fetchone():
+            return jsonify({"error": "That driver is already headed to a vendor."}), 400
+
+        vname = ven["name"]
+        vaddr = (ven["address"] or "").strip() or vname
+        stop_id = _insert_vendor_stop(conn, route_id, 0, vname, vaddr,
+                                      None, ven["id"], note or None)
+        held = _reprioritize_for_vendor(conn, route_id, stop_id) if hold_rest else 0
+
+        who = (drv["full_name"] or drv["username"] or "Driver").strip()
+        _rest = ("" if not held else
+                 " Your %d other stop%s will open back up when you're done."
+                 % (held, "" if held == 1 else "s"))
+        if mode == "now":
+            body = "🔧 Head to %s now — leave the route where it is.%s" % (vname, _rest)
+        elif mode == "first":
+            body = "🔧 First stop today: %s. Get it handled, then start your route.%s" % (vname, _rest)
+        else:
+            body = "🔧 Added a stop: %s." % vname
+        if note:
+            body += " " + note
+        conn.execute(
+            "INSERT INTO messages (route_id, sender_user_id, body, created_at, priority)"
+            " VALUES (?,?,?,?,?)",
+            (route_id, session["user_id"], body[:500], now_ts(),
+             "urgent" if mode == "now" else None))
+        notify(conn, cid(), "VENDOR_DISPATCH",
+               "%s → %s" % (who, vname),
+               body, link=url_for("view_route", route_id=route_id),
+               actor_user_id=session["user_id"], entity_type="stop", entity_id=stop_id)
+        conn.commit()
+        return jsonify({"success": True, "stop_id": stop_id, "route_id": route_id,
+                        "held": held, "created_route": created_route,
+                        "mode": mode, "message": body})
+    finally:
+        conn.close()
 
 
 @app.route("/api/driver/vendor-self-dispatch", methods=["POST"])
