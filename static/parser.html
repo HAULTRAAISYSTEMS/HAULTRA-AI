@@ -340,10 +340,7 @@
   .vsheet-vendor { font-size: 1.05rem; font-weight: 800; }
   .vsheet-addr { font-size: 0.82rem; color: var(--text-faint); margin-top: 2px; }
   .vsheet-hint { font-size: 0.76rem; color: var(--text-faint); margin-top: 8px; min-height: 1.1em; }
-  .qa-badge.badge-vendor {
-    background: rgba(140,160,179,0.18); color: #CBD5E1;
-    border: 1px solid rgba(203,213,225,0.45); letter-spacing: .5px;
-  }
+  .qa-badge.badge-shop { letter-spacing: .5px; }
   .qa-row.is-vendor .qa-label::after {
     content: 'VENDOR'; margin-left: 8px; font-size: 0.58rem; font-weight: 800;
     letter-spacing: .08em; color: #94A3B8; vertical-align: middle;
@@ -356,12 +353,15 @@
   #sheet-actions.invalid { animation: qa-shake .3s; border: 2px solid #FF5252; border-radius: 12px; }
   @keyframes qa-shake { 0%,100% { transform: translateX(0); } 25% { transform: translateX(-4px); } 75% { transform: translateX(4px); } }
   /* Action-badge palette — solid fill + near-black ink (matches haultra-theme.css). */
-  .badge-pr,.badge-p,.badge-d,.badge-s,.badge-r,.badge-yard,.badge-ll {
+  .badge-pr,.badge-p,.badge-d,.badge-s,.badge-r,.badge-yard,.badge-ll,.badge-shop {
     color:#0A0A0A !important; border:none !important; box-shadow:none !important; text-shadow:none !important; }
   .badge-pr{background:#FF6B1A !important;} .badge-p{background:#FFC53D !important;}
   .badge-d{background:#4DA3FF !important;} .badge-s{background:#A78BFA !important;}
   .badge-r{background:#7C8CA1 !important;} .badge-yard{background:#E5E5E5 !important;}
   .badge-ll{background:#FFC53D !important;}
+  /* SHOP — teal is reserved for AI-parsed and red for urgent, so a shop visit
+     takes a muted steel-cyan of its own: clearly not a container job. */
+  .badge-shop{background:#7FD1C4 !important;}
   .qa-text { flex: 1; min-width: 0; }
   .qa-label { font-size: 0.98rem; font-weight: 700; line-height: 1.25; word-break: break-word; }
   .qa-sub {
@@ -1190,6 +1190,8 @@
     <div class="sheet-head">
       <div id="sheet-title" class="sheet-title">Confirm Stop</div>
       <div style="display:flex;gap:8px;align-items:center;">
+        <button type="button" id="sheet-send-now" class="btn btn-secondary" hidden
+                style="min-height:44px;padding:0 16px;" title="Send a driver there now instead of adding it to the tray">Send now →</button>
         <button type="button" id="sheet-add-top" class="btn btn-orange-solid" style="min-height:44px;padding:0 20px;">Add Stop</button>
         <button type="button" id="sheet-close" class="sheet-close" aria-label="Cancel">&times;</button>
       </div>
@@ -1209,7 +1211,7 @@
         <input id="sheet-address" class="sheet-input" type="text" autocomplete="off"
                autocapitalize="words" spellcheck="false" placeholder="Street address" required>
       </div>
-      <div class="sheet-field">
+      <div class="sheet-field" id="sheet-size-field">
         <span class="sheet-label">Container size</span>
         <div id="sheet-sizes" class="sheet-chips" role="group" aria-label="Container size"></div>
       </div>
@@ -1219,13 +1221,13 @@
           <option value="">Pick from yard…</option>
         </select>
       </div>
-      <div class="sheet-field">
+      <div class="sheet-field" id="sheet-dump-field">
         <label class="sheet-label" for="sheet-dump">Dump at (site)</label>
         <input id="sheet-dump" class="sheet-input" type="text" autocomplete="off"
                list="sheet-dump-list" placeholder="e.g. transfer station (optional)">
         <datalist id="sheet-dump-list"></datalist>
       </div>
-      <div class="sheet-field">
+      <div class="sheet-field" id="sheet-return-field">
         <label class="sheet-label" for="sheet-return">Return to</label>
         <input id="sheet-return" class="sheet-input" type="text" autocomplete="off"
                list="sheet-return-list" placeholder="e.g. yard (optional)">
@@ -1257,10 +1259,16 @@
     S:    { full: 'Swap',          group: 'dropswap' },
     R:    { full: 'Relocate',      group: 'dropswap' },
     YARD: { full: 'Yard',          group: 'dropswap' },
+    // 2026-10-30: a shop visit — tyre shop, tarp repair, parts pickup. Not a
+    // container job, so it carries no size, dump leg or return leg.
+    SHOP: { full: 'Shop / repair',  group: 'shop' },
   };
   var ACTION_CODES = Object.keys(ACTION_META);
   // Order of the action chips in the Confirm-Stop sheet.
-  var SHEET_ACTIONS = ['P', 'D', 'S', 'PR', 'R', 'YARD'];
+  var SHEET_ACTIONS = ['P', 'D', 'S', 'PR', 'R', 'YARD', 'SHOP'];
+  // Actions that are a visit, not a container job: the sheet hides size, dump
+  // and return for these, and the card shows no can.
+  function isShopAction(code) { return code === 'SHOP'; }
 
   var currentStops = [];
   var editMode = false;
@@ -2048,11 +2056,32 @@
 
   // 2026-10-23: Yard can picker — only for Deliveries. Lists available yard
   // cans, filtered by selected size when one is picked.
+  var sheetVendorLoc = null;
+
+  function renderSheetSendNow() {
+    var btn = document.getElementById('sheet-send-now');
+    if (!btn) return;
+    // Only a place that IS in the vendor list can be sent straight out: the
+    // dispatch endpoint takes a vendor id, not a name.
+    var can = isShopAction(sheetAction) && sheetVendorLoc && sheetVendorLoc.vendor_id;
+    btn.hidden = !can;
+  }
+
   function renderSheetCanField() {
+    // A shop visit has no container, nothing to dump and nowhere to return to;
+    // leaving those on screen invites the boss to fill in fields that will be
+    // thrown away.
+    var shop = isShopAction(sheetAction);
+    ['sheet-size-field', 'sheet-dump-field', 'sheet-return-field'].forEach(function (id) {
+      var f = document.getElementById(id);
+      if (f) f.hidden = shop;
+    });
+    if (shop) { sheetSize = ''; renderSheetSizeChips(); }
+    renderSheetSendNow();
     var field = el('sheet-can-field');
     var sel = el('sheet-can');
     if (!field || !sel) return;
-    var isDelivery = (sheetAction === 'D');
+    var isDelivery = (sheetAction === 'D') && !shop;
     field.hidden = !isDelivery;
     if (!isDelivery) return;
     sel.innerHTML = '<option value="">Pick from yard…</option>';
@@ -2099,6 +2128,7 @@
     sheetEditId = editId || null;
     var pa = (prefill.action || '').toUpperCase();
     sheetAction = (ACTION_CODES.indexOf(pa) !== -1) ? pa : '';
+    sheetVendorLoc = prefill._vendor || null;
     sheetSize = (CONTAINER_SIZES.indexOf(prefill.container_size) !== -1) ? prefill.container_size : '';
     sheetAssignedCan = (prefill.assigned_can || '').trim();
     el('sheet-title').textContent = editId ? 'Edit Stop' : 'Confirm Stop';
@@ -2244,6 +2274,7 @@
     'delivery': 'D', 'deliver': 'D', 'drop': 'D', 'drop off': 'D', 'd': 'D',
     'swap': 'S', 's': 'S',
     'relocate': 'R', 'move': 'R', 'reposition': 'R', 'r': 'R',
+    'vendor': 'SHOP', 'shop': 'SHOP', 'repair': 'SHOP', 'v': 'SHOP',
   };
   // 2026-10-30 ROOT CAUSE of the vendor-shows-as-Pull bug: this used to end
   // in `|| 'P'`, so ANY action it did not recognise rendered as a Pickup
@@ -2387,6 +2418,13 @@
   }
 
   document.addEventListener('DOMContentLoaded', function () {
+    var sn = document.getElementById('sheet-send-now');
+    if (sn) sn.addEventListener('click', function () {
+      var loc = sheetVendorLoc;
+      if (!loc) return;
+      closeStopSheet(false);
+      openVendorSheet(loc);
+    });
     var c = vsheetEl('vsheet-close'); if (c) c.addEventListener('click', closeVendorSheet);
     var s = vsheetEl('vsheet-send');  if (s) s.addEventListener('click', sendToVendor);
     var bd = vsheetEl('vendor-sheet-backdrop');
@@ -2414,7 +2452,7 @@
     if (vendor) {
       // A vendor is somewhere the truck goes, not a container job — it gets
       // its own badge and never a work action.
-      badge.className = 'qa-badge badge-vendor';
+      badge.className = 'qa-badge badge-shop';
       badge.textContent = 'SHOP';
       badge.title = 'Vendor — send a driver here';
     } else if (learnedCode) {
@@ -2454,8 +2492,13 @@
       ev.preventDefault();
       hideSuggest();
       if (qaInput) qaInput.blur();
-      if (isVendorLoc(loc)) { openVendorSheet(loc); return; }
-      openStopSheet(prefillFromLoc(loc), null);
+      // 2026-10-30: a vendor used to open a different sheet from every other
+      // suggestion, which made the one concept feel like two. It opens the
+      // same Confirm Stop sheet now, with SHOP already picked; "Send now"
+      // inside that sheet is the urgent path.
+      var pre = prefillFromLoc(loc);
+      if (isVendorLoc(loc)) { pre.action = 'SHOP'; pre._vendor = loc; }
+      openStopSheet(pre, null);
     });
     return row;
   }

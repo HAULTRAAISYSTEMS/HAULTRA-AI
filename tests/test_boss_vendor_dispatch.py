@@ -66,8 +66,8 @@ conn.commit()
 app.app.config["TESTING"] = True
 cl = app.app.test_client()
 with cl.session_transaction() as s:
-    s.update(user_id=boss, company_id=co, role="boss", roles=["boss", "owner"],
-             _csrf_token="tok")
+    s.update(user_id=boss, company_id=co, role="boss",
+             roles=["boss", "owner", "dispatcher"], _csrf_token="tok")
 
 
 def post(path, payload):
@@ -257,7 +257,7 @@ ok(_fn and "'P'" not in _fn,
    "codeFromAction's body no longer falls back to P (body: %r)" % _fn.strip()[:80])
 ok("ACTION_BY_NAME[(name || '').trim().toLowerCase()] || null" in _html,
    "unknown actions return null instead of masquerading as Pull")
-ok("badge-vendor" in _html, "a vendor badge exists")
+ok("badge-shop" in _html, "a shop badge exists")
 ok("openVendorSheet" in _html, "picking a vendor opens the vendor sheet")
 ok("vendor-sheet-backdrop" in _html, "the vendor sheet markup is present")
 ok("/api/dispatch/vendor-visit" in _html, "the sheet posts to the boss endpoint")
@@ -273,6 +273,60 @@ _v2 = next((s for s in (r.get_json() or [])
             if (s.get("customer_name") or "").startswith("MA WASTE")), None)
 ok(_v2 is not None and _v2.get("vendor_id") == vendor,
    "the suggestion carries vendor_id so no name re-matching is needed")
+
+
+# ══════════════════════════════════════════════════════════════════
+# 4. SHOP action — marking a place a shop WITHOUT the Vendors page
+# ══════════════════════════════════════════════════════════════════
+# From the yard 2026-10-30: "maypaw" was typed straight into Quick Add, so it
+# was never in the vendors table, the name-match migration could not reach it,
+# and the Confirm Stop sheet had no vendor action to pick. It came back a Pull.
+print("\n-- SHOP action --")
+ok(app._PARSER_ACTION_MAP.get("SHOP") == "Vendor",
+   "SHOP maps to the existing Vendor stop type")
+ok(app._kind_for_action("Vendor") == "vendor", "a Vendor stop teaches a vendor")
+ok(app._kind_for_action("Pull") == "customer", "a work stop still teaches a customer")
+
+r = cl.post("/api/dispatch", data=json.dumps({
+        "driver_id": drv, "route_name": "shop test",
+        "stops": [{"action": "SHOP", "address": "150 S Military Hwy, Norfolk VA",
+                   "customer": "maypaw", "notes": "hydraulic line"}]}),
+    content_type="application/json", headers={"X-CSRF-Token": "tok"})
+ok(r.status_code in (200, 201), "a SHOP stop dispatches (got %d)" % r.status_code)
+row = conn.execute(
+    "SELECT action, customer_name FROM stops WHERE customer_name='maypaw'"
+    " ORDER BY id DESC LIMIT 1").fetchone()
+ok(row is not None, "the stop exists")
+ok(row and row["action"] == "Vendor",
+   "it is stored as a Vendor stop, not a Pull (got %r)" % (row["action"] if row else None))
+
+sa = conn.execute(
+    "SELECT kind, default_action FROM saved_addresses WHERE company_id=?"
+    " AND customer_name='maypaw'", (co,)).fetchone()
+ok(sa is not None, "the place is learned into the address book")
+ok(sa and sa["kind"] == "vendor",
+   "and learned as a VENDOR, so next time it is not offered as a Pull (got %r)"
+   % (sa["kind"] if sa else None))
+
+# The whole point: type it again and Quick Add no longer says Pull.
+r = cl.get("/api/address-suggestions?q=maypaw")
+_mp = next((s for s in (r.get_json() or [])
+            if (s.get("customer_name") or "") == "maypaw"), None)
+ok(_mp is not None, "it comes back as a suggestion")
+ok(_mp and _mp.get("kind") == "vendor", "tagged as a vendor")
+ok(_mp and _mp.get("default_action") == "Vendor",
+   "and never again as a Pull (got %r)" % (_mp.get("default_action") if _mp else None))
+
+print("\n-- SHOP in the sheet --")
+ok("'SHOP'" in _html and "SHEET_ACTIONS" in _html, "SHOP is in the sheet's action row")
+ok("SHOP: { full: 'Shop / repair'" in _html, "it reads as Shop / repair")
+ok("isShopAction" in _html, "the sheet knows a shop visit is not a container job")
+for _f in ("sheet-size-field", "sheet-dump-field", "sheet-return-field"):
+    ok(_f in _html, "%s can be hidden for a shop visit" % _f)
+ok("'vendor': 'SHOP'" in _html, "an action of 'Vendor' from the server maps to the SHOP chip")
+ok("sheet-send-now" in _html, "the urgent path lives inside the same sheet")
+ok("badge-shop" in _html, "SHOP has its own badge colour")
+ok("badge-vendor" not in _html, "no leftover duplicate vendor badge vocabulary")
 
 print("\n%d failure(s)" % len(FAILURES))
 for f in FAILURES:

@@ -43905,7 +43905,23 @@ def add_parsed_stops(route_id):
 # labels used everywhere else (is_pull_job, compute_can_flow, Route Board
 # badges), so a dispatched route behaves identically to one created via
 # Create Route / Paste Dispatch Text.
-_PARSER_ACTION_MAP = {"PR": "Pickup and Return", "P": "Pull", "D": "Delivery", "S": "Swap", "R": "Relocate", "LL": "Live Load", "YARD": "Yard"}
+def _kind_for_action(action):
+    """Address-book kind implied by a stop's action.
+
+    A shop visit teaches the book a vendor, not a customer, so the next time
+    the boss types that name Quick Add shows it as a shop instead of offering
+    it as a Pull.
+    """
+    return "vendor" if (action or "").strip().lower() == "vendor" else "customer"
+
+
+# 2026-10-30: SHOP is the boss's way to say "this stop is a shop visit, not a
+# container job" from the Confirm Stop sheet. It maps to the Vendor stop the
+# breakdown flow already ships, so arrive / complete / holds behave identically.
+# Without it the only way to mark a repair shop was to add it to the Vendors
+# page first -- a place typed straight into Quick Add had no vendor option at
+# all and came back as a Pull.
+_PARSER_ACTION_MAP = {"PR": "Pickup and Return", "P": "Pull", "D": "Delivery", "S": "Swap", "R": "Relocate", "LL": "Live Load", "YARD": "Yard", "SHOP": "Vendor"}
 
 
 def _persist_manual_delivery(conn, clean_stops, new_ids):
@@ -44660,7 +44676,7 @@ def api_dispatch():
             _new_ids.append(cur.lastrowid)
             _new_ids_is_synth.append(_is_synth)
             learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
-                           action=s["action"])
+                           action=s["action"], kind=_kind_for_action(s["action"]))
             continue
         _acan_val = (s.get("assigned_can") or "").strip()[:20]
         try:
@@ -44690,7 +44706,8 @@ def api_dispatch():
         # Self-building address book: learn every dispatched stop's address.
         learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
                        action=s["action"], container_size=s["container_size"],
-                       dump_location=s.get("dump_leg") or "")
+                       dump_location=s.get("dump_leg") or "",
+                       kind=_kind_for_action(s["action"]))
 
     # Persist a confirm-sheet [change] -> delivery pick: translate the D stop's
     # POSITION to its real id and pre-write it as a manual delivery on the picking
@@ -44857,7 +44874,7 @@ def api_insert_stops(route_id):
             new_stops.append((cur.lastrowid, s.get("insert_before", "end")))
             _new_by_index[(_kind, _key)] = cur.lastrowid
             learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
-                           action=s["action"])
+                           action=s["action"], kind=_kind_for_action(s["action"]))
             continue
         cur.execute("""
             INSERT INTO stops (route_id, stop_order, customer_name, address, action, container_size,
@@ -44874,7 +44891,8 @@ def api_insert_stops(route_id):
         # Self-building address book: learn every inserted stop's address.
         learn_location(conn, cid(), s["address"], customer_name=s.get("customer") or "",
                        action=s["action"], container_size=s["container_size"],
-                       dump_location=s.get("dump_leg") or "")
+                       dump_location=s.get("dump_leg") or "",
+                       kind=_kind_for_action(s["action"]))
 
     if _rewrite and _rewrite["rewrite"]:
         # Plan order already accounts for converts, cancels, and the locked
