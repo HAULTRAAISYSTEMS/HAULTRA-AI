@@ -190,6 +190,13 @@ ALLOW = {
     "convert_order_to_route",  # one customer order -> one stop
     "_perform_assignment",     # one customer request -> one stop
     "_insert_vendor_stop",     # one breakdown/vendor shop stop
+    # One half of a truck-to-truck meet (Transfer / Ride). Deliberately NOT
+    # resolved: a meet is not a roll-off job, so it can never be a leg of a
+    # can-swap chain, and its note is the boss's instruction about the
+    # meeting rather than a dispatch line. Running the resolver over it
+    # would let a phrase like "use it to swap at Heartland" in that note
+    # link a handover into a chain it has no part in. (2026-10-30)
+    "_append_meet_stop",
     # Garbage routes (Toter / Hand Pickup / Landfill) never carry roll-off cans,
     # so there's no can-swap chain to resolve:
     "garbage_templates_dispatch",
