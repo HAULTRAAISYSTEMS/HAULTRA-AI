@@ -38084,6 +38084,51 @@ def _name_near(a, b):
     return False
 
 
+def _known_can_labels(conn, company_id):
+    """Every can number this company's fleet knows, normalized for comparison.
+
+    2026-10-31: the owner looked at a suggestion reading 'Marlyn 3027 ·
+    Marlyn 3029 · Marlyn 3104' labelled 'lot numbers' and pointed out those
+    are CAN numbers. He was right, and the app already knew -- containers.label
+    holds exactly those numbers. The code simply had not asked.
+    """
+    out = set()
+    try:
+        for r in conn.execute(
+                "SELECT label FROM containers WHERE company_id=? "
+                "AND label IS NOT NULL AND TRIM(label) != ''", (company_id,)).fetchall():
+            n = _norm_lot(r[0])
+            if n:
+                out.add(n)
+    except Exception:
+        pass
+    return out
+
+
+def _trailing_number_kind(numbers, can_labels):
+    """What the trailing numbers on a set of customer names actually are.
+
+    Returns (kind, sentence). kind is 'can', 'lot' or 'number'.
+
+    The MERGE does not depend on this: a trailing number is never part of a
+    customer's identity, whether it counts a lot, a can, a job or a size, so
+    names at one address differing only by that number are one customer
+    either way. What depends on it is the explanation shown to the owner,
+    and an explanation that says 'lot numbers' about a row of can numbers is
+    simply wrong -- it invites him to distrust a suggestion that is correct,
+    or to trust the next one for the wrong reason.
+    """
+    nums = [n for n in (numbers or []) if n]
+    if not nums:
+        return ("number", "Same address, differing only by a trailing number.")
+    hits = sum(1 for n in nums if n in can_labels)
+    if hits == len(nums):
+        return ("can", "Same address, differing only by a can number.")
+    if hits == 0:
+        return ("lot", "Same address, differing only by a lot number.")
+    return ("number", "Same address, differing only by a trailing number.")
+
+
 def customer_duplicate_groups(conn, company_id):
     """Active customer records that look like one customer, for the boss to
     confirm. Returns
@@ -38127,22 +38172,29 @@ def customer_duplicate_groups(conn, company_id):
     used = set()
     groups = []
 
-    # (a) high confidence: the lot rule, which already picked a canonical name.
+    # (a) high confidence: same address, differing only by a trailing number.
+    _cans = _known_can_labels(conn, company_id)
     canon_members = {}
-    for vkey, (canon_name, _lot) in lot_names.items():
+    canon_numbers = {}
+    for vkey, (canon_name, _num) in lot_names.items():
         if vkey not in by_key:
             continue
-        canon_members.setdefault(_norm_cust_key(canon_name), set()).add(vkey)
+        _ck = _norm_cust_key(canon_name)
+        canon_members.setdefault(_ck, set()).add(vkey)
+        if _num:
+            canon_numbers.setdefault(_ck, []).append(_num)
     for ckey, vkeys in canon_members.items():
         surv = by_key.get(ckey)
         members = [by_key[v] for v in sorted(vkeys)
                    if v in by_key and v != ckey and by_key[v]["id"] != (surv or {}).get("id")]
         if surv is None or not members:
             continue
+        _kind, _why = _trailing_number_kind(canon_numbers.get(ckey, []), _cans)
         groups.append({"survivor": {"id": surv["id"], "name": surv["name"]},
                        "members": [{"id": m["id"], "name": m["name"]} for m in members],
                        "confidence": "high",
-                       "why": "Same address, differing only by a lot number."})
+                       "number_kind": _kind,
+                       "why": _why})
         used.add(surv["id"])
         used.update(m["id"] for m in members)
 
@@ -38172,15 +38224,23 @@ def customer_duplicate_groups(conn, company_id):
 
 
 def _resolve_lot_names(pairs):
-    """Decide which names are really ONE customer with several lots.
+    """Decide which names are really ONE customer written several ways.
 
-    2026-10-31. The boss's own rule, and the only test applied here: if two
-    names sit at the SAME street address and differ only by trailing digits,
-    those digits are a lot number, not a different customer.
+    2026-10-31. The rule, and the only test applied here: if two names sit at
+    the SAME street address and differ only by trailing digits, that number is
+    not part of the customer's name.
+
+    The number was first assumed to be a LOT number, on the boss's own
+    account, and for 'bish0090' it is. Then he looked at a suggestion reading
+    'Marlyn 3027 · Marlyn 3029 · Marlyn 3104' and pointed out those are CAN
+    numbers. Both are true, and the grouping holds either way -- which is the
+    real point: a trailing number on a customer name is a lot, a can, a job
+    or a size, and never the customer. Only the explanation shown to the boss
+    needs to know which (see _trailing_number_kind).
 
     `pairs` is an iterable of (customer_name, address). Returns
 
-        { _norm_cust_key(name): (canonical_name, lot) }
+        { _norm_cust_key(name): (canonical_name, trailing_number) }
 
     holding ONLY the names this rule actually fires on. A name it says nothing
     about is absent from the result and must be left exactly as it is -- that
@@ -48070,12 +48130,20 @@ def customers_page():
             _ms = _g["members"]
             _ids = ",".join(str(m["id"]) for m in _ms)
             _is_high = _g["confidence"] == "high"
+            # The chip names what the trailing numbers ACTUALLY are, checked
+            # against the fleet's own can numbers. Saying "lot numbers" about
+            # a row of can numbers is wrong and teaches the owner to distrust
+            # a suggestion that happens to be correct.
+            _chip_text = {"can": "Same address · can numbers",
+                          "lot": "Same address · lot numbers",
+                          "number": "Same address · trailing numbers",
+                          }.get(_g.get("number_kind") or "number",
+                                "Same address · trailing numbers") if _is_high else "Check first"
             # Teal is reserved for AI-parsed content and red for urgent, so a
             # confident group is marked with weight and a neutral chip only.
             _chip = ('<span style="display:inline-block;padding:2px 9px;border-radius:999px;'
                      'font-size:11px;font-weight:800;background:rgba(255,255,255,0.08);'
-                     'color:var(--slate);">%s</span>'
-                     % ("Same address · lot numbers" if _is_high else "Check first"))
+                     'color:var(--slate);">%s</span>' % e(_chip_text))
             _names = " · ".join(e(m["name"]) for m in _ms)
             _rows_html += f"""
             <div style="padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.06);
