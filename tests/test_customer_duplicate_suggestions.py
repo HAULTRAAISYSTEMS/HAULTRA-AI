@@ -226,6 +226,79 @@ ok(r.status_code == 200, "customers page renders (got %d)" % r.status_code)
 ok("757 Restoration" in html, "the remaining duplicate pair is offered on the page")
 ok("merge-group" in html, "with a merge control wired to the group endpoint")
 
+
+# ── 6. Can number vs lot number ────────────────────────────────────
+# 2026-10-31, reported from the live page: a group read
+# "Marlyn 3027 · Marlyn 3029 · Marlyn 3034 · Marlyn 3099 · Marlyn 3104"
+# under the label "Same address · lot numbers". Those are CAN numbers.
+# The merge was right -- a trailing number is never part of a customer's
+# name -- but the explanation was wrong, and a wrong explanation teaches
+# the boss to distrust a suggestion that is correct.
+print("\n-- what the trailing numbers actually are --")
+c5 = app.get_db()
+c5.execute("INSERT INTO companies (name, slug, subscription_plan, subscription_status,"
+           " max_drivers, created_at) VALUES (?,?,?,?,?,?)",
+           ("Can Co", "canco", "pro", "active", 10, ts))
+mco = c5.execute("SELECT id FROM companies WHERE slug='canco'").fetchone()["id"]
+c5.execute("INSERT INTO users (username, password_hash, role, full_name, company_id,"
+           " is_active, created_at) VALUES (?,?,?,?,?,1,?)",
+           ("m_drv", "x", "driver", "M Drv", mco, ts))
+mdrv = c5.execute("SELECT id FROM users WHERE username='m_drv'").fetchone()["id"]
+# The fleet knows cans 3027 and 3029; it has never heard of 0090 or 2643.
+for _lbl in ("3027", "3029", "3104"):
+    c5.execute("INSERT INTO containers (company_id, size, label, status, created_at)"
+               " VALUES (?,?,?,'deployed',?)", (mco, "20yd", _lbl, ts))
+for nm in ("Marlyn", "Marlyn 3027", "Marlyn 3029", "Bish", "Bish 0090", "Bish 2643"):
+    c5.execute("INSERT INTO customers (company_id, business_name, portal_token,"
+               " is_active, created_at) VALUES (?,?,?,1,?)",
+               (mco, nm, "ct-" + nm.replace(" ", "-"), ts))
+c5.execute("INSERT INTO routes (company_id, route_date, route_name, created_by,"
+           " assigned_to, status, created_at) VALUES (?,?,?,?,?,'completed',?)",
+           (mco, "2026-10-02", "M", mdrv, mdrv, ts))
+mrid = c5.execute("SELECT id FROM routes WHERE company_id=? ORDER BY id DESC LIMIT 1",
+                  (mco,)).fetchone()["id"]
+for i, (cn, ad) in enumerate([("Marlyn", "697 Independence Pkwy"),
+                              ("Marlyn 3027", "697 Independence Pkwy"),
+                              ("Marlyn 3029", "697 Independence Pkwy"),
+                              ("Bish", "123 Builder Way"),
+                              ("Bish 0090", "123 Builder Way"),
+                              ("Bish 2643", "123 Builder Way")], start=1):
+    c5.execute("""INSERT INTO stops (route_id, stop_order, customer_name, address, city,
+                  state, action, container_size, status, created_at)
+                  VALUES (?,?,?,?,'Norfolk','VA','Pull','20yd','completed',?)""",
+               (mrid, i, cn, ad, ts))
+c5.commit()
+
+ok(app._known_can_labels(c5, mco) == {"3027", "3029", "3104"},
+   "the fleet's can numbers are read (got %r)" % (app._known_can_labels(c5, mco),))
+
+mgroups = app.customer_duplicate_groups(c5, mco)
+c5.close()
+_mar = next((g for g in mgroups if g["survivor"]["name"] == "Marlyn"), None)
+_bsh = next((g for g in mgroups if g["survivor"]["name"] == "Bish"), None)
+ok(_mar is not None, "Marlyn's numbered records are still grouped")
+ok(_bsh is not None, "Bish's numbered records are still grouped")
+ok(_mar and _mar["number_kind"] == "can",
+   "Marlyn's trailing numbers are recognised as CAN numbers (got %r)"
+   % (_mar.get("number_kind") if _mar else None))
+ok(_mar and "can number" in _mar["why"],
+   "and the explanation says so (got %r)" % (_mar["why"] if _mar else None))
+ok(_bsh and _bsh["number_kind"] == "lot",
+   "Bish's, which match no can in the fleet, read as lot numbers (got %r)"
+   % (_bsh.get("number_kind") if _bsh else None))
+ok(_mar and _mar["confidence"] == "high" and _bsh and _bsh["confidence"] == "high",
+   "both stay high confidence -- the merge never depended on which kind it was")
+
+print("\n-- the classifier on its own --")
+_cans = {"3027", "3029", "3104"}
+ok(app._trailing_number_kind(["3027", "3029"], _cans)[0] == "can", "all known cans -> can")
+ok(app._trailing_number_kind(["90", "2643"], _cans)[0] == "lot", "none known -> lot")
+ok(app._trailing_number_kind(["3027", "2643"], _cans)[0] == "number",
+   "a mix claims neither")
+ok(app._trailing_number_kind([], _cans)[0] == "number", "nothing to go on claims neither")
+ok("lot" not in app._trailing_number_kind(["3027"], _cans)[1],
+   "a can group's sentence never says 'lot'")
+
 print("\n%d failure(s)" % len(FAILURES))
 for f in FAILURES:
     print("  FAILED: " + f)
