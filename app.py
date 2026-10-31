@@ -37744,6 +37744,81 @@ def _norm_cust_key(name):
     return " ".join((name or "").split()).casefold().strip(" .,")
 
 
+def _cans_on_site_by_customer(conn, company_id):
+    """{normalized customer key: cans on site}, from BOTH real sources.
+
+    2026-10-31: the customer list read this from the fleet table alone, where
+    a can's customer is PARSED OUT OF A FREE-TEXT NOTE (_fleet_site_of). Three
+    of the note shapes that function handles carry no customer at all --
+    'On site at ADDR (Bin Tracker)', 'Placed <date> — Site', and anything bulk
+    deployed -- so a can sitting on a job site attributed to nobody, and the
+    customer read "0 cans on site" while a container was physically there.
+
+    So the count is built from the two records that actually know:
+
+      1. The fleet (containers marked deployed) knows each PHYSICAL can.
+         Where its note names the customer, that stands.
+      2. The daily log (completed stops, replayed by compute_containers_out)
+         knows which CUSTOMER holds a can at which address. A fleet can whose
+         note names no customer is attributed through its site address here.
+
+      3. A customer the fleet knows nothing about at all falls back to the
+         replay's own count, so cans that never made it into the fleet table
+         still show. Applied only at zero, so nothing is ever double counted.
+
+    Deliberately does NOT invent: a customer with no deployed can and no
+    delivery in the log still reads 0, which for a finished job is correct.
+    """
+    try:
+        _fcusts, _, _ = _fleet_site_groups(conn, company_id)
+    except Exception:
+        _fcusts = {}
+    try:
+        out = compute_containers_out(conn, company_id)
+    except Exception:
+        out = []
+
+    # address -> customer, from the daily log
+    addr_cust = {}
+    for o in out:
+        _a = (o.get("address") or "").strip().casefold()
+        _c = (o.get("customer_name") or "").strip()
+        if _a and _c:
+            addr_cust.setdefault(_a, _c)
+
+    counts = {}
+    orphan_sites = []
+    for _disp, _groups in (_fcusts or {}).items():
+        for _g in _groups:
+            n = len(_g.get("cans") or [])
+            if not n:
+                continue
+            cust = (_g.get("customer") or "").strip() or (_disp or "").strip()
+            if cust:
+                counts[_norm_cust_key(cust)] = counts.get(_norm_cust_key(cust), 0) + n
+            else:
+                orphan_sites.append((_g.get("site") or "", n))
+
+    # (2) attribute customer-less fleet cans through the log's address map
+    for site, n in orphan_sites:
+        s = (site or "").strip().casefold()
+        cust = addr_cust.get(s) or addr_cust.get(s.split(",")[0].strip())
+        if cust:
+            counts[_norm_cust_key(cust)] = counts.get(_norm_cust_key(cust), 0) + n
+
+    # (3) customers the fleet knows nothing about
+    log_counts = {}
+    for o in out:
+        _c = (o.get("customer_name") or "").strip()
+        if _c:
+            k = _norm_cust_key(_c)
+            log_counts[k] = log_counts.get(k, 0) + 1
+    for k, n in log_counts.items():
+        if not counts.get(k):
+            counts[k] = n
+    return counts
+
+
 def _customer_alias_map(conn, company_id):
     """Merged-away normalized names -> survivor display name."""
     try:
@@ -47023,10 +47098,9 @@ def customers_page():
             ORDER BY LOWER(COALESCE(c.business_name, c.contact_name, '')), c.id""",
         (cid(),),
     ).fetchall()
-    _fcusts, _fn, _fs = _fleet_site_groups(conn, cid())
-    _fleet_n = {}
-    for _disp, _gs in _fcusts.items():
-        _fleet_n[_norm_cust_key(_disp)] = sum(len(_g["cans"]) for _g in _gs)
+    # Fleet + daily log together: the fleet alone lost any can whose note
+    # named no customer, which read as "0 cans on site" on a live job.
+    _fleet_n = _cans_on_site_by_customer(conn, cid())
     conn.close()
 
     size_opts = "".join(f'<option value="{s}">{s}</option>' for s in REQUEST_SIZES)
