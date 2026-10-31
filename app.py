@@ -617,6 +617,155 @@ def _normalize_name(text):
     return " ".join(s.split()).strip()
 
 
+# ── Lot numbers ───────────────────────────────────────────────────────────
+# 2026-10-31: a lot number had nowhere to live, so the boss put it in the only
+# field that accepted one -- the customer name. Every lot then became its own
+# "customer": three stops at 11496 Shiloh Dr arrived as "Lot 35", "Ashdon" and
+# "EW", which is one builder, not three customers.
+#
+# Two shapes show up, and they need very different confidence:
+#
+#   EXPLICIT   "Lot 35", "lot#35", "LT 41", a bare "#35"
+#              Unambiguous. Split on sight.
+#
+#   GLUED      "bish0090", "BISH2643" beside "BISHARD"
+#              Ambiguous on its own -- "A1 Demolition" and "757 Restoration"
+#              are real names with digits in them, and a 4-digit tail looks
+#              exactly like a can number. So this function does NOT guess.
+#              It only reports the split it *would* make, and the caller
+#              confirms it against the ADDRESS (_resolve_lot_names below):
+#              digits are a lot number only when another name at the same
+#              street address reduces to the same base. That test is the
+#              boss's own rule and it is the thing that makes this safe.
+#
+# The bare "#35" form is deliberately NOT in the default pattern. A can number
+# is written exactly that way all over this app -- "can #3104", "container
+# #3117" -- so reading a bare # as a lot in a NOTE would both invent a lot and
+# strip the can reference the driver needs. It is only safe in the CUSTOMER
+# field, where a can number has no business being, so callers opt in there.
+_LOT_WORD_RE = re.compile(
+    r"""(?ix)
+    (?:^|[\s,;(\-])                 # start, or a separator before it
+    (?:lot|lt) \s* [#.:\-]? \s*     # the word is required
+    (?P<n> [0-9]{1,5} [a-z]? )
+    (?=$|[\s,;).\-])                # and a separator after it
+    """
+)
+_LOT_WORD_OR_HASH_RE = re.compile(
+    r"""(?ix)
+    (?:^|[\s,;(\-])
+    (?:
+        (?:lot|lt) \s* [#.:\-]? \s* (?P<n1> [0-9]{1,5} [a-z]? )
+      | \# \s* (?P<n2> [0-9]{1,5} [a-z]? )
+    )
+    (?=$|[\s,;).\-])
+    """
+)
+
+# A name that is NOTHING but a lot reference ("Lot 35", "#41", "lot 7a").
+# These must never mint a customer record -- the customer comes from the
+# address instead.
+_LOT_ONLY_RE = re.compile(r"(?i)^\s*(?:lot|lt)?\s*[#.:\-]?\s*[0-9]{1,5}[a-z]?\s*$")
+
+# A name ending in glued digits: "bish0090" -> ("bish", "0090"). Requires at
+# least two leading letters so a bare number is not mistaken for a split.
+_LOT_GLUED_RE = re.compile(r"(?i)^(?P<base>[a-z][a-z&'. ]{1,}?)\s*(?P<lot>[0-9]{1,5}[a-z]?)\s*$")
+
+
+def _norm_lot(value):
+    """Normalized lot number for comparison: digits without leading zeros,
+    lowercase suffix. '0090' and '90' are the same lot; '7a' keeps its 'a'."""
+    s = re.sub(r"[^0-9a-z]+", "", str(value or "").lower())
+    if not s:
+        return ""
+    m = re.match(r"^0*([0-9]+)([a-z]?)$", s)
+    return (m.group(1) + m.group(2)) if m else s
+
+
+def _fmt_lot(value):
+    """Display form for a lot number: 'Lot 35'. '' for no lot."""
+    n = _norm_lot(value)
+    return ("Lot " + n.upper()) if n else ""
+
+
+def stop_customer_label(customer_name, lot, fallback=""):
+    """What a human should read for a stop: 'Ashdon — Lot 35'.
+
+    The builder comes first because that is what the driver is looking for on
+    a street of identical lots, and it is the half that used to be missing:
+    before the lot had a column of its own, a stop like this one showed a bare
+    'Lot 35' with no clue whose development it was.
+
+    Falls back to the lot alone when no customer is known, then to `fallback`.
+    """
+    name = " ".join(str(customer_name or "").split())
+    lot_txt = _fmt_lot(lot)
+    if name and lot_txt:
+        return name + " — " + lot_txt
+    return name or lot_txt or fallback
+
+
+def is_lot_only_name(name):
+    """True when a customer name carries no customer at all, only a lot
+    reference. 'Lot 35' and '#41' are True; 'Ashdon' and '757 Rest' are not."""
+    return bool(name) and bool(_LOT_ONLY_RE.match(str(name)))
+
+
+def split_explicit_lot(text, allow_bare_hash=False):
+    """Pull an EXPLICIT lot reference out of free text.
+
+    Returns (remaining_text, lot).
+
+        "Ashdon lot 35"       -> ("Ashdon", "35")
+        "lot 41 can 3104"     -> ("can 3104", "41")   <- can number untouched
+        "place on lot 35"     -> ("place on", "35")
+        "Ashdon"              -> ("Ashdon", "")
+        "can 3124"            -> ("can 3124", "")     <- never reads a can
+        "can #3104"           -> ("can #3104", "")    <- nor this one
+
+    By default the word 'lot' or 'lt' must be present. A can number is a bare
+    digit run and is frequently written '#3104', so a bare '#' is read as a
+    lot ONLY when the caller passes allow_bare_hash=True -- appropriate for
+    the customer-name field, never for notes.
+    """
+    if not text:
+        return ("", "")
+    s = str(text)
+    rx = _LOT_WORD_OR_HASH_RE if allow_bare_hash else _LOT_WORD_RE
+    m = rx.search(s)
+    if not m:
+        return (s.strip(), "")
+    g = m.groupdict()
+    lot = g.get("n") or g.get("n1") or g.get("n2") or ""
+    rest = (s[:m.start()] + " " + s[m.end():])
+    rest = re.sub(r"\s+", " ", rest).strip(" ,;-")
+    return (rest, _norm_lot(lot))
+
+
+def propose_glued_lot(name):
+    """The split a GLUED name would make, WITHOUT deciding it is right.
+
+        "bish0090" -> ("bish", "90")
+        "BISH2643" -> ("BISH", "2643")
+        "BISHARD"  -> ("BISHARD", "")      <- no trailing digits
+        "757 Rest" -> ("757 Rest", "")     <- digits lead, they are the name
+        "A1"       -> ("A", "1")           proposal only; the address decides
+
+    Returns (base, lot) with lot == "" when there is nothing to propose. The
+    caller MUST corroborate against the address before acting on it.
+    """
+    if not name:
+        return ("", "")
+    s = " ".join(str(name).split())
+    m = _LOT_GLUED_RE.match(s)
+    if not m:
+        return (s, "")
+    base = m.group("base").strip(" .&'")
+    if len(re.sub(r"[^a-z]", "", base.lower())) < 2:
+        return (s, "")
+    return (base, _norm_lot(m.group("lot")))
+
+
 # Delimiter that cannot appear in either normalized component, so a name+address
 # key can never collide with a differently-split name/address pair.
 _ADDR_BOOK_KEY_SEP = "\x1f"
@@ -3987,6 +4136,13 @@ def init_db():
     safe_add_column(conn, "stops", "transfer_peer_stop_id INTEGER")
     safe_add_column(conn, "stops", "transfer_can TEXT")
     safe_add_column(conn, "stops", "transfer_user_id INTEGER")
+    # 2026-10-31: lot number as a first-class field. It used to have nowhere
+    # to live, so it went into the customer name ("Lot 35", "bish0090") and
+    # every lot became its own customer. One builder's development is ONE
+    # customer with many lots, so the lot belongs on the stop and the site,
+    # not in the name.
+    safe_add_column(conn, "stops", "lot TEXT")
+    safe_add_column(conn, "sites", "lot TEXT")
     # Customer Request System (Phase 3): boss's reason when denying a request.
     safe_add_column(conn, "requests", "deny_reason TEXT")
     # Phase 5 — two-stage workflow adds the 'accepted' status and a manager's
@@ -17715,7 +17871,7 @@ def _build_route_board_html(user, day=None):
                {_truck_select}
                u.username AS driver_username, u.full_name AS driver_full_name,
                u.avatar_path AS driver_avatar,
-               s.id AS stop_id, s.stop_order, s.customer_name, s.address, s.city,
+               s.id AS stop_id, s.stop_order, s.customer_name, s.lot, s.address, s.city,
                s.action, s.container_size, s.status AS stop_status, s.driver_status,
                s.notes, s.placement_note, s.assigned_can, s.dump_location,
                (SELECT dt.can_number FROM dump_tickets dt WHERE dt.stop_id = s.id ORDER BY dt.id DESC LIMIT 1) AS ticket_can,
@@ -18057,6 +18213,12 @@ def _build_route_board_html(user, day=None):
             hold_icon = '<span class="stop-mini-hold" title="Held — truck at vendor">&#9208;</span>' if held else ""
 
             addr_text = ", ".join(p for p in [s["address"] or "", s["city"] or ""] if p) or (s["customer_name"] or "Stop")
+            # 2026-10-31: on a street of identical lots the address alone does
+            # not say which one, so the lot rides alongside it when there is
+            # one. No lot, no change to the row.
+            _lot_txt = _fmt_lot(_row_get(s, "lot"))
+            if _lot_txt:
+                addr_text = addr_text + " · " + _lot_txt
             addr_cls = "stop-mini-addr done" if (_swap_done or (stop_status == "completed" and not _returning)) else "stop-mini-addr"
             size_label = size_bucket(s["container_size"]) or (s["container_size"] or "")
             # Garbage stops (2026-10-10): show the can/bag count or tons instead
@@ -37744,6 +37906,94 @@ def _norm_cust_key(name):
     return " ".join((name or "").split()).casefold().strip(" .,")
 
 
+def _resolve_lot_names(pairs):
+    """Decide which names are really ONE customer with several lots.
+
+    2026-10-31. The boss's own rule, and the only test applied here: if two
+    names sit at the SAME street address and differ only by trailing digits,
+    those digits are a lot number, not a different customer.
+
+    `pairs` is an iterable of (customer_name, address). Returns
+
+        { _norm_cust_key(name): (canonical_name, lot) }
+
+    holding ONLY the names this rule actually fires on. A name it says nothing
+    about is absent from the result and must be left exactly as it is -- that
+    is what keeps "A1 Demolition" and "757 Restoration" safe, and what keeps
+    two unrelated customers who merely share a building apart.
+
+    Worked example, all at 123 Builder Way:
+
+        bish0090, BISH2643, BISHARD
+          -> base 'bish' is shared, and BISHARD carries no trailing digits,
+             so it is the canonical spelling:
+             bish0090 -> ("BISHARD", "90")
+             BISH2643 -> ("BISHARD", "2643")
+             BISHARD  -> ("BISHARD", "")
+
+    Why the canonical name is the digit-free variant: it is the one the boss
+    typed when he was naming the builder rather than the lot, so it is the
+    name a human recognizes on an invoice.
+    """
+    by_addr = {}
+    for _name, _addr in pairs:
+        if not _name:
+            continue
+        akey = _normalize_addr(_addr or "")
+        if not akey:
+            continue
+        by_addr.setdefault(akey, {})[" ".join(str(_name).split())] = True
+
+    out = {}
+    for _akey, _names in by_addr.items():
+        if len(_names) < 2:
+            continue
+        # Group this address's names by the alphabetic base a glued split
+        # would propose. Names carrying digits open the groups; a digitless
+        # name joins the group whose base it STARTS WITH, because the boss
+        # writes the builder's name both in full and clipped -- "BISHARD"
+        # alongside "bish0090". Exact-base matching alone would leave
+        # "BISHARD" in a group of its own and pick "BISH" as the name on the
+        # invoice, which is not what a human would recognize.
+        groups = {}
+        digitless = []
+        for _nm in _names:
+            base, lot = propose_glued_lot(_nm)
+            bkey = _norm_cust_key(base)
+            if not bkey:
+                continue
+            if lot:
+                groups.setdefault(bkey, []).append((_nm, lot))
+            else:
+                digitless.append((_nm, bkey))
+        for _nm, _nkey in digitless:
+            # Longest base wins, so a name is claimed by the most specific
+            # group it could belong to. Require 3+ letters in the base: a
+            # 1-2 letter prefix would sweep in unrelated names.
+            cands = [b for b in groups
+                     if len(re.sub(r"[^a-z]", "", b)) >= 3 and _nkey.startswith(b)]
+            if cands:
+                groups[max(cands, key=len)].append((_nm, ""))
+        for _bkey, members in groups.items():
+            # The rule needs corroboration: at least one name with digits AND
+            # a second name reducing to the same base. One lone "ACME1234" at
+            # an address proves nothing and is left alone.
+            if len(members) < 2 or not any(lot for _nm, lot in members):
+                continue
+            # Canonical = a member with no trailing digits (longest, so
+            # "BISHARD" beats "BISH"); else the longest base spelling.
+            digitless = sorted((nm for nm, lot in members if not lot),
+                               key=lambda s: (-len(s), s))
+            if digitless:
+                canon = digitless[0]
+            else:
+                canon = sorted((propose_glued_lot(nm)[0] for nm, lot in members),
+                               key=lambda s: (-len(s), s))[0]
+            for _nm, _lot in members:
+                out[_norm_cust_key(_nm)] = (canon, _lot)
+    return out
+
+
 def _cans_on_site_by_customer(conn, company_id):
     """{normalized customer key: cans on site}, from BOTH real sources.
 
@@ -37816,6 +38066,27 @@ def _cans_on_site_by_customer(conn, company_id):
     for k, n in log_counts.items():
         if not counts.get(k):
             counts[k] = n
+
+    # (4) 2026-10-31: fold lot-number variants into the canonical customer.
+    # The keys above come from names as the boss typed them ('bish0090'),
+    # while the Customers page looks up by the canonical name ('BISHARD').
+    # Without this fold the page would read 0 cans on a live builder -- the
+    # exact bug this function was written to kill, one layer further up.
+    try:
+        _lot_names = _resolve_lot_names(
+            (r[0], r[1]) for r in conn.execute(
+                "SELECT s.customer_name, s.address FROM stops s JOIN routes r ON r.id = s.route_id "
+                "WHERE r.company_id=? AND s.customer_name IS NOT NULL AND TRIM(s.customer_name) != ''",
+                (company_id,)).fetchall())
+    except Exception:
+        _lot_names = {}
+    for _vkey, (_canon_name, _lot) in _lot_names.items():
+        _ckey = _norm_cust_key(_canon_name)
+        if _vkey == _ckey:
+            continue
+        _n = counts.pop(_vkey, 0)
+        if _n:
+            counts[_ckey] = counts.get(_ckey, 0) + _n
     return counts
 
 
@@ -44253,9 +44524,24 @@ def _validate_parser_stops(stops_in):
         # Keep dispatch instructions out of the customer name: a long or
         # verb-laden name is split — the clean customer stays, the overflow
         # moves to the stop note so it's never learned as a location name.
-        _cust_clean, _cust_overflow = _clean_customer_name(
-            expand_abbrev((s.get("customer") or "").strip()))
-        _notes = expand_abbrev((s.get("notes") or "").strip())
+        _cust_raw = expand_abbrev((s.get("customer") or "").strip())
+        _notes_raw = expand_abbrev((s.get("notes") or "").strip())
+        # 2026-10-31: take the lot number out of the customer name before
+        # anything downstream reads it as a customer. "Lot 35" is not a
+        # customer at all; "Ashdon lot 35" is Ashdon, on lot 35.
+        # Bare '#36' is allowed here: this is the customer field, where a can
+        # number does not belong. The note below gets the strict pattern.
+        _cust_raw, _lot = split_explicit_lot(_cust_raw, allow_bare_hash=True)
+        if not _lot and is_lot_only_name(_cust_raw):
+            _lot = _norm_lot(_cust_raw)
+            _cust_raw = ""
+        if not _lot:
+            # Read the note, never rewrite it: "lot 41 can 3104" gives lot 41
+            # while the note stays whole, because the driver still needs the
+            # placement instruction and the can reference.
+            _lot = split_explicit_lot(_notes_raw)[1]
+        _cust_clean, _cust_overflow = _clean_customer_name(_cust_raw)
+        _notes = _notes_raw
         if _cust_overflow:
             _notes = (_cust_overflow + ((" — " + _notes) if _notes else "")).strip()
         # The model emits a STRUCTURED chain_hint, never prose — fold it into the
@@ -44265,6 +44551,7 @@ def _validate_parser_stops(stops_in):
             "address": address,
             "action": _PARSER_ACTION_MAP[action_code],
             "customer": _cust_clean,
+            "lot": _lot,
             "container_size": expand_abbrev((s.get("container_size") or "").strip()),
             # Multi-leg: dump/return legs of a single job (kept on the one stop).
             "dump_leg": expand_abbrev((s.get("dump_leg") or "").strip()),
@@ -44871,6 +45158,13 @@ def api_dispatch():
                   s["notes"], s.get("empty_can_plan") or "", s.get("carry_can_ref") or "", now_ts()))
         _new_ids.append(cur.lastrowid)
         _new_ids_is_synth.append(_is_synth)
+        # Lot number set in one place so all three INSERT variants above get
+        # it without threading another positional arg through each of them.
+        if s.get("lot"):
+            try:
+                cur.execute("UPDATE stops SET lot=? WHERE id=?", (s["lot"], cur.lastrowid))
+            except Exception:
+                pass  # column not migrated yet on this DB
         # Resolve the dump/return site names to location records + set the FKs.
         _link_stop_sites(conn, cid(), cur.lastrowid, s.get("dump_leg") or "", s.get("return_leg") or "")
         # Self-building address book: learn every dispatched stop's address.
@@ -47011,7 +47305,36 @@ def _sync_customer_records(conn, company_id):
     book (customer kind) and on routes becomes a formal customers record,
     merged by _norm_cust_key so spelling variants collapse to one record.
     Idempotent; commits its own inserts. Returns {norm_key: customer_id}
-    for every known name, with merged-away names resolving to survivors."""
+    for every known name, with merged-away names resolving to survivors.
+
+    2026-10-31: lot-number variants collapse here too. Names that sit at the
+    same street address and differ only by trailing digits are one builder
+    with several lots (_resolve_lot_names), so 'bish0090' and 'BISH2643' stop
+    minting customers of their own and fold into 'BISHARD'. A name the rule
+    says nothing about is untouched, so two unrelated customers sharing a
+    building stay separate."""
+    _lot_names = _resolve_lot_names(
+        (r[0], r[1]) for r in conn.execute(
+            "SELECT s.customer_name, s.address FROM stops s JOIN routes r ON r.id = s.route_id "
+            "WHERE r.company_id=? AND s.customer_name IS NOT NULL AND TRIM(s.customer_name) != ''",
+            (company_id,)).fetchall())
+
+    def _canon(_raw):
+        """Canonical spelling when the lot rule reassigned this name, else
+        the name exactly as the boss typed it."""
+        _hit = _lot_names.get(_norm_cust_key(_raw))
+        return _hit[0] if _hit else " ".join(str(_raw or "").split())
+
+    def _skip_name(_nm, _k):
+        """Names that are not customers and must never become records.
+
+        'Lot 35' is the one that matters here: the parse path stops creating
+        these going forward, but a year of history already has lots sitting
+        in customer_name, and those rows would keep re-minting a 'Lot 35'
+        customer on every sync. A bare lot number is never a customer."""
+        return (not _k) or _k in _place_keys or _k in ("the yard", "unassigned") \
+            or is_lot_only_name(_nm)
+
     _place_keys = set()
     for _r in conn.execute(
             "SELECT label FROM saved_addresses WHERE company_id=? AND kind IN ('vendor','yard','dump')",
@@ -47023,25 +47346,27 @@ def _sync_customer_records(conn, company_id):
     for _r in conn.execute(
             "SELECT label FROM saved_addresses WHERE company_id=? AND kind='customer' "
             "AND label IS NOT NULL AND TRIM(label) != ''", (company_id,)).fetchall():
-        _k = _norm_cust_key(_r[0])
-        if _k and _k not in _place_keys:
+        _nm = _canon(_r[0])
+        _k = _norm_cust_key(_nm)
+        if not _skip_name(_nm, _k):
             _votes.setdefault(_k, {})
-            _votes[_k][_r[0].strip()] = _votes[_k].get(_r[0].strip(), 0) + 2
-            _ab_spell.setdefault(_k, _r[0].strip())
+            _votes[_k][_nm] = _votes[_k].get(_nm, 0) + 2
+            _ab_spell.setdefault(_k, _nm)
     for _r in conn.execute(
             "SELECT DISTINCT s.customer_name FROM stops s JOIN routes r ON r.id = s.route_id "
             "WHERE r.company_id=? AND s.customer_name IS NOT NULL AND TRIM(s.customer_name) != ''",
             (company_id,)).fetchall():
-        _k = _norm_cust_key(_r[0])
-        if _k and _k not in _place_keys and _k not in ("the yard", "unassigned"):
+        _nm = _canon(_r[0])
+        _k = _norm_cust_key(_nm)
+        if not _skip_name(_nm, _k):
             _votes.setdefault(_k, {})
-            _votes[_k][_r[0].strip()] = _votes[_k].get(_r[0].strip(), 0) + 1
+            _votes[_k][_nm] = _votes[_k].get(_nm, 0) + 1
     for _r in conn.execute(
             "SELECT notes FROM containers WHERE company_id=? AND notes IS NOT NULL",
             (company_id,)).fetchall():
         _nc, _ns, _nd = _fleet_site_of(_r[0])
         _k = _norm_cust_key(_nc)
-        if _k and _k not in _place_keys and _k not in ("the yard", "unassigned"):
+        if not _skip_name(_nc, _k):
             _votes.setdefault(_k, {})
             _votes[_k][_nc.strip()] = _votes[_k].get(_nc.strip(), 0) + 1
     _existing = {}
@@ -47075,6 +47400,14 @@ def _sync_customer_records(conn, company_id):
             _new += 1
         except Exception:
             pass
+    # Every lot-variant name resolves to the canonical customer's id, so a
+    # caller that looks up by the name the boss typed ('bish0090') lands on
+    # the same record as 'BISHARD'. Without this the Customers page would
+    # show one row while cans-on-site counted under three separate keys.
+    for _vkey, (_canon_name, _lot) in _lot_names.items():
+        _cid_for = _out.get(_norm_cust_key(_canon_name))
+        if _cid_for is not None:
+            _out[_vkey] = _cid_for
     if _new:
         conn.commit()
     return _out
