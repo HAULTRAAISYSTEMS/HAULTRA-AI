@@ -19,7 +19,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11.9"
+          # 2026-10-31: was pinned to "3.11.9". GitHub prunes exact patch
+          # releases from the hosted runner's tool cache, and once 3.11.9
+          # left it the step died in ~1s before any test ran. The app is
+          # not sensitive to the patch level -- Render pins the deploy
+          # separately via .python-version -- so track the 3.11 line.
+          python-version: "3.11"
           cache: pip
       - run: pip install -r requirements.txt
       - name: Compile Python
