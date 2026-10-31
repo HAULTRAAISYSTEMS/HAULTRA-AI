@@ -51,6 +51,11 @@ def sa(name, addr, city, used):
                    hidden,times_used,last_used_at,created_at) VALUES (?,?,?,?,?,?,0,?,?,?)""",
                 (co,name,addr,city,(addr+", "+city),nk,used,app.now_ts(),app.now_ts()))
     return cur.lastrowid
+# Real production case: one Heartland customer, two identical 630 sites,
+# and a legitimate different 430 site. Older keys allowed duplicate rows.
+sa("heartland", "430 Washington Park", "Norfolk", 8)
+sa("Heartland", "630 Washington park, Norfolk, VA", "Norfolk", 6)
+sa("Heartland", "630 Washington park, Norfolk", "Norfolk", 5)
 sa("Recovery","6403 Granby St","Norfolk",3)
 sa("recovery","6403 Granby St","Norfolk",5)
 sa("Serv Pro","527 J Clyde Morris Blvd","Newport News",4)
@@ -63,6 +68,18 @@ conn.commit(); conn.close()
 app.init_db()
 
 conn = app.get_db()
+# Heartland's duplicate 630 entries collapse, while 430 remains a separate site.
+_h = conn.execute(
+    "SELECT address, times_used FROM saved_addresses WHERE company_id=? "
+    "AND LOWER(customer_name)='heartland' ORDER BY address", (co,)
+).fetchall()
+ok(len(_h) == 2, "Heartland has exactly two distinct job sites")
+_h630 = [r for r in _h if "630 washington" in r["address"].lower()]
+ok(len(_h630) == 1 and _h630[0]["times_used"] == 11,
+   "duplicate Heartland 630 site merged with 11 historical uses")
+ok(any("430 washington" in r["address"].lower() and r["times_used"] == 8
+       for r in _h), "Heartland 430 site preserved separately")
+
 # item 2: shorthand deduped to one 'hamp' row for the company
 hamp = conn.execute("SELECT COUNT(*) n FROM parse_vocab WHERE company_id=? AND LOWER(term)='hamp'",(co,)).fetchone()["n"]
 ok(hamp == 1, "duplicate 'hamp' shorthand collapsed to a single row")

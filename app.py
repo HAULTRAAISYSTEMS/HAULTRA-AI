@@ -599,6 +599,11 @@ def _normalize_addr(text):
             out.append(_ADDR_CITY_MAP[tok])
         else:
             out.append(tok)
+    # A trailing state abbreviation is optional in dispatch text: Norfolk and
+    # Norfolk, VA refer to the same city/site. Only remove a terminal state
+    # token, never the street number, street suffix, city or lot/unit.
+    if len(out) >= 3 and out[-1] in ("va", "virginia", "nc", "north carolina"):
+        out.pop()
     key = " ".join(out)
     # Multi-word city shorthand (e.g. "va beach") — apply after token join.
     for short, full in _ADDR_CITY_MAP.items():
@@ -47689,6 +47694,51 @@ def _sync_customer_records(conn, company_id):
     return _out
 
 
+def _collapse_exact_duplicate_customers(conn, company_id):
+    """Merge exact duplicate business names only, preserving linked history.
+
+    Conflicting contact data, different business names and address-only
+    matches are intentionally never auto-merged.
+    """
+    rows = conn.execute(
+        "SELECT id, business_name, contact_name, phone, email FROM customers "
+        "WHERE company_id=? AND is_active=1 ORDER BY id", (company_id,)
+    ).fetchall()
+    groups = {}
+    for row in rows:
+        key = _norm_cust_key(row["business_name"])
+        if key:
+            groups.setdefault(key, []).append(row)
+    merged = 0
+    for group in groups.values():
+        survivor = group[0]
+        for alias in group[1:]:
+            if any((survivor[field] or "").strip().casefold() !=
+                   (alias[field] or "").strip().casefold()
+                   for field in ("contact_name", "phone", "email")
+                   if (survivor[field] or "").strip() and (alias[field] or "").strip()):
+                continue
+            try:
+                conn.execute("SAVEPOINT customer_dedupe")
+                for table in ("bins", "requests", "sites"):
+                    conn.execute(f"UPDATE {table} SET customer_id=? WHERE customer_id=?",
+                                 (survivor["id"], alias["id"]))
+                conn.execute(
+                    "UPDATE stops SET customer_id=? WHERE customer_id=? "
+                    "AND route_id IN (SELECT id FROM routes WHERE company_id=?)",
+                    (survivor["id"], alias["id"], company_id))
+                conn.execute("UPDATE customers SET is_active=0 WHERE id=? AND company_id=?",
+                             (alias["id"], company_id))
+                conn.execute("RELEASE SAVEPOINT customer_dedupe")
+                merged += 1
+            except Exception:
+                conn.execute("ROLLBACK TO SAVEPOINT customer_dedupe")
+                conn.execute("RELEASE SAVEPOINT customer_dedupe")
+    if merged:
+        conn.commit()
+    return merged
+
+
 @app.route("/customers")
 @roles_required("customer_manager")
 def customers_page():
@@ -47696,6 +47746,7 @@ def customers_page():
     an Add Customer form."""
     conn = get_db()
     _sync_customer_records(conn, cid())
+    _collapse_exact_duplicate_customers(conn, cid())
     rows = conn.execute(
         """SELECT c.id, c.business_name, c.contact_name, c.phone,
                   (SELECT COUNT(*) FROM requests r
