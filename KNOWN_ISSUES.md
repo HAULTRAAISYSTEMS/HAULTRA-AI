@@ -20,3 +20,6 @@ product defect -- the override behaviour is correct in isolation:
 Both now pick dates that cannot collide. A permanently red suite is worse than
 no suite: it trains everyone to merge without looking, which is how a bad
 dependency pin reached production during this work.
+
+<!-- CI control probe 2026-10-31T10:56:40Z: no code change. Verifying whether the backend
+     check fails on an unmodified main. Delete this branch after. -->
