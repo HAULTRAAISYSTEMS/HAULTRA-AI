@@ -37168,13 +37168,65 @@ def _invoice_due_date(terms, issued_day):
     return (d + timedelta(days=days)).strftime("%Y-%m-%d")
 
 
+def _street_key(address):
+    """Street-only key for one physical job site.
+
+    2026-10-31. Billing grouped on the raw address string, so one site typed
+    three ways became three invoices: Napo's 1013 Paragon Way was billed at
+    $4,725 + $1,100 + $400 because the boss wrote ", Suffolk, VA" on some
+    stops and not others. The parser puts the city in `stops.address`
+    sometimes and in `stops.city` other times, so the street alone is the
+    only part that is reliably present.
+
+    This collapses ONLY differences in how a person typed the same place:
+    case, punctuation, whitespace, an abbreviated street type (Rd/Road,
+    Pkwy/Parkway) and a trailing city/state.
+
+    It deliberately does NOT collapse anything where the characters
+    themselves differ -- a different house number (1413 vs 1431 Laskin), a
+    different street name, or a different street TYPE (Independence Pkwy vs
+    Independence Blvd). Those may be typos in one company's data and two real
+    addresses in another's, and merging two real sites bills the wrong job.
+    They belong in a suggestion a human confirms, never in a key.
+    """
+    base = _normalize_addr(address or "")
+    if not base:
+        return ""
+    toks = base.split()
+    # Strip a trailing state code, then a trailing city name. Both maps are
+    # already lowercase-normalized by _normalize_addr.
+    if toks and toks[-1] in _STATE_TOKENS:
+        toks = toks[:-1]
+    for _city in _CITY_TAIL_TOKENS:
+        _ct = _city.split()
+        if len(toks) > len(_ct) and toks[-len(_ct):] == _ct:
+            toks = toks[:-len(_ct)]
+            break
+    out = " ".join(toks).strip()
+    # An address that was ONLY a city keeps its original key rather than
+    # becoming blank, so two different cities never group together.
+    return out or base
+
+
+# States and city names that may trail a street address. Built from the
+# parser's own city tables so a city it understands is a city here too.
+_STATE_TOKENS = {"va", "nc", "virginia", "carolina", "md", "maryland"}
+_CITY_TAIL_TOKENS = sorted(
+    {_normalize_addr(_full) for _full, _st in _CITY_CODES.values()}
+    | {_normalize_addr(_v) for _v in _ADDR_CITY_MAP.values()},
+    key=lambda s: -len(s.split()))
+
+
 def _group_key(customer, site):
     """Normalized (customer, site) billing key. Blank customer → 'unassigned',
-    blank site → 'no address'. Case/space-insensitive so the same site typed
-    two ways still groups together."""
+    blank site → 'no address'.
+
+    The site half goes through _street_key so one job site is ONE billing
+    group however the address was typed; see that function for what is
+    deliberately left un-merged."""
     c = (customer or "").strip()
     s = (site or "").strip()
-    return (c.casefold() or "unassigned", s.casefold() or "no address")
+    return (c.casefold() or "unassigned", _street_key(s) or "no address")
 
 
 def _group_display(customer, site):
@@ -37287,6 +37339,15 @@ def _unbilled_stop_groups(conn, company_id, route_id=None):
                                    "raw_customer": (sd.get("customer_name") or "").strip(),
                                    "raw_site": (sd.get("address") or "").strip(),
                                    "route_ids": set(), "stop_ids": set()}
+            else:
+                # Several spellings of one site now share a group, so show the
+                # most complete one on the invoice -- "3533 Sleepy Hole Rd,
+                # Suffolk, VA" reads better than whichever stop happened to be
+                # first. Longest wins, ties keep the incumbent.
+                _cand = (sd.get("address") or "").strip()
+                if len(_cand) > len(g["raw_site"]):
+                    g["raw_site"] = _cand
+                    g["site"] = _group_display(sd.get("customer_name"), _cand)[1]
             g["route_ids"].add(sd["route_id"])
             g["stop_ids"].add(sd["id"])
         out = []
