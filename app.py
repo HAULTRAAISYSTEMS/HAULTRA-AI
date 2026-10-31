@@ -599,6 +599,11 @@ def _normalize_addr(text):
             out.append(_ADDR_CITY_MAP[tok])
         else:
             out.append(tok)
+    # A trailing state abbreviation is optional in dispatch text: Norfolk and
+    # Norfolk, VA refer to the same city/site. Only remove a terminal state
+    # token, never the street number, street suffix, city or lot/unit.
+    if len(out) >= 3 and out[-1] in ("va", "virginia", "nc", "north carolina"):
+        out.pop()
     key = " ".join(out)
     # Multi-word city shorthand (e.g. "va beach") — apply after token join.
     for short, full in _ADDR_CITY_MAP.items():
