@@ -5138,6 +5138,10 @@ def init_db():
     # Per-company one-time backfill flag: seeds the address book from all
     # historical stops the first time the company's parser/quick-add loads.
     safe_add_column(conn, "companies", "address_book_seeded INTEGER NOT NULL DEFAULT 0")
+    # 2026-10-31: same per-company lazy pattern for job sites. Dispatch now
+    # records a site as each stop goes out, but a year of existing routes
+    # predates that, so the first Customers page load backfills from history.
+    safe_add_column(conn, "companies", "job_sites_seeded INTEGER NOT NULL DEFAULT 0")
     # Speeds up the normalized dedupe lookup that runs on every learned stop.
     # (Non-unique here; a UNIQUE index is created AFTER the merge below, once
     # duplicates have been collapsed — constraining before merging is what caused
@@ -37994,6 +37998,244 @@ def _resolve_lot_names(pairs):
     return out
 
 
+# ── Job sites ─────────────────────────────────────────────────────────────
+# 2026-10-31: a dispatched stop carried a customer NAME and never a
+# customer_id, and nothing created a `sites` row. The sites table, the
+# customer detail page that lists sites, and merge_customer's re-pointing of
+# them all existed -- the only writers were the manual "+ Add Customer" form,
+# manual bin-add, and the demo seeder. So a builder working six addresses was
+# six unrelated strings on six stops, and his job-site list was empty.
+#
+# Attaching a stop to the WRONG customer is worse than attaching it to none:
+# it moves a can, and a bill, onto someone else's account without a trace. So
+# both functions below refuse rather than guess.
+
+def _place_name_keys(conn, company_id):
+    """Names that belong to the yard, a dump or a vendor, not a customer."""
+    keys = set()
+    try:
+        for r in conn.execute(
+                "SELECT label FROM saved_addresses WHERE company_id=? "
+                "AND kind IN ('vendor','yard','dump')", (company_id,)).fetchall():
+            if r[0]:
+                keys.add(_norm_cust_key(r[0]))
+    except Exception:
+        pass
+    try:
+        for r in conn.execute("SELECT name FROM vendors WHERE company_id=?",
+                              (company_id,)).fetchall():
+            if r[0]:
+                keys.add(_norm_cust_key(r[0]))
+    except Exception:
+        pass
+    return keys
+
+
+def resolve_or_create_customer(conn, company_id, name, action=""):
+    """customers.id for a dispatched stop's customer name, creating the record
+    the first time that name is seen. Returns None when the name is not a
+    customer at all, which the caller must treat as 'leave it unattached'.
+
+    Refuses: an empty name, the yard, 'unassigned', a bare lot number, a
+    vendor/dump/yard name, and any stop whose ACTION is not customer work.
+    Everything else resolves through customer_aliases first (so a merged name
+    lands on its survivor) and then through the existing records.
+
+    Deliberately lighter than _sync_customer_records: this runs inside
+    dispatch, per stop, so it does two small reads rather than that function's
+    several full-table scans and vote tally.
+    """
+    nm = " ".join(str(name or "").split())
+    if not nm:
+        return None
+    if _kind_for_action(action) != "customer":
+        return None
+    if (action or "").strip().lower() in ("yard", "dump", "vendor", "ride", "transfer"):
+        return None
+    k = _norm_cust_key(nm)
+    if not k or k in ("the yard", "unassigned", "yard", "shop") or is_lot_only_name(nm):
+        return None
+    if k in _place_name_keys(conn, company_id):
+        return None
+    try:
+        a = conn.execute(
+            "SELECT survivor_id FROM customer_aliases WHERE company_id=? AND alias_key=?",
+            (company_id, k)).fetchone()
+        if a and a[0]:
+            return a[0]
+    except Exception:
+        pass
+    for r in conn.execute(
+            "SELECT id, business_name, contact_name FROM customers "
+            "WHERE company_id=? AND is_active=1", (company_id,)).fetchall():
+        for cand in (r["business_name"], r["contact_name"]):
+            if cand and _norm_cust_key(cand) == k:
+                return r["id"]
+    try:
+        cur = conn.execute(
+            "INSERT INTO customers (company_id, business_name, portal_token, is_active, created_at) "
+            "VALUES (?, ?, ?, 1, ?)",
+            (company_id, nm, secrets.token_urlsafe(24), now_ts()))
+        return cur.lastrowid
+    except Exception:
+        return None
+
+
+def customer_id_for_address(conn, company_id, address):
+    """Who owns this address, from the job sites already recorded, or None.
+
+    This is how a stop whose 'customer' was nothing but 'Lot 35' finds its
+    builder. It answers only from sites ALREADY on file, and only when the
+    answer is unambiguous: if two customers have a site at the address -- a
+    strip mall, an apartment complex -- it returns None rather than pick one.
+    """
+    akey = _normalize_addr(address or "")
+    if not akey:
+        return None
+    found = set()
+    try:
+        rows = conn.execute(
+            "SELECT s.customer_id, s.address FROM sites s JOIN customers c ON c.id = s.customer_id "
+            "WHERE c.company_id=? AND c.is_active=1", (company_id,)).fetchall()
+    except Exception:
+        return None
+    for r in rows:
+        if _normalize_addr(r["address"] or "") == akey:
+            found.add(r["customer_id"])
+    return found.pop() if len(found) == 1 else None
+
+
+def learn_job_site(conn, customer_id, address, lot=""):
+    """Record (or find) this customer's job site at an address, returning its
+    sites.id. One site per address PER LOT, because each lot is a distinct
+    place a can sits -- lots 35 and 41 on one street address are two sites,
+    while a second visit to lot 35 is the same one.
+
+    Deduped on the normalized address, so '101 Oak St' and '101 Oak Street'
+    do not become twins.
+    """
+    if not customer_id:
+        return None
+    akey = _normalize_addr(address or "")
+    if not akey:
+        return None
+    lotn = _norm_lot(lot)
+    try:
+        for r in conn.execute("SELECT id, address, lot FROM sites WHERE customer_id=?",
+                              (customer_id,)).fetchall():
+            if (_normalize_addr(r["address"] or "") == akey
+                    and _norm_lot(_row_get(r, "lot")) == lotn):
+                return r["id"]
+    except Exception:
+        return None
+    try:
+        cur = conn.execute(
+            "INSERT INTO sites (customer_id, address, lot, created_at) VALUES (?, ?, ?, ?)",
+            (customer_id, " ".join(str(address or "").split()), lotn or None, now_ts()))
+        return cur.lastrowid
+    except Exception:
+        try:
+            cur = conn.execute(
+                "INSERT INTO sites (customer_id, address, created_at) VALUES (?, ?, ?)",
+                (customer_id, " ".join(str(address or "").split()), now_ts()))
+            return cur.lastrowid
+        except Exception:
+            return None
+
+
+def _seed_job_sites(conn, company_id, name_to_id):
+    """One-time per company: build job sites out of existing route history.
+
+    Dispatch records a site as each stop goes out now, but every route
+    dispatched before that predates it, so without this a long-standing
+    customer shows an empty job-site list until he happens to be dispatched
+    again.
+
+    Resolves through `name_to_id` -- the map _sync_customer_records just
+    built, which already folds aliases and lot variants -- rather than
+    creating records of its own, so the backfill cannot invent a customer
+    that the voting logic would have spelled differently.
+
+    Two passes, because a stop whose only 'customer' was 'Lot 35' can only
+    find its builder once the named stops have put that address on file.
+    Idempotent: learn_job_site returns the existing site rather than adding
+    a second, so a re-run changes nothing.
+    """
+    try:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT s.id, s.customer_name, s.address, s.lot, s.action "
+            "  FROM stops s JOIN routes r ON r.id = s.route_id "
+            " WHERE r.company_id=? AND s.address IS NOT NULL AND TRIM(s.address) != ''",
+            (company_id,)).fetchall()]
+    except Exception:
+        return 0
+    made = 0
+    deferred = []
+    for r in rows:
+        _act = r.get("action") or ""
+        if _kind_for_action(_act) != "customer":
+            continue
+        if (_act or "").strip().lower() in ("yard", "dump", "vendor", "ride", "transfer"):
+            continue
+        nm = " ".join(str(r.get("customer_name") or "").split())
+        _k = _norm_cust_key(nm)
+        if not nm or is_lot_only_name(nm) or _k in ("the yard", "unassigned"):
+            deferred.append(r)
+            continue
+        _cid = name_to_id.get(_k)
+        if not _cid:
+            continue
+        try:
+            conn.execute("UPDATE stops SET customer_id=? WHERE id=? AND customer_id IS NULL",
+                         (_cid, r["id"]))
+        except Exception:
+            pass
+        if learn_job_site(conn, _cid, r.get("address"), r.get("lot")):
+            made += 1
+    # Second pass: the lot-only stops, now that the addresses are on file.
+    for r in deferred:
+        if not r.get("lot"):
+            continue
+        _cid = customer_id_for_address(conn, company_id, r.get("address"))
+        if not _cid:
+            continue
+        try:
+            conn.execute("UPDATE stops SET customer_id=? WHERE id=? AND customer_id IS NULL",
+                         (_cid, r["id"]))
+        except Exception:
+            pass
+        if learn_job_site(conn, _cid, r.get("address"), r.get("lot")):
+            made += 1
+    try:
+        conn.execute("UPDATE companies SET job_sites_seeded=1 WHERE id=?", (company_id,))
+        conn.commit()
+    except Exception:
+        pass
+    return made
+
+
+def attach_stop_to_customer(conn, company_id, stop_id, customer_name, address,
+                            lot="", action=""):
+    """Wire one dispatched stop to its customer record and record the job
+    site. Returns the customer id, or None when the stop is left unattached.
+
+    Order matters: the NAME decides, and only when the name is not a customer
+    at all (a bare 'Lot 35') does the ADDRESS get consulted -- and then only
+    for an address exactly one customer already owns.
+    """
+    cust_id = resolve_or_create_customer(conn, company_id, customer_name, action=action)
+    if cust_id is None and lot and _kind_for_action(action) == "customer":
+        cust_id = customer_id_for_address(conn, company_id, address)
+    if not cust_id:
+        return None
+    try:
+        conn.execute("UPDATE stops SET customer_id=? WHERE id=?", (cust_id, stop_id))
+    except Exception:
+        pass
+    learn_job_site(conn, cust_id, address, lot)
+    return cust_id
+
+
 def _cans_on_site_by_customer(conn, company_id):
     """{normalized customer key: cans on site}, from BOTH real sources.
 
@@ -45165,6 +45407,13 @@ def api_dispatch():
                 cur.execute("UPDATE stops SET lot=? WHERE id=?", (s["lot"], cur.lastrowid))
             except Exception:
                 pass  # column not migrated yet on this DB
+        # 2026-10-31: wire the stop to its customer RECORD and record the job
+        # site. Until now a stop carried only a name string, so a builder's
+        # job sites were never captured and the customer had to be
+        # reverse-engineered later by voting on spellings.
+        attach_stop_to_customer(conn, cid(), cur.lastrowid,
+                                s.get("customer") or "", s["address"],
+                                lot=s.get("lot") or "", action=s["action"])
         # Resolve the dump/return site names to location records + set the FKs.
         _link_stop_sites(conn, cid(), cur.lastrowid, s.get("dump_leg") or "", s.get("return_leg") or "")
         # Self-building address book: learn every dispatched stop's address.
@@ -45350,6 +45599,16 @@ def api_insert_stops(route_id):
               s.get("empty_can_plan") or "", s.get("carry_can_ref") or "", now_ts()))
         new_stops.append((cur.lastrowid, s["insert_before"]))
         _new_by_index[(_kind, _key)] = cur.lastrowid
+        # 2026-10-31: this path never persisted the lot, so a stop added
+        # mid-route lost it while the same stop dispatched up front kept it.
+        if s.get("lot"):
+            try:
+                cur.execute("UPDATE stops SET lot=? WHERE id=?", (s["lot"], cur.lastrowid))
+            except Exception:
+                pass
+        attach_stop_to_customer(conn, cid(), cur.lastrowid,
+                                s.get("customer") or "", s["address"],
+                                lot=s.get("lot") or "", action=s["action"])
         # Resolve the dump/return site names to location records + set the FKs.
         _link_stop_sites(conn, cid(), cur.lastrowid, s.get("dump_leg") or "", s.get("return_leg") or "")
         # Self-building address book: learn every inserted stop's address.
@@ -47352,10 +47611,18 @@ def _sync_customer_records(conn, company_id):
             _votes.setdefault(_k, {})
             _votes[_k][_nm] = _votes[_k].get(_nm, 0) + 2
             _ab_spell.setdefault(_k, _nm)
+    # 2026-10-31: the action is now part of this query. Without it a Vendor
+    # stop's name became a customer record -- "Maypaw Diesel" on the customer
+    # list -- unless that vendor happened to be in saved_addresses already,
+    # which a stop predating the vendor work never is. A repair shop is not a
+    # customer no matter how its name reached a stop row.
     for _r in conn.execute(
-            "SELECT DISTINCT s.customer_name FROM stops s JOIN routes r ON r.id = s.route_id "
+            "SELECT DISTINCT s.customer_name, s.action FROM stops s JOIN routes r ON r.id = s.route_id "
             "WHERE r.company_id=? AND s.customer_name IS NOT NULL AND TRIM(s.customer_name) != ''",
             (company_id,)).fetchall():
+        _act = (_r[1] or "").strip().lower()
+        if _kind_for_action(_r[1] or "") != "customer" or _act in ("yard", "dump", "ride", "transfer"):
+            continue
         _nm = _canon(_r[0])
         _k = _norm_cust_key(_nm)
         if not _skip_name(_nm, _k):
@@ -47410,6 +47677,15 @@ def _sync_customer_records(conn, company_id):
             _out[_vkey] = _cid_for
     if _new:
         conn.commit()
+    # One-time job-site backfill, after the records above exist so the seed
+    # resolves against them instead of minting its own spellings.
+    try:
+        _seeded = conn.execute("SELECT job_sites_seeded FROM companies WHERE id=?",
+                               (company_id,)).fetchone()
+        if _seeded is not None and not _seeded[0]:
+            _seed_job_sites(conn, company_id, _out)
+    except Exception:
+        pass
     return _out
 
 
