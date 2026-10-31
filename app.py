@@ -599,6 +599,11 @@ def _normalize_addr(text):
             out.append(_ADDR_CITY_MAP[tok])
         else:
             out.append(tok)
+    # A trailing state abbreviation is optional in dispatch text: Norfolk and
+    # Norfolk, VA refer to the same city/site. Only remove a terminal state
+    # token, never the street number, street suffix, city or lot/unit.
+    if len(out) >= 3 and out[-1] in ("va", "virginia", "nc", "north carolina"):
+        out.pop()
     key = " ".join(out)
     # Multi-word city shorthand (e.g. "va beach") — apply after token join.
     for short, full in _ADDR_CITY_MAP.items():
@@ -37168,13 +37173,65 @@ def _invoice_due_date(terms, issued_day):
     return (d + timedelta(days=days)).strftime("%Y-%m-%d")
 
 
+def _street_key(address):
+    """Street-only key for one physical job site.
+
+    2026-10-31. Billing grouped on the raw address string, so one site typed
+    three ways became three invoices: Napo's 1013 Paragon Way was billed at
+    $4,725 + $1,100 + $400 because the boss wrote ", Suffolk, VA" on some
+    stops and not others. The parser puts the city in `stops.address`
+    sometimes and in `stops.city` other times, so the street alone is the
+    only part that is reliably present.
+
+    This collapses ONLY differences in how a person typed the same place:
+    case, punctuation, whitespace, an abbreviated street type (Rd/Road,
+    Pkwy/Parkway) and a trailing city/state.
+
+    It deliberately does NOT collapse anything where the characters
+    themselves differ -- a different house number (1413 vs 1431 Laskin), a
+    different street name, or a different street TYPE (Independence Pkwy vs
+    Independence Blvd). Those may be typos in one company's data and two real
+    addresses in another's, and merging two real sites bills the wrong job.
+    They belong in a suggestion a human confirms, never in a key.
+    """
+    base = _normalize_addr(address or "")
+    if not base:
+        return ""
+    toks = base.split()
+    # Strip a trailing state code, then a trailing city name. Both maps are
+    # already lowercase-normalized by _normalize_addr.
+    if toks and toks[-1] in _STATE_TOKENS:
+        toks = toks[:-1]
+    for _city in _CITY_TAIL_TOKENS:
+        _ct = _city.split()
+        if len(toks) > len(_ct) and toks[-len(_ct):] == _ct:
+            toks = toks[:-len(_ct)]
+            break
+    out = " ".join(toks).strip()
+    # An address that was ONLY a city keeps its original key rather than
+    # becoming blank, so two different cities never group together.
+    return out or base
+
+
+# States and city names that may trail a street address. Built from the
+# parser's own city tables so a city it understands is a city here too.
+_STATE_TOKENS = {"va", "nc", "virginia", "carolina", "md", "maryland"}
+_CITY_TAIL_TOKENS = sorted(
+    {_normalize_addr(_full) for _full, _st in _CITY_CODES.values()}
+    | {_normalize_addr(_v) for _v in _ADDR_CITY_MAP.values()},
+    key=lambda s: -len(s.split()))
+
+
 def _group_key(customer, site):
     """Normalized (customer, site) billing key. Blank customer → 'unassigned',
-    blank site → 'no address'. Case/space-insensitive so the same site typed
-    two ways still groups together."""
+    blank site → 'no address'.
+
+    The site half goes through _street_key so one job site is ONE billing
+    group however the address was typed; see that function for what is
+    deliberately left un-merged."""
     c = (customer or "").strip()
     s = (site or "").strip()
-    return (c.casefold() or "unassigned", s.casefold() or "no address")
+    return (c.casefold() or "unassigned", _street_key(s) or "no address")
 
 
 def _group_display(customer, site):
@@ -37287,6 +37344,15 @@ def _unbilled_stop_groups(conn, company_id, route_id=None):
                                    "raw_customer": (sd.get("customer_name") or "").strip(),
                                    "raw_site": (sd.get("address") or "").strip(),
                                    "route_ids": set(), "stop_ids": set()}
+            else:
+                # Several spellings of one site now share a group, so show the
+                # most complete one on the invoice -- "3533 Sleepy Hole Rd,
+                # Suffolk, VA" reads better than whichever stop happened to be
+                # first. Longest wins, ties keep the incumbent.
+                _cand = (sd.get("address") or "").strip()
+                if len(_cand) > len(g["raw_site"]):
+                    g["raw_site"] = _cand
+                    g["site"] = _group_display(sd.get("customer_name"), _cand)[1]
             g["route_ids"].add(sd["route_id"])
             g["stop_ids"].add(sd["id"])
         out = []
@@ -47884,6 +47950,51 @@ def _sync_customer_records(conn, company_id):
     return _out
 
 
+def _collapse_exact_duplicate_customers(conn, company_id):
+    """Merge exact duplicate business names only, preserving linked history.
+
+    Conflicting contact data, different business names and address-only
+    matches are intentionally never auto-merged.
+    """
+    rows = conn.execute(
+        "SELECT id, business_name, contact_name, phone, email FROM customers "
+        "WHERE company_id=? AND is_active=1 ORDER BY id", (company_id,)
+    ).fetchall()
+    groups = {}
+    for row in rows:
+        key = _norm_cust_key(row["business_name"])
+        if key:
+            groups.setdefault(key, []).append(row)
+    merged = 0
+    for group in groups.values():
+        survivor = group[0]
+        for alias in group[1:]:
+            if any((survivor[field] or "").strip().casefold() !=
+                   (alias[field] or "").strip().casefold()
+                   for field in ("contact_name", "phone", "email")
+                   if (survivor[field] or "").strip() and (alias[field] or "").strip()):
+                continue
+            try:
+                conn.execute("SAVEPOINT customer_dedupe")
+                for table in ("bins", "requests", "sites"):
+                    conn.execute(f"UPDATE {table} SET customer_id=? WHERE customer_id=?",
+                                 (survivor["id"], alias["id"]))
+                conn.execute(
+                    "UPDATE stops SET customer_id=? WHERE customer_id=? "
+                    "AND route_id IN (SELECT id FROM routes WHERE company_id=?)",
+                    (survivor["id"], alias["id"], company_id))
+                conn.execute("UPDATE customers SET is_active=0 WHERE id=? AND company_id=?",
+                             (alias["id"], company_id))
+                conn.execute("RELEASE SAVEPOINT customer_dedupe")
+                merged += 1
+            except Exception:
+                conn.execute("ROLLBACK TO SAVEPOINT customer_dedupe")
+                conn.execute("RELEASE SAVEPOINT customer_dedupe")
+    if merged:
+        conn.commit()
+    return merged
+
+
 @app.route("/customers")
 @roles_required("customer_manager")
 def customers_page():
@@ -47891,6 +48002,7 @@ def customers_page():
     an Add Customer form."""
     conn = get_db()
     _sync_customer_records(conn, cid())
+    _collapse_exact_duplicate_customers(conn, cid())
     rows = conn.execute(
         """SELECT c.id, c.business_name, c.contact_name, c.phone,
                   (SELECT COUNT(*) FROM requests r
@@ -52749,7 +52861,14 @@ def merge_customer(customer_id):
         conn.close()
         flash("Nothing to merge.", "error")
         return redirect(url_for("customer_detail_page", customer_id=customer_id))
-    _fold_customer_into(conn, cid(), surv, alias)
+    try:
+        conn.execute("BEGIN")
+        _fold_customer_into(conn, cid(), surv, alias)
+    except Exception:
+        conn.rollback()
+        conn.close()
+        flash("Merge could not be completed. No records were changed.", "error")
+        return redirect(url_for("customer_detail_page", customer_id=customer_id))
     conn.commit()
     conn.close()
     _sname = surv["business_name"] or surv["contact_name"] or "Customer"
@@ -52758,22 +52877,26 @@ def merge_customer(customer_id):
 
 
 def _fold_customer_into(conn, company_id, surv, alias):
-    """Fold one customer record into another: re-point its bins, requests and
-    job sites, hide it, and record its spellings as aliases of the survivor so
-    _sync_customer_records resolves them there instead of minting the record
-    again on the next page load. Does not commit."""
+    """Fold one customer record into another: re-point its bins, requests,
+    job sites and historical route stops, hide it, and record its spellings
+    as aliases of the survivor so _sync_customer_records resolves them there
+    instead of minting the record again on the next page load.
+
+    Does not begin, commit or roll back -- the caller owns the transaction,
+    because a partially merged customer is worse than a merge that failed
+    outright. Failures are allowed to propagate for the same reason; only
+    the alias bookkeeping, which is advisory, is best-effort.
+    """
     _sid = surv["id"]
     for _tbl in ("bins", "requests", "sites"):
-        try:
-            conn.execute(f"UPDATE {_tbl} SET customer_id=? WHERE customer_id=?",
-                         (_sid, alias["id"]))
-        except Exception:
-            pass
-    try:
-        conn.execute("UPDATE stops SET customer_id=? WHERE customer_id=?",
+        conn.execute(f"UPDATE {_tbl} SET customer_id=? WHERE customer_id=?",
                      (_sid, alias["id"]))
-    except Exception:
-        pass
+    # Scoped to this tenant's routes, so a stop can never be re-pointed
+    # across companies even if two ids ever collided.
+    conn.execute(
+        "UPDATE stops SET customer_id=? WHERE customer_id=? "
+        "AND route_id IN (SELECT id FROM routes WHERE company_id=?)",
+        (_sid, alias["id"], company_id))
     conn.execute("UPDATE customers SET is_active=0 WHERE id=?", (alias["id"],))
     _sname = surv["business_name"] or surv["contact_name"] or "Customer"
     for _nm in (alias["business_name"], alias["contact_name"]):
@@ -52806,17 +52929,27 @@ def merge_customer_group(customer_id):
         conn.close()
         flash("Nothing to merge.", "error")
         return redirect(url_for("customers_page"))
+    # The whole group goes in or none of it does. Folding three records and
+    # failing on the fourth would leave the boss looking at a half-merged
+    # customer with no way to tell which half moved.
     done = 0
-    for _aid in ids:
-        if _aid == customer_id:
-            continue
-        alias = conn.execute(
-            "SELECT * FROM customers WHERE id=? AND company_id=? AND is_active=1",
-            (_aid, cid())).fetchone()
-        if not alias:
-            continue
-        _fold_customer_into(conn, cid(), surv, alias)
-        done += 1
+    try:
+        conn.execute("BEGIN")
+        for _aid in ids:
+            if _aid == customer_id:
+                continue
+            alias = conn.execute(
+                "SELECT * FROM customers WHERE id=? AND company_id=? AND is_active=1",
+                (_aid, cid())).fetchone()
+            if not alias:
+                continue
+            _fold_customer_into(conn, cid(), surv, alias)
+            done += 1
+    except Exception:
+        conn.rollback()
+        conn.close()
+        flash("Merge could not be completed. No records were changed.", "error")
+        return redirect(url_for("customers_page"))
     conn.commit()
     conn.close()
     _sname = surv["business_name"] or surv["contact_name"] or "Customer"
