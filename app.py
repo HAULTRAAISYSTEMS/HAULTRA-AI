@@ -37976,6 +37976,201 @@ def _norm_cust_key(name):
     return " ".join((name or "").split()).casefold().strip(" .,")
 
 
+# ── Duplicate customer records already on the books ──────────────────────
+# 2026-10-31. The lot-number and job-site work stopped NEW duplicates being
+# created and changed the Customers list by exactly zero rows, because
+# _sync_customer_records only ever CREATES a record -- it never deactivates
+# or merges one. Four Bishard spellings and two 757s were still sitting
+# there. These find them and offer the merge; nothing here performs one.
+
+# A size that leaked into the customer field. "Bushard 30/20" is a swap
+# instruction -- put a 30 in, take the 20 out -- written where the name goes,
+# the same way lot numbers were.
+_SIZE_FRAGMENT_RE = re.compile(
+    r"""(?ix)
+    \s+                                   # must follow a real name
+    (?:
+        \d{1,2} \s* (?:yd|yard)s? \b      # 20yd / 30 yard
+      | \d{1,2} (?:\s*/\s*\d{1,2})+       # 30/20, 10/20/30
+      | \d{1,2} \s* (?:yd|yard)s? \s* /\s* \d{1,2} \s* (?:yd|yard)s?
+    )
+    \s*$
+    """
+)
+
+
+def _strip_size_fragment(name):
+    """Drop a container size written on the end of a customer name.
+
+    'Bushard 30/20' -> 'Bushard'; 'Marlyn 20yd' -> 'Marlyn'. A name that is
+    ONLY a size is returned untouched rather than emptied -- there is nothing
+    left to call the customer, so it stays as the boss typed it.
+    """
+    n = " ".join(str(name or "").split())
+    if not n:
+        return ""
+    out = _SIZE_FRAGMENT_RE.sub("", n).strip(" ,-/")
+    return out or n
+
+
+def _edit_distance_le1(a, b):
+    """True when a and b are at most one insert, delete or substitution
+    apart. Cheap, and enough for a single mistyped letter."""
+    if a == b:
+        return True
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1:
+        return False
+    if la == lb:
+        diff = sum(1 for x, y in zip(a, b) if x != y)
+        return diff == 1
+    if la > lb:
+        a, b, la, lb = b, a, lb, la
+    i = j = 0
+    skipped = False
+    while i < la and j < lb:
+        if a[i] != b[j]:
+            if skipped:
+                return False
+            skipped = True
+            j += 1
+            continue
+        i += 1
+        j += 1
+    return True
+
+
+def _name_near(a, b):
+    """Could these two customer names be the same customer?
+
+    Answers for a SUGGESTION the boss confirms, never for an automatic
+    merge, so it is allowed to be generous -- but not so generous that the
+    list fills with noise. True when, after dropping a trailing size:
+
+      - they match on case alone                 HEARTLAND / Heartland
+      - one is a prefix of the other, stem >= 6  757 Rest / 757 Restoration
+      - one typo apart, length >= 6, SAME first
+        letter                                   Bushard / Bishard
+
+    Identical strings are never near: there is nothing to suggest.
+
+    The length floors keep 'EW' away from 'EWING' and 'Beck' away from
+    'Bees'. The same-first-letter condition is what separates 'Bushard' and
+    'Bishard' (one typo in the middle of one name) from 'Baylor' and
+    'Taylor', which are one letter apart and two different surnames -- a
+    first-letter difference is far more often two names than one typo.
+    Two names differing by a whole WORD ('Bishard Homes' vs 'Bishard
+    Plumbing') are left alone: routinely two real companies under one
+    family name.
+    """
+    if " ".join(str(a or "").split()) == " ".join(str(b or "").split()):
+        return False          # the same string: nothing to suggest
+    ka = _norm_cust_key(_strip_size_fragment(a))
+    kb = _norm_cust_key(_strip_size_fragment(b))
+    if not ka or not kb:
+        return False
+    if ka == kb:
+        return True           # differed only by a size fragment or case
+    # A differing extra WORD is a different business, not a typo.
+    wa, wb = ka.split(), kb.split()
+    if len(wa) != len(wb) and min(len(wa), len(wb)) >= 1 and wa[:1] == wb[:1] \
+            and len(wa) > 1 and len(wb) > 1:
+        return False
+    short, long_ = (ka, kb) if len(ka) <= len(kb) else (kb, ka)
+    if len(short) >= 6 and long_.startswith(short):
+        return True
+    if len(short) >= 6 and ka[:1] == kb[:1] and _edit_distance_le1(ka, kb):
+        return True
+    return False
+
+
+def customer_duplicate_groups(conn, company_id):
+    """Active customer records that look like one customer, for the boss to
+    confirm. Returns
+
+        [{"survivor": {"id", "name"},
+          "members":  [{"id", "name"}],      # the records to fold in
+          "confidence": "high" | "review",
+          "why": "<one line>"}]
+
+    'high' is the boss's own stated rule and nothing else: names at the SAME
+    street address differing only by trailing digits are one builder with
+    several lots. Everything else is 'review' -- offered, never pre-selected.
+
+    A customer with no duplicate is absent from the result. Nothing here
+    writes anything.
+    """
+    rows = [dict(r) for r in conn.execute(
+        "SELECT id, business_name, contact_name FROM customers "
+        "WHERE company_id=? AND is_active=1", (company_id,)).fetchall()]
+    named = []
+    for r in rows:
+        nm = (r["business_name"] or r["contact_name"] or "").strip()
+        if nm:
+            named.append({"id": r["id"], "name": nm})
+    if len(named) < 2:
+        return []
+
+    try:
+        lot_names = _resolve_lot_names(
+            (x[0], x[1]) for x in conn.execute(
+                "SELECT s.customer_name, s.address FROM stops s JOIN routes r ON r.id = s.route_id "
+                "WHERE r.company_id=? AND s.customer_name IS NOT NULL AND TRIM(s.customer_name) != ''",
+                (company_id,)).fetchall())
+    except Exception:
+        lot_names = {}
+
+    by_key = {}
+    for c in named:
+        by_key.setdefault(_norm_cust_key(c["name"]), c)
+
+    used = set()
+    groups = []
+
+    # (a) high confidence: the lot rule, which already picked a canonical name.
+    canon_members = {}
+    for vkey, (canon_name, _lot) in lot_names.items():
+        if vkey not in by_key:
+            continue
+        canon_members.setdefault(_norm_cust_key(canon_name), set()).add(vkey)
+    for ckey, vkeys in canon_members.items():
+        surv = by_key.get(ckey)
+        members = [by_key[v] for v in sorted(vkeys)
+                   if v in by_key and v != ckey and by_key[v]["id"] != (surv or {}).get("id")]
+        if surv is None or not members:
+            continue
+        groups.append({"survivor": {"id": surv["id"], "name": surv["name"]},
+                       "members": [{"id": m["id"], "name": m["name"]} for m in members],
+                       "confidence": "high",
+                       "why": "Same address, differing only by a lot number."})
+        used.add(surv["id"])
+        used.update(m["id"] for m in members)
+
+    # (b) review: near-name matches among whatever is left.
+    rest = [c for c in named if c["id"] not in used]
+    rest.sort(key=lambda c: (-len(c["name"]), c["name"]))
+    claimed = set()
+    for i, a in enumerate(rest):
+        if a["id"] in claimed:
+            continue
+        members = []
+        for b in rest[i + 1:]:
+            if b["id"] in claimed:
+                continue
+            if _name_near(a["name"], b["name"]):
+                members.append(b)
+                claimed.add(b["id"])
+        if members:
+            claimed.add(a["id"])
+            groups.append({"survivor": {"id": a["id"], "name": a["name"]},
+                           "members": [{"id": m["id"], "name": m["name"]} for m in members],
+                           "confidence": "review",
+                           "why": "Similar names. Check these are the same customer."})
+    groups.sort(key=lambda g: (0 if g["confidence"] == "high" else 1,
+                               -len(g["members"]), g["survivor"]["name"].casefold()))
+    return groups
+
+
 def _resolve_lot_names(pairs):
     """Decide which names are really ONE customer with several lots.
 
@@ -47856,8 +48051,70 @@ def customers_page():
 
     empty_hidden = "" if not rows else " hidden"
     _cust_meta = f"<span>{len(rows)} customer{'s' if len(rows) != 1 else ''} on the books</span>"
+
+    # 2026-10-31: duplicate records already on the books. The lot-number and
+    # job-site work stopped new ones being created but left these untouched,
+    # because _sync_customer_records only ever creates. Each group is offered
+    # with the merge it would perform spelled out; nothing merges on its own.
+    _dupe_html = ""
+    try:
+        _conn2 = get_db()
+        _dupes = customer_duplicate_groups(_conn2, cid())
+        _conn2.close()
+    except Exception:
+        _dupes = []
+    if _dupes:
+        _rows_html = ""
+        for _g in _dupes:
+            _sv = _g["survivor"]
+            _ms = _g["members"]
+            _ids = ",".join(str(m["id"]) for m in _ms)
+            _is_high = _g["confidence"] == "high"
+            # Teal is reserved for AI-parsed content and red for urgent, so a
+            # confident group is marked with weight and a neutral chip only.
+            _chip = ('<span style="display:inline-block;padding:2px 9px;border-radius:999px;'
+                     'font-size:11px;font-weight:800;background:rgba(255,255,255,0.08);'
+                     'color:var(--slate);">%s</span>'
+                     % ("Same address · lot numbers" if _is_high else "Check first"))
+            _names = " · ".join(e(m["name"]) for m in _ms)
+            _rows_html += f"""
+            <div style="padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.06);
+                        display:flex;justify-content:space-between;align-items:center;
+                        gap:12px;flex-wrap:wrap;">
+              <div style="min-width:220px;flex:1;">
+                <div style="font-weight:700;font-size:14px;">
+                  {e(_sv['name'])} <span style="color:var(--slate);font-weight:500;">keeps</span>
+                </div>
+                <div style="color:var(--slate);font-size:13px;margin-top:3px;
+                            overflow-wrap:anywhere;">absorbs {_names}</div>
+                <div style="margin-top:6px;">{_chip}</div>
+              </div>
+              <form method="post" action="{url_for('merge_customer_group', customer_id=_sv['id'])}"
+                    style="margin:0;">
+                <input type="hidden" name="_csrf_token" value="{get_csrf_token()}">
+                <input type="hidden" name="alias_ids" value="{_ids}">
+                <button class="btn secondary" type="submit"
+                        style="min-height:40px;">Merge</button>
+              </form>
+            </div>"""
+        _n = len(_dupes)
+        _dupe_html = f"""
+        <details class="card" style="padding:16px;margin-bottom:16px;">
+          <summary style="cursor:pointer;font-weight:800;font-size:15px;">
+            {_n} possible duplicate{'s' if _n != 1 else ''}
+            <span style="color:var(--slate);font-weight:500;font-size:13px;">
+              — review and merge</span>
+          </summary>
+          <div style="color:var(--slate);font-size:13px;margin:8px 0 4px;">
+            Merging keeps one record and folds the others into it. Cans, job
+            sites and requests move across; route history is untouched.
+          </div>
+          {_rows_html}
+        </details>"""
+
     body = f"""
     {_cmd_header("Customers", _cust_meta)}
+    {_dupe_html}
     <div style="display:flex;justify-content:flex-end;margin-bottom:12px;">
         {_export_link(url_for('export_customers_csv'), "⬇ Export CSV")}
     </div>
@@ -52604,38 +52861,104 @@ def merge_customer(customer_id):
         conn.close()
         flash("Nothing to merge.", "error")
         return redirect(url_for("customer_detail_page", customer_id=customer_id))
-    # Keep historical Daily Routes attached to the surviving customer too.
-    # All records are scoped to this tenant; never silently ignore failures,
-    # because that would leave partially merged customer history.
     try:
         conn.execute("BEGIN")
-        for _tbl in ("bins", "requests", "sites"):
-            conn.execute(
-                f"UPDATE {_tbl} SET customer_id=? WHERE customer_id=?",
-                (customer_id, alias["id"]))
-        conn.execute(
-            "UPDATE stops SET customer_id=? WHERE customer_id=? "
-            "AND route_id IN (SELECT id FROM routes WHERE company_id=?)",
-            (customer_id, alias["id"], cid()))
-        conn.execute("UPDATE customers SET is_active=0 WHERE id=?", (alias["id"],))
+        _fold_customer_into(conn, cid(), surv, alias)
     except Exception:
         conn.rollback()
         conn.close()
         flash("Merge could not be completed. No records were changed.", "error")
         return redirect(url_for("customer_detail_page", customer_id=customer_id))
+    conn.commit()
+    conn.close()
+    _sname = surv["business_name"] or surv["contact_name"] or "Customer"
+    flash(f"Merged {alias['business_name'] or alias['contact_name']} into {_sname}.", "success")
+    return redirect(url_for("customer_detail_page", customer_id=customer_id))
+
+
+def _fold_customer_into(conn, company_id, surv, alias):
+    """Fold one customer record into another: re-point its bins, requests,
+    job sites and historical route stops, hide it, and record its spellings
+    as aliases of the survivor so _sync_customer_records resolves them there
+    instead of minting the record again on the next page load.
+
+    Does not begin, commit or roll back -- the caller owns the transaction,
+    because a partially merged customer is worse than a merge that failed
+    outright. Failures are allowed to propagate for the same reason; only
+    the alias bookkeeping, which is advisory, is best-effort.
+    """
+    _sid = surv["id"]
+    for _tbl in ("bins", "requests", "sites"):
+        conn.execute(f"UPDATE {_tbl} SET customer_id=? WHERE customer_id=?",
+                     (_sid, alias["id"]))
+    # Scoped to this tenant's routes, so a stop can never be re-pointed
+    # across companies even if two ids ever collided.
+    conn.execute(
+        "UPDATE stops SET customer_id=? WHERE customer_id=? "
+        "AND route_id IN (SELECT id FROM routes WHERE company_id=?)",
+        (_sid, alias["id"], company_id))
+    conn.execute("UPDATE customers SET is_active=0 WHERE id=?", (alias["id"],))
     _sname = surv["business_name"] or surv["contact_name"] or "Customer"
     for _nm in (alias["business_name"], alias["contact_name"]):
         if _nm:
             try:
                 conn.execute(
-                    "INSERT OR REPLACE INTO customer_aliases (company_id, alias_key, survivor_id, survivor_name, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (cid(), _norm_cust_key(_nm), customer_id, _sname, now_ts()))
+                    "INSERT OR REPLACE INTO customer_aliases (company_id, alias_key,"
+                    " survivor_id, survivor_name, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (company_id, _norm_cust_key(_nm), _sid, _sname, now_ts()))
             except Exception:
                 pass
+
+
+@app.route("/customers/<int:customer_id>/merge-group", methods=["POST"])
+@boss_required
+def merge_customer_group(customer_id):
+    """Fold several duplicate records into one survivor in a single click.
+
+    The Customers page offers groups it is confident about; this applies one
+    after the boss presses Merge. Every id is re-checked against this company
+    here -- the page's suggestion is a convenience, never the authority on
+    what may be merged."""
+    conn = get_db()
+    surv = conn.execute(
+        "SELECT * FROM customers WHERE id=? AND company_id=? AND is_active=1",
+        (customer_id, cid())).fetchone()
+    raw = (request.form.get("alias_ids", "") or "").strip()
+    ids = [int(x) for x in re.split(r"[,\s]+", raw) if x.isdigit()]
+    if not surv or not ids:
+        conn.close()
+        flash("Nothing to merge.", "error")
+        return redirect(url_for("customers_page"))
+    # The whole group goes in or none of it does. Folding three records and
+    # failing on the fourth would leave the boss looking at a half-merged
+    # customer with no way to tell which half moved.
+    done = 0
+    try:
+        conn.execute("BEGIN")
+        for _aid in ids:
+            if _aid == customer_id:
+                continue
+            alias = conn.execute(
+                "SELECT * FROM customers WHERE id=? AND company_id=? AND is_active=1",
+                (_aid, cid())).fetchone()
+            if not alias:
+                continue
+            _fold_customer_into(conn, cid(), surv, alias)
+            done += 1
+    except Exception:
+        conn.rollback()
+        conn.close()
+        flash("Merge could not be completed. No records were changed.", "error")
+        return redirect(url_for("customers_page"))
     conn.commit()
     conn.close()
-    flash(f"Merged {alias['business_name'] or alias['contact_name']} into {_sname}.", "success")
-    return redirect(url_for("customer_detail_page", customer_id=customer_id))
+    _sname = surv["business_name"] or surv["contact_name"] or "Customer"
+    if done:
+        flash("Merged %d record%s into %s." % (done, "" if done == 1 else "s", _sname),
+              "success")
+    else:
+        flash("Nothing to merge.", "error")
+    return redirect(url_for("customers_page"))
 
 
 @app.route("/customers/<int:customer_id>/print")
