@@ -2,11 +2,14 @@ name: Production readiness
 
 on:
   pull_request:
-  # 2026-10-22: push trigger DISABLED — the workflow was failing on every
-  # push (Android/iOS builds) and spamming failure emails. Re-enable after
-  # the build jobs are fixed. Backend tests can run via PR.
-  # push:
-  #   branches: [main]
+  # 2026-10-31: push trigger RE-ENABLED, backend only. It was disabled on
+  # Oct 22 because the Android/iOS builds failed on every push and spammed
+  # failure emails. The cost of that silence: a stale Python pin broke the
+  # backend job and nobody knew for nine days, because nothing watched main.
+  # The mobile jobs now carry an `if` that keeps them to pull_request, so a
+  # push to main runs the Python suite and nothing else.
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -36,6 +39,10 @@ jobs:
           done
 
   android:
+    # PR-only: these builds are slow and still flaky, and a failure on a
+    # push to main would just be email noise. Keep them on the gate where
+    # someone is actually looking at the result.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -58,6 +65,8 @@ jobs:
         run: ./android/gradlew -p android test bundleRelease -PHAULTRA_VERSION_CODE=1 -PHAULTRA_VERSION_NAME=1.0.0
 
   ios:
+    # PR-only, same reason as android.
+    if: github.event_name == 'pull_request'
     runs-on: macos-26
     timeout-minutes: 30
     steps:
