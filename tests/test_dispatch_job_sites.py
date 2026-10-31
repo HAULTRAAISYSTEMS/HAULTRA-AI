@@ -291,6 +291,22 @@ r = cl.post("/customers/%d/merge" % surv,
             data={"alias_id": str(alias), "_csrf_token": "tok"},
             headers=HJ, follow_redirects=True)
 ok(r.status_code == 200, "merge posted (got %d)" % r.status_code)
+# Historical route stops must follow the surviving customer after a merge.
+# Otherwise Daily Routes still points at a deactivated customer record.
+c = app.get_db()
+_orphaned = c.execute(
+    "SELECT COUNT(*) n FROM stops s JOIN routes r ON r.id=s.route_id "
+    "WHERE r.company_id=? AND s.customer_id=?", (co, alias)
+).fetchone()["n"]
+_relinked = c.execute(
+    "SELECT COUNT(*) n FROM stops s JOIN routes r ON r.id=s.route_id "
+    "WHERE r.company_id=? AND s.customer_id=? AND s.address IN (?,?)",
+    (co, surv, "11 Short St", "12 Short St")
+).fetchone()["n"]
+c.close()
+ok(_orphaned == 0, "merged alias has no historical route stop references")
+ok(_relinked == 2, "historical route stops now point to surviving customer")
+
 after = sites_for("757 Restoration")
 ok(after is not None and len(after) == 8,
    "after the merge the survivor holds all 8 job sites, none lost (got %d)"

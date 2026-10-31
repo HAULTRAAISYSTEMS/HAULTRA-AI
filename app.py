@@ -52492,12 +52492,25 @@ def merge_customer(customer_id):
         conn.close()
         flash("Nothing to merge.", "error")
         return redirect(url_for("customer_detail_page", customer_id=customer_id))
-    for _tbl in ("bins", "requests", "sites"):
-        try:
-            conn.execute(f"UPDATE {_tbl} SET customer_id=? WHERE customer_id=?", (customer_id, alias["id"]))
-        except Exception:
-            pass
-    conn.execute("UPDATE customers SET is_active=0 WHERE id=?", (alias["id"],))
+    # Keep historical Daily Routes attached to the surviving customer too.
+    # All records are scoped to this tenant; never silently ignore failures,
+    # because that would leave partially merged customer history.
+    try:
+        conn.execute("BEGIN")
+        for _tbl in ("bins", "requests", "sites"):
+            conn.execute(
+                f"UPDATE {_tbl} SET customer_id=? WHERE customer_id=?",
+                (customer_id, alias["id"]))
+        conn.execute(
+            "UPDATE stops SET customer_id=? WHERE customer_id=? "
+            "AND route_id IN (SELECT id FROM routes WHERE company_id=?)",
+            (customer_id, alias["id"], cid()))
+        conn.execute("UPDATE customers SET is_active=0 WHERE id=?", (alias["id"],))
+    except Exception:
+        conn.rollback()
+        conn.close()
+        flash("Merge could not be completed. No records were changed.", "error")
+        return redirect(url_for("customer_detail_page", customer_id=customer_id))
     _sname = surv["business_name"] or surv["contact_name"] or "Customer"
     for _nm in (alias["business_name"], alias["contact_name"]):
         if _nm:
