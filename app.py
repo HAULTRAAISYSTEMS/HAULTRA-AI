@@ -4020,6 +4020,14 @@ def init_db():
     safe_add_column(conn, "stops", "shop_leg_pos TEXT")
     safe_add_column(conn, "stops", "shop_can TEXT")
     safe_add_column(conn, "stops", "shop_done_at TEXT")
+    # 2026-11-03: the reason lives ON the leg, not appended to the stop note.
+    # The first cut wrote "— Shop: fix cable" into notes, so the cab showed the
+    # boss's own instruction and the leg's reason on the same line, saying the
+    # same thing twice. shop_source is 'parsed' when the app read the errand
+    # out of dispatch text, which the UI marks in teal (reserved for
+    # AI-parsed content), so the driver can see the app inferred it.
+    safe_add_column(conn, "stops", "shop_note TEXT")
+    safe_add_column(conn, "stops", "shop_source TEXT")
 
     # --- Chained can-swap (feat/chained-swaps-and-optional-tickets) ---
     # One can rides the truck through an ARBITRARY-LENGTH run of can-producing
@@ -21936,6 +21944,22 @@ def driver_route_detail(route_id):
             f'data-navpref="{e(_nav_pref)}" data-legs="{e(json.dumps(_legs))}">'
             f'<div class="cab-leg-header" id="cab-leg-head">LEG {_leg_idx + 1} OF {_leg_total}</div>{_chip_btns}</div>'
         )
+        # What the shop is for, shown only while the SHOP leg is the active one.
+        # Teal when the app read the errand out of the boss's dispatch text --
+        # that colour is reserved for AI-parsed content, so it tells the driver
+        # at a glance that nobody typed this in, the parser found it.
+        _shop_why = (_row_get(_s, "shop_note") or "").strip()
+        _shop_src = (_row_get(_s, "shop_source") or "").strip()
+        if _curleg["key"] == "shop" and (_shop_why or _shop_src == "parsed"):
+            _parsed = _shop_src == "parsed"
+            _tag = ('<span style="font-size:11px;font-weight:800;color:var(--teal);'
+                    'background:var(--teal-dim);border-radius:999px;padding:2px 8px;'
+                    'margin-right:6px;">FROM DISPATCH</span>') if _parsed else ""
+            _leg_switch_html += (
+                f'<div style="margin-top:8px;font-size:13px;color:var(--slate);'
+                f'display:flex;align-items:center;gap:6px;flex-wrap:wrap;">'
+                f'{_tag}<span>{e(_shop_why) if _shop_why else "Shop stop"}</span></div>'
+            )
         _noaddr_html = (
             f'<div class="cab-noaddr" id="cab-noaddr"{"" if not nav_has_addr else " hidden"}>'
             f'&#9888;&#65039; No address saved for <span id="cab-noaddr-site">{e(_curleg["name"] or "this site")}</span> '
@@ -24412,7 +24436,8 @@ def stop_shop_leg(stop_id):
     if data.get("clear"):
         conn.execute(
             "UPDATE stops SET shop_leg=NULL, shop_addr=NULL, shop_vendor_id=NULL,"
-            " shop_leg_pos=NULL, shop_can=NULL, shop_done_at=NULL WHERE id=?", (stop_id,))
+            " shop_leg_pos=NULL, shop_can=NULL, shop_note=NULL, shop_source=NULL,"
+            " shop_done_at=NULL WHERE id=?", (stop_id,))
         if (stop["active_leg"] or "") == "shop":
             conn.execute("UPDATE stops SET active_leg='primary' WHERE id=?", (stop_id,))
         conn.commit()
@@ -24448,14 +24473,14 @@ def stop_shop_leg(stop_id):
         can = (_row_get(stop, "assigned_can") or "").strip()[:20]
     note = str(data.get("note") or "").strip()[:300]
 
+    # The reason goes ON the leg. Appending it to the stop note printed the
+    # boss's instruction and the leg's reason on one line, saying the same
+    # thing twice in the cab.
+    _src = "boss" if session.get("role") == "boss" else "driver"
     conn.execute(
         "UPDATE stops SET shop_leg=?, shop_addr=?, shop_vendor_id=?, shop_leg_pos=?,"
-        " shop_can=?, shop_done_at=NULL WHERE id=?",
-        (vname, vaddr or None, vid, position, can or None, stop_id))
-    if note:
-        _n = (stop["notes"] or "").strip()
-        conn.execute("UPDATE stops SET notes=? WHERE id=?",
-                     ((_n + " — " if _n else "") + "Shop: " + note, stop_id))
+        " shop_can=?, shop_note=?, shop_source=?, shop_done_at=NULL WHERE id=?",
+        (vname, vaddr or None, vid, position, can or None, note or None, _src, stop_id))
 
     _who = _actor_name(conn) or "Driver"
     _where = "before the dump" if position == "before_dump" else "after the dump"
@@ -26856,6 +26881,110 @@ import re as _re_for_can_notes
 _CAN_WORD_RE = _re_for_can_notes.compile(r'\b(?:can|container|bin)s?\s*#?\s*(\d{3,5})\b', _re_for_can_notes.IGNORECASE)
 _CAN_REF_RE = _re_for_can_notes.compile(r'\bcan\s+ref(?:erence)?\s*#?\s*(\d{3,5})\b', _re_for_can_notes.IGNORECASE)
 _CAN_HASH_RE = _re_for_can_notes.compile(r'#\s*(\d{3,5})\b')
+
+
+# ── Shop errands buried in dispatch text ─────────────────────────────────
+# 2026-11-03. The boss texts "Can 2058 stop at Gregory's to get the cable
+# looked at", it comes through the parser, and the whole errand survives only
+# as prose in the stop note. The driver has to read it and re-enter the shop
+# himself. Same disease as lot numbers and can numbers in a customer name: a
+# real thing living as free text in a field that cannot act on it.
+#
+# The trigger is a vendor the boss ALREADY HAS ON FILE, not a guess at
+# phrasing. That is the same move that settled can-vs-lot: ask the data the
+# app already holds instead of inventing a heuristic. A name only reaches the
+# vendors table because somebody put it there.
+
+# Errand phrasings seen in real dispatch text. These raise confidence and let
+# a SHORT vendor name match safely; a long name matches on its own.
+_SHOP_VERB_RE = re.compile(
+    r"(?i)\b(?:stop(?:\s+by|\s+at|\s+in)?|swing\s+by|swing\s+in|go\s+by|run\s+by|"
+    r"drop\s+by|drop\s+it\s+(?:off\s+)?at|take\s+it\s+to|bring\s+it\s+to|head\s+to|"
+    r"see|hit)\s*$"
+)
+
+# "before you dump", "on the way to the dump" → the shop comes first.
+_SHOP_BEFORE_DUMP_RE = re.compile(
+    r"(?i)\b(?:before\s+(?:you\s+)?(?:dump|dumping)|on\s+the\s+way\s+to\s+the\s+dump|"
+    r"before\s+the\s+dump|first\s+then\s+dump)\b")
+
+
+# "dump at United", "dumping at Bay" — the name is the DUMP, not an errand.
+# United is both a dump site and, on some books, a vendor; the boss writes
+# "dump at United" on half his stops, so without this the parser would hang a
+# shop visit on them all. Caught in testing, and it would have been the kind
+# of wrong that makes a feature worse than not having it.
+_SHOP_DUMP_CTX_RE = re.compile(r"(?i)\b(?:dump|dumping|dumped|tip|tipping)\s+(?:at\s+|in\s+)?$")
+
+
+def detect_shop_instruction(text, vendors, skip_names=()):
+    """Find a shop errand inside free dispatch text.
+
+    `vendors` is [(id, name), ...] — the company's own vendor list, which is
+    what makes this safe. `skip_names` are places this stop already uses for
+    something else (its dump site, its return destination): a name doing a
+    job on this stop is not also an errand. Returns None, or
+
+        {"vendor_id", "vendor_name", "reason", "position"}
+
+    Matching rules, and why each exists:
+
+      - A vendor name of 4+ characters matches on its own. The boss curated
+        that list; his text naming one of them is not a coincidence.
+      - A shorter name ("Bay", "NAPA") matches ONLY when an errand verb comes
+        immediately before it, because a 3-letter name collides with ordinary
+        words and would fire on half the notes in the system.
+      - The longest matching name wins, so "Gregory's Truck" is not shadowed
+        by a vendor called "Gregory".
+
+    `reason` is what the text says to do there, with a leading "to" trimmed:
+    "stop at Gregory's to get the cable looked at" -> "get the cable looked at".
+    `position` reads "before the dump" out of the text when it is stated, and
+    otherwise defaults to after it, which is the commoner shape.
+    """
+    s = " ".join(str(text or "").split())
+    if not s or not vendors:
+        return None
+    low = s.lower()
+    _skip = {_norm_cust_key(x) for x in (skip_names or []) if x}
+    best = None
+    for vid, vname in vendors:
+        nm = " ".join(str(vname or "").split())
+        if not nm or _norm_cust_key(nm) in _skip:
+            continue
+        # Compare on letters/digits only so "Gregory's" matches "Gregorys".
+        probe = nm.lower()
+        idx = low.find(probe)
+        if idx < 0:
+            _loose = re.sub(r"[^a-z0-9 ]+", "", probe)
+            if _loose and _loose != probe:
+                idx = re.sub(r"[^a-z0-9 ]+", "", low).find(_loose)
+                if idx >= 0:
+                    # Re-locate in the ORIGINAL string so slicing stays right.
+                    m = re.search(re.escape(_loose).replace(r"\ ", r"[^a-z0-9]*"),
+                                  low.replace("'", "").replace("’", ""))
+                    idx = m.start() if m else -1
+        if idx < 0:
+            continue
+        _before = s[:idx]
+        if _SHOP_DUMP_CTX_RE.search(_before):
+            continue          # "dump at United" — that is the dump, not an errand
+        alpha = re.sub(r"[^a-z0-9]", "", probe)
+        if len(alpha) < 4 and not _SHOP_VERB_RE.search(_before):
+            continue          # too short to stand alone, and no errand verb
+        if best is None or len(alpha) > best[0]:
+            best = (len(alpha), vid, nm, idx, len(probe))
+    if best is None:
+        return None
+    _alen, vid, vname, idx, plen = best
+    tail = s[idx + plen:].strip(" ,.;:-—")
+    tail = re.sub(r"(?i)^(?:and\s+|to\s+|so\s+|then\s+|for\s+them\s+to\s+)+", "", tail).strip()
+    tail = re.sub(r"(?i)^have\s+them\s+", "", tail).strip()
+    # Drop a trailing can reference: the can rides on the leg, not the reason.
+    tail = re.sub(r"(?i)\b(?:can|container|bin)\s*#?\s*\d{1,5}\b", "", tail).strip(" ,.;:-—")
+    position = "before_dump" if _SHOP_BEFORE_DUMP_RE.search(s) else "after_dump"
+    return {"vendor_id": vid, "vendor_name": vname,
+            "reason": tail[:300], "position": position}
 
 
 def _can_from_notes(text):
@@ -38611,6 +38740,73 @@ def customer_id_for_address(conn, company_id, address):
     return found.pop() if len(found) == 1 else None
 
 
+def _company_vendor_list(conn, company_id):
+    """[(id, name)] of this company's active vendors, for shop detection."""
+    try:
+        return [(r["id"], r["name"]) for r in conn.execute(
+            "SELECT id, name FROM vendors WHERE company_id=? AND is_active=1",
+            (company_id,)).fetchall() if (r["name"] or "").strip()]
+    except Exception:
+        return []
+
+
+def apply_parsed_shop_leg(conn, company_id, stop_id, text, stop_row=None,
+                          vendors=None):
+    """Turn a shop errand written in dispatch text into a real SHOP leg.
+
+    2026-11-03: the boss texts "Can 2058 stop at Gregory's to get the cable
+    looked at", the parser carries it through as prose, and the driver reads
+    the note and re-enters the shop by hand. The errand is a real thing living
+    in a field that cannot act on it -- the same shape as lot numbers and can
+    numbers in a customer name.
+
+    Returns the vendor name when a leg was created, else "". Never raises: a
+    stop that dispatches is worth more than an errand that was detected.
+    """
+    try:
+        if not text or not text.strip():
+            return ""
+        row = stop_row
+        if row is None:
+            row = conn.execute("SELECT * FROM stops WHERE id=?", (stop_id,)).fetchone()
+        if row is None:
+            return ""
+        # A stop that already has a shop leg, or that IS a vendor visit, is
+        # not looking for another one.
+        if (_row_get(row, "shop_leg") or "").strip():
+            return ""
+        if _kind_for_action(_row_get(row, "action") or "") != "customer":
+            return ""
+        # Names already doing a job on THIS stop are not errands.
+        skip = [_row_get(row, "dump_location") or "",
+                _row_get(row, "return_destination") or "",
+                _row_get(row, "customer_name") or ""]
+        hit = detect_shop_instruction(
+            text, vendors if vendors is not None else _company_vendor_list(conn, company_id),
+            skip_names=skip)
+        if not hit:
+            return ""
+        vaddr = ""
+        try:
+            _v = conn.execute("SELECT address FROM vendors WHERE id=? AND company_id=?",
+                              (hit["vendor_id"], company_id)).fetchone()
+            if _v:
+                vaddr = (_v["address"] or "").strip()
+        except Exception:
+            pass
+        can = (_row_get(row, "assigned_can") or "").strip()[:20]
+        if not can:
+            can = _can_from_notes(text) or ""
+        conn.execute(
+            "UPDATE stops SET shop_leg=?, shop_addr=?, shop_vendor_id=?, shop_leg_pos=?,"
+            " shop_can=?, shop_note=?, shop_source='parsed' WHERE id=?",
+            (hit["vendor_name"], vaddr or None, hit["vendor_id"], hit["position"],
+             can or None, (hit["reason"] or None), stop_id))
+        return hit["vendor_name"]
+    except Exception:
+        return ""
+
+
 def learn_job_site(conn, customer_id, address, lot=""):
     """Record (or find) this customer's job site at an address, returning its
     sites.id. One site per address PER LOT, because each lot is a distinct
@@ -45870,6 +46066,9 @@ def api_dispatch():
         _to_insert_synth = [False] * len(_to_insert)
     _new_ids = []
     _new_ids_is_synth = []
+    # Vendor list fetched once per dispatch, not per stop.
+    _vendor_list = _company_vendor_list(conn, cid())
+    _shops_found = []
     for (s, _ord), _is_synth in zip(_to_insert, _to_insert_synth):
         if route_type == "garbage":
             cur.execute("""
@@ -45920,6 +46119,14 @@ def api_dispatch():
         attach_stop_to_customer(conn, cid(), cur.lastrowid,
                                 s.get("customer") or "", s["address"],
                                 lot=s.get("lot") or "", action=s["action"])
+        # 2026-11-03: a shop errand written into the dispatch text becomes a
+        # real SHOP leg instead of prose the driver has to read and re-enter.
+        # The NOTE only. Folding the customer name in let "PRO-MIT" run on
+        # into the reason, which then read "get the cable looked at PRO-MIT".
+        _shop_hit = apply_parsed_shop_leg(
+            conn, cid(), cur.lastrowid, s.get("notes") or "", vendors=_vendor_list)
+        if _shop_hit:
+            _shops_found.append(_shop_hit)
         # Resolve the dump/return site names to location records + set the FKs.
         _link_stop_sites(conn, cid(), cur.lastrowid, s.get("dump_leg") or "", s.get("return_leg") or "")
         # Self-building address book: learn every dispatched stop's address.
@@ -46069,6 +46276,8 @@ def api_insert_stops(route_id):
             _apply_midday_plan_ops(conn, route_id, _rewrite, session["user_id"])
 
     cur = conn.cursor()
+    _vendor_list = _company_vendor_list(conn, cid())
+    _shops_found = []
     new_stops = []
     _new_by_index = {}
     _chain_batch = []
@@ -46115,6 +46324,14 @@ def api_insert_stops(route_id):
         attach_stop_to_customer(conn, cid(), cur.lastrowid,
                                 s.get("customer") or "", s["address"],
                                 lot=s.get("lot") or "", action=s["action"])
+        # 2026-11-03: a shop errand written into the dispatch text becomes a
+        # real SHOP leg instead of prose the driver has to read and re-enter.
+        # The NOTE only. Folding the customer name in let "PRO-MIT" run on
+        # into the reason, which then read "get the cable looked at PRO-MIT".
+        _shop_hit = apply_parsed_shop_leg(
+            conn, cid(), cur.lastrowid, s.get("notes") or "", vendors=_vendor_list)
+        if _shop_hit:
+            _shops_found.append(_shop_hit)
         # Resolve the dump/return site names to location records + set the FKs.
         _link_stop_sites(conn, cid(), cur.lastrowid, s.get("dump_leg") or "", s.get("return_leg") or "")
         # Self-building address book: learn every inserted stop's address.
