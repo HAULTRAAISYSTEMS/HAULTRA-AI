@@ -22543,7 +22543,13 @@ def driver_route_detail(route_id):
 <div id="vg-overlay" class="no-photo-confirm-overlay" hidden onclick="closeVendorGo()"></div>
 <div id="vg-modal" class="no-photo-confirm-modal" hidden style="max-width:440px;text-align:left;">
     <div class="no-photo-confirm-title" style="color:#FFB74D;">&#128666; Headed to Vendor</div>
-    <p class="no-photo-confirm-body" style="margin-bottom:12px;">The boss is notified automatically — no approval needed. Your remaining stops are held until you're back in service.</p>
+    <p class="no-photo-confirm-body" style="margin-bottom:12px;">The boss is notified automatically — no approval needed.</p>
+    <label class="uw-lbl">When</label>
+    <select id="vg-mode" style="width:100%;min-height:48px;margin-bottom:10px;border-radius:12px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.16);color:#E6E6E0;">
+        <option value="after" selected>After this stop — nothing held</option>
+        <option value="now">Go now — hold my remaining stops</option>
+        <option value="line">Add to my route — whenever I pass it</option>
+    </select>
     <label class="uw-lbl">Vendor</label>
     <select id="vg-vendor" style="width:100%;min-height:48px;margin-bottom:10px;border-radius:12px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.16);color:#E6E6E0;">
         <option value="">Loading vendors…</option>
@@ -22683,7 +22689,8 @@ def driver_route_detail(route_id):
         var name = document.getElementById('vg-name').value.trim();
         var note = document.getElementById('vg-note').value.trim();
         var st = document.getElementById('vg-status');
-        var payload = {{note: note}};
+        var modeEl = document.getElementById('vg-mode');
+        var payload = {{note: note, mode: modeEl ? modeEl.value : 'after'}};
         if (sel.value && sel.value !== 'other') payload.vendor_id = parseInt(sel.value, 10);
         else if (name) payload.vendor_name = name;
         else {{
@@ -51173,18 +51180,36 @@ def _insert_vendor_stop(conn, route_id, after_working_index, vendor_name, addres
 
 
 def _reprioritize_for_vendor(conn, route_id, vendor_stop_id):
-    """Go NOW: make the vendor stop the driver's CURRENT stop and park every
-    other incomplete stop (held). Completed stops keep their place at the front;
-    the vendor stop lands right after them; the rest follow, held. Returns the
-    number of stops put on hold."""
+    """Go NOW: the vendor becomes the next thing the driver does, and the rest
+    of the route is parked (held). Returns how many stops were put on hold.
+
+    2026-11-03 — the bug this used to have. _insert_vendor_stop respects a
+    locked prefix of completed stops PLUS the driver's single IN-PROGRESS
+    stop; this function rebuilt the order from completed stops alone and so
+    pushed the vendor in front of the stop the driver was physically standing
+    at, and held it. On a real route that meant: boxed out at PRO-MIT, can on
+    the truck, and the app locked him out of finishing the stop he was on.
+
+    A stop he has STARTED (arrived or later) is now part of the locked prefix
+    and is never held. "Drop everything and go" means the work ahead of him,
+    not the work under his feet.
+    """
     rows = conn.execute(
-        "SELECT id, status FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
-        (route_id,),
+        "SELECT id, status, driver_status FROM stops WHERE route_id=?"
+        " ORDER BY stop_order ASC, id ASC", (route_id,),
     ).fetchall()
-    completed = [r["id"] for r in rows if r["status"] == "completed"]
-    others = [r["id"] for r in rows
-              if r["status"] != "completed" and r["id"] != vendor_stop_id]
-    order = completed + [vendor_stop_id] + others
+    _started = ("arrived", "box_out", "going_to_dump", "need_box_in")
+    locked, others = [], []
+    for r in rows:
+        if r["id"] == vendor_stop_id:
+            continue
+        if r["status"] == "completed":
+            locked.append(r["id"])
+        elif (_row_get(r, "driver_status") or "") in _started:
+            locked.append(r["id"])     # he is standing at it — never parked
+        else:
+            others.append(r["id"])
+    order = locked + [vendor_stop_id] + others
     for pos, sid in enumerate(order, start=1):
         conn.execute("UPDATE stops SET stop_order=? WHERE id=?", (pos, sid))
     ts = now_ts()
@@ -51192,6 +51217,33 @@ def _reprioritize_for_vendor(conn, route_id, vendor_stop_id):
         conn.execute("UPDATE stops SET held_at=? WHERE id=?", (ts, sid))
     conn.execute("UPDATE stops SET held_at=NULL WHERE id=?", (vendor_stop_id,))
     return len(others)
+
+
+def _place_vendor_without_holding(conn, route_id, vendor_stop_id, at_end=False):
+    """Put the vendor stop in the running order and hold NOTHING.
+
+    `at_end` False → straight after the work the driver has already started,
+    so it is the next thing he does. True → behind everything, for an errand
+    with no urgency. Returns 0, so callers can report holds uniformly.
+    """
+    rows = conn.execute(
+        "SELECT id, status, driver_status FROM stops WHERE route_id=?"
+        " ORDER BY stop_order ASC, id ASC", (route_id,),
+    ).fetchall()
+    _started = ("arrived", "box_out", "going_to_dump", "need_box_in")
+    locked, rest = [], []
+    for r in rows:
+        if r["id"] == vendor_stop_id:
+            continue
+        if r["status"] == "completed" or (_row_get(r, "driver_status") or "") in _started:
+            locked.append(r["id"])
+        else:
+            rest.append(r["id"])
+    order = (locked + rest + [vendor_stop_id]) if at_end else (locked + [vendor_stop_id] + rest)
+    for pos, sid in enumerate(order, start=1):
+        conn.execute("UPDATE stops SET stop_order=? WHERE id=?", (pos, sid))
+    conn.execute("UPDATE stops SET held_at=NULL WHERE id=?", (vendor_stop_id,))
+    return 0
 
 
 def _release_holds(conn, route_id):
@@ -51803,12 +51855,33 @@ def driver_vendor_self_dispatch():
             conn.close()
             return jsonify({"error": "pick a vendor or enter a name"}), 400
         vname = vendor_name
+    # 2026-11-03: the driver gets the same choice the boss has had since
+    # Oct 30. This path was hardcoded to "drop everything", so the person on
+    # the road -- the only one who can see whether the errand fits -- had the
+    # least control of anyone.
+    #
+    # A caller that sends no mode still means "go now". That was a deliberate
+    # choice when this path was built for breakdowns, and the fix above
+    # removed what made it costly -- go-now no longer takes the stop the
+    # driver is standing at. The CAB defaults its picker to "after this stop",
+    # which is the commoner errand, so the driver leads with the gentle option
+    # while an old caller keeps the behaviour it was written against.
+    mode = str(data.get("mode") or "").strip().lower()
+    if mode not in ("now", "after", "line"):
+        mode = "now"
     new_id = _insert_vendor_stop(conn, route_id, 0, vname, address, None, vid,
                                  note or "Driver self-dispatch to vendor")
-    held_n = _reprioritize_for_vendor(conn, route_id, new_id)
+    if mode == "now":
+        held_n = _reprioritize_for_vendor(conn, route_id, new_id)
+    else:
+        held_n = _place_vendor_without_holding(conn, route_id, new_id,
+                                               at_end=(mode == "line"))
     driver_name = _actor_name(conn) or "Driver"
-    body = ("🚚 %s headed to %s — %d stop%s held, no approval needed."
-            % (driver_name, vname, held_n, "" if held_n == 1 else "s"))
+    _where = {"now": "going now", "after": "after his current stop",
+              "line": "later in the route"}[mode]
+    body = ("🚚 %s headed to %s — %s%s. No approval needed."
+            % (driver_name, vname, _where,
+               (", %d stop%s held" % (held_n, "" if held_n == 1 else "s")) if held_n else ""))
     conn.execute(
         "INSERT INTO messages (route_id, sender_user_id, body, created_at, priority)"
         " VALUES (?,?,?,?,'urgent')",
