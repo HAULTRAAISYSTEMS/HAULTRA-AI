@@ -561,4 +561,65 @@ ok(_bin3 == "",
    "and an end-of-day yard drop leaves the truck empty — the can stayed there")
 c.close()
 
+# ── 14. the daily log stops guessing, and stops leaking machine text ──────
+# Reported 2026-11-14 off the printed log: "The daily log should not show 3143
+# box in for the rest of the routes. It's only the next one .. also in ticket
+# it say start from yard on the 3rd route."
+
+# (a) "start from yard" is a chain TRIGGER PHRASE that chain_resolver writes
+# into a note so the resolver can read it back. chain_resolver.strip_chain_phrases
+# exists precisely so it is "never shown to a user as raw text" — the cab card
+# strips it, the log did not.
+_cell = app._log_ticket_cell("", None, None, "start from yard", None, False, [])
+ok("start from yard" not in _cell,
+   "the log's ticket cell does not print the chain trigger phrase (the "
+   "reported 'start from yard' on stop 3)")
+_cell2 = app._log_ticket_cell("", None, None, "gate code 1234 start from yard", None, False, [])
+ok("gate code 1234" in _cell2 and "start from yard" not in _cell2,
+   "but the driver's real note survives — only the machine phrase is removed")
+_cell3 = app._log_ticket_cell("", None, None, "Start with #30115 container at yard",
+                              None, False, [])
+ok("30115" in _cell3,
+   "and a yard load's own note still prints — that one is for the driver")
+
+# (b) Box In is known for the stop he is on, and not for the ones past it.
+# The chain carried _prev_box_out through every pending stop, so 3143 was
+# printed as Box In on all three remaining rows as if the day were decided.
+as_boss()
+r = cl.post("/api/dispatch", json={"driver_id": drv3, "route_date": "2026-11-20", "stops": [
+    {"action": "YARD", "address": "2545 Squadron Ct, Virginia Beach", "customer": "The yard",
+     "container_size": "30yd", "notes": "Start with #30115 container at yard"},
+    {"action": "PR", "address": "401 Clearfield Ave, Chesapeake", "customer": "Balicore",
+     "container_size": "30yd", "dump_leg": "Dominion"},
+    {"action": "PR", "address": "3388 Cadence Way, Virginia Beach", "customer": "Cadence",
+     "container_size": "30yd", "dump_leg": "Dominion"},
+    {"action": "PR", "address": "2810 Atlantic Ave, Virginia Beach", "customer": "Atlantic",
+     "container_size": "30yd", "dump_leg": "Dominion"},
+    {"action": "PR", "address": "529 Whispering Oaks Cir, Chesapeake", "customer": "Oaks",
+     "container_size": "30yd", "dump_leg": "Dominion"},
+]}, headers=HJ)
+ok(r.status_code == 200, "the five-stop day dispatches — status %s" % r.status_code)
+c = app.get_db()
+rid9 = c.execute("SELECT id FROM routes WHERE company_id=? AND route_date=?",
+                 (co, "2026-11-20")).fetchone()["id"]
+_ids9 = [dict(x)["id"] for x in c.execute(
+    "SELECT id FROM stops WHERE route_id=? ORDER BY stop_order, id", (rid9,)).fetchall()]
+# Exactly where he was: yard done, Clearfield done with its 3143 ticket,
+# everything after it untouched.
+c.execute("UPDATE stops SET status='completed' WHERE id IN (?,?)", (_ids9[0], _ids9[1]))
+c.execute("""INSERT INTO dump_tickets (company_id, route_id, stop_id, can_number, dump_site, created_at)
+             VALUES (?,?,?,?,?,?)""", (co, rid9, _ids9[1], "3143", "Dominion", app.now_ts()))
+c.commit(); c.close()
+
+with cl.session_transaction() as s:
+    s.update(user_id=boss, company_id=co, role="boss", roles=["owner", "dispatcher"], _csrf_token="tok")
+_log = cl.get("/route/%d/daily-log" % rid9).get_data(as_text=True)
+ok("DAILY ROUTE LOG" in _log or "Daily" in _log, "the log renders")
+# 3143 belongs in exactly two cells: Clearfield's BOX OUT, and the next
+# stop's BOX IN. Never on the two stops beyond that.
+_n3143 = _log.count(">3143<")
+ok(_n3143 == 2,
+   "3143 appears as Box Out at Clearfield and Box In at the NEXT stop only — "
+   "found %d cells (it was printed on every remaining stop)" % _n3143)
+
 print("ALL YARD-START TESTS PASSED")
