@@ -356,4 +356,113 @@ ok("Arrived at Stop" in _h2 and 'id="cab-nav-btn"' in _h2,
    "a normal stop still shows Navigate and Arrived at Stop — the yard branch "
    "is scoped, not a cab-wide change")
 
+# ── 11. the can he hooked at the yard RIDES to the next stop ──────────────
+# Reported from the cab 2026-11-14: "So I started with the can from the yard
+# but the next route don't show that I brought that can to this route. It's
+# acting as if this is an regular PR."
+#
+# It was. compute_can_flow walks the stops tracking whether the truck holds an
+# empty, and 'yard' was not one of the actions it knew, so the state stayed
+# no_can and the next PR derived return-same-can mode. The engine already had
+# the right shape for this — a Pull leaves the truck holding an empty, which
+# the very next PR consumes as a swap — a yard load just never joined it.
+_cur2 = app.get_db(); _c2 = _cur2.cursor()
+_c2.execute("INSERT INTO users (username,password_hash,role,full_name,company_id,created_at)"
+            " VALUES (?,?,?,?,?,?)", ("y_drv3", "x", "driver", "Flow", co, app.now_ts()))
+drv3 = _c2.lastrowid
+_cur2.commit(); _cur2.close()
+
+as_boss()
+r = cl.post("/api/dispatch", json={"driver_id": drv3, "route_date": "2026-11-17", "stops": [
+    {"action": "YARD", "address": "2545 Squadron Ct, Virginia Beach", "customer": "The yard",
+     "container_size": "30yd", "notes": "Start with #30115 container at yard"},
+    {"action": "PR", "address": "401 Clearfield Ave, Chesapeake", "customer": "Balicore",
+     "container_size": "30yd", "dump_leg": "Dominion"},
+]}, headers=HJ)
+ok(r.status_code == 200, "yard load + PR dispatches — status %s" % r.status_code)
+c = app.get_db()
+rid5 = c.execute("SELECT id FROM routes WHERE company_id=? AND route_date=?",
+                 (co, "2026-11-17")).fetchone()["id"]
+_fl = [dict(x) for x in c.execute(
+    "SELECT action, can_state_before, swap_with_prev_pull FROM stops"
+    " WHERE route_id=? ORDER BY stop_order, id", (rid5,)).fetchall()]
+ok(_fl[0]["can_state_before"] == "no_can",
+   "he reaches the yard with an empty truck — nothing on it yet")
+ok(_fl[1]["can_state_before"] == "empty_can",
+   "he reaches Balicore CARRYING the empty he hooked at the yard (was 'no_can')")
+ok(_fl[1]["swap_with_prev_pull"] == 1,
+   "so Balicore is a SWAP, not a regular PR — set the empty off, box out the "
+   "full (the reported bug)")
+c.close()
+
+# An END-of-day yard stop is the opposite: he drops the empty off and leaves
+# the yard with an empty truck. It must not pretend he is still carrying one.
+c = app.get_db()
+ok(app._next_can_state("yard", "no_can", yard_loads=True) == "empty_can",
+   "a yard LOAD leaves the truck holding an empty")
+ok(app._next_can_state("yard", "empty_can", yard_loads=False) == "no_can",
+   "a yard DROP-OFF leaves the truck empty — the can stayed at the yard")
+c.close()
+
+# The can is spoken for: a later Delivery assigned that exact can means the
+# yard load is a courier run, not a swap feed. Swapping it off at an
+# intervening PR would hand the wrong customer's can to the delivery.
+as_boss()
+r = cl.post("/api/dispatch", json={"driver_id": drv3, "route_date": "2026-11-18", "stops": [
+    {"action": "YARD", "address": "2545 Squadron Ct, Virginia Beach", "customer": "The yard",
+     "container_size": "30yd", "notes": "Start with #30115 container at yard"},
+    {"action": "PR", "address": "401 Clearfield Ave, Chesapeake", "customer": "Balicore",
+     "container_size": "30yd", "dump_leg": "Dominion"},
+    {"action": "D", "address": "11496 Shiloh Dr, Virginia Beach", "customer": "Ashdon",
+     "container_size": "30yd", "assigned_can": "30115"},
+]}, headers=HJ)
+ok(r.status_code == 200, "yard load + PR + a Delivery of that same can — status %s" % r.status_code)
+c = app.get_db()
+rid6 = c.execute("SELECT id FROM routes WHERE company_id=? AND route_date=?",
+                 (co, "2026-11-18")).fetchone()["id"]
+_fl6 = [dict(x) for x in c.execute(
+    "SELECT action, can_state_before, swap_with_prev_pull FROM stops"
+    " WHERE route_id=? ORDER BY stop_order, id", (rid6,)).fetchall()]
+ok(_fl6[1]["swap_with_prev_pull"] == 0,
+   "when a later Delivery claims can 30115, the PR stays a regular PR — the "
+   "yard can is being couriered, not fed to a swap")
+c.close()
+
+# And the cab says so out loud on the next stop.
+with cl.session_transaction() as s:
+    s.update(user_id=drv3, company_id=co, role="driver", roles=["driver"], _csrf_token="tok")
+as_boss()
+r = cl.post("/api/dispatch", json={"driver_id": drv3, "route_date": _today, "stops": [
+    {"action": "YARD", "address": "2545 Squadron Ct, Virginia Beach", "customer": "The yard",
+     "container_size": "30yd", "notes": "Start with #30115 container at yard"},
+    {"action": "PR", "address": "401 Clearfield Ave, Chesapeake", "customer": "Balicore",
+     "container_size": "30yd", "dump_leg": "Dominion"},
+]}, headers=HJ)
+ok(r.status_code == 200, "today's flow route dispatches — status %s" % r.status_code)
+c = app.get_db()
+rid7 = c.execute("SELECT id FROM routes WHERE company_id=? AND assigned_to=? AND route_date=?",
+                 (co, drv3, _today)).fetchone()["id"]
+_pr_id = c.execute("SELECT id FROM stops WHERE route_id=? AND action='Pickup and Return'",
+                   (rid7,)).fetchone()["id"]
+c.close()
+with cl.session_transaction() as s:
+    s.update(user_id=drv3, company_id=co, role="driver", roles=["driver"], _csrf_token="tok")
+cl.post("/driver/clock/in", data={"_csrf_token": "tok", "next": "/driver/route/%d" % rid7})
+cl.post("/route/%d/start" % rid7, data={"_csrf_token": "tok"})
+_h3 = cl.get("/driver/route/%d?show_stop=%d" % (rid7, _pr_id)).get_data(as_text=True)
+ok('class="cab-card' in _h3 and "PRE-FLIGHT" not in _h3,
+   "the PR card is really rendered — not the pre-flight gate")
+ok("Can on board" in _h3 and "30115" in _h3,
+   "the next stop's card says the can rode along, and names it: "
+   "'Can on board #30115'")
+# The swap step only shows once he taps Arrived (before that every PR shows
+# "Arrived at Stop"), so arrive and check the step he actually gets.
+cl.post("/stop/%d/driver-action" % _pr_id, data={"_csrf_token": "tok", "action": "arrived"})
+_h4 = cl.get("/driver/route/%d?show_stop=%d" % (rid7, _pr_id)).get_data(as_text=True)
+ok("Remove Old Container" in _h4,
+   "and the work step is the SWAP one — 'Bin Out — Remove Old Container' — "
+   "instead of a plain PR's 'Box Out — Remove Container'")
+# (The rest of the swap sequence — Bin In, Place Empty Bin — only appears at
+# later driver_status steps and is already covered by the swap-PR suites.)
+
 print("ALL YARD-START TESTS PASSED")

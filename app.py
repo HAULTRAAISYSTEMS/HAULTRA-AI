@@ -2045,9 +2045,15 @@ def _can_flow_valid(action_lower, can_state):
     return True  # PR (either mode), dump run, or unrecognised — no constraint
 
 
-def _next_can_state(action_lower, can_state):
+def _next_can_state(action_lower, can_state, yard_loads=False):
     """
     Simulate the truck can-state after completing a stop (including its dump run).
+
+    Yard (start-of-day load, yard_loads=True):
+      no_can → hook the empty at the yard → empty_can
+
+    Yard (end-of-day drop-off, yard_loads=False):
+      empty_can → leave the can at the yard → no_can
 
     Pull (return-same-can):
       no_can → pick up full → dump → return empty to customer → no_can
@@ -2067,6 +2073,16 @@ def _next_can_state(action_lower, can_state):
     )
     is_delivery = "delivery" in action_lower
     is_pull     = ("pull" in action_lower or "pickup" in action_lower) and "return" not in action_lower
+
+    # 2026-11-14: the yard. A morning load is the mirror image of a Delivery —
+    # the truck gains the can instead of losing it — and the empty it gains is
+    # exactly what the next PR swaps off, the same way a Pull's empty is below.
+    # Reported from the cab: "I started with the can from the yard but the next
+    # route don't show that I brought that can... it's acting as if this is an
+    # regular PR." It was: 'yard' fell through to the no-change return at the
+    # bottom, so the truck was modelled as empty all the way to Balicore.
+    if action_lower.strip() == "yard":
+        return "empty_can" if yard_loads else "no_can"
 
     if is_delivery:
         return "no_can"   # left the can at the site; truck is empty
@@ -2362,15 +2378,32 @@ def compute_can_flow(conn, route_id, starts_with_can=False):
     Caller is responsible for conn.commit().
     """
     stops = conn.execute(
-        "SELECT id, action, pr_mode FROM stops WHERE route_id=? ORDER BY stop_order ASC, id ASC",
+        "SELECT id, action, pr_mode, notes, assigned_can FROM stops"
+        " WHERE route_id=? ORDER BY stop_order ASC, id ASC",
         (route_id,)
     ).fetchall()
+
+    # 2026-11-14: cans a later Delivery has already been assigned. A yard load
+    # whose can is spoken for is a COURIER run — the can is going to that
+    # delivery, so it must not be fed to an intervening PR as swap stock, which
+    # would set the wrong customer's can down and arrive at the delivery with
+    # someone else's. Only an unclaimed yard can becomes swap stock.
+    _claimed = set()
+    for _s in stops:
+        if "delivery" in (_s["action"] or "").lower():
+            _ac = (_row_get(_s, "assigned_can") or "").strip()
+            if _ac:
+                _claimed.add(_ac)
 
     can_state = "empty_can" if starts_with_can else "no_can"
 
     for s in stops:
         action_lower   = (s["action"]  or "").lower().strip()
         parser_pr_mode = (s["pr_mode"] or "").lower().strip()
+        # A yard stop LOADS unless its note marks it as the end-of-day return.
+        _yard_loads = (action_lower == "yard"
+                       and _is_yard_start_stop(action_lower, _row_get(s, "notes"))
+                       and (_row_get(s, "assigned_can") or "").strip() not in _claimed)
 
         # Is this a PR-type stop (Pickup and Return or Swap-only)?
         is_pr = (
@@ -2393,7 +2426,7 @@ def compute_can_flow(conn, route_id, starts_with_can=False):
                 "UPDATE stops SET can_state_before=? WHERE id=?",
                 (can_state, s["id"])
             )
-            can_state = _next_can_state(action_lower, can_state)
+            can_state = _next_can_state(action_lower, can_state, yard_loads=_yard_loads)
 
 
 # =============================================================
@@ -21814,8 +21847,22 @@ def driver_route_detail(route_id):
     _has_carried_can = (prev_stop is not None
                         and (dict(prev_stop).get("empty_can_plan") or "").strip() == "carry_next")
     _carried_ref = (dict(prev_stop).get("carry_can_ref") or "").strip() if _has_carried_can else ""
+    # 2026-11-14: the yard load carries its can forward too, and the driver was
+    # getting no sign of it on the stop he brought it to — the card read like
+    # any other PR. Same banner, different source line, because where the can
+    # came from is the part he needs.
+    _from_yard = (prev_stop is not None
+                  and _is_yard_start_stop(dict(prev_stop).get("action"),
+                                          dict(prev_stop).get("notes")))
     can_on_board_html = ""
-    if _has_carried_can:
+    if _from_yard:
+        _y_ref = _effective_can(prev_stop)
+        can_on_board_html = (
+            f'<div class="cab-can-onboard">&#128666; Can on board'
+            f'{(" #" + e(_y_ref)) if _y_ref else ""} '
+            f'&mdash; hooked at the yard this morning</div>'
+        )
+    elif _has_carried_can:
         _cob_ref_txt = (" #" + e(_carried_ref)) if _carried_ref else ""
         can_on_board_html = (
             f'<div class="cab-can-onboard">&#128666; Can on board{_cob_ref_txt} '
@@ -33081,10 +33128,17 @@ def optimize_route(route_id):
     no_address = []   # stop_ids with no geocodable address
     eod_stops  = []   # notes: "end of day" / "return to yard" etc.
 
+    # 2026-11-14: a yard load is pinned first, which takes it OUT of the set the
+    # dump-aware algorithm simulates — so without this the optimizer sequences
+    # the day as if the truck rolled out empty when it rolled out carrying an
+    # empty, and mis-costs the first swap.
+    _starts_loaded = False
     for s in stops:
         notes_lower = (s["notes"] or "").lower()
         if any(kw in notes_lower for kw in _FIRST_KEYWORDS):
             first_pins.append(s["id"])
+            if _is_yard_start_stop(_row_get(s, "action"), _row_get(s, "notes")):
+                _starts_loaded = True
         elif any(kw in notes_lower for kw in _EOD_KEYWORDS):
             eod_stops.append(s["id"])
         else:
@@ -33144,7 +33198,8 @@ def optimize_route(route_id):
     action_map = {s["id"]: (s["action"] or "") for s in main_stops if s["id"] in {d["id"] for d in stops_data}}
 
     ordered_ids, can_constrained = _dump_aware_order(
-        stops_data, origin=yard_origin, action_map=action_map
+        stops_data, origin=yard_origin, action_map=action_map,
+        starts_with_can=_starts_loaded
     )
 
     final_order = (
