@@ -3825,7 +3825,8 @@ def init_db():
         size        TEXT NOT NULL,
         label       TEXT,
         status      TEXT NOT NULL DEFAULT 'yard'
-                    CHECK(status IN ('yard','deployed','loaded_at_yard','lost','retired')),
+                    CHECK(status IN ('yard','deployed','loaded_at_yard',
+                                     'full_at_yard','lost','retired')),
         notes       TEXT,
         created_at  TEXT NOT NULL
     )
@@ -3836,10 +3837,18 @@ def init_db():
     # preserve it as its own fleet state. Older SQLite databases have a table-
     # level CHECK that cannot be ALTERed; rebuild once, copying every row and
     # keeping the table name stable for customer_containers.container_id.
+    #
+    # 2026-11-14: that state is 'full_at_yard', and it is now actually added —
+    # the comment above has been here since the exception work was scaffolded,
+    # but the rebuild below only ever restated the five statuses it replaced.
+    # The guard keys on the new value so a database that already took the
+    # earlier rebuild takes this one too, exactly once. It matters more than it
+    # looks: a can sitting in the yard FULL must never be handed to the next
+    # customer as an empty, which is precisely what 'yard' would imply.
     _containers_sql_row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='containers'"
     ).fetchone()
-    if _containers_sql_row and "loaded_at_yard" not in (_containers_sql_row["sql"] or ""):
+    if _containers_sql_row and "full_at_yard" not in (_containers_sql_row["sql"] or ""):
         conn.executescript("""
             PRAGMA foreign_keys=off;
             BEGIN;
@@ -3849,7 +3858,8 @@ def init_db():
                 size        TEXT NOT NULL,
                 label       TEXT,
                 status      TEXT NOT NULL DEFAULT 'yard'
-                            CHECK(status IN ('yard','deployed','loaded_at_yard','lost','retired')),
+                            CHECK(status IN ('yard','deployed','loaded_at_yard',
+                                             'full_at_yard','lost','retired')),
                 notes       TEXT,
                 created_at  TEXT NOT NULL
             );
@@ -5060,6 +5070,22 @@ def init_db():
     # stop is dimmed, cannot be completed, and resumes when the vendor stop
     # resolves (Repaired = yes) or the boss releases it manually.
     safe_add_column(conn, "stops", "held_at TEXT")
+
+    # 2026-11-14 — "couldn't dump, taking it back to the yard". The landfill
+    # shuts before the last stop is dumped, so the can comes home still loaded.
+    # The CUSTOMER side of the stop is finished (on a swap they already have
+    # their empty), which is why the stop completes; what is outstanding is the
+    # dump, and with it the ticket and the tonnage. _disposal_charge is
+    # tons x rate, so a stop invoiced before its ticket exists bills short —
+    # dump_deferred_at is what lets billing and the board see that the job is
+    # done but its ticket is still owed. Cleared when the can is finally dumped.
+    safe_add_column(conn, "stops", "dump_deferred_at TEXT")
+    safe_add_column(conn, "stops", "dump_deferred_can TEXT")
+    # The catch-up dump stop points back at the job whose can it is carrying.
+    # Without the link the ticket and its tonnage would settle on the catch-up
+    # stop, which belongs to no customer, and the original job would stay
+    # short forever.
+    safe_add_column(conn, "stops", "deferred_for_stop_id INTEGER")
 
     # Garbage routes (2026-10-10): route_type 'rolloff' (default) or 'garbage'.
     # Garbage stops use action 'Toter' / 'Hand Pickup' / 'Landfill' with a fast
@@ -19496,6 +19522,28 @@ window.cabBlocked = function(stopId) {
         else alert(j.error || 'Could not report.');
     }).catch(function(){ alert('Network error.'); });
 };
+window.cabCantDump = function(stopId, guessCan) {
+    var can = prompt("Landfill closed — which can are you bringing back FULL?", guessCan || "");
+    if (can === null) return;
+    can = (can || '').trim();
+    if (!can) { alert('Need the can number — it goes in the yard as full.'); return; }
+    var note = prompt("Anything to add? (optional)") || '';
+    var csrf = (document.querySelector('meta[name="csrf-token"]')||{}).content || "";
+    // One id per tap, so a POST replayed out of a dead zone is recognised as
+    // the same exception rather than filed twice.
+    var uuid = 'cd-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+    fetch('/api/stops/' + stopId + '/cant-dump', {
+        method: 'POST', credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf},
+        body: JSON.stringify({can: can, note: note, client_uuid: uuid})
+    }).then(function(r){ return r.json(); }).then(function(j){
+        if (j.success) {
+            alert('Logged. Can ' + (j.can || can) + ' goes to the yard FULL — '
+                  + 'it stays off the available list until it is dumped.');
+            location.reload();
+        } else alert(j.error || 'Could not report.');
+    }).catch(function(){ alert('Network error.'); });
+};
 window.closeTruckIssue = function() {
     document.getElementById('bk-overlay').hidden = true;
     document.getElementById('bk-modal').hidden = true;
@@ -19944,10 +19992,13 @@ def _cab_cancel_ui(route_id, stop_id, csrf, stop_label=""):
     return _CAB_CANCEL_CSS + """
 <div id="cab-cancel-overlay" class="no-photo-confirm-overlay" hidden onclick="closeCabCancel()"></div>
 <div id="cab-cancel-modal" class="no-photo-confirm-modal" hidden style="text-align:left;">
-    <div class="no-photo-confirm-title" style="margin-bottom:6px;">Can't run this</div>
+    <div class="no-photo-confirm-title" style="margin-bottom:6px;">Cancel</div>
     <div class="no-photo-confirm-body" style="margin-bottom:14px;">
         Pick a reason, then choose what to drop. Cancelled work stays on the
         route marked cancelled &mdash; the office sees it either way.
+        <br><br><strong>Couldn't dump?</strong> Don't cancel &mdash; use
+        &ldquo;Couldn't dump&rdquo; instead, so the job still counts and the
+        can is tracked.
     </div>
     <form method="POST" onsubmit="return cabConfirmCancel(this);">
         <input type="hidden" name="_csrf_token" value="__CSRF__">
@@ -20036,7 +20087,7 @@ def _cab_cancel_ui(route_id, stop_id, csrf, stop_label=""):
             // A plain tap explains itself rather than doing nothing.
             if (modal && modal.hidden) {
                 btn.textContent = 'HOLD to cancel work';
-                setTimeout(function() { btn.innerHTML = '&#10005; Can\\'t run this'; }, 1600);
+                setTimeout(function() { btn.innerHTML = '&#10005; Cancel'; }, 1600);
             }
         });
     }
@@ -22608,7 +22659,8 @@ def driver_route_detail(route_id):
         <button type="button" class="haul-dropdown-item" onclick="openVendorGo()"><span class="haul-di-icon">&#128666;</span><span class="haul-di-text">Headed to Vendor</span></button>
         {(f'<button type="button" class="haul-dropdown-item" onclick="openShopLeg({s["id"]})"><span class="haul-di-icon">&#128295;</span><span class="haul-di-text">Shop stop on this job</span></button>') if not (_row_get(s, "shop_leg") or "") else (f'<button type="button" class="haul-dropdown-item" onclick="clearShopLeg({s["id"]})"><span class="haul-di-icon">&#128295;</span><span class="haul-di-text">Remove shop stop</span></button>')}
         {f'<button type="button" class="haul-dropdown-item" onclick="cabBlocked({s["id"]})"><span class="haul-di-icon">&#128683;</span><span class="haul-di-text">Can&#39;t Get In</span></button>' if not s["blocked_at"] else f'<button type="button" class="haul-dropdown-item" onclick="cabUnblock({s["id"]})"><span class="haul-di-icon">&#9989;</span><span class="haul-di-text">I&#39;m In — Clear</span></button>'}
-        <button type="button" class="haul-dropdown-item danger" id="cab-cancel-btn"><span class="haul-di-icon">&#10005;</span><span class="haul-di-text">Can&#39;t run this</span></button>
+        {(f'<button type="button" class="haul-dropdown-item" onclick="cabCantDump({s["id"]}, {json.dumps(_effective_can(s))})"><span class="haul-di-icon">&#9888;</span><span class="haul-di-text">Couldn&#39;t dump &mdash; landfill closed</span></button>') if (_classify_service(action_lower) in ("pull", "swap") and not (_row_get(s, "dump_deferred_at") or "")) else ""}
+        <button type="button" class="haul-dropdown-item danger" id="cab-cancel-btn"><span class="haul-di-icon">&#10005;</span><span class="haul-di-text">Cancel</span></button>
     </div>
     {nav_pref_modal_html}
     {urgent_banner_html}
@@ -31036,7 +31088,8 @@ def api_confirm_rates():
 
 def _valid_container_status(s):
     s = (s or "").strip().lower()
-    return s if s in ("yard", "deployed", "loaded_at_yard", "lost", "retired") else "yard"
+    return s if s in ("yard", "deployed", "loaded_at_yard",
+                      "full_at_yard", "lost", "retired") else "yard"
 
 
 @app.route("/api/yard-inventory")
@@ -31581,6 +31634,30 @@ def dump_ticket(stop_id):
                     conn.execute("UPDATE stops SET weight_tons=? WHERE id=?", (net_tons, stop_id))
             except Exception:
                 pass
+
+        # 2026-11-14: a CATCH-UP dump settles its tonnage on the job it came
+        # from. When the landfill shut, the can went home full and the original
+        # stop was left completed-but-ticketless; this stop exists only to dump
+        # it. The tons belong to that customer's job — left here they would sit
+        # on a stop with no customer and the real job would invoice short
+        # forever. Clearing dump_deferred_at also retires the "Disposal
+        # pending" line from that invoice.
+        try:
+            _dfor = _row_get(stop, "deferred_for_stop_id")
+            if _dfor:
+                if net_tons is not None:
+                    conn.execute(
+                        "UPDATE stops SET weight_tons=? WHERE id=? AND"
+                        " COALESCE(weight_tons,0)=0", (net_tons, _dfor))
+                conn.execute(
+                    "UPDATE stops SET dump_deferred_at=NULL WHERE id=?", (_dfor,))
+                # The can is dumped, so it is finally a plain empty in the yard.
+                _dcan = (can_number or _row_get(stop, "dump_deferred_can") or "").strip()
+                if _dcan:
+                    _fleet_upsert(conn, cid(), _dcan, _row_get(stop, "container_size") or "",
+                                  "yard", f"Dumped {now_ts()[:10]} — caught up", force=True)
+        except Exception as _exc:
+            app.logger.warning("deferred dump settle: %s", _exc)
 
         # Optional ticket photo
         photo = request.files.get("ticket_photo")
@@ -38099,7 +38176,7 @@ def _build_invoice_lines_for_route(conn, company_id, route_id, group=None):
         _surcharge_markup = _get_surcharge_markup_cents(conn, company_id)
         stops = conn.execute(
             """SELECT id, action, container_size, weight_tons, address,
-                      customer_name
+                      customer_name, dump_deferred_at, dump_deferred_can
                FROM stops WHERE route_id=? AND status='completed'
                ORDER BY stop_order, id""", (route_id,)).fetchall()
         billed = _invoiced_stop_ids(conn, company_id)
@@ -38140,6 +38217,20 @@ def _build_invoice_lines_for_route(conn, company_id, route_id, group=None):
                 desc = (f"Disposal — {_fmt_tons(tons)} at {_fmt_money(drate)}/ton")
                 lines.append({"kind": "disposal", "description": desc, "qty": 1,
                               "unit_cents": disp, "amount_cents": disp,
+                              "stop_id": sd["id"]})
+            # 2026-11-14: the landfill shut and the can came home full, so this
+            # job has no ticket and no tons YET. The haul above still bills, but
+            # the disposal and overage lines silently did not appear — the kind
+            # of short invoice nobody notices until the month is closed. A zero
+            # line is not a charge; it is the sheet saying out loud that a
+            # ticket is still owed, so the invoice is not sent a line short.
+            if (sd.get("dump_deferred_at") or "") and not float(sd.get("weight_tons") or 0):
+                _dcan = (sd.get("dump_deferred_can") or "").strip()
+                lines.append({"kind": "note",
+                              "description": ("Disposal pending — landfill closed, can "
+                                              + (("#" + _dcan) if _dcan else "")
+                                              + " not dumped yet. Tonnage to follow."),
+                              "qty": 1, "unit_cents": 0, "amount_cents": 0,
                               "stop_id": sd["id"]})
             for fee in _stop_fees(conn, sd["id"]):
                 fd = dict(fee)
@@ -39507,8 +39598,9 @@ def _containers_section_html():
     containers = conn.execute(
         """SELECT * FROM containers WHERE company_id=?
            ORDER BY CASE status WHEN 'yard' THEN 0 WHEN 'loaded_at_yard' THEN 1
-                    WHEN 'deployed' THEN 2 WHEN 'lost' THEN 3 WHEN 'retired' THEN 4
-                    ELSE 5 END,
+                    WHEN 'full_at_yard' THEN 2
+                    WHEN 'deployed' THEN 3 WHEN 'lost' THEN 4 WHEN 'retired' THEN 5
+                    ELSE 6 END,
                     CAST(label AS INTEGER) ASC, label ASC""",
         (cid(),)
     ).fetchall()
@@ -39531,6 +39623,7 @@ def _containers_section_html():
         "yard":     "#fbbf24",
         "deployed": "#3DDC84",
         "loaded_at_yard": "#7FB8FF",
+        "full_at_yard": "#C77DFF",
         "stale":    "#FF9D5C",
         "lost":     "#f87171",
         "retired":  "#6b7280",
@@ -39539,6 +39632,10 @@ def _containers_section_html():
     _GROUP_LABEL = {
         "yard": "🟡 At Yard — in the yard, ready to assign",
         "loaded_at_yard": "🔵 On Truck — on a truck right now, heading to the dump, the yard, or back to the job",
+        # 2026-11-14: pulled from a customer, brought back still loaded because
+        # the landfill was shut. Sitting in the yard but NOT available — it has
+        # to be dumped before anyone can have it.
+        "full_at_yard": "🟣 Full — needs dump — back in the yard still loaded, not available until it is dumped",
         "stale": "⚠️ Needs review — was on a truck days ago, confirm where it is now",
         "deployed": "🟢 Deployed — dropped at a customer",
         "lost": "🔴 Lost",
@@ -39547,7 +39644,8 @@ def _containers_section_html():
     # Display groups: stale in-transit cans split out of On Truck, then
     # re-sorted so each group stays contiguous (SQL order alone would
     # interleave fresh and stale rows by can number).
-    _GROUP_ORDER = {"yard": 0, "loaded_at_yard": 1, "stale": 2, "deployed": 3, "lost": 4, "retired": 5}
+    _GROUP_ORDER = {"yard": 0, "loaded_at_yard": 1, "full_at_yard": 2, "stale": 3,
+                    "deployed": 4, "lost": 5, "retired": 6}
     _disp_rows = []
     for _r in containers:
         _d = dict(_r)
@@ -39634,7 +39732,8 @@ def _containers_section_html():
         if _disp == "stale":
             _badge_label = "needs review"
         else:
-            _badge_label = {"loaded_at_yard": "on truck"}.get(_cd["status"], _cd["status"])
+            _badge_label = {"loaded_at_yard": "on truck",
+                            "full_at_yard": "full — needs dump"}.get(_cd["status"], _cd["status"])
         # 2026-10-24: every badge glows its own circle color (the pulse
         # uses currentColor, which IS the badge's status color) and never
         # wraps — "needs review" stays on one line. The status cell is
@@ -39712,6 +39811,7 @@ def _containers_section_html():
             <button type="button" class="fl-chip active" data-fl-status="all" onclick="flSetStatus('all', this)">All ({len(containers)})</button>
             <button type="button" class="fl-chip fl-sign-glow" style="--glow:#fbbf24;" data-fl-status="yard" onclick="flSetStatus('yard', this)">🟡 At Yard ({_group_counts.get("yard", 0)})</button>
             <button type="button" class="fl-chip fl-sign-glow" style="--glow:#7FB8FF;" data-fl-status="loaded_at_yard" onclick="flSetStatus('loaded_at_yard', this)">🔵 On Truck ({_group_counts.get("loaded_at_yard", 0)})</button>
+            <button type="button" class="fl-chip fl-sign-glow" style="--glow:#C77DFF;" data-fl-status="full_at_yard" onclick="flSetStatus('full_at_yard', this)">🟣 Full &mdash; needs dump ({_group_counts.get("full_at_yard", 0)})</button>
             <button type="button" class="fl-chip fl-sign-glow" style="--glow:#FF9D5C;" data-fl-status="stale" onclick="flSetStatus('stale', this)">⚠️ Needs review ({_group_counts.get("stale", 0)})</button>
             <button type="button" class="fl-chip fl-sign-glow" style="--glow:#3DDC84;" data-fl-status="deployed" onclick="flSetStatus('deployed', this)">🟢 Deployed ({_group_counts.get("deployed", 0)})</button>
             <button type="button" class="fl-chip fl-sign-glow" style="--glow:#f87171;" data-fl-status="lost" onclick="flSetStatus('lost', this)">🔴 Lost ({_group_counts.get("lost", 0)})</button>
@@ -42661,7 +42761,8 @@ def edit_container(c_id):
             for o in opts
         )
     size_opts   = _sel("size",   ["10yd","15yd","20yd","30yd","40yd","Other"], _c["size"])
-    status_opts = _sel("status", ["yard","deployed","loaded_at_yard","lost","retired"], _c["status"])
+    status_opts = _sel("status", ["yard","deployed","loaded_at_yard",
+                                  "full_at_yard","lost","retired"], _c["status"])
 
     body = f"""
     <div class="hero"><h1>Edit Container</h1></div>
@@ -46568,6 +46669,10 @@ def api_dispatch():
             "appended": appended_to_existing,
             "notices": [],
         })
+    # A can left undumped because the landfill shut has to be caught up before
+    # it can be used again. Added here, when there is finally a route to put it
+    # on — at 6pm when the driver reported it, tomorrow did not exist yet.
+    _add_catchup_dumps(conn, cid(), route_id)
     # Before the can flow and the chain resolver, which both read the SAVED
     # order: a start-of-day yard load belongs at the front of the day wherever
     # in the paste it was written.
@@ -51604,6 +51709,80 @@ def _pin_yard_start_first(conn, route_id, only_ids=None):
         return 0
 
 
+def _add_catchup_dumps(conn, company_id, route_id):
+    """Put yesterday's undumped cans on the route being dispatched.
+
+    2026-11-14. When the landfill shuts before the last stop, the can comes
+    home full and the job is left completed-but-ticketless (see
+    report_cant_dump). That can has to be dumped before anything else can
+    happen to it, and the tonnage still belongs to the customer whose job it
+    came off — so the catch-up stop carries deferred_for_stop_id back to that
+    job, and saving its ticket settles the tons there.
+
+    Runs when a route is dispatched rather than guessing at a route that does
+    not exist yet: at 6pm there is no tomorrow to put the work on. Each
+    outstanding can is added ONCE — a can already waiting on an open catch-up
+    stop is skipped, so dispatching twice in a day does not dump it twice.
+    Returns the number of catch-up stops added. Never raises.
+    """
+    try:
+        _pending = conn.execute(
+            """SELECT s.id, s.dump_deferred_can, s.container_size, s.customer_name,
+                      s.dump_location
+                 FROM stops s JOIN routes r ON r.id = s.route_id
+                WHERE r.company_id = ?
+                  AND COALESCE(s.dump_deferred_at,'') <> ''
+                  AND COALESCE(s.dump_deferred_can,'') <> ''
+                  AND s.route_id <> ?
+                ORDER BY s.id""", (company_id, route_id)).fetchall()
+        if not _pending:
+            return 0
+        # Cans already queued on an open catch-up stop anywhere in the company.
+        _already = {
+            (r["dump_deferred_can"] or "").strip()
+            for r in conn.execute(
+                """SELECT s.dump_deferred_can FROM stops s
+                     JOIN routes r ON r.id = s.route_id
+                    WHERE r.company_id = ? AND s.deferred_for_stop_id IS NOT NULL
+                      AND s.status <> 'completed'
+                      AND COALESCE(s.cancelled_at,'') = ''""", (company_id,)).fetchall()
+        }
+        _next = (conn.execute(
+            "SELECT COALESCE(MAX(stop_order),0) n FROM stops WHERE route_id=?",
+            (route_id,)).fetchone()["n"] or 0)
+        added = 0
+        for p in _pending:
+            _can = (p["dump_deferred_can"] or "").strip()
+            if not _can or _can in _already:
+                continue
+            _already.add(_can)
+            _next += 1
+            _site = (_row_get(p, "dump_location") or "").strip()
+            conn.execute(
+                """INSERT INTO stops (route_id, stop_order, customer_name, address,
+                       action, container_size, notes, assigned_can,
+                       dump_deferred_can, deferred_for_stop_id, status, created_at,
+                       dump_location)
+                   VALUES (?,?,?,?,?,?,?,?,?,?, 'open', ?,?)""",
+                (route_id, _next,
+                 "Catch-up dump",
+                 (_site or "Dump site"),
+                 "Dump", _row_get(p, "container_size") or "",
+                 # The customer name is interpolated into a note, and a note is
+                 # what the chain resolver reads. Strip any swap phrase out of
+                 # it so a customer called "Use To Swap Inc" can never link this
+                 # errand into a chain it has no part in.
+                 ("Left over from %s — landfill was closed. Dump can %s."
+                  % (chain_resolver.strip_chain_phrases(
+                        _row_get(p, "customer_name") or "") or "a job", _can)),
+                 _can, _can, p["id"], now_ts(), _site))
+            added += 1
+        return added
+    except Exception as exc:
+        app.logger.warning("_add_catchup_dumps: %s", exc)
+        return 0
+
+
 def _heal_yard_can_flow(conn, route_id):
     """Recompute can-flow for a route whose yard load was stamped by old code.
 
@@ -52500,6 +52679,110 @@ def report_blocked(stop_id):
     conn.commit()
     conn.close()
     return jsonify({"success": True})
+
+
+@app.route("/api/stops/<int:stop_id>/cant-dump", methods=["POST"])
+@driver_required
+def report_cant_dump(stop_id):
+    """Driver one-tap "couldn't dump — taking it back to the yard" (2026-11-14).
+
+    The landfill shuts before the last stop is dumped. The driver is holding a
+    FULL can and drives it home. Three facts have to survive the night, and
+    before this endpoint none of them did:
+
+      1. The customer side of the job is DONE. On a swap they already have
+         their empty, so this is not a cancel — cancelling would erase a
+         completed service and a real haul.
+      2. The dump is still owed, and with it the ticket and the tonnage.
+         _disposal_charge is tons x rate, so invoicing this stop before the
+         ticket exists bills the customer short.
+      3. The can is in the yard but NOT available. Handing it to tomorrow's
+         delivery as an empty is the expensive mistake this prevents.
+
+    Writes the route_exceptions row the schema has been waiting for since the
+    exception work was scaffolded — type DISPOSAL_CLOSED, resolution
+    TAKE_TO_YARD — both of which already existed as CHECK values with nothing
+    in the app able to produce them.
+
+    The can number comes from the driver: customer_containers is disabled
+    (ENABLE_CONTAINER_TRACKING is off) and there is no dump ticket yet, so the
+    app genuinely does not know which can he pulled. He is standing next to it.
+
+    JSON: {"can": "3143", "note": "...", "client_uuid": "..."}
+    """
+    data = request.get_json(silent=True) or {}
+    can = re.sub(r"[^0-9A-Za-z-]", "", str(data.get("can") or ""))[:20]
+    note = str(data.get("note") or "").strip()[:300]
+    client_uuid = str(data.get("client_uuid") or "").strip()[:80]
+    if not can:
+        return jsonify({"success": False, "error": "which can are you carrying?"}), 400
+    if not client_uuid:
+        # The table carries a UNIQUE(company_id, client_uuid) so a POST replayed
+        # out of a dead zone is one exception, not two. Without an id from the
+        # device there is nothing to deduplicate on.
+        client_uuid = "cd-%s-%s" % (stop_id, now_ts())
+
+    conn = get_db()
+    stop = conn.execute(
+        "SELECT s.*, r.company_id FROM stops s"
+        " JOIN routes r ON s.route_id = r.id"
+        " WHERE s.id = ? AND r.assigned_to = ? AND r.company_id = ?",
+        (stop_id, session["user_id"], cid())).fetchone()
+    if not stop:
+        conn.close()
+        return jsonify({"success": False, "error": "stop not found"}), 404
+    # Only a stop that hauls something can fail to dump it. A Delivery drops a
+    # can off and drives away empty; there is nothing on the truck to defer.
+    _act = (_row_get(stop, "action") or "").lower()
+    if _classify_service(_act) not in ("pull", "swap"):
+        conn.close()
+        return jsonify({"success": False,
+                        "error": "this stop has nothing to dump"}), 400
+
+    ts = now_ts()
+    _size = _row_get(stop, "container_size") or ""
+    try:
+        conn.execute(
+            """INSERT INTO route_exceptions
+               (company_id, client_uuid, stop_id, driver_id, type,
+                container_state_at_time, note, occurred_at, created_at,
+                resolution, resolved_by, resolved_at)
+               VALUES (?,?,?,?,'DISPOSAL_CLOSED',?,?,?,?,'TAKE_TO_YARD',?,?)""",
+            (cid(), client_uuid, stop_id, session["user_id"],
+             f"full can {can} on truck", note, ts, ts, session["user_id"], ts))
+    except sqlite3.IntegrityError:
+        # Same client_uuid: this is the retry of a POST that already landed.
+        conn.close()
+        return jsonify({"success": True, "duplicate": True})
+
+    # The can is home, and it is full. Never 'yard' — that would offer it to
+    # the next customer as an empty.
+    _fleet_upsert(conn, cid(), can, _size, "full_at_yard",
+                  f"Landfill closed {ts[:10]} — came back loaded", force=True)
+
+    # Service delivered, ticket owed.
+    conn.execute(
+        "UPDATE stops SET status='completed', completed_at=COALESCE(completed_at,?),"
+        " dump_deferred_at=?, dump_deferred_can=? WHERE id=?",
+        (ts, ts, can, stop_id))
+
+    driver = conn.execute("SELECT full_name, username FROM users WHERE id = ?",
+                          (session["user_id"],)).fetchone()
+    _who = (driver["full_name"] or driver["username"]) if driver else "Driver"
+    _where = _row_get(stop, "customer_name") or _row_get(stop, "address") or f"stop #{stop_id}"
+    msg = (f"\U0001F6AB {_who} couldn't dump at {_where} — landfill closed. "
+           f"Can {can} is coming back to the yard FULL and still needs dumping"
+           + (f" — {note}" if note else ""))
+    try:
+        conn.execute(
+            "INSERT INTO messages (route_id, sender_user_id, body, created_at)"
+            " VALUES (?,?,?,?)",
+            (_row_get(stop, "route_id"), session["user_id"], msg, ts))
+    except Exception:
+        pass
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "can": can})
 
 
 @app.route("/api/stops/<int:stop_id>/landfill-depart", methods=["POST"])
