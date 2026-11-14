@@ -465,4 +465,100 @@ ok("Remove Old Container" in _h4,
 # (The rest of the swap sequence — Bin In, Place Empty Bin — only appears at
 # later driver_status steps and is already covered by the swap-PR suites.)
 
+# ── 12. a route dispatched BEFORE the fix heals itself ────────────────────
+# Reported from the cab 2026-11-14, mid-route: the board still read
+# "#3143 · returning empty" at Clearfield and would not let the stop finish,
+# while the driver was already carrying 3143 to Cadence Way.
+#
+# can_state_before / swap_with_prev_pull are STAMPED at dispatch, not derived
+# at read time. His route was dispatched before the yard fix deployed, so it
+# carried the old stamp all day and the cab kept running the non-swap PR
+# flow — "Return Bin — Place Empty Bin" at a customer whose empty he had
+# already set down. Rendering fixes reached that route; stamped ones did not.
+as_boss()
+r = cl.post("/api/dispatch", json={"driver_id": drv3, "route_date": "2026-11-19", "stops": [
+    {"action": "YARD", "address": "2545 Squadron Ct, Virginia Beach", "customer": "The yard",
+     "container_size": "30yd", "notes": "Start with #30115 container at yard"},
+    {"action": "PR", "address": "401 Clearfield Ave, Chesapeake", "customer": "Balicore",
+     "container_size": "30yd", "dump_leg": "Dominion"},
+    {"action": "PR", "address": "3388 Cadence Way, Virginia Beach", "customer": "Cadence",
+     "container_size": "30yd", "dump_leg": "Dominion"},
+]}, headers=HJ)
+ok(r.status_code == 200, "a three-stop yard route dispatches — status %s" % r.status_code)
+c = app.get_db()
+rid8 = c.execute("SELECT id FROM routes WHERE company_id=? AND route_date=?",
+                 (co, "2026-11-19")).fetchone()["id"]
+# Put it back the way the OLD code left it: nothing knew about the yard load.
+c.execute("""UPDATE stops SET can_state_before='no_can', swap_with_prev_pull=0
+             WHERE route_id=? AND action='Pickup and Return'""", (rid8,))
+c.commit()
+_stale = [dict(x) for x in c.execute(
+    "SELECT action, swap_with_prev_pull FROM stops WHERE route_id=? ORDER BY stop_order, id",
+    (rid8,)).fetchall()]
+ok(_stale[1]["swap_with_prev_pull"] == 0, "fixture really is stamped the old way")
+
+ok(app._heal_yard_can_flow(c, rid8) is True,
+   "the healer recognizes a route stamped before the yard fix and recomputes it")
+c.commit()
+_healed = [dict(x) for x in c.execute(
+    "SELECT action, can_state_before, swap_with_prev_pull FROM stops"
+    " WHERE route_id=? ORDER BY stop_order, id", (rid8,)).fetchall()]
+ok(_healed[1]["can_state_before"] == "empty_can" and _healed[1]["swap_with_prev_pull"] == 1,
+   "the already-dispatched route now knows he left the yard carrying a can")
+
+# Second call writes nothing — a read-time heal must not churn every page load.
+ok(app._heal_yard_can_flow(c, rid8) is False,
+   "a route that is already correct is left alone — the heal only fires on "
+   "stale data, so it costs a read on every other page load")
+
+# A route with no yard stop is never touched.
+ok(app._heal_yard_can_flow(c, rid3) is False,
+   "a route with no yard load is not a candidate at all")
+c.close()
+
+with cl.session_transaction() as s:
+    s.update(user_id=boss, company_id=co, role="boss", roles=["owner", "dispatcher"], _csrf_token="tok")
+_dl = cl.get("/route/%d/daily-log" % rid8)
+ok(_dl.status_code == 200, "the daily log opens on a yard route — status %s" % _dl.status_code)
+
+
+# ── 13. the truck still shows a can after the yard load completes ─────────
+# "It don't show that I have an container on for the next route." The carried
+# bin walk (_route_final_bin_detail) had no yard branch, so a completed yard
+# load fell through to the else, found no dump ticket, and set the carried bin
+# to '' — the truck pill went blank at the exact moment the can went ON.
+c = app.get_db()
+_y8 = c.execute("SELECT id FROM stops WHERE route_id=? AND action='Yard'", (rid8,)).fetchone()["id"]
+c.execute("UPDATE stops SET status='completed' WHERE id=?", (_y8,))
+c.commit()
+_bin, _bsize = app._route_final_bin_detail(c, rid8)
+ok(_bin == "30115",
+   "with only the yard load done, the truck is carrying 30115 — it was "
+   "reading '' (the reported blank truck pill)")
+
+# Then the swap PR completes with its own dump ticket: the truck now carries
+# the can pulled THERE, not the one dropped off.
+_pr8 = c.execute("SELECT id FROM stops WHERE route_id=? AND address LIKE '401 Clearfield%'",
+                 (rid8,)).fetchone()["id"]
+c.execute("UPDATE stops SET status='completed' WHERE id=?", (_pr8,))
+c.execute("""INSERT INTO dump_tickets (company_id, route_id, stop_id, can_number, dump_site, created_at)
+             VALUES (?,?,?,?,?,?)""", (co, rid8, _pr8, "3143", "Dominion", app.now_ts()))
+c.commit()
+_bin2, _ = app._route_final_bin_detail(c, rid8)
+ok(_bin2 == "3143",
+   "after the swap at Clearfield he carries 3143 onward to Cadence Way — "
+   "not '' and not the 30115 he set down")
+
+# An end-of-day yard stop is the opposite: the can stays at the yard.
+c.execute("""INSERT INTO stops (route_id, stop_order, customer_name, address, action,
+             container_size, notes, assigned_can, status, created_at)
+             VALUES (?,?,?,?,?,?,?,?, 'completed', ?)""",
+          (rid8, 98, "The yard", "2545 Squadron Ct", "Yard", "30yd",
+           "end of day", "3143", app.now_ts()))
+c.commit()
+_bin3, _ = app._route_final_bin_detail(c, rid8)
+ok(_bin3 == "",
+   "and an end-of-day yard drop leaves the truck empty — the can stayed there")
+c.close()
+
 print("ALL YARD-START TESTS PASSED")
