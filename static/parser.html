@@ -2081,9 +2081,12 @@
     var field = el('sheet-can-field');
     var sel = el('sheet-can');
     if (!field || !sel) return;
-    var isDelivery = (sheetAction === 'D') && !shop;
-    field.hidden = !isDelivery;
-    if (!isDelivery) return;
+    // 2026-11-14: a YARD stop picks a can too — that IS the whole stop. Without
+    // it the boss could see a start-of-day yard load in the sheet with no way
+    // to say, or correct, which can goes out on the truck.
+    var needsCan = (sheetAction === 'D' || sheetAction === 'YARD') && !shop;
+    field.hidden = !needsCan;
+    if (!needsCan) return;
     sel.innerHTML = '<option value="">Pick from yard…</option>';
     var avail = yardInventory.filter(function(c) { return c.available; });
     if (sheetSize) avail = avail.filter(function(c) { return !c.size || c.size === sheetSize; });
@@ -2179,8 +2182,11 @@
       return;
     }
     // 2026-10-23: capture the yard can for Deliveries
+    // 2026-11-14: and for a YARD load — must match renderSheetCanField above,
+    // or the picker shows a can and saving silently drops it.
     var canSel = el('sheet-can');
-    sheetAssignedCan = (sheetAction === 'D' && canSel) ? canSel.value.trim() : '';
+    sheetAssignedCan = ((sheetAction === 'D' || sheetAction === 'YARD') && canSel)
+                        ? canSel.value.trim() : '';
     var fields = {
       source: 'manual',
       action: sheetAction,

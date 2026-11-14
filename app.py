@@ -1985,8 +1985,16 @@ def geocode_stop_in_background(stop_id):
 
 # Actions that require a dump trip after the customer stop
 _DUMP_ACTIONS = frozenset({"pickup and return", "pull", "swap"})
-# Notes keywords that pin a stop to the very beginning of the route
-_FIRST_KEYWORDS = ("do this first", "first stop", "start here", "start with this")
+# Notes keywords that pin a stop to the very beginning of the route.
+# 2026-11-14: "start of day" joins them — a yard load is the one stop whose
+# position is not a preference. The driver is standing in the yard at 6am, so
+# optimizing it into the middle of the day would send him back for a can he
+# should already be carrying. Checked BEFORE the end-of-day list below, so a
+# note that happens to mention the yard both ways still pins to the front.
+# "start with" (not just "start with this"): the boss writes "Start with
+# #30115 container at yard", and Optimize must agree with the insert pass.
+_FIRST_KEYWORDS = ("do this first", "first stop", "start here", "start with",
+                   "start of day")
 # Notes keywords that pin a stop to the very end (already used in optimize_route)
 _EOD_KEYWORDS_SET = frozenset(("end of day", "return to yard", "take to yard", "back to yard", "eod"))
 
@@ -21106,6 +21114,11 @@ def driver_route_detail(route_id):
     # Vendor-visit stop (inserted by the vendor-dispatch alert) — read-only,
     # its own completion flow ("Truck repaired?"), no container workflow.
     is_vendor = action_lower == "vendor"
+    # 2026-11-14: start-of-day yard load. The driver is standing in the yard
+    # in the truck, so there is nothing to navigate to and no arrival to mark
+    # — "Arrived at Stop" was being shown to a man who had not moved. One tap
+    # says the can is hooked and the day starts.
+    is_yard_start = _is_yard_start_stop(action_lower, _s.get("notes") or "")
     is_pr    = "pickup and return" in action_lower or ("swap" in action_lower and "pull" not in action_lower)
     is_pull  = ("pull" in action_lower or "pickup" in action_lower) and "return" not in action_lower
     is_swap_pr = is_pr and bool(_s.get("swap_with_prev_pull"))
@@ -21525,6 +21538,27 @@ def driver_route_detail(route_id):
             <button type="button" class="btn secondary" id="no-photo-add-first">Add Photo First</button>
         </div>
     </div>
+    """
+
+    # ── Start-of-day yard load: ONE tap. Reported from the cab 2026-11-14 —
+    #    "it's saying arrive at stop when the driver is already starting at
+    #    the yard in the truck". He is: this stop's whole content is "hook
+    #    #30115 before you roll". An arrival step for a place he has not left
+    #    is a tap that means nothing, and a tap that means nothing is a tap
+    #    drivers learn to hit without reading. No photo gate either — there is
+    #    no job site to photograph. The note stays on the card above, so which
+    #    can to hook is still the first thing he reads. ──
+    if is_yard_start:
+        workflow_btn_html = ""
+        complete_section = f"""
+    <form method="POST" action="{url_for('toggle_stop_complete', stop_id=stop_id)}" id="cab-complete-form"
+          data-has-photo="1" data-photo-mode="off">
+        <input type="hidden" name="_csrf_token" value="{_csrf}">
+        <input type="hidden" name="intent" value="complete">
+        <button class="cab-complete-btn" type="submit"
+                style="background:linear-gradient(135deg,#00c853,#00e57a);color:#001a0a;">
+            &#128230; Can Hooked &mdash; Start Route</button>
+    </form>
     """
 
     # ── Vendor-visit stop: two-step read-only flow — Arrived at Vendor (→ AT
@@ -22002,7 +22036,18 @@ def driver_route_detail(route_id):
         f'🏗️ Hook can #{e(_acan)} at yard</div>'
     ) if _acan else ""
     _arrive_action = url_for('stop_driver_action', stop_id=stop_id)
-    if _arrived:
+    if is_yard_start:
+        # No Navigate and no arrival step: he is in the truck, in the yard.
+        # The address still shows (a second driver covering the route may not
+        # know it) but it is information, not a destination. The green "Hook
+        # can #..." banner above this body already names the can.
+        _phase_body = f"""
+        <div class="cab-address" id="cab-address">{e(_addr_display)}</div>
+        {f'<div class="cab-meta-line">{meta_line}</div>' if meta_line else ''}
+        <div class="cab-primary-zone">{complete_section}</div>
+        {_msg_boss_html}
+        """
+    elif _arrived:
         _phase_body = f"""
         <div class="cab-navstrip">
             <span class="cab-navstrip-addr" id="cab-address">{e(_addr_display)}</span>
@@ -27029,9 +27074,15 @@ def _effective_can(stop):
     """The yard can for a stop: explicit assigned_can first, else a can
     number read from the stop's notes/placement note.
 
-    Only Delivery stops carry a yard can — a Pull stop's notes can is the
-    bin being pulled from the customer, not a yard can, so it is never
+    Only Delivery and YARD stops carry a yard can — a Pull stop's notes can
+    is the bin being pulled from the customer, not a yard can, so it is never
     treated as one here.
+
+    2026-11-14: YARD joined Delivery. A yard load written by hand puts the
+    number in the note ("Start with #30115 container at yard") and nowhere
+    else, and a note-can on a YARD stop is a yard can by definition — that is
+    the entire stop. Without this the cab's "Hook can #..." banner stayed
+    blank on the one stop whose whole purpose is naming the can.
     """
     try:
         d = dict(stop)
@@ -27040,7 +27091,8 @@ def _effective_can(stop):
     ac = (d.get("assigned_can") or "").strip()
     if ac:
         return ac
-    if "delivery" not in (d.get("action") or "").lower():
+    _a = (d.get("action") or "").lower()
+    if "delivery" not in _a and _a.strip() != "yard":
         return ""
     for field in ("notes", "placement_note"):
         can = _can_from_notes(d.get(field) or "")
@@ -27219,6 +27271,22 @@ def _sync_fleet_from_history(conn, company_id):
                     ins, ch = _fleet_upsert(conn, company_id, eff, size, "loaded_at_yard",
                                             f"On route {rdate} — {who}" if who else f"On route {rdate}",
                                             force=False)
+                pass
+            # 2026-11-14: a YARD stop LOADS a can onto the truck at the yard.
+            # It is 'loaded_at_yard' either way and NEVER 'deployed' — nothing
+            # was dropped anywhere, so there is no site to deploy it at. This
+            # branch is why the start-of-day stop must not be a Delivery: the
+            # delivery branch above would have written "Delivered — 2545
+            # Squadron Ct", parking the can at the yard as if the yard were a
+            # customer. Whatever the can is eventually dropped at moves it on.
+            elif eff and act.strip() == "yard" and not _eff_old:
+                # force follows the evidence, as everywhere else here: a
+                # completed load is the driver saying he hooked it, which beats
+                # a bulk deploy; an open one is only the boss's plan.
+                ins, ch = _fleet_upsert(
+                    conn, company_id, eff, size, "loaded_at_yard",
+                    (f"Loaded at yard {rdate}" if done else f"Going out {rdate}"),
+                    force=bool(done))
                 pass
             tcan = tickets.get(d["id"])
             _tcan_old = bool(tcan and bulk_dates.get(tcan) and rdate and rdate < bulk_dates[tcan])
@@ -32259,7 +32327,16 @@ def route_daily_log(route_id):
         _giver = (takes_from or {}).get(_sid)
         _is_delivery = "delivery" in _act_lc
         _deliv_can = _effective_can(s) if _is_delivery else ""
-        if _giver and can_by_stop.get(_giver):
+        # 2026-11-14: a yard load hooks a can at the yard. It has no Box In
+        # (the truck arrived empty — the day had not started) and its Box Out
+        # is the can it takes out, so the NEXT stop's Box In is that can.
+        _is_yard_load = _act_lc.strip() == "yard"
+        _yard_can = _effective_can(s) if _is_yard_load else ""
+        if _is_yard_load:
+            # Nothing came in: the truck started the day empty at the yard.
+            box_in = ""
+            box_out = _yard_can or box_out
+        elif _giver and can_by_stop.get(_giver):
             box_in = can_by_stop.get(_giver)
         elif _deliv_can:
             # 2026-10-24: a Delivery drops the yard can it hooked — that can
@@ -33482,6 +33559,11 @@ Action codes:
   D  = drop (deliver an empty container)
   S  = swap (drop an empty, pull a full — one stop)
   R  = relocate (move a container on-site or between addresses)
+  YARD = work done AT the company's own yard, driven to by nobody because the driver
+         starts and ends the day there. Use it ONLY for loading a can onto the truck at
+         the yard before the route starts (see START OF DAY below). A dump leg, a
+         "return it to the yard" and a "take it back to the yard" are still legs of
+         another stop — they are NOT YARD stops.
 
 UNIVERSAL SYNONYMS (these mean the same across every roll-off company — map them
 to the action code, don't treat them as customer/site names):
@@ -33548,7 +33630,19 @@ YARD CANS (important): "deliver can 3117 to <addr>" / "drop can 3117 at <addr>" 
   Same rule for "start with can 3117 from the yard" / "grab can 3117 at the yard and deliver
   it to <addr>" / "go pick up container 3117 from the dump and deliver it to <addr>": the
   Delivery stop gets assigned_can "3117" — the can starts at the yard/dump and ends
-  deployed at the customer.
+  deployed at the customer. This needs a DESTINATION; see the next rule when there is none.
+
+START OF DAY — loading a can at the yard (important): "start with #30115 at the yard" /
+  "start with can 30115" / "take 3117 out of the yard" with NO destination named is NOT a
+  Delivery. The driver begins the day standing in the yard: nothing is driven to and nothing
+  is dropped off — a can is hooked onto the truck before the route starts. Emit action YARD,
+  address = the YARD address from KNOWN LOCATIONS & VOCABULARY below, assigned_can the can
+  number (digits only), notes "start of day — load can <n>". Never emit D for this: a can
+  cannot be delivered to the yard it already lives in.
+  If the SAME text does name where that can is going ("start with #30115 and drop it at 11496
+  Shiloh"), go back to the rule above instead — ONE D stop at the destination with
+  assigned_can "30115", and no YARD stop, because the yard is where the can is picked up,
+  not a stop of its own.
 
 PICKUP CANS: on a P or PR stop, a number right after the customer name ("Marlyn 3101")
   is that customer's container number — put "can 3101" in notes (digits only after
@@ -33562,7 +33656,7 @@ NAME TOLERANCE: dispatchers mistype names ("restorstion" for "Restoration"). Mat
   typo.
 
 For every stop extract:
-  action          one of PR, P, D, S, R
+  action          one of PR, P, D, S, R, YARD
   address         the primary street address (expand shorthand using KNOWN LOCATIONS below)
   customer        the business/customer name if stated, else ""
   container_size  e.g. "30yd", or null if not stated
@@ -33991,6 +34085,60 @@ def _ensure_end_of_day_return(raw_text, stops, company_id):
         return stops
 
 
+def _ensure_yard_not_delivery(stops, company_id):
+    """Deterministic guard (2026-11-14): a Delivery to the company's OWN yard
+    is not a Delivery. It becomes a YARD stop.
+
+    Reported from the cab: "Start with #30115 at the yard" came back as
+      D · 2545 Squadron Ct · "start of day — pick up can 30115 from yard".
+    The address was right — that IS the yard — but at 6am the driver is
+    standing in it. Nothing is driven to and nothing is delivered; a can is
+    being hooked onto the truck. The prompt now teaches this (see the START OF
+    DAY rule), but the prompt is advice and this is the invariant, so it is
+    enforced in code on both parse paths the way the end-of-day return above
+    is: you cannot deliver a can to your own yard. A can leaving the yard on
+    the truck is a load; a can arriving back is a return. Both are YARD, and
+    the notes keywords already decide which end of the day it belongs to.
+
+    Why it earns a guard rather than a prompt line alone: the wrong action was
+    the visible half. The expensive half was downstream — _sync_fleet_from_history
+    marks a completed Delivery's can 'deployed' AT THE STOP ADDRESS, so can
+    30115 would have read as sitting out at a job site called 2545 Squadron
+    Ct, missing from yard inventory and wrong on the Bin Tracker, every single
+    morning.
+
+    Only the action and (when the note names a can) assigned_can change. The
+    address is kept — the yard is genuinely where the driver is. Any other
+    action at the yard is left alone: a Pull from the yard is a real errand,
+    and so are a Swap and a Relocate. Never raises; on any doubt returns
+    stops unchanged."""
+    try:
+        if not isinstance(stops, list) or not stops:
+            return stops
+        conn = get_db()
+        try:
+            for s in stops:
+                if not isinstance(s, dict):
+                    continue
+                if (s.get("action") or "").strip().upper() != "D":
+                    continue
+                if not _is_company_yard_address(conn, company_id, s.get("address")):
+                    continue
+                s["action"] = "YARD"
+                # Structure the can the note already names, so the fleet can
+                # follow it without re-reading prose later.
+                if not (s.get("assigned_can") or "").strip():
+                    _c = (_can_from_notes(s.get("notes") or "")
+                          or _can_from_notes(s.get("raw") or ""))
+                    if _c:
+                        s["assigned_can"] = _c
+        finally:
+            conn.close()
+        return stops
+    except Exception:
+        return stops
+
+
 # =========================================================
 # PARSER CORRECTION LEARNING (2026-10-24)
 # The loop the boss asked for: what he fixes in the confirm sheet
@@ -34243,6 +34391,10 @@ def api_parse_dispatch():
         # path so the batch still ends with the Delivery the synth needs.
         mapped = _ensure_end_of_day_return(text, mapped, cid())
         mapped = _apply_parse_lessons(mapped, cid())
+        # Last, after the lessons: you cannot deliver a can to your own yard,
+        # and that is a fact about the world rather than a preference a
+        # lesson is allowed to overturn.
+        mapped = _ensure_yard_not_delivery(mapped, cid())
         _pid = _store_parse_session(cid(), text, manual_stops + mapped)
         if mapped:
             return jsonify({
@@ -34269,6 +34421,7 @@ def api_parse_dispatch():
     # no matter what the model did (prompt-only guidance proved insufficient).
     ai_stops = _ensure_end_of_day_return(text, ai_stops, cid())
     ai_stops = _apply_parse_lessons(ai_stops, cid())
+    ai_stops = _ensure_yard_not_delivery(ai_stops, cid())
     _pid = _store_parse_session(cid(), text, manual_stops + ai_stops)
 
     return jsonify({"parse_id": _pid, "stops": manual_stops + ai_stops})
@@ -37601,6 +37754,52 @@ _CITY_TAIL_TOKENS = sorted(
     {_normalize_addr(_full) for _full, _st in _CITY_CODES.values()}
     | {_normalize_addr(_v) for _v in _ADDR_CITY_MAP.values()},
     key=lambda s: -len(s.split()))
+
+
+def _is_company_yard_address(conn, company_id, address):
+    """True when `address` is this company's OWN yard.
+
+    2026-11-14. Asked by address alone, deliberately: a start-of-day yard
+    stop usually arrives with an EMPTY customer field ("Start with #30115 at
+    the yard" names no customer), so the name-keyed _lookup_site_kind cannot
+    answer it. Both places a yard can be recorded are consulted — the
+    companies.yard_address set in Yard Setup, and any address-book row whose
+    kind is 'yard' — because a company that has only ever used one of the two
+    must still be understood.
+
+    Matching goes through _street_key, so "2545 Squadron Ct", "2545 squadron
+    court" and "2545 Squadron Ct, VB" are one place while 2547 Squadron Ct
+    stays a different one. Never raises; False on any doubt, which leaves the
+    caller's behavior exactly as it was before this function existed.
+    """
+    try:
+        key = _street_key(address or "")
+        if not key:
+            return False
+        keys = set()
+        try:
+            co = conn.execute(
+                "SELECT yard_address, yard_city FROM companies WHERE id=?",
+                (company_id,)).fetchone()
+            if co and (co["yard_address"] or "").strip():
+                keys.add(_street_key(co["yard_address"]))
+        except Exception:
+            pass
+        try:
+            for r in conn.execute(
+                    "SELECT address, full_address FROM saved_addresses "
+                    "WHERE company_id=? AND LOWER(COALESCE(kind,''))='yard'",
+                    (company_id,)).fetchall():
+                for _a in (r["address"], r["full_address"]):
+                    _k = _street_key(_a or "")
+                    if _k:
+                        keys.add(_k)
+        except Exception:
+            pass
+        keys.discard("")
+        return key in keys
+    except Exception:
+        return False
 
 
 def _group_key(customer, site):
@@ -45281,6 +45480,7 @@ def add_parsed_stops(route_id):
     ).fetchone()["m"] or 0
 
     added = 0
+    _added_ids = []
     for stop in stops:
         if not isinstance(stop, dict):
             continue
@@ -45320,6 +45520,7 @@ def add_parsed_stops(route_id):
                   return_destination, pr_mode, notes,
                   swap_flag, now_ts()))
             added += 1
+            _added_ids.append(_cur.lastrowid)
             _link_stop_sites(conn, cid(), _cur.lastrowid, dump_location, return_destination)
             # 2026-10-23: Yard Inventory Awareness — save the assigned yard can.
             _acan = (stop.get("assigned_can") or "").strip()[:20]
@@ -45338,6 +45539,10 @@ def add_parsed_stops(route_id):
     if added:
         conn.commit()
         try:
+            # Same pass as the other two insert paths, so a yard load added
+            # here is in the same place as one added anywhere else.
+            _pin_yard_start_first(conn, route_id, only_ids=set(_added_ids))
+            conn.commit()
             compute_can_flow(conn, route_id)
             # Resolve can-swap chains over the route's FINAL order (one resolver,
             # all paths). Blocking errors are flashed on the next page load.
@@ -45577,8 +45782,13 @@ def _validate_parser_stops(stops_in):
             # 2026-10-23: Yard Inventory Awareness — the specific yard can.
             # 2026-10-24: notes-derived — 'Can 3117' in notes fills this in
             # when the picker was not used, so a Delivery still tracks.
+            # 2026-11-14: a YARD stop reads its can out of the note too. Without
+            # this, "start of day — load can 30115" inserted with a blank
+            # assigned_can and the fleet never learned what went out on the
+            # truck — the same gap that lost the lot number in #133.
             "assigned_can": ((str(s.get("assigned_can") or "").strip()[:20])
-                              or (_can_from_notes(_notes) if "delivery" in _PARSER_ACTION_MAP[action_code].lower() else "")),
+                              or (_can_from_notes(_notes)
+                                  if action_code in ("D", "YARD") else "")),
             # A confirm-sheet [change] -> delivery pick: the POSITION (0-based) of the
             # D stop this stop's chain delivers its final empty to. Translated to a
             # real stop id after insert (positions are all we have pre-insert).
@@ -46229,6 +46439,11 @@ def api_dispatch():
             "appended": appended_to_existing,
             "notices": [],
         })
+    # Before the can flow and the chain resolver, which both read the SAVED
+    # order: a start-of-day yard load belongs at the front of the day wherever
+    # in the paste it was written.
+    _pin_yard_start_first(conn, route_id, only_ids=set(_new_ids))
+    conn.commit()
     try:
         compute_can_flow(conn, route_id)
     except Exception as exc:
@@ -46439,6 +46654,11 @@ def api_insert_stops(route_id):
             "notices": [],
             "midday_edits": (_rewrite["changes"] + _rewrite["notes"]) if _rewrite else [],
         })
+    # Same pass as /api/dispatch: a yard load typed AFTER the day was built
+    # appended to the bottom, which is the case the cab reported — five stops
+    # done, then go back for the can you should have left with.
+    _pin_yard_start_first(conn, route_id, only_ids={i for i, _ in new_stops})
+    conn.commit()
     try:
         compute_can_flow(conn, route_id)
     except Exception as exc:
@@ -51177,6 +51397,82 @@ def _insert_vendor_stop(conn, route_id, after_working_index, vendor_name, addres
     for pos, sid in enumerate(locked + working, start=1):
         conn.execute("UPDATE stops SET stop_order=? WHERE id=?", (pos, sid))
     return new_id
+
+
+def _is_yard_start_stop(action, notes):
+    """True for a YARD stop that is a START-of-day load rather than an
+    end-of-day drop-off.
+
+    Both ends of the day are YARD stops (you cannot deliver to your own yard,
+    see _ensure_yard_not_delivery), so the note is what tells them apart. The
+    end-of-day wording is the narrower, better-defined set — "end of day",
+    "return to yard", "back to yard" — so it is the one tested for, and
+    everything else is a load. That bias is deliberate: a yard stop is
+    overwhelmingly the morning hook-up, and pinning one to the front is
+    cheap to undo by dragging while a start-of-day load stranded at the
+    bottom of the board sends the driver back across town for it."""
+    if (action or "").strip().lower() != "yard":
+        return False
+    low = (notes or "").lower()
+    return not any(kw in low for kw in _EOD_KEYWORDS_SET)
+
+
+def _pin_yard_start_first(conn, route_id, only_ids=None):
+    """Move a start-of-day yard load to the front of the running route.
+
+    2026-11-14, asked for from the cab: "If I put in start with container at
+    the yard AFTER putting in some routes, the parser or route board should
+    recognize what is going on and put that on the first one." Adding a stop
+    appends it, so a yard load typed once the day was already built landed
+    dead last — the driver would finish five stops and then be told to go get
+    the can he was supposed to leave with.
+
+    Run as a pass over the saved order rather than inside either insert
+    algorithm, so every path that can create one — the AI parse, Build by
+    hand, Add Stop mid-route — gets the same answer, and running it twice
+    changes nothing.
+
+    What stays put: completed stops, and a stop the driver has STARTED. Same
+    rule as _reprioritize_for_vendor and for the same reason — he may already
+    be boxed out somewhere, and the yard is not more urgent than the can under
+    his feet. A merely pending first stop IS moved down: nothing has begun, so
+    the morning still belongs to the yard.
+
+    `only_ids` scopes the move to stops just inserted, and every caller in the
+    insert paths passes it. A mid-day swing back to the yard for a second can
+    is a real errand the boss placed on purpose, and without this scope the
+    next Add Stop would drag it back to breakfast — a yard stop would be
+    unable to stay anywhere but first. Pass None to consider every stop.
+    Returns the number of stops moved.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT id, action, notes, status, driver_status FROM stops"
+            " WHERE route_id=? AND COALESCE(cancelled_at,'')=''"
+            " ORDER BY stop_order ASC, id ASC", (route_id,)).fetchall()
+        if not rows:
+            return 0
+        _started = ("arrived", "box_out", "going_to_dump", "need_box_in")
+        locked, yard_starts, others = [], [], []
+        for r in rows:
+            if r["status"] == "completed" or (_row_get(r, "driver_status") or "") in _started:
+                locked.append(r["id"])
+            elif (_is_yard_start_stop(_row_get(r, "action"), _row_get(r, "notes"))
+                  and (only_ids is None or r["id"] in only_ids)):
+                yard_starts.append(r["id"])
+            else:
+                others.append(r["id"])
+        if not yard_starts:
+            return 0
+        order = locked + yard_starts + others
+        if order == [r["id"] for r in rows]:
+            return 0                      # already in place — write nothing
+        for pos, sid in enumerate(order, start=1):
+            conn.execute("UPDATE stops SET stop_order=? WHERE id=?", (pos, sid))
+        return len(yard_starts)
+    except Exception as exc:
+        app.logger.warning("_pin_yard_start_first: %s", exc)
+        return 0
 
 
 def _reprioritize_for_vendor(conn, route_id, vendor_stop_id):
