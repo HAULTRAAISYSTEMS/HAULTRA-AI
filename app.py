@@ -17936,6 +17936,20 @@ def _build_route_board_html(user, day=None):
     _cancel_select = ("r.cancelled_at AS route_cancelled_at, s.cancelled_at AS stop_cancelled_at,"
                       if (_has_rc and _has_sc) else "NULL AS route_cancelled_at, NULL AS stop_cancelled_at,")
 
+    # 2026-11-14: same self-healing shape, for the yard load. can_state_before
+    # and swap_with_prev_pull are stamped at dispatch, so a day dispatched
+    # before the yard fix shipped kept the old stamp — the lane read
+    # "returning empty" at a customer whose empty the driver had already set
+    # down, and the truck pill went blank while he was carrying a can. Costs
+    # one SELECT per route and writes only when a route is actually stale.
+    try:
+        for _hr in conn.execute(
+                "SELECT id FROM routes WHERE company_id=? AND route_date=?",
+                (company_id, day)).fetchall():
+            _heal_yard_can_flow(conn, _hr["id"])
+    except Exception:
+        pass
+
     params = [company_id, day]
     sql = f"""
         SELECT r.id AS route_id, r.route_name, r.assigned_to,
@@ -20418,6 +20432,11 @@ def driver_route_detail(route_id):
         conn.close()
         flash("Route not found.", "error")
         return redirect(url_for("driver_dashboard"))
+
+    # 2026-11-14: a route dispatched before the yard fix shipped kept the old
+    # stamp, so the cab ran the non-swap PR flow at a customer whose empty the
+    # driver had already set down. Heal before the stops are read.
+    _heal_yard_can_flow(conn, route_id)
 
     stops = conn.execute("""
         SELECT *
@@ -27580,6 +27599,22 @@ def _route_final_bin_detail(conn, route_id):
                     if _tc:
                         prev = _tc
                         prev_size = size
+            elif act == "yard":
+                # 2026-11-14: the yard, the mirror of a Delivery. A morning
+                # LOAD puts its can on the truck — without this branch a yard
+                # stop fell to the else below, found no dump ticket, and set
+                # the carried bin to '' — so the truck pill went blank the
+                # moment the driver finished loading, and the next stop had
+                # nothing to carry in. An end-of-day drop-off really does
+                # leave the truck empty.
+                if _is_yard_start_stop(act, sd.get("notes")):
+                    _ycan = _effective_can(sd)
+                    if _ycan:
+                        prev = _ycan
+                        prev_size = size
+                else:
+                    prev = ""
+                    prev_size = ""
             elif is_delivery:
                 prev = ""
                 prev_size = ""
@@ -32262,6 +32297,10 @@ def route_daily_log(route_id):
     conn = get_db()
     # 2026-10-21: self-healing truck_id (stale boss session may predate deploy).
     _ensure_routes_truck_id(conn)
+    # 2026-11-14: same idea for a route whose yard load was stamped before the
+    # yard fix shipped — the log would show the empty going back to the
+    # customer the driver had already set one down at.
+    _heal_yard_can_flow(conn, route_id)
     route = conn.execute(
         """SELECT r.*, u.username AS driver_name, u.full_name AS driver_full,
                   t.name AS truck_name
@@ -51528,6 +51567,48 @@ def _pin_yard_start_first(conn, route_id, only_ids=None):
     except Exception as exc:
         app.logger.warning("_pin_yard_start_first: %s", exc)
         return 0
+
+
+def _heal_yard_can_flow(conn, route_id):
+    """Recompute can-flow for a route whose yard load was stamped by old code.
+
+    2026-11-14, reported mid-route. can_state_before and swap_with_prev_pull
+    are STAMPED at dispatch, not derived at read time, so a route dispatched
+    before the yard fix shipped carried the old stamp all day: the board read
+    "#3143 - returning empty" at a customer whose empty the driver had already
+    set down, and the cab kept offering "Return Bin - Place Empty Bin" on a
+    stop that was finished. Rendering fixes reached that route the moment it
+    deployed; stamped ones could not.
+
+    So the stamp is healed where it is read. The same self-healing shape as
+    _ensure_routes_truck_id, for the same reason it exists — a boss or driver
+    whose work predates a deploy should not have to re-dispatch the day.
+
+    Only fires when the route HAS a yard load and the stop after it was not
+    stamped as carrying a can, which is exactly the pre-fix signature, so an
+    already-correct route costs one SELECT and writes nothing. Returns True
+    when it recomputed. Never raises; the caller's page renders either way.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT id, action, notes, can_state_before FROM stops"
+            " WHERE route_id=? AND COALESCE(cancelled_at,'')=''"
+            " ORDER BY stop_order ASC, id ASC", (route_id,)).fetchall()
+        _yard_at = None
+        for _i, r in enumerate(rows):
+            if _is_yard_start_stop(_row_get(r, "action"), _row_get(r, "notes")):
+                _yard_at = _i
+                break
+        if _yard_at is None or _yard_at + 1 >= len(rows):
+            return False
+        if (_row_get(rows[_yard_at + 1], "can_state_before") or "") == "empty_can":
+            return False                      # already knows; nothing to do
+        compute_can_flow(conn, route_id)
+        conn.commit()
+        return True
+    except Exception as exc:
+        app.logger.warning("_heal_yard_can_flow: %s", exc)
+        return False
 
 
 def _reprioritize_for_vendor(conn, route_id, vendor_stop_id):
