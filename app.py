@@ -25881,8 +25881,17 @@ def _log_ticket_cell(ticket_no, ticket_photo, ticket_id, notes, material, has_ti
                      f'style="color:#FF9D5C;font-size:12px;">{sc_label}{sc_amt} \U0001F4F7</a>')
         else:
             cell += f'<br><span style="color:#FF9D5C;font-size:12px;">{sc_label}{sc_amt}</span>'
-    if notes:
-        cell += f"<br><small>{e(notes)}</small>"
+    # 2026-11-14: strip can-swap TRIGGER PHRASES before printing. "start from
+    # yard", "swap till end" and friends are written into the note by
+    # chain_resolver.hint_to_note so the resolver can read them back; its own
+    # strip_chain_phrases exists so they are "never shown to a user as raw
+    # text". The cab card already stripped them, the log did not — so the
+    # printed sheet carried "start from yard" in the TICKET column of a stop
+    # that has nothing to do with the yard. The driver's own words survive;
+    # only the machine phrase goes.
+    _note_txt = chain_resolver.strip_chain_phrases(notes or "")
+    if _note_txt:
+        cell += f"<br><small>{e(_note_txt)}</small>"
     return cell
 
 
@@ -32382,6 +32391,9 @@ def route_daily_log(route_id):
     # Box Out = the bin at this job site. The driver only enters the bin
     # number at the dump when doing the ticket — never at the pull.
     _prev_box_out = ""
+    # True once the walk has passed a stop that is not finished: from there on
+    # the carried bin is a prediction, not a record, so Box In is left blank.
+    _past_open = False
     # 2026-10-21: start time for a stop = finish time of the PREVIOUS stop
     # (the driver rolls straight from one job to the next).
     _prev_finish = ""
@@ -32418,6 +32430,10 @@ def route_daily_log(route_id):
         # is the can it takes out, so the NEXT stop's Box In is that can.
         _is_yard_load = _act_lc.strip() == "yard"
         _yard_can = _effective_can(s) if _is_yard_load else ""
+        # True only when Box In was DERIVED by walking the carry chain, rather
+        # than read off this stop's own record or an explicit chain FK. Only a
+        # walked value becomes a guess once the walk passes an unfinished stop.
+        _box_in_carried = False
         if _is_yard_load:
             # Nothing came in: the truck started the day empty at the yard.
             box_in = ""
@@ -32441,11 +32457,27 @@ def route_daily_log(route_id):
             # Show them separately; the pulled bin is now on the truck.
             if box_out and _prev_box_out and _prev_box_out != box_out:
                 box_in = _prev_box_out
+                _box_in_carried = True
+            elif box_out:
+                box_in = box_out
             else:
-                box_in = box_out if box_out else _prev_box_out
+                box_in = _prev_box_out
+                _box_in_carried = True
         else:
             # Pull or PR swap: Box In = bin carried on truck (prev Box Out)
             box_in = _prev_box_out
+            _box_in_carried = True
+        # 2026-11-14: Box In is a FACT for the stop the driver is working and a
+        # GUESS for every stop past it — what he carries into stop 5 depends on
+        # what happens at 3 and 4. The chain propagated the carried bin through
+        # all of them, so a log printed mid-route showed "3143" as Box In on
+        # every remaining row, as if the rest of the day were already decided.
+        # Past the first unfinished stop the honest answer is a dash — but only
+        # for a WALKED value. A chain leg's Box In comes from its giver's FK and
+        # a Delivery's from its own assigned can; those are facts the schedule
+        # already records, so they stand whatever is unfinished ahead of them.
+        if _past_open and _box_in_carried:
+            box_in = ""
         # Carry forward: PR (non-swap) returns the bin, so truck leaves empty
         # for the next stop. Pull/PR-swap carries the (now empty) bin forward.
         # 2026-10-23: incomplete stop — truck still has the incoming bin.
@@ -32466,6 +32498,9 @@ def route_daily_log(route_id):
                 _prev_box_out = "" if box_out else _prev_box_out
         else:
             _prev_box_out = box_out
+        # Everything after an unfinished stop is a guess (see Box In above).
+        if s["status"] != "completed":
+            _past_open = True
         # 2026-10-26: a chain's final empty never rides on to later stops —
         # it goes back to the head (or yard / delivery site). Once the tail
         # is processed, the truck is empty again, so later stops must not
