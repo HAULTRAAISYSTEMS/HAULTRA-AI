@@ -207,7 +207,13 @@ ok(cl.get("/driver/route/%d" % rid).status_code == 200, "cab view renders")
 as_driver()
 html = cl.get("/driver/route/%d" % rid).data.decode()
 ok('id="cab-cancel-btn"' in html, "cab view exposes the cancel control")
-ok("Can&#39;t run this" in html or "Can't run this" in html, "cancel control is labelled for the cab")
+# 2026-11-14: relabelled "Can't run this" -> "Cancel" at the driver's request.
+# The old wording was doing two jobs: drivers reached for it when they simply
+# could not DUMP, which cancelled a job they had actually completed. Now that
+# "Couldn't dump — landfill closed" exists (test_cant_dump.py), this control
+# can mean only what it says.
+ok(">Cancel<" in html, "cancel control is labelled for the cab")
+ok("run this" not in html, "and the old wording that drivers misused is gone")
 ok("cab-interrupt" in html, "cab view carries the realtime interrupt overlay")
 ok("BOSS_SAID_CANCEL" in html, "'Boss said cancel it' is an offered reason")
 ok("/route/%d/cancel" % rid in html, "whole-route cancel is reachable from the cab")

@@ -200,6 +200,15 @@ ALLOW = {
     # Garbage routes (Toter / Hand Pickup / Landfill) never carry roll-off cans,
     # so there's no can-swap chain to resolve:
     "garbage_templates_dispatch",
+    # A catch-up dump: the landfill shut, the can came home full, and this
+    # stop exists only to go dump it. It is an errand at the dump, not a
+    # roll-off job at a customer, so it can never be a leg of a can-swap
+    # chain — the same reasoning as _insert_vendor_stop above. Its note is
+    # machine-written, and the one piece of user text in it (the customer
+    # name it came from) is passed through strip_chain_phrases first, so the
+    # note cannot carry a trigger phrase either way. The dispatch path that
+    # calls it resolves the route's chains afterwards regardless. (2026-11-14)
+    "_add_catchup_dumps",
 }
 missing = []
 for f in funcs:
