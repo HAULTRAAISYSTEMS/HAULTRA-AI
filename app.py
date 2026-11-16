@@ -33805,6 +33805,17 @@ MULTI-LEG STOPS (important): a single job can have up to three legs but is still
   end-of-day marker. A plain "return it to <yard>" with no end-of-day marker stays a
   return_leg, and "return it to the yard to end the day" (no named place) also stays a
   return_leg — the yard is where the truck ends up, not a delivery stop.
+  EXCEPTION 2 — the DRIVER heads to the yard (2026-11-16): "dump dominion and head to
+  yard once returned" / "then head back to the yard" / "go to the yard when you're done"
+  is NOT a return_leg. Watch the verb. "RETURN it / TAKE it / BRING it back to the yard"
+  moves the CAN, so that is a return_leg. "HEAD to / GO to / DRIVE back to the yard"
+  moves the TRUCK, so the can is not going anywhere near the yard. "once returned" /
+  "when returned" / "after it's returned" settles it outright: the can has ALREADY gone
+  back to the customer, and only then does the driver head in. For these emit the PR with
+  NO return_leg — a PR returns the same can to the customer by default, which is the
+  whole point of the second R — and put the instruction in notes with "end of day".
+  Getting this wrong sends the customer's container to the yard and leaves the job site
+  with nothing.
 
 NEW STOP vs LEG (important): "and then <action> <place>" starts a NEW stop, not a leg.
   A dump leg hauls to a KNOWN DUMP SITE ("dump dominion"); a return leg says "return it to
@@ -34291,6 +34302,92 @@ def _ensure_end_of_day_return(raw_text, stops, company_id):
         return stops
 
 
+# 2026-11-16 — "...dump dominion and head to yard once returned".
+#
+# Two sentences that both end at the yard but move different things:
+#     "return it to the yard"       -> the CAN goes to the yard  (return_leg)
+#     "head to yard once returned"  -> the TRUCK goes there      (end of day)
+#
+# The verb is the whole difference. return/take/bring/drop/leave take the can
+# as their object; head/go/drive/roll/run/back take the driver as their
+# subject. "once returned" seals it — the return has ALREADY happened, to the
+# customer, before the driver heads anywhere.
+_YARD_DRIVER_MOVE_RE = re.compile(
+    r"(?i)\b(?:head(?:ing|ed)?|go(?:ing)?|come|drive|driving|roll(?:ing)?|run(?:ning)?)"
+    r"\s+(?:on\s+)?(?:back\s+|straight\s+|right\s+)?(?:to|in\s+to|into)\s+"
+    r"(?:the\s+)?yard\b")
+# "back to the yard once returned" with no verb at all in front of "back".
+_YARD_AFTER_RETURN_RE = re.compile(
+    r"(?i)\bback\s+to\s+(?:the\s+)?yard\b[^.]{0,40}?\bonce\s+(?:it'?s\s+)?return")
+# The can-movement verbs. If one of these governs the yard, the CAN is going
+# there and nothing below may touch it.
+_YARD_CAN_MOVE_RE = re.compile(
+    r"(?i)\b(?:return|returns|returning|take|takes|taking|took|bring|brings|bringing|"
+    r"drop|drops|dropping|leave|leaves|leaving|put|puts|putting)\b"
+    r"(?:\s+\w+){0,4}?\s+(?:to|at|in|back\s+to|back\s+at)\s+(?:the\s+)?yard\b")
+
+
+def _is_driver_move_to_yard(text):
+    """True when the text sends the TRUCK to the yard rather than the can.
+
+    Used to stop "head to yard once returned" being read as a return leg,
+    which would send the customer's own container to the yard and leave the
+    job site empty. A can-movement phrase anywhere in the text wins, so
+    "return it to the yard" is never mistaken for driver movement even if the
+    sentence also says the driver heads there.
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _YARD_CAN_MOVE_RE.search(t):
+        return False
+    return bool(_YARD_DRIVER_MOVE_RE.search(t) or _YARD_AFTER_RETURN_RE.search(t))
+
+
+def _ensure_head_to_yard_not_return(stops, company_id):
+    """Deterministic guard (2026-11-16): "head to yard once returned" is where
+    the DRIVER goes, not where the can goes.
+
+    Reported from the cab. "Pr 520 kings borough sq, velocity 30yd dump
+    dominion and head to yard once returned" parsed with return_leg set to the
+    yard. A PR returns the SAME can to the customer it was pulled from — that
+    is what the second R means — so a yard return leg quietly turns the job
+    into a pull and leaves Velocity with no container, showing on the board as
+    a clean green stop.
+
+    Only a return leg pointing at the company's OWN yard is suspect, and only
+    when the text moves the driver rather than the can. A return leg to a
+    customer address is never touched. The instruction is not thrown away: it
+    moves into the notes marked end of day, which is what heading to the yard
+    after the last return actually is, and which the optimizer already knows
+    how to pin last.
+
+    Never raises; on any doubt the stops come back untouched."""
+    try:
+        if not isinstance(stops, list) or not stops:
+            return stops
+        conn = get_db()
+        try:
+            for s in stops:
+                if not isinstance(s, dict):
+                    continue
+                _ret = (s.get("return_leg") or "").strip()
+                if not _ret or not _is_company_yard_address(conn, company_id, _ret):
+                    continue
+                _text = " ".join([str(s.get("raw") or ""), str(s.get("notes") or "")])
+                if not _is_driver_move_to_yard(_text):
+                    continue
+                s["return_leg"] = ""
+                _n = (s.get("notes") or "").strip()
+                if "end of day" not in _n.lower():
+                    s["notes"] = (_n + " — " if _n else "") + "head to the yard, end of day"
+        finally:
+            conn.close()
+        return stops
+    except Exception:
+        return stops
+
+
 def _ensure_yard_not_delivery(stops, company_id):
     """Deterministic guard (2026-11-14): a Delivery to the company's OWN yard
     is not a Delivery. It becomes a YARD stop.
@@ -34601,6 +34698,8 @@ def api_parse_dispatch():
         # and that is a fact about the world rather than a preference a
         # lesson is allowed to overturn.
         mapped = _ensure_yard_not_delivery(mapped, cid())
+        # Nor does "head to yard once returned" send the customer's can there.
+        mapped = _ensure_head_to_yard_not_return(mapped, cid())
         _pid = _store_parse_session(cid(), text, manual_stops + mapped)
         if mapped:
             return jsonify({
@@ -34628,6 +34727,7 @@ def api_parse_dispatch():
     ai_stops = _ensure_end_of_day_return(text, ai_stops, cid())
     ai_stops = _apply_parse_lessons(ai_stops, cid())
     ai_stops = _ensure_yard_not_delivery(ai_stops, cid())
+    ai_stops = _ensure_head_to_yard_not_return(ai_stops, cid())
     _pid = _store_parse_session(cid(), text, manual_stops + ai_stops)
 
     return jsonify({"parse_id": _pid, "stops": manual_stops + ai_stops})
