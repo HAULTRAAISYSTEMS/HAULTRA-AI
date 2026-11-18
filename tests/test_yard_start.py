@@ -32,10 +32,12 @@ def ok(c, m):
         raise SystemExit("FAILED: " + m)
 
 # 2026-11-17: fixture dates are derived from today, never written literally.
-# A driver may hold only one route per date, and this file also needs a route
-# dated TODAY for the cab. Hard-coded dates meant that on one particular day
-# of the year the two collided and the suite failed with nothing in the app
-# changed.
+# They used to be hard-coded literal dates in November 2026 while the cab
+# tests needed a route dated TODAY. A driver may hold only one route per date,
+# so the day the calendar reached one of those literals the two collided: the
+# "today" dispatch landed on an existing route instead of a new one and the
+# can flow assertions failed — on a Tuesday, with nothing in the app changed.
+# _day(n) is always n days ahead, so no fixture can ever be today.
 import datetime as _dt
 _TODAY = app.now_ts()[:10]
 def _day(n):
