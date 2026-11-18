@@ -31,6 +31,16 @@ def ok(c, m):
     if not c:
         raise SystemExit("FAILED: " + m)
 
+# 2026-11-17: fixture dates are derived from today, never written literally.
+# A driver may hold only one route per date, and this file also needs a route
+# dated TODAY for the cab. Hard-coded dates meant that on one particular day
+# of the year the two collided and the suite failed with nothing in the app
+# changed.
+import datetime as _dt
+_TODAY = app.now_ts()[:10]
+def _day(n):
+    return (_dt.date.fromisoformat(_TODAY) + _dt.timedelta(days=n)).isoformat()
+
 app.init_db()
 conn = app.get_db(); cur = conn.cursor(); ts = app.now_ts()
 cur.execute("""INSERT INTO companies (name,slug,subscription_plan,subscription_status,max_drivers,
@@ -125,7 +135,7 @@ ok("start of day" in prompt.lower(),
 
 # ── 4. it survives the insert ──────────────────────────────────────────────
 as_boss()
-r = cl.post("/api/dispatch", json={"driver_id": drv, "route_date": "2026-11-14", "stops": [
+r = cl.post("/api/dispatch", json={"driver_id": drv, "route_date": _day(1), "stops": [
     {"action": "YARD", "address": "2545 Squadron Ct, Virginia Beach", "customer": "",
      "container_size": "30yd", "notes": "start of day — load can 30115"},
     {"action": "D", "address": "11496 Shiloh Dr, Virginia Beach", "customer": "Ashdon",
@@ -184,14 +194,14 @@ ok(not app._is_yard_start_stop("Delivery", "start of day"),
 # putting in some routes the parser or route board should recognize what is
 # going on an put that on the first one."  It was landing LAST.
 as_boss()
-r = cl.post("/api/dispatch", json={"driver_id": drv, "route_date": "2026-11-15", "stops": [
+r = cl.post("/api/dispatch", json={"driver_id": drv, "route_date": _day(2), "stops": [
     {"action": "P",  "address": "401 Clearfield Ave, Chesapeake",    "customer": "Balicore", "container_size": "30yd"},
     {"action": "PR", "address": "529 Whispering Oaks Cir, Chesapeake", "customer": "Oaks",   "container_size": "30yd"},
 ]}, headers=HJ)
 ok(r.status_code == 200, "two ordinary stops dispatch first — status %s" % r.status_code)
 c = app.get_db()
 rid2 = c.execute("SELECT id FROM routes WHERE company_id=? AND route_date=?",
-                 (co, "2026-11-15")).fetchone()["id"]
+                 (co, _day(2))).fetchone()["id"]
 c.close()
 
 # ...and NOW the boss adds the yard load, the way he actually did it.
@@ -257,14 +267,14 @@ c.close()
 # He may be boxed out somewhere. The yard is not more urgent than the can
 # under his feet — same rule _reprioritize_for_vendor follows.
 as_boss()
-r = cl.post("/api/dispatch", json={"driver_id": drv, "route_date": "2026-11-16", "stops": [
+r = cl.post("/api/dispatch", json={"driver_id": drv, "route_date": _day(3), "stops": [
     {"action": "P", "address": "401 Clearfield Ave, Chesapeake", "customer": "Balicore", "container_size": "30yd"},
     {"action": "P", "address": "1994 Tiger Dr, Virginia Beach",  "customer": "Tiger",    "container_size": "30yd"},
 ]}, headers=HJ)
 ok(r.status_code == 200, "a third route dispatches — status %s" % r.status_code)
 c = app.get_db()
 rid3 = c.execute("SELECT id FROM routes WHERE company_id=? AND route_date=?",
-                 (co, "2026-11-16")).fetchone()["id"]
+                 (co, _day(3))).fetchone()["id"]
 _first_id = c.execute("SELECT id FROM stops WHERE route_id=? ORDER BY stop_order LIMIT 1",
                       (rid3,)).fetchone()["id"]
 # The driver is physically at it — boxed out, can on the hook.
@@ -306,7 +316,7 @@ _cur.execute("INSERT INTO users (username,password_hash,role,full_name,company_i
 drv2 = _cur.lastrowid
 c2.commit(); c2.close(); c.close()
 
-_today = app.now_ts()[:10]
+_today = _TODAY
 as_boss()
 r = cl.post("/api/dispatch", json={"driver_id": drv2, "route_date": _today, "stops": [
     {"action": "YARD", "address": "2545 Squadron Ct, Virginia Beach", "customer": "The yard",
@@ -373,7 +383,7 @@ drv3 = _c2.lastrowid
 _cur2.commit(); _cur2.close()
 
 as_boss()
-r = cl.post("/api/dispatch", json={"driver_id": drv3, "route_date": "2026-11-17", "stops": [
+r = cl.post("/api/dispatch", json={"driver_id": drv3, "route_date": _day(4), "stops": [
     {"action": "YARD", "address": "2545 Squadron Ct, Virginia Beach", "customer": "The yard",
      "container_size": "30yd", "notes": "Start with #30115 container at yard"},
     {"action": "PR", "address": "401 Clearfield Ave, Chesapeake", "customer": "Balicore",
@@ -382,7 +392,7 @@ r = cl.post("/api/dispatch", json={"driver_id": drv3, "route_date": "2026-11-17"
 ok(r.status_code == 200, "yard load + PR dispatches — status %s" % r.status_code)
 c = app.get_db()
 rid5 = c.execute("SELECT id FROM routes WHERE company_id=? AND route_date=?",
-                 (co, "2026-11-17")).fetchone()["id"]
+                 (co, _day(4))).fetchone()["id"]
 _fl = [dict(x) for x in c.execute(
     "SELECT action, can_state_before, swap_with_prev_pull FROM stops"
     " WHERE route_id=? ORDER BY stop_order, id", (rid5,)).fetchall()]
@@ -408,7 +418,7 @@ c.close()
 # yard load is a courier run, not a swap feed. Swapping it off at an
 # intervening PR would hand the wrong customer's can to the delivery.
 as_boss()
-r = cl.post("/api/dispatch", json={"driver_id": drv3, "route_date": "2026-11-18", "stops": [
+r = cl.post("/api/dispatch", json={"driver_id": drv3, "route_date": _day(5), "stops": [
     {"action": "YARD", "address": "2545 Squadron Ct, Virginia Beach", "customer": "The yard",
      "container_size": "30yd", "notes": "Start with #30115 container at yard"},
     {"action": "PR", "address": "401 Clearfield Ave, Chesapeake", "customer": "Balicore",
@@ -419,7 +429,7 @@ r = cl.post("/api/dispatch", json={"driver_id": drv3, "route_date": "2026-11-18"
 ok(r.status_code == 200, "yard load + PR + a Delivery of that same can — status %s" % r.status_code)
 c = app.get_db()
 rid6 = c.execute("SELECT id FROM routes WHERE company_id=? AND route_date=?",
-                 (co, "2026-11-18")).fetchone()["id"]
+                 (co, _day(5))).fetchone()["id"]
 _fl6 = [dict(x) for x in c.execute(
     "SELECT action, can_state_before, swap_with_prev_pull FROM stops"
     " WHERE route_id=? ORDER BY stop_order, id", (rid6,)).fetchall()]
@@ -476,7 +486,7 @@ ok("Remove Old Container" in _h4,
 # flow — "Return Bin — Place Empty Bin" at a customer whose empty he had
 # already set down. Rendering fixes reached that route; stamped ones did not.
 as_boss()
-r = cl.post("/api/dispatch", json={"driver_id": drv3, "route_date": "2026-11-19", "stops": [
+r = cl.post("/api/dispatch", json={"driver_id": drv3, "route_date": _day(6), "stops": [
     {"action": "YARD", "address": "2545 Squadron Ct, Virginia Beach", "customer": "The yard",
      "container_size": "30yd", "notes": "Start with #30115 container at yard"},
     {"action": "PR", "address": "401 Clearfield Ave, Chesapeake", "customer": "Balicore",
@@ -487,7 +497,7 @@ r = cl.post("/api/dispatch", json={"driver_id": drv3, "route_date": "2026-11-19"
 ok(r.status_code == 200, "a three-stop yard route dispatches — status %s" % r.status_code)
 c = app.get_db()
 rid8 = c.execute("SELECT id FROM routes WHERE company_id=? AND route_date=?",
-                 (co, "2026-11-19")).fetchone()["id"]
+                 (co, _day(6))).fetchone()["id"]
 # Put it back the way the OLD code left it: nothing knew about the yard load.
 c.execute("""UPDATE stops SET can_state_before='no_can', swap_with_prev_pull=0
              WHERE route_id=? AND action='Pickup and Return'""", (rid8,))
@@ -586,7 +596,7 @@ ok("30115" in _cell3,
 # The chain carried _prev_box_out through every pending stop, so 3143 was
 # printed as Box In on all three remaining rows as if the day were decided.
 as_boss()
-r = cl.post("/api/dispatch", json={"driver_id": drv3, "route_date": "2026-11-20", "stops": [
+r = cl.post("/api/dispatch", json={"driver_id": drv3, "route_date": _day(7), "stops": [
     {"action": "YARD", "address": "2545 Squadron Ct, Virginia Beach", "customer": "The yard",
      "container_size": "30yd", "notes": "Start with #30115 container at yard"},
     {"action": "PR", "address": "401 Clearfield Ave, Chesapeake", "customer": "Balicore",
@@ -601,7 +611,7 @@ r = cl.post("/api/dispatch", json={"driver_id": drv3, "route_date": "2026-11-20"
 ok(r.status_code == 200, "the five-stop day dispatches — status %s" % r.status_code)
 c = app.get_db()
 rid9 = c.execute("SELECT id FROM routes WHERE company_id=? AND route_date=?",
-                 (co, "2026-11-20")).fetchone()["id"]
+                 (co, _day(7))).fetchone()["id"]
 _ids9 = [dict(x)["id"] for x in c.execute(
     "SELECT id FROM stops WHERE route_id=? ORDER BY stop_order, id", (rid9,)).fetchall()]
 # Exactly where he was: yard done, Clearfield done with its 3143 ticket,
