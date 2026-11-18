@@ -34014,6 +34014,20 @@ MULTI-LEG STOPS (important): a single job can have up to three legs but is still
   Text like "pull the 30yd at <addr>, dump <site>, then return it to <yard>" is ONE stop:
   action PR, address <addr>, dump_leg "<site>", return_leg "<yard>". Never split the dump
   or return into their own stops.
+  A return leg is NOT only "return it to…". The boss states the empty's destination in
+  whatever verb he likes, and these are all the SAME third leg (2026-11-18):
+      "after dumping take the container to dominion landfill"
+      "leave the can at dominion after you dump"
+      "drop the box at branscome when it's empty"
+      "dump at branscome then stage it at dominion"
+  All of them put the emptied container somewhere that is NEITHER the customer NOR the
+  yard — a very common roll-off move, since cans get staged where tomorrow's work is.
+  Emit them as return_leg "<site>" on the SAME stop, never as a new stop, and keep the
+  rest of the sentence in notes. This holds for a plain Pull too, not just a PR: a Pull
+  with a return_leg means haul it, empty it, and leave the can at that site.
+  Watch the object, which is what separates this from the yard rule below: take/leave/
+  drop/bring THE CONTAINER moves the can, so it is a return_leg. "Head to the yard"
+  with no container named moves the truck, so it is not.
   EXCEPTION — end-of-day return to a NAMED place (Alix pattern, 2026-10-24): "then
   return <place> to end the day" / "return <place> at end of day", where <place> is a
   street address, site, or customer name (e.g. "central dr"), is NOT a return_leg. Emit
@@ -34606,6 +34620,131 @@ def _ensure_head_to_yard_not_return(stops, company_id):
         return stops
 
 
+# 2026-11-18 — "concrete. After dumping take the container to dominion landfill".
+#
+# The boss writes where the EMPTY ends up, and it is neither the customer nor
+# the yard: he stages the can at another site. The cab has had a RETURN leg
+# that handles exactly this since it was built — its own comment notes it fires
+# "when the stop simply has no dump leg", i.e. on a plain Pull — but nothing
+# ever read the instruction out of the sentence, so it sat in the notes as
+# prose and the driver got no leg and no Navigate.
+#
+# Deliberately the MIRROR of _is_driver_move_to_yard, which teaches that "head
+# to the yard" moves the truck. Here take/leave/drop/bring + "the container"
+# moves the CAN, and that is a destination. The two rules must not overlap:
+# this one needs a can word, that one needs a travel verb with no can word.
+_DROP_CAN_AT_RE = re.compile(
+    r"(?i)\b(?:take|takes|taking|leave|leaves|leaving|drop|drops|dropping|"
+    r"bring|brings|bringing|park|parks|parking|stage|stages|staging)\s+"
+    r"(?:it\s+|the\s+|that\s+|this\s+)?"
+    r"(?:empty\s+|dumped\s+)?"
+    r"(?:container|can|box|bin|dumpster|roll\s*-?\s*off)?\s*"
+    r"(?:\#?\s*[0-9]{2,6}[a-z]?\s*)?"
+    # "@" because that is how it gets written in a moving truck — the paper
+    # route log this came from reads "leave @ dom after dumping it".
+    r"(?:to|at|@|over\s+to|back\s+to)\s*"
+    r"(?:the\s+)?(?P<dest>[a-z0-9][a-z0-9 '&.\-]{1,40}?)"
+    r"\s*(?:landfill|dump|site|yard\s+site)?\s*(?:[.,;)\n]|$)")
+
+
+def _known_site_names(conn, company_id):
+    """Every place this company can send a container, lowest-name-keyed.
+
+    Both tables, because they are both real: dump_locations is the legacy dump
+    list the parser already offers as dump_leg targets, and saved_addresses is
+    the address book the nav layer resolves from.
+    """
+    out = {}
+    try:
+        for r in conn.execute(
+                "SELECT name FROM dump_locations WHERE company_id=? AND active=1",
+                (company_id,)).fetchall():
+            nm = (r["name"] or "").strip()
+            if nm:
+                out.setdefault(nm.lower(), nm)
+    except Exception:
+        pass
+    try:
+        for r in conn.execute(
+                "SELECT customer_name FROM saved_addresses WHERE company_id=?"
+                " AND COALESCE(hidden,0)=0 AND TRIM(COALESCE(customer_name,''))<>''",
+                (company_id,)).fetchall():
+            nm = (r["customer_name"] or "").strip()
+            if nm:
+                out.setdefault(nm.lower(), nm)
+    except Exception:
+        pass
+    return out
+
+
+def _find_drop_destination(text, known):
+    """The site a 'take the container to X' instruction names, or ''.
+
+    Resolved against the company's OWN sites rather than trusted as free text:
+    a destination the app cannot navigate to is worse than none, because it
+    renders a leg with a dead Navigate button. Falls back to a prefix match so
+    "dominion landfill" finds "Dominion".
+    """
+    if not text or not known:
+        return ""
+    for m in _DROP_CAN_AT_RE.finditer(text):
+        dest = (m.group("dest") or "").strip(" .,;-").lower()
+        if not dest:
+            continue
+        if dest in known:
+            return known[dest]
+        for k, orig in known.items():
+            if dest.startswith(k) or k.startswith(dest):
+                if len(k) >= 4:
+                    return orig
+    return ""
+
+
+def _ensure_drop_can_at_site(stops, company_id):
+    """Deterministic guard (2026-11-18): "after dumping take the container to
+    <site>" sets the RETURN leg to <site>.
+
+    Reported from the cab with the instruction sitting in the stop's notes:
+    "concrete. After dumping take the container to dominion landfill". The can
+    comes off a customer, gets emptied at the concrete yard, and is then staged
+    at a different site — so the driver needs a third leg with its own
+    Navigate, and the fleet needs to know where the can actually ended up.
+
+    Only fills an EMPTY return leg, and only with a site the company already
+    knows, so it can never overwrite what the boss stated explicitly nor invent
+    a destination the Navigate button cannot reach. Never raises."""
+    try:
+        if not isinstance(stops, list) or not stops:
+            return stops
+        conn = get_db()
+        try:
+            known = _known_site_names(conn, company_id)
+            if not known:
+                return stops
+            for s in stops:
+                if not isinstance(s, dict):
+                    continue
+                if (s.get("return_leg") or "").strip():
+                    continue                      # the boss already said
+                _text = " ".join([str(s.get("notes") or ""), str(s.get("raw") or "")])
+                if not _text.strip():
+                    continue
+                dest = _find_drop_destination(_text, known)
+                if not dest:
+                    continue
+                # Never fight the yard rule: "head to the yard once returned"
+                # moves the truck, and that case must stay return-leg-free.
+                if _is_driver_move_to_yard(_text) and _is_company_yard_address(
+                        conn, company_id, dest):
+                    continue
+                s["return_leg"] = dest
+        finally:
+            conn.close()
+        return stops
+    except Exception:
+        return stops
+
+
 def _ensure_yard_not_delivery(stops, company_id):
     """Deterministic guard (2026-11-14): a Delivery to the company's OWN yard
     is not a Delivery. It becomes a YARD stop.
@@ -34918,6 +35057,9 @@ def api_parse_dispatch():
         mapped = _ensure_yard_not_delivery(mapped, cid())
         # Nor does "head to yard once returned" send the customer's can there.
         mapped = _ensure_head_to_yard_not_return(mapped, cid())
+        # After the yard rule, so a "head to the yard" stop has already had its
+        # return leg cleared and this cannot put one back.
+        mapped = _ensure_drop_can_at_site(mapped, cid())
         _pid = _store_parse_session(cid(), text, manual_stops + mapped)
         if mapped:
             return jsonify({
@@ -34946,6 +35088,7 @@ def api_parse_dispatch():
     ai_stops = _apply_parse_lessons(ai_stops, cid())
     ai_stops = _ensure_yard_not_delivery(ai_stops, cid())
     ai_stops = _ensure_head_to_yard_not_return(ai_stops, cid())
+    ai_stops = _ensure_drop_can_at_site(ai_stops, cid())
     _pid = _store_parse_session(cid(), text, manual_stops + ai_stops)
 
     return jsonify({"parse_id": _pid, "stops": manual_stops + ai_stops})
