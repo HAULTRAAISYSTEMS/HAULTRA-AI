@@ -5193,6 +5193,18 @@ def init_db():
     # Only meaningful for kind='dump' rows; harmless on others.
     _add_column_if_missing(conn, "saved_addresses", "issues_tickets",
                            "issues_tickets INTEGER NOT NULL DEFAULT 1")
+    # 2026-11-18 — how this site charges. tons x rate is the wrong MODEL for
+    # some sites, not a missing number: clean concrete and fill are feedstock
+    # to a recycler, who crushes them into saleable base rock, so those yards
+    # charge a flat per-load fee or nothing at all and never put a truck on a
+    # scale. Billing a tonless dump at tons x rate silently produces $0.
+    #   per_ton (default) — today's behaviour, unchanged for every site
+    #   flat             — disposal_flat_cents per load, no weight needed
+    #   free             — no disposal charge, nothing flagged
+    _add_column_if_missing(conn, "saved_addresses", "disposal_mode",
+                           "disposal_mode TEXT NOT NULL DEFAULT 'per_ton'")
+    _add_column_if_missing(conn, "saved_addresses", "disposal_flat_cents",
+                           "disposal_flat_cents INTEGER NOT NULL DEFAULT 0")
     # Any pre-existing row with a NULL/blank kind is a legacy customer entry.
     try:
         conn.execute(
@@ -31489,6 +31501,82 @@ def _site_issues_tickets(conn, company_id, stop):
     return True, False
 
 
+@app.route("/api/dump-site/<int:site_id>/terms", methods=["POST"])
+@login_required
+def set_dump_site_terms(site_id):
+    """Set how a dump site charges, from wherever the driver notices (2026-11-18).
+
+    Deliberately reachable by a DRIVER, not just the boss. He is the one
+    standing at the scale house, and he is the only one who knows whether a
+    yard weighed him. Asking him to remember it for the office that evening
+    means it is never recorded, and every load at that site keeps billing $0.
+
+    Scoped to the caller's own company and to kind='dump' rows, so this can
+    only ever retune a dump site's pricing — not a customer's.
+    """
+    data = request.get_json(silent=True) or {}
+    mode = str(data.get("mode") or "").strip().lower()
+    if mode not in ("per_ton", "flat", "free"):
+        return jsonify({"ok": False, "error": "unknown pricing mode"}), 400
+    try:
+        flat = max(0, int(data.get("flat_cents") or 0))
+    except (TypeError, ValueError):
+        flat = 0
+    if mode != "flat":
+        flat = 0
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id FROM saved_addresses WHERE id=? AND company_id=?"
+        " AND LOWER(COALESCE(kind,''))='dump'", (site_id, cid())).fetchone()
+    if row is None:
+        conn.close()
+        return jsonify({"ok": False, "error": "dump site not found"}), 404
+    conn.execute(
+        "UPDATE saved_addresses SET disposal_mode=?, disposal_flat_cents=? WHERE id=?",
+        (mode, flat, site_id))
+    # A site that charges a flat fee or nothing has no scale to issue a
+    # weigh ticket from, so stop demanding one in the same breath.
+    if mode in ("flat", "free"):
+        conn.execute("UPDATE saved_addresses SET issues_tickets=0 WHERE id=?", (site_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "mode": mode, "flat_cents": flat})
+
+
+def _site_disposal_terms(conn, company_id, stop):
+    """(disposal_mode, flat_cents, saved_address_id) for this stop's dump site.
+
+    2026-11-18. Some sites charge by weight and some do not, and that is a
+    difference of MODEL rather than a missing number. Clean concrete, asphalt
+    and fill are feedstock to a recycler — they crush them into saleable base
+    rock — so those yards take a flat per-load fee or nothing, and never put a
+    truck on a scale. Billing such a dump at tons x rate quietly yields $0.
+
+    Falls back to 'per_ton' for an unlinked or unknown site, which is exactly
+    today's behaviour, so no existing company's invoices move until someone
+    deliberately marks a site otherwise.
+    """
+    try:
+        sid = dict(stop).get("dump_site_id")
+        if not sid:
+            return "per_ton", 0, None
+        row = conn.execute(
+            "SELECT id, disposal_mode, disposal_flat_cents FROM saved_addresses"
+            " WHERE id=? AND company_id=?", (sid, company_id)).fetchone()
+        if row is None:
+            return "per_ton", 0, None
+        mode = (_row_get(row, "disposal_mode") or "per_ton").strip().lower()
+        if mode not in ("per_ton", "flat", "free"):
+            mode = "per_ton"
+        try:
+            flat = int(_row_get(row, "disposal_flat_cents") or 0)
+        except (TypeError, ValueError):
+            flat = 0
+        return mode, max(0, flat), row["id"]
+    except Exception:
+        return "per_ton", 0, None
+
+
 def _gen_internal_dump_ref(conn, company_id, user_id):
     """Auto reference for a dump site that issues no ticket:
     HT-YYYYMMDD-{driver initials}-{seq}. seq is the company's internal-ticket
@@ -31608,7 +31696,13 @@ def dump_ticket(stop_id):
             _is_chained = bool((dict(stop).get("chain_group_id") or "").strip())
             if _issues_tickets and not _is_chained:
                 if not _has_ticket and not _has_photo:
-                    msg = "This dump site issues tickets — enter the ticket number or add a photo of it to complete."
+                    # 2026-11-18: name the way out. This site is only marked as
+                    # issuing tickets because that is the fail-safe default, and
+                    # the driver standing at a yard with no scale house had no
+                    # idea that was a setting he could correct in one tap.
+                    msg = ("This dump site is set to issue tickets — enter the number, "
+                           "or add a photo. If it has no scale, tap “Flat fee per "
+                           "load” or “Free to dump” above and save again.")
                     if request.headers.get("X-Requested-With") == "fetch":
                         conn.close()
                         return jsonify({"ok": False, "error": msg}), 400
@@ -31617,16 +31711,14 @@ def dump_ticket(stop_id):
                     return redirect(url_for("dump_ticket", stop_id=stop_id))
                 _ticket_source = "site"
             else:
-                # Site issues no ticket: the photo IS the record. Require it.
-                # (Chained stops exempt — driver keeps moving through the chain.)
-                if not _has_photo and not _is_chained:
-                    msg = "This dump site issues no ticket — add a photo of the dump so there's a verifiable record."
-                    if request.headers.get("X-Requested-With") == "fetch":
-                        conn.close()
-                        return jsonify({"ok": False, "error": msg}), 400
-                    conn.close()
-                    flash(msg, "error")
-                    return redirect(url_for("dump_ticket", stop_id=stop_id))
+                # Site issues no ticket. The photo USED to be mandatory here as
+                # the stand-in record. 2026-11-18, at the driver's call: the
+                # can number, the arrival and departure times and the internal
+                # HT- reference are the record, and they are the things he
+                # actually has at a yard where he pulls in, dumps and leaves.
+                # Demanding a photo of an empty concrete pad to prove a dump
+                # bought little and cost a stop's worth of fumbling. A photo is
+                # still welcome and still attaches; it is simply not a gate.
                 if not _has_ticket:
                     ticket_number = _gen_internal_dump_ref(conn, cid(), session["user_id"])
                     _ticket_source = "internal"
@@ -31822,6 +31914,14 @@ def dump_ticket(stop_id):
         if _dl:
             default_site = _dl["name"]
 
+    # 2026-11-18: the form has to know the site's own policy, because the
+    # browser was enforcing a stricter rule than the server it posts to —
+    # demanding net tons and a ticket number from every site, including ones
+    # that have neither a scale nor a ticket book. The driver's only way past
+    # it was "Skip", which is the wrong word for recording a real dump.
+    _dt_issues_tickets, _dt_site_linked = _site_issues_tickets(conn, cid(), stop)
+    _dt_mode, _dt_flat_cents, _dt_site_id = _site_disposal_terms(conn, cid(), stop)
+
     conn.close()
 
     csrf_tok = get_csrf_token()
@@ -31830,6 +31930,38 @@ def dump_ticket(stop_id):
         if ticket and ticket[field] is not None:
             return e(str(ticket[field]))
         return ""
+
+    # 2026-11-18 — set the site's terms HERE, standing at the scale house.
+    # This is the one moment the driver knows for certain whether a site
+    # weighs him and what it charges. Making him remember to go and edit a
+    # saved address that evening means it never gets done, and every dump at
+    # that site keeps billing $0 until somebody reconciles a month.
+    # Only shown when the stop is linked to a real site record to write to,
+    # and only when something is actually off — a weight-priced site that
+    # produced no weight.
+    _dt_terms_needed = (_dt_site_id is not None and _dt_mode == "per_ton"
+                        and not (ticket and (ticket["net_tons"] or 0)))
+    _dt_site_terms_html = ""
+    if _dt_terms_needed:
+        _dt_site_terms_html = f"""
+        <div style="margin:16px 0;padding:14px;border:1px solid rgba(255,255,255,0.12);
+                    border-radius:12px;background:rgba(255,255,255,0.02);">
+          <div style="font-size:13px;font-weight:700;margin-bottom:4px;">
+            &#9878;&#65039; No scale at {e(default_site or 'this site')}?</div>
+          <div class="muted" style="font-size:12px;margin-bottom:10px;">
+            Save without weight any time. But this site is priced <strong>per ton</strong>,
+            so with no weight its disposal bills $0. Set how it really charges &mdash;
+            once, for every future load.</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button type="button" class="btn secondary" style="flex:1;min-width:120px;min-height:44px;"
+                    onclick="dtSetTerms('flat')">Flat fee per load</button>
+            <button type="button" class="btn secondary" style="flex:1;min-width:120px;min-height:44px;"
+                    onclick="dtSetTerms('free')">Free to dump</button>
+          </div>
+          <div id="dt-terms-status" class="muted" style="font-size:12px;margin-top:8px;"></div>
+        </div>"""
+
+    _dt_terms_url = url_for("set_dump_site_terms", site_id=(_dt_site_id or 0))
 
     # Where the page navigates after a successful fetch()-based save (fallback
     # if the JSON response is missing a redirect for any reason).
@@ -31968,6 +32100,7 @@ def dump_ticket(stop_id):
                 <input name="surcharge_total" id="f-surcharge-total" type="number" min="0" step="0.01" inputmode="decimal" placeholder="Total $" style="font-size:15px;padding:10px;width:100%;">
                 <input type="hidden" name="surcharge_photo_path" id="f-surcharge-photo-path" value="">
             </div>
+            {_dt_site_terms_html}
             <div id="dt-error" role="alert" style="display:none;margin-bottom:12px;padding:12px 14px;
                  border-radius:10px;background:var(--red-dim);border:1px solid rgba(255,82,82,0.40);
                  color:var(--red);font-size:14px;font-weight:600;"></div>
@@ -32048,15 +32181,60 @@ def dump_ticket(stop_id):
         // Existing ticket photo on file (page load) → skip the attach step.
         var HAS_PHOTO = {('true' if (ticket and (ticket['photo_path'] or '').strip()) else 'false')};
         if (HAS_PHOTO) showPhotoSaved('Ticket photo on file.');
+        // A photo already on file, or one attached during this visit, both
+        // satisfy a ticket-issuing site in place of typing the number.
+        // Set this dump site's pricing from the cab, once, for good.
+        window.dtSetTerms = function(mode) {{
+            var cents = 0;
+            if (mode === 'flat') {{
+                var v = prompt('What does this site charge per load? ($)', '');
+                if (v === null) return;
+                var n = parseFloat(String(v).replace(/[^0-9.]/g, ''));
+                if (!(n >= 0)) {{ alert('Enter a dollar amount, like 75'); return; }}
+                cents = Math.round(n * 100);
+            }}
+            var st = document.getElementById('dt-terms-status');
+            if (st) st.textContent = 'Saving…';
+            fetch({_dt_terms_url!r}, {{
+                method: 'POST', credentials: 'same-origin',
+                headers: {{'Content-Type': 'application/json', 'X-CSRF-Token': {csrf_tok!r}}},
+                body: JSON.stringify({{mode: mode, flat_cents: cents}})
+            }}).then(function(r) {{ return r.json(); }}).then(function(j) {{
+                if (st) st.textContent = j.ok
+                    ? ('Saved — ' + (mode === 'free'
+                        ? 'this site is free to dump.'
+                        : 'this site bills a flat fee per load.'))
+                    : (j.error || 'Could not save.');
+            }}).catch(function() {{ if (st) st.textContent = 'Network error.'; }});
+        }};
+        function photoOnFile() {{
+            if (HAS_PHOTO) return true;
+            var f = document.getElementById('f-photo');
+            if (f && f.files && f.files.length) return true;
+            return !!(photoDone && photoDone.style.display === 'block');
+        }}
         var fallbackRedirect = {_fallback_redirect!r};
         var SAVE_TIMEOUT_MS = 20000;
         var COMPRESS_MAX_EDGE = 1200;
         var COMPRESS_TARGET   = 300 * 1024;   // ~300 KB
 
         // ── Inline validation ────────────────────────────────────────────
-        // Required: dump site, net tons, ticket number. Scale-in / scale-out
-        // are OPTIONAL — they only exist to auto-calculate net tons, so once
-        // net tons has a value (typed or calculated) they are never required.
+        // 2026-11-18. This used to demand dump site + net tons + ticket number
+        // from EVERY site. The server never required net tons at all, and it
+        // already knows which sites issue tickets — so the browser was the
+        // strictest thing in the stack, and stricter than the world. At a
+        // concrete yard with no scale and no ticket book the driver could not
+        // save what he plainly knew (can number, in, out) and had to hit
+        // "Skip", which threw the whole record away and is the wrong word for
+        // a dump that really happened.
+        //
+        // Now it mirrors the server:
+        //   dump site   — always required; nothing downstream works without it
+        //   net tons    — NEVER required. No scale, no tons. The site's
+        //                 disposal mode decides what that costs.
+        //   ticket no.  — required only where the site ISSUES tickets, and
+        //                 even then a photo of one satisfies it.
+        var SITE_ISSUES_TICKETS = {('true' if _dt_issues_tickets else 'false')};
         function clearInvalid() {{
             [document.getElementById('f-site'),
              document.getElementById('f-net'),
@@ -32069,11 +32247,9 @@ def dump_ticket(stop_id):
             var ticket = document.getElementById('f-ticket');
             if (site && !site.value.trim())
                 return {{ el: site, msg: 'Select a dump site before saving.' }};
-            if (net && !net.value.trim())
-                return {{ el: net,
-                    msg: 'Enter net tons (or fill scale-in and scale-out to auto-calculate it).' }};
-            if (ticket && !ticket.value.trim())
-                return {{ el: ticket, msg: 'Enter the landfill ticket number.' }};
+            if (SITE_ISSUES_TICKETS && ticket && !ticket.value.trim() && !photoOnFile())
+                return {{ el: ticket,
+                    msg: 'This site issues tickets — enter the number, or add a photo of it.' }};
             return null;
         }}
 
@@ -37895,11 +38071,15 @@ def _route_revenue_cents(conn, company_id, route_id, rate_card=None, tonnage_rat
         tonnage_rates = _get_tonnage_rates(conn, company_id)
     total = 0
     for s in conn.execute(
-            "SELECT action, container_size, weight_tons FROM stops WHERE route_id=? AND status='completed'",
+            "SELECT action, container_size, weight_tons, dump_site_id FROM stops"
+            " WHERE route_id=? AND status='completed'",
             (route_id,)).fetchall():
         total += _stop_revenue_cents(rate_card, s["action"], s["container_size"])
         total += _stop_overage_cents(tonnage_rates, s["action"], s["container_size"], s["weight_tons"])
-        total += _stop_disposal_cents(rate_card, s["action"], s["weight_tons"])
+        # Same per-site terms the invoice uses, or this estimate and the
+        # invoice disagree on every flat-rate site.
+        _m, _f, _ = _site_disposal_terms(conn, company_id, s)
+        total += _stop_disposal_cents(rate_card, s["action"], s["weight_tons"], _m, _f)
     return total
 
 
@@ -37991,8 +38171,18 @@ def _stop_overage_cents(tonnage_rates, action, size, tons):
         return 0
 
 
-def _stop_disposal_cents(rate_card, action, tons):
-    """Disposal charge for one pull/swap stop: recorded tons × disposal $/ton.
+def _stop_disposal_cents(rate_card, action, tons, site_mode="per_ton", site_flat_cents=0):
+    """Disposal charge for one pull/swap stop.
+
+    per_ton (default) — recorded tons × disposal $/ton, exactly as before.
+    flat              — this site charges per LOAD, so weight is irrelevant.
+    free              — this site charges nothing.
+
+    2026-11-18: the mode exists because tons × rate is the wrong MODEL at some
+    sites, not a missing number. A recycler taking clean concrete crushes it
+    into saleable base rock, so it charges a flat per-load fee or nothing and
+    never weighs the truck. Without a mode those dumps silently billed $0 and
+    the shortfall only showed up when the month was closed.
 
     The disposal rate is 0/off by default (disposal bundled in the pull
     price). Delivery stops never dispose. Never raises.
@@ -38000,6 +38190,11 @@ def _stop_disposal_cents(rate_card, action, tons):
     try:
         if _classify_service(action) not in ("pull", "swap"):
             return 0
+        mode = (site_mode or "per_ton").strip().lower()
+        if mode == "free":
+            return 0
+        if mode == "flat":
+            return max(0, int(site_flat_cents or 0))
         tons = float(tons or 0)
         rate = int(rate_card.get(("disposal", "*"), 0) or 0)
         if tons <= 0 or rate <= 0:
@@ -38318,7 +38513,8 @@ def _build_invoice_lines_for_route(conn, company_id, route_id, group=None):
         _surcharge_markup = _get_surcharge_markup_cents(conn, company_id)
         stops = conn.execute(
             """SELECT id, action, container_size, weight_tons, address,
-                      customer_name, dump_deferred_at, dump_deferred_can
+                      customer_name, dump_deferred_at, dump_deferred_can,
+                      dump_site_id
                FROM stops WHERE route_id=? AND status='completed'
                ORDER BY stop_order, id""", (route_id,)).fetchall()
         billed = _invoiced_stop_ids(conn, company_id)
@@ -38352,13 +38548,30 @@ def _build_invoice_lines_for_route(conn, company_id, route_id, group=None):
                 lines.append({"kind": "overage", "description": desc, "qty": 1,
                               "unit_cents": over, "amount_cents": over,
                               "stop_id": sd["id"]})
-            disp = _stop_disposal_cents(rate_card, action, sd.get("weight_tons"))
+            _dmode, _dflat, _ = _site_disposal_terms(conn, company_id, sd)
+            disp = _stop_disposal_cents(rate_card, action, sd.get("weight_tons"),
+                                        _dmode, _dflat)
             if disp > 0:
-                tons = float(sd.get("weight_tons") or 0)
-                drate = int(rate_card.get(("disposal", "*"), 0) or 0)
-                desc = (f"Disposal — {_fmt_tons(tons)} at {_fmt_money(drate)}/ton")
+                if _dmode == "flat":
+                    desc = "Disposal — flat per load"
+                else:
+                    tons = float(sd.get("weight_tons") or 0)
+                    drate = int(rate_card.get(("disposal", "*"), 0) or 0)
+                    desc = (f"Disposal — {_fmt_tons(tons)} at {_fmt_money(drate)}/ton")
                 lines.append({"kind": "disposal", "description": desc, "qty": 1,
                               "unit_cents": disp, "amount_cents": disp,
+                              "stop_id": sd["id"]})
+            elif (_dmode == "per_ton" and not float(sd.get("weight_tons") or 0)
+                  and int(rate_card.get(("disposal", "*"), 0) or 0) > 0
+                  and not (sd.get("dump_deferred_at") or "")):
+                # Charged by weight, but no weight was ever recorded. Either
+                # the site has no scale — in which case its mode is wrong — or
+                # the tons simply never got entered. Both bill $0 in silence,
+                # so say it on the sheet rather than discover it at month end.
+                lines.append({"kind": "note",
+                              "description": "Disposal — no weight recorded for this dump. "
+                                             "Set the site to flat or free if it has no scale.",
+                              "qty": 1, "unit_cents": 0, "amount_cents": 0,
                               "stop_id": sd["id"]})
             # 2026-11-14: the landfill shut and the can came home full, so this
             # job has no ticket and no tons YET. The haul above still bills, but
