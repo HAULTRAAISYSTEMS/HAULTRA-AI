@@ -18029,6 +18029,7 @@ def _build_route_board_html(user, day=None):
                 "SELECT id FROM routes WHERE company_id=? AND route_date=?",
                 (company_id, day)).fetchall():
             _heal_yard_can_flow(conn, _hr["id"])
+            _heal_drop_can_destination(conn, _hr["id"])
     except Exception:
         pass
 
@@ -20544,6 +20545,11 @@ def driver_route_detail(route_id):
     # stamp, so the cab ran the non-swap PR flow at a customer whose empty the
     # driver had already set down. Heal before the stops are read.
     _heal_yard_can_flow(conn, route_id)
+    # 2026-11-18, same shape and same reason: a drop-off leg the parser only
+    # learned to read after this stop was already created. Without it the
+    # driver opens a stop whose note plainly says where the can goes and still
+    # gets no leg for it.
+    _heal_drop_can_destination(conn, route_id)
 
     stops = conn.execute("""
         SELECT *
@@ -32605,6 +32611,7 @@ def route_daily_log(route_id):
     # yard fix shipped — the log would show the empty going back to the
     # customer the driver had already set one down at.
     _heal_yard_can_flow(conn, route_id)
+    _heal_drop_can_destination(conn, route_id)
     route = conn.execute(
         """SELECT r.*, u.username AS driver_name, u.full_name AS driver_full,
                   t.name AS truck_name
@@ -52278,6 +52285,61 @@ def _add_catchup_dumps(conn, company_id, route_id):
         return added
     except Exception as exc:
         app.logger.warning("_add_catchup_dumps: %s", exc)
+        return 0
+
+
+def _heal_drop_can_destination(conn, route_id):
+    """Fill in a drop-off leg the parser only learned to read later.
+
+    2026-11-18, reported from the cab: a stop whose note says "After dumping
+    take the container to dominion landfill" drew only two legs, because
+    return_destination is STAMPED when a stop is created and the stop predated
+    the rule that reads that sentence (_ensure_drop_can_at_site). Teaching the
+    parser helps tomorrow's routes; today's driver is already carrying the can.
+
+    The same trap as the address book ("nothing changed") and the yard can
+    flow, whose heal sits directly below this one — a stamped field is not
+    improved by a smarter parser unless something goes back for it.
+
+    Only fills an EMPTY destination, and only from a site the company already
+    knows, so it can neither overwrite the boss nor invent a leg whose
+    Navigate button goes nowhere. Returns how many stops it healed; writes
+    nothing when there is nothing to heal, because this runs on page loads.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT id, notes, return_destination FROM stops"
+            " WHERE route_id=? AND COALESCE(cancelled_at,'')=''"
+            "   AND TRIM(COALESCE(return_destination,''))=''"
+            "   AND TRIM(COALESCE(notes,''))<>''", (route_id,)).fetchall()
+        if not rows:
+            return 0
+        company_id = conn.execute(
+            "SELECT company_id FROM routes WHERE id=?", (route_id,)).fetchone()
+        if not company_id:
+            return 0
+        company_id = company_id["company_id"]
+        known = _known_site_names(conn, company_id)
+        if not known:
+            return 0
+        healed = 0
+        for r in rows:
+            dest = _find_drop_destination(_row_get(r, "notes") or "", known)
+            if not dest:
+                continue
+            # Never undo the yard rule: "head to the yard once returned" moves
+            # the truck, and that stop must stay without a return leg.
+            if _is_driver_move_to_yard(_row_get(r, "notes") or "") and \
+                    _is_company_yard_address(conn, company_id, dest):
+                continue
+            conn.execute("UPDATE stops SET return_destination=? WHERE id=?",
+                         (dest, r["id"]))
+            healed += 1
+        if healed:
+            conn.commit()
+        return healed
+    except Exception as exc:
+        app.logger.warning("_heal_drop_can_destination: %s", exc)
         return 0
 
 
