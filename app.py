@@ -2045,7 +2045,7 @@ def _can_flow_valid(action_lower, can_state):
     return True  # PR (either mode), dump run, or unrecognised — no constraint
 
 
-def _next_can_state(action_lower, can_state, yard_loads=False):
+def _next_can_state(action_lower, can_state, yard_loads=False, leaves_can=False):
     """
     Simulate the truck can-state after completing a stop (including its dump run).
 
@@ -2066,6 +2066,9 @@ def _next_can_state(action_lower, can_state, yard_loads=False):
 
     Delivery:
       empty_can → drop off empty → no_can (truck is empty)
+
+    Any stop with a return destination (leaves_can=True):
+      the can is set down at that destination → no_can, whatever the type
     """
     is_pr = (
         "pickup and return" in action_lower
@@ -2083,6 +2086,18 @@ def _next_can_state(action_lower, can_state, yard_loads=False):
     # bottom, so the truck was modelled as empty all the way to Balicore.
     if action_lower.strip() == "yard":
         return "empty_can" if yard_loads else "no_can"
+
+    # 2026-11-18: the can was dropped somewhere and left there (the stop has a
+    # return_destination -- "after dumping take the container to dominion and
+    # leave it there"). That is the mirror image of a Delivery: whatever the
+    # stop type would normally do with the empty, it is not on the truck now.
+    # Reported from the cab: "It's still saying bin in for velocity but I'm
+    # just PR." It was, and he was right -- he had left the can at Dominion
+    # one stop earlier, but the walk carried a phantom empty forward and the
+    # next PR derived swap_with_prev_pull=1 off it, which is the wf_map whose
+    # box_out step is "Bin In - Place Empty Bin".
+    if leaves_can:
+        return "no_can"
 
     if is_delivery:
         return "no_can"   # left the can at the site; truck is empty
@@ -2378,7 +2393,7 @@ def compute_can_flow(conn, route_id, starts_with_can=False):
     Caller is responsible for conn.commit().
     """
     stops = conn.execute(
-        "SELECT id, action, pr_mode, notes, assigned_can FROM stops"
+        "SELECT id, action, pr_mode, notes, assigned_can, return_destination FROM stops"
         " WHERE route_id=? ORDER BY stop_order ASC, id ASC",
         (route_id,)
     ).fetchall()
@@ -2404,6 +2419,9 @@ def compute_can_flow(conn, route_id, starts_with_can=False):
         _yard_loads = (action_lower == "yard"
                        and _is_yard_start_stop(action_lower, _row_get(s, "notes"))
                        and (_row_get(s, "assigned_can") or "").strip() not in _claimed)
+        # 2026-11-18: this stop sets its can down somewhere and leaves it, so
+        # it is not swap stock for whatever comes next. See _next_can_state.
+        _leaves_can = bool((_row_get(s, "return_destination") or "").strip())
 
         # Is this a PR-type stop (Pickup and Return or Swap-only)?
         is_pr = (
@@ -2420,13 +2438,16 @@ def compute_can_flow(conn, route_id, starts_with_can=False):
                 "UPDATE stops SET can_state_before=?, swap_with_prev_pull=? WHERE id=?",
                 (effective_state, derived_swap, s["id"])
             )
-            can_state = _next_can_state(action_lower, effective_state)
+            can_state = _next_can_state(action_lower, effective_state,
+                                        leaves_can=_leaves_can)
         else:
             conn.execute(
                 "UPDATE stops SET can_state_before=? WHERE id=?",
                 (can_state, s["id"])
             )
-            can_state = _next_can_state(action_lower, can_state, yard_loads=_yard_loads)
+            can_state = _next_can_state(action_lower, can_state,
+                                        yard_loads=_yard_loads,
+                                        leaves_can=_leaves_can)
 
 
 # =============================================================
@@ -18030,6 +18051,7 @@ def _build_route_board_html(user, day=None):
                 (company_id, day)).fetchall():
             _heal_yard_can_flow(conn, _hr["id"])
             _heal_drop_can_destination(conn, _hr["id"])
+            _heal_can_flow_after_drop(conn, _hr["id"])
     except Exception:
         pass
 
@@ -20550,6 +20572,10 @@ def driver_route_detail(route_id):
     # driver opens a stop whose note plainly says where the can goes and still
     # gets no leg for it.
     _heal_drop_can_destination(conn, route_id)
+    # 2026-11-18: and the can flow stamped around that drop-off, which is what
+    # decides whether the next PR runs as a swap. Second, so it sees whatever
+    # the line above just wrote.
+    _heal_can_flow_after_drop(conn, route_id)
 
     stops = conn.execute("""
         SELECT *
@@ -32612,6 +32638,7 @@ def route_daily_log(route_id):
     # customer the driver had already set one down at.
     _heal_yard_can_flow(conn, route_id)
     _heal_drop_can_destination(conn, route_id)
+    _heal_can_flow_after_drop(conn, route_id)
     route = conn.execute(
         """SELECT r.*, u.username AS driver_name, u.full_name AS driver_full,
                   t.name AS truck_name
@@ -52382,6 +52409,50 @@ def _heal_yard_can_flow(conn, route_id):
         return True
     except Exception as exc:
         app.logger.warning("_heal_yard_can_flow: %s", exc)
+        return False
+
+
+def _heal_can_flow_after_drop(conn, route_id):
+    """Recompute can-flow for a route whose drop-off was stamped by old code.
+
+    2026-11-18, reported mid-route, one stop after the heal above:
+
+        SUSSEX  PULL -> DUMP Branscome -> RETURN Dominion
+        velocity  PICKUP AND RETURN -> [ Bin In - Place Empty Bin ]
+        "It's still saying bin in for velocity but I'm just PR"
+
+    He had left the can at Dominion, so he reached velocity with an empty
+    truck and there was no empty to set off. can_state_before and
+    swap_with_prev_pull are STAMPED at dispatch, so the walk fix cannot reach
+    a route already on the road -- the fourth time that has bitten, hence the
+    fourth heal of this exact shape (_ensure_routes_truck_id,
+    _heal_yard_can_flow, _heal_drop_can_destination, this).
+
+    It also closes _heal_drop_can_destination's own loop. That heal writes a
+    return destination onto a stop created before the parser could read one,
+    and the can flow stamped alongside that stop is now stale by construction.
+    Both run at the same three read points, this one second.
+
+    Fires only on the pre-fix signature -- a stop that leaves its can
+    somewhere, followed by a live stop still stamped as carrying one -- so a
+    correct route costs one SELECT and writes nothing. Returns True when it
+    recomputed. Never raises; the caller's page renders either way.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT id, return_destination, can_state_before FROM stops"
+            " WHERE route_id=? AND COALESCE(cancelled_at,'')=''"
+            " ORDER BY stop_order ASC, id ASC", (route_id,)).fetchall()
+        for _i, r in enumerate(rows[:-1]):
+            if not (_row_get(r, "return_destination") or "").strip():
+                continue
+            if (_row_get(rows[_i + 1], "can_state_before") or "") == "empty_can":
+                compute_can_flow(conn, route_id)
+                conn.commit()
+                return True
+        return False
+    except Exception as exc:
+        app.logger.warning("_heal_can_flow_after_drop: %s", exc)
         return False
 
 
