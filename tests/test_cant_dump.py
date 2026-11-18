@@ -41,6 +41,16 @@ def ok(c, m):
     if not c:
         raise SystemExit("FAILED: " + m)
 
+# 2026-11-17: fixture dates are derived from today, never written literally.
+# A driver may hold only one route per date, and this file also needs a route
+# dated TODAY for the cab. Hard-coded dates meant that on one particular day of
+# the year the two collided and the suite failed with nothing in the app
+# changed — which is exactly what happened to test_yard_start.
+import datetime as _dt
+_TODAY = app.now_ts()[:10]
+def _day(n):
+    return (_dt.date.fromisoformat(_TODAY) + _dt.timedelta(days=n)).isoformat()
+
 app.init_db()
 conn = app.get_db(); cur = conn.cursor(); ts = app.now_ts()
 cur.execute("""INSERT INTO companies (name,slug,subscription_plan,subscription_status,max_drivers,
@@ -86,7 +96,7 @@ c.close()
 
 # ── 2. the driver reports it ───────────────────────────────────────────────
 as_boss()
-r = cl.post("/api/dispatch", json={"driver_id": drv, "route_date": "2026-11-14", "stops": [
+r = cl.post("/api/dispatch", json={"driver_id": drv, "route_date": _day(1), "stops": [
     {"action": "PR", "address": "529 Whispering Oaks Cir, Chesapeake", "customer": "Craftsman",
      "container_size": "30yd", "dump_leg": "Dominion"},
     {"action": "D", "address": "11496 Shiloh Dr, Virginia Beach", "customer": "Ashdon",
@@ -191,14 +201,14 @@ ok(not any(l.get("kind") == "disposal" for l in _lines),
 
 # ── 4. it rolls onto the next route dispatched ─────────────────────────────
 as_boss()
-r = cl.post("/api/dispatch", json={"driver_id": drv, "route_date": "2026-11-15", "stops": [
+r = cl.post("/api/dispatch", json={"driver_id": drv, "route_date": _day(2), "stops": [
     {"action": "P", "address": "401 Clearfield Ave, Chesapeake", "customer": "Balicore",
      "container_size": "30yd"},
 ]}, headers=HJ)
 ok(r.status_code == 200, "the next day dispatches — status %s" % r.status_code)
 c = app.get_db()
 rid2 = c.execute("SELECT id FROM routes WHERE company_id=? AND route_date=?",
-                 (co, "2026-11-15")).fetchone()["id"]
+                 (co, _day(2))).fetchone()["id"]
 _catch = c.execute(
     "SELECT * FROM stops WHERE route_id=? AND deferred_for_stop_id IS NOT NULL",
     (rid2,)).fetchone()
@@ -215,7 +225,7 @@ c.close()
 
 # Dispatching again must not queue the same can twice.
 as_boss()
-r = cl.post("/api/dispatch", json={"driver_id": drv, "route_date": "2026-11-16", "stops": [
+r = cl.post("/api/dispatch", json={"driver_id": drv, "route_date": _day(3), "stops": [
     {"action": "P", "address": "1994 Tiger Dr, Virginia Beach", "customer": "Tiger",
      "container_size": "30yd"},
 ]}, headers=HJ)
@@ -261,7 +271,7 @@ ok(not any("Disposal pending" in (l.get("description") or "") for l in _lines2),
 
 # ── 6. the cab offers it, and only where it makes sense ───────────────────
 as_boss()
-_today = app.now_ts()[:10]
+_today = _TODAY
 r = cl.post("/api/dispatch", json={"driver_id": drv, "route_date": _today, "stops": [
     {"action": "PR", "address": "529 Whispering Oaks Cir, Chesapeake", "customer": "Craftsman",
      "container_size": "30yd", "dump_leg": "Dominion"},

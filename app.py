@@ -17838,6 +17838,15 @@ _STOP_DRAG_JS = """
         chosenClass: 'stop-mini-lift',
         ghostClass: 'stop-mini-ghost',
         dragClass: 'stop-mini-drag',
+        // 2026-11-17: the long-press cancel menu below shares this gesture.
+        // Sortable lifts at 450ms, that menu used to fire on its own 600ms
+        // timer, so holding a card to drag it popped "Cancel This Stop" over
+        // the lifted card 150ms later - before the finger had moved at all,
+        // which is exactly what waiting for the lift feels like. The lift now
+        // claims the gesture: once a card is chosen, this press can only be a
+        // drag.
+        onChoose: function() { window.__stopDragActive = true; },
+        onUnchoose: function() { window.__stopDragActive = false; },
         onMove: function(evt) {
           // never displace a locked stop
           if (evt.related && evt.related.classList && evt.related.classList.contains('locked')) return false;
@@ -17873,9 +17882,22 @@ _STOP_DRAG_JS = """
   document.addEventListener('DOMContentLoaded', window.initStopSort);
 
   // 2026-10-12: Long-press a stop card -> quick action menu (Cancel Stop).
+  // 2026-11-17: decided on RELEASE, not on a timer. Two long-presses were
+  // armed on the same card - Sortable lifts to drag at 450ms, this fired at
+  // 600ms - so holding a card to drag it popped the cancel menu over the
+  // lifted card. A timer cannot tell the two apart, because at 600ms a drag
+  // and a cancel look identical: finger down, not yet moved.
+  //
+  // Releasing tells them apart perfectly:
+  //     hold, then MOVE     -> drag        (Sortable owns it)
+  //     hold, then let go   -> cancel menu
+  //
+  // So the menu waits for touchend and only opens if the finger never moved
+  // and Sortable never claimed the card.
   (function() {
-    var pressTimer = null;
+    var pressAt = 0, pressCard = null, pressX = 0, pressY = 0, pressMoved = false;
     var LONG_PRESS_MS = 600;
+    var MOVE_SLOP = 14;   // matches Sortable's touchStartThreshold
     function showStopMenu(stopId, stopLabel) {
       var old = document.getElementById('stop-longpress-menu');
       if (old) old.remove();
@@ -17906,21 +17928,43 @@ _STOP_DRAG_JS = """
         }).catch(function() { alert('Could not cancel - try again'); });
       };
     }
-    function onPressStart(e) {
-      var card = e.target.closest('.stop-mini');
-      if (!card || card.dataset.locked === '1') return;
-      var sid = card.dataset.stopId;
-      pressTimer = setTimeout(function() {
-        var lblEl = card.querySelector('.stop-mini-addr');
-        var label = lblEl ? lblEl.textContent.trim().substring(0, 40) : 'Stop';
-        showStopMenu(sid, label);
-      }, LONG_PRESS_MS);
+    function pointOf(e) {
+      var t = (e.touches && e.touches[0]) || (e.changedTouches && e.changedTouches[0]) || e;
+      return { x: t.clientX || 0, y: t.clientY || 0 };
     }
-    function onPressEnd() { if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; } }
+    function onPressStart(e) {
+      var card = e.target.closest ? e.target.closest('.stop-mini') : null;
+      pressCard = null;
+      if (!card || card.dataset.locked === '1') return;
+      var p = pointOf(e);
+      pressCard = card; pressAt = Date.now();
+      pressX = p.x; pressY = p.y; pressMoved = false;
+    }
+    function onPressMove(e) {
+      if (!pressCard || pressMoved) return;
+      var p = pointOf(e);
+      if (Math.abs(p.x - pressX) > MOVE_SLOP || Math.abs(p.y - pressY) > MOVE_SLOP) {
+        pressMoved = true;          // this is a drag, not a menu
+      }
+    }
+    function onPressEnd() {
+      var card = pressCard;
+      pressCard = null;
+      if (!card) return;
+      // Sortable claimed it (lifted to drag), or the finger travelled: not a menu.
+      if (window.__stopDragActive || pressMoved) return;
+      if (Date.now() - pressAt < LONG_PRESS_MS) return;   // a tap opens the stop
+      var lblEl = card.querySelector('.stop-mini-addr');
+      var label = lblEl ? lblEl.textContent.trim().substring(0, 40) : 'Stop';
+      showStopMenu(card.dataset.stopId, label);
+    }
+    function onPressCancel() { pressCard = null; }
     document.addEventListener('touchstart', onPressStart, {passive: true});
+    document.addEventListener('touchmove', onPressMove, {passive: true});
     document.addEventListener('touchend', onPressEnd);
-    document.addEventListener('touchmove', onPressEnd);
+    document.addEventListener('touchcancel', onPressCancel);
     document.addEventListener('mousedown', onPressStart);
+    document.addEventListener('mousemove', onPressMove);
     document.addEventListener('mouseup', onPressEnd);
   })();
 })();
@@ -20721,7 +20765,6 @@ def driver_route_detail(route_id):
                                  prev_stop, _done, _total, _pct,
                                  unread_messages, _csrf, route_id)
 
-    _reorder_html = ""
     _reorder_list_html = ""
     if _reorderable:
         _ro_rows = "".join(
@@ -20735,19 +20778,18 @@ def driver_route_detail(route_id):
             % (_r["id"], e(_r["name"]), e(_r["address"]))
             for _r in _reorderable)
         # 2026-10-10: list only — the toggle lives in the top bar now.
+        # 2026-11-17: the <script> that defines roMove/roSave is part of THIS
+        # string. It used to live in _reorder_html, which stopped being
+        # rendered when the toggle moved to the top bar — the list kept being
+        # emitted, the script did not, and every arrow called a function that
+        # did not exist. The driver reported the arrows doing nothing; the
+        # reorder API was healthy the whole time, which is why the endpoint
+        # test never caught it. Keep the handlers next to the markup that
+        # calls them so they cannot be separated again.
         _reorder_list_html = (
             '<div id="cab-ro-list">'
             + _ro_rows +
             '<div id="cab-ro-status" class="cab-photo-status" hidden></div>'
-            '</div>'
-        )
-        _reorder_html = (
-            '<div class="cab-ro-wrap">'
-            '<button type="button" class="cab-ro-toggle"'
-            ' onclick="document.getElementById(\'cab-ro-list\').hidden='
-            '!document.getElementById(\'cab-ro-list\').hidden">'
-            '&#8645; Upcoming Stops (%d) — tap to reorder</button>' % len(_reorderable)
-            + _reorder_list_html +
             '</div>'
             '<script>(function(){'
             'var RO_CSRF=' + json.dumps(_csrf) + ';'
