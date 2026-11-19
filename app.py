@@ -34809,7 +34809,7 @@ def _ensure_yard_dump_return(stops, company_id):
             if not address or not _is_company_yard_address(conn, company_id, address):
                 continue
             instruction = " ".join(str(stop.get(k) or "") for k in ("raw", "notes"))
-            if not re.search(r"\\b(?:return|bring|take|drop)\\s+(?:the\\s+)?(?:empty\\s+)?(?:can|container|it)\\s+(?:back\\s+)?to\\s+(?:the\\s+)?yard\\b|\\b(?:return|bring|take)\\s+(?:the\\s+)?(?:empty\\s+)?(?:can|container|it)\\s+back\\b", instruction, re.I):
+            if not re.search(r"\b(?:return|bring|take|drop)\s+(?:the\s+)?(?:empty\s+)?(?:can|container|it)\s+(?:back\s+)?to\s+(?:the\s+)?yard\b|\b(?:return|bring|take)\s+(?:the\s+)?(?:empty\s+)?(?:can|container|it)\s+back\b", instruction, re.I):
                 continue
             stop["return_leg"] = address
     finally:
