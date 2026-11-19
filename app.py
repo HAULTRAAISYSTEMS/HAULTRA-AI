@@ -19986,6 +19986,10 @@ def _cab_stop_legs(s, full_address, site_addr_by_id, dump_loc_by_name):
     _ret_id = s.get("return_site_id") if "return_site_id" in s.keys() else None
     if _ret_name or _ret_id:
         nm, addr = _resolve(_ret_id, _ret_name)
+        # A yard dump-and-return can use the original stop address as its
+        # return destination. Do not require a second site record for it.
+        if not addr and _ret_name and _street_key(_ret_name) == _street_key(full_address):
+            addr = (full_address or "").strip()
         legs.append({"key": "return", "label": "RETURN", "name": nm, "address": addr})
 
     want = (s.get("active_leg") or "primary") if "active_leg" in s.keys() else "primary"
@@ -34779,6 +34783,40 @@ def _ensure_drop_can_at_site(stops, company_id):
         return stops
 
 
+
+def _ensure_yard_dump_return(stops, company_id):
+    """Keep a full yard can's explicit dump-and-return trip on one stop.
+
+    A yard load with a dump leg needs a third cab leg when the instruction
+    explicitly says the emptied can comes back to the same yard. Do not
+    interpret merely heading the truck back as a can return, and never
+    overwrite a dispatcher-selected return destination.
+    """
+    if not isinstance(stops, list):
+        return stops
+    conn = get_db()
+    try:
+        for stop in stops:
+            if not isinstance(stop, dict):
+                continue
+            if (stop.get("action") or "").strip().upper() != "YARD":
+                continue
+            if not (stop.get("dump_leg") or "").strip():
+                continue
+            if (stop.get("return_leg") or "").strip():
+                continue
+            address = (stop.get("address") or "").strip()
+            if not address or not _is_company_yard_address(conn, company_id, address):
+                continue
+            instruction = " ".join(str(stop.get(k) or "") for k in ("raw", "notes"))
+            if not re.search(r"\\b(?:return|bring|take|drop)\\s+(?:the\\s+)?(?:empty\\s+)?(?:can|container|it)\\s+(?:back\\s+)?to\\s+(?:the\\s+)?yard\\b|\\b(?:return|bring|take)\\s+(?:the\\s+)?(?:empty\\s+)?(?:can|container|it)\\s+back\\b", instruction, re.I):
+                continue
+            stop["return_leg"] = address
+    finally:
+        conn.close()
+    return stops
+
+
 def _ensure_yard_not_delivery(stops, company_id):
     """Deterministic guard (2026-11-14): a Delivery to the company's OWN yard
     is not a Delivery. It becomes a YARD stop.
@@ -35094,6 +35132,7 @@ def api_parse_dispatch():
         # After the yard rule, so a "head to the yard" stop has already had its
         # return leg cleared and this cannot put one back.
         mapped = _ensure_drop_can_at_site(mapped, cid())
+        mapped = _ensure_yard_dump_return(mapped, cid())
         _pid = _store_parse_session(cid(), text, manual_stops + mapped)
         if mapped:
             return jsonify({
@@ -35123,6 +35162,7 @@ def api_parse_dispatch():
     ai_stops = _ensure_yard_not_delivery(ai_stops, cid())
     ai_stops = _ensure_head_to_yard_not_return(ai_stops, cid())
     ai_stops = _ensure_drop_can_at_site(ai_stops, cid())
+    ai_stops = _ensure_yard_dump_return(ai_stops, cid())
     _pid = _store_parse_session(cid(), text, manual_stops + ai_stops)
 
     return jsonify({"parse_id": _pid, "stops": manual_stops + ai_stops})
